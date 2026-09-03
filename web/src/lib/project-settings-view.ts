@@ -8,13 +8,11 @@ export function projectSettingsSections(
   sourceType: string | null | undefined
 ) {
   const isUploadedSource = sourceType === 'uploaded_source'
-  const isComposeSource = sourceType === 'compose'
-  const isLocalSource = isUploadedSource || isComposeSource
 
   return {
-    showRepository: view === 'git' && !isLocalSource,
-    showUploadedSource: view === 'git' && isLocalSource,
+    showRepository: view === 'git' && !isUploadedSource,
+    showUploadedSource: view === 'git' && isUploadedSource,
     showBuildConfiguration: view === 'build',
-    showGitAutomation: view === 'git' && !isLocalSource,
+    showGitAutomation: view === 'git' && !isUploadedSource,
   }
 }

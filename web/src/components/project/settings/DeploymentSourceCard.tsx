@@ -27,12 +27,7 @@ import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 type SourceType =
-  | 'git'
-  | 'docker_image'
-  | 'static_files'
-  | 'uploaded_source'
-  | 'compose'
-  | 'manual'
+  'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual'
 
 /** How each source type reads in the "keeps deploying from X" sentence. */
 const SOURCE_LABELS: Record<SourceType, string> = {
@@ -40,7 +35,6 @@ const SOURCE_LABELS: Record<SourceType, string> = {
   docker_image: 'a Docker image',
   static_files: 'an uploaded static bundle',
   uploaded_source: 'an uploaded source archive',
-  compose: 'an editable Docker Compose document',
   manual: 'its configured source',
 }
 

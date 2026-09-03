@@ -532,11 +532,6 @@ impl TempsPlugin for DeploymentsPlugin {
 
         // Get data directory for local file storage
         let data_dir = config_service.data_dir();
-        let compose_source_service = Arc::new(crate::services::ComposeSourceService::new(
-            db.clone(),
-            data_dir.clone(),
-        ));
-
         // Create NodeService for admin node routes (list/get with session auth)
         let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
 
@@ -580,7 +575,6 @@ impl TempsPlugin for DeploymentsPlugin {
             cron_service,
             external_deployment_manager,
             remote_deployment_service,
-            compose_source_service,
             db,
             workflow_planner,
             workflow_executor,

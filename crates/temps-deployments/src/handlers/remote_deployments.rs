@@ -10,13 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::audit::{
-    ComposeSourceSavedAudit, DeployFromComposeSourceAudit, DeployFromImageAudit,
-    DeployFromImageUploadAudit, DeployFromStaticAudit, DeployFromUploadedSourceAudit,
-    ExternalImageDeletedAudit, ExternalImageRegisteredAudit, StaticBundleDeletedAudit,
-    StaticBundleUploadedAudit,
+    DeployFromImageAudit, DeployFromImageUploadAudit, DeployFromStaticAudit,
+    DeployFromUploadedSourceAudit, ExternalImageDeletedAudit, ExternalImageRegisteredAudit,
+    StaticBundleDeletedAudit, StaticBundleUploadedAudit,
 };
 use super::types::AppState;
-use crate::services::{ComposeSourceDocument, ComposeSourceError};
 use axum::{
     extract::{Extension, Multipart, Path, Query, State},
     http::StatusCode,
@@ -53,9 +51,6 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
         deploy_from_image_upload,
         deploy_from_static,
         deploy_from_uploaded_source,
-        get_compose_source,
-        save_compose_source,
-        deploy_compose_source,
         upload_static_bundle,
         register_external_image,
         list_remote_external_images,
@@ -70,10 +65,6 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
         DeployFromImageUploadQuery,
         DeployFromStaticRequest,
         RemoteDeploymentResponse,
-        ComposeSourceResponse,
-        SaveComposeSourceRequest,
-        DeployComposeSourceRequest,
-        ComposeSourceServiceResponse,
         ExternalImageResponse,
         StaticBundleResponse,
         PaginatedExternalImagesResponse,
@@ -91,103 +82,6 @@ pub struct RemoteDeploymentsApiDoc;
 pub struct SourceArchiveUpload {
     #[schema(value_type = String, format = Binary)]
     pub file: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ComposeSourceServiceResponse {
-    pub name: String,
-    pub image: Option<String>,
-    pub looks_like_database: bool,
-    pub detected_service_type: Option<temps_entities::preset::ComposeServiceFamily>,
-    pub ports: Vec<temps_entities::preset::ComposePortMapping>,
-    pub health_check_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ComposeSourceResponse {
-    /// Editable Docker Compose YAML owned by Temps.
-    pub content: String,
-    /// Immutable source-bundle ID. Deployments snapshot this revision.
-    pub revision: i32,
-    /// Content checksum used for diagnostics and cache validation.
-    pub checksum: String,
-    #[schema(value_type = String, format = DateTime)]
-    pub updated_at: UtcDateTime,
-    pub services: Vec<ComposeSourceServiceResponse>,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct SaveComposeSourceRequest {
-    /// Complete Docker Compose YAML document.
-    pub content: String,
-    /// Last revision read by the editor. A mismatch returns 409 instead of
-    /// silently overwriting another save.
-    pub expected_revision: Option<i32>,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema, Default)]
-pub struct DeployComposeSourceRequest {
-    /// Omit to deploy the current saved revision. Supplying a revision is used
-    /// by deterministic rollback/replay flows.
-    pub revision: Option<i32>,
-}
-
-impl From<ComposeSourceError> for Problem {
-    fn from(error: ComposeSourceError) -> Self {
-        let status = match &error {
-            ComposeSourceError::ProjectNotFound { .. }
-            | ComposeSourceError::EnvironmentNotFound { .. }
-            | ComposeSourceError::SourceNotFound { .. } => StatusCode::NOT_FOUND,
-            ComposeSourceError::IncompatibleProject { .. }
-            | ComposeSourceError::InvalidPresetConfig { .. }
-            | ComposeSourceError::UnsafeComposePath { .. }
-            | ComposeSourceError::RevisionConflict { .. } => StatusCode::CONFLICT,
-            ComposeSourceError::EmptySource { .. }
-            | ComposeSourceError::InvalidYaml { .. }
-            | ComposeSourceError::NoServices { .. }
-            | ComposeSourceError::EmbeddedCredential { .. }
-            | ComposeSourceError::InvalidHealthCheckPath { .. } => StatusCode::BAD_REQUEST,
-            ComposeSourceError::SourceTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            ComposeSourceError::Database { .. }
-            | ComposeSourceError::Storage { .. }
-            | ComposeSourceError::Task { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        let title = match &error {
-            ComposeSourceError::ProjectNotFound { .. } => "Project Not Found",
-            ComposeSourceError::EnvironmentNotFound { .. } => "Environment Not Found",
-            ComposeSourceError::SourceNotFound { .. } => "Compose Source Not Found",
-            ComposeSourceError::IncompatibleProject { .. } => {
-                "Project Is Not an Editable Compose Service"
-            }
-            ComposeSourceError::InvalidPresetConfig { .. } => "Invalid Compose Configuration",
-            ComposeSourceError::UnsafeComposePath { .. } => "Invalid Compose Path",
-            ComposeSourceError::RevisionConflict { .. } => "Compose Source Changed",
-            ComposeSourceError::EmptySource { .. } => "Empty Compose Source",
-            ComposeSourceError::InvalidYaml { .. } => "Invalid Docker Compose YAML",
-            ComposeSourceError::NoServices { .. } => "Compose Source Has No Services",
-            ComposeSourceError::EmbeddedCredential { .. } => {
-                "Compose Source Contains a Literal Credential"
-            }
-            ComposeSourceError::InvalidHealthCheckPath { .. } => "Invalid Health Check Path",
-            ComposeSourceError::SourceTooLarge { .. } => "Compose Source Too Large",
-            ComposeSourceError::Database { .. } => "Compose Database Operation Failed",
-            ComposeSourceError::Storage { .. } => "Compose Source Storage Failed",
-            ComposeSourceError::Task { .. } => "Compose Source Operation Failed",
-        };
-        problemdetails::new(status)
-            .with_title(title)
-            .with_detail(error.to_string())
-    }
-}
-
-fn compose_source_response(document: ComposeSourceDocument) -> ComposeSourceResponse {
-    ComposeSourceResponse {
-        content: document.content,
-        revision: document.bundle.id,
-        checksum: document.bundle.checksum,
-        updated_at: document.bundle.created_at,
-        services: compose_service_responses(&document.services),
-    }
 }
 
 static ARCHIVE_UPLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -240,223 +134,6 @@ async fn read_bounded_multipart_text(
             .with_title("Invalid Multipart Text")
             .with_detail(format!("{label} is not valid UTF-8: {error}"))
     })
-}
-
-fn compose_service_responses(
-    services: &[temps_presets::ComposeServicePreview],
-) -> Vec<ComposeSourceServiceResponse> {
-    services
-        .iter()
-        .map(|service| ComposeSourceServiceResponse {
-            name: service.name.clone(),
-            image: service.image.clone(),
-            looks_like_database: service.looks_like_database,
-            detected_service_type: service.detected_service_type,
-            ports: service.ports.clone(),
-            health_check_path: service.health_check_path.clone(),
-        })
-        .collect()
-}
-
-/// Read the current Temps-owned Docker Compose source.
-#[utoipa::path(
-    get,
-    tag = "Deployments",
-    path = "/projects/{project_id}/compose-source",
-    responses(
-        (status = 200, description = "Current editable Compose source", body = ComposeSourceResponse),
-        (status = 404, description = "Project or Compose source not found"),
-        (status = 409, description = "Project is not an editable Compose service")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn get_compose_source(
-    RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<AppState>>,
-    Path(project_id): Path<i32>,
-) -> Result<Json<ComposeSourceResponse>, Problem> {
-    permission_guard!(auth, DeploymentsRead);
-    project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, state.project_access_checker);
-
-    let document = state.compose_source_service.get(project_id).await?;
-    Ok(Json(compose_source_response(document)))
-}
-
-/// Validate and save a new immutable revision of a Temps-owned Compose source.
-#[utoipa::path(
-    put,
-    tag = "Deployments",
-    path = "/projects/{project_id}/compose-source",
-    request_body = SaveComposeSourceRequest,
-    responses(
-        (status = 200, description = "Compose source saved", body = ComposeSourceResponse),
-        (status = 400, description = "Invalid Compose YAML or health-check path"),
-        (status = 409, description = "Revision conflict or incompatible project")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn save_compose_source(
-    RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<AppState>>,
-    Path(project_id): Path<i32>,
-    Extension(metadata): Extension<RequestMetadata>,
-    Json(request): Json<SaveComposeSourceRequest>,
-) -> Result<Json<ComposeSourceResponse>, Problem> {
-    project_permission_guard!(
-        auth,
-        DeploymentsCreate,
-        project_id,
-        state.project_access_checker
-    );
-    project_scope_guard!(auth, project_id);
-    let document = state
-        .compose_source_service
-        .save(project_id, request.content, request.expected_revision)
-        .await?;
-    let revision = document.bundle.id;
-    let audit = ComposeSourceSavedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address),
-            user_agent: metadata.user_agent,
-        },
-        project_id,
-        source_bundle_id: revision,
-    };
-    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
-        error!(project_id, revision, %error, "Failed to create Compose-source save audit log");
-    }
-    Ok(Json(compose_source_response(document)))
-}
-
-/// Deploy the current (or explicitly selected) immutable Compose source revision.
-#[utoipa::path(
-    post,
-    tag = "Deployments",
-    path = "/projects/{project_id}/environments/{environment_id}/deploy/compose",
-    request_body = DeployComposeSourceRequest,
-    responses(
-        (status = 202, description = "Compose deployment started", body = RemoteDeploymentResponse),
-        (status = 404, description = "Project, environment, or source revision not found"),
-        (status = 409, description = "Project is not an editable Compose service")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn deploy_compose_source(
-    RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<AppState>>,
-    Path((project_id, environment_id)): Path<(i32, i32)>,
-    Extension(metadata): Extension<RequestMetadata>,
-    Json(request): Json<DeployComposeSourceRequest>,
-) -> Result<impl IntoResponse, Problem> {
-    project_permission_guard!(
-        auth,
-        DeploymentsCreate,
-        project_id,
-        state.project_access_checker
-    );
-    project_scope_guard!(auth, project_id);
-
-    let prepared = state
-        .compose_source_service
-        .prepare_deployment(project_id, environment_id, request.revision)
-        .await?;
-    let deployment = prepared.deployment;
-    let environment = prepared.environment;
-    let bundle = prepared.bundle;
-
-    if let Err(error) = state
-        .workflow_planner
-        .create_deployment_jobs(deployment.id)
-        .await
-    {
-        if let Err(cleanup_error) = state
-            .compose_source_service
-            .delete_unqueued_deployment(project_id, deployment.id)
-            .await
-        {
-            error!(deployment_id = deployment.id, %cleanup_error, "Failed to clean up unplanned Compose deployment");
-        }
-        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Job Creation Failed")
-            .with_detail(format!(
-                "Could not plan deployment {} from Compose revision {}: {error}",
-                deployment.id, bundle.id
-            )));
-    }
-
-    if let Err(error) = state
-        .queue_service
-        .send(Job::DeploymentCreated(DeploymentCreatedJob {
-            deployment_id: deployment.id,
-            project_id,
-            environment_id,
-            environment_name: environment.name.clone(),
-            branch: None,
-            commit_sha: None,
-        }))
-        .await
-    {
-        if let Err(cleanup_error) = state
-            .compose_source_service
-            .delete_unqueued_deployment(project_id, deployment.id)
-            .await
-        {
-            error!(deployment_id = deployment.id, %cleanup_error, "Failed to clean up unqueued Compose deployment");
-        }
-        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Deployment Queue Failed")
-            .with_detail(format!(
-                "Could not queue deployment {} from Compose revision {}: {error}",
-                deployment.id, bundle.id
-            )));
-    }
-
-    let workflow_executor = state.workflow_executor.clone();
-    let deployment_gate = state.deployment_gate.clone();
-    let db = state.db.clone();
-    let environment_name = environment.name.clone();
-    let deployment_id = deployment.id;
-    tokio::spawn(async move {
-        crate::services::job_processor::JobProcessorService::gate_check_then_run(
-            &db,
-            &workflow_executor,
-            &deployment_gate,
-            project_id,
-            &environment_name,
-            deployment_id,
-        )
-        .await;
-    });
-
-    let audit = DeployFromComposeSourceAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address),
-            user_agent: metadata.user_agent,
-        },
-        project_id,
-        environment_id,
-        deployment_id: deployment.id,
-        source_bundle_id: bundle.id,
-    };
-    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
-        error!(deployment_id = deployment.id, revision = bundle.id, %error, "Failed to create Compose deployment audit log");
-    }
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(RemoteDeploymentResponse {
-            id: deployment.id,
-            project_id,
-            environment_id,
-            slug: deployment.slug,
-            state: deployment.state,
-            source_type: SourceType::Compose.to_string(),
-            created_at: deployment.created_at,
-        }),
-    ))
 }
 
 async fn rollback_uploaded_source(
@@ -667,7 +344,6 @@ pub async fn deploy_from_uploaded_source(
     let now = Utc::now();
     let bundle = match (source_bundles::ActiveModel {
         project_id: Set(project_id),
-        source_kind: Set(SourceType::UploadedSource.to_string()),
         archive_path: Set(relative_path.clone()),
         original_filename: Set(original_filename),
         content_type: Set("application/zip".to_string()),
@@ -3065,14 +2741,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/environments/{environment_id}/deploy/source",
             post(deploy_from_uploaded_source).layer(DefaultBodyLimit::max(501 * 1024 * 1024)),
         )
-        .route(
-            "/projects/{project_id}/compose-source",
-            get(get_compose_source).put(save_compose_source),
-        )
-        .route(
-            "/projects/{project_id}/environments/{environment_id}/deploy/compose",
-            post(deploy_compose_source),
-        )
         // Upload endpoints with increased body limit
         .route(
             "/projects/{project_id}/environments/{environment_id}/deploy/image-upload",
@@ -3134,7 +2802,6 @@ mod tests {
             SourceType::Git,
             SourceType::DockerImage,
             SourceType::StaticFiles,
-            SourceType::Compose,
             SourceType::Manual,
         ] {
             assert!(
@@ -3272,9 +2939,6 @@ mod tests {
     fn every_project_scoped_remote_handler_enforces_deployment_token_scope() {
         let source = include_str!("remote_deployments.rs");
         for handler_name in [
-            "get_compose_source",
-            "save_compose_source",
-            "deploy_compose_source",
             "deploy_from_uploaded_source",
             "deploy_from_image",
             "deploy_from_static",

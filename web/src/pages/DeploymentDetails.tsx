@@ -47,8 +47,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
-import { deployComposeSource } from '@/lib/compose-source-api'
-import { composeRevisionForRedeploy } from '@/lib/project-deploy-action'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
 import { historicalImageRuntime } from '@/lib/template-runtime-defaults'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
@@ -957,22 +955,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
-  const redeployCompose = useMutation({
-    mutationFn: ({
-      environmentId,
-      revision,
-    }: {
-      environmentId: number
-      revision?: number
-    }) => deployComposeSource(project.id, environmentId, revision),
-    meta: {
-      errorTitle: 'Failed to deploy Compose source',
-    },
-    onSuccess: () => {
-      setIsRedeployModalOpen(false)
-    },
-  })
-
   const pauseDeployment = useMutation({
     ...pauseDeploymentMutation(),
     meta: {
@@ -1023,14 +1005,12 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     tag,
     environmentId,
     imageRef: editedImageRef,
-    composeRevision,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
     imageRef?: string
-    composeRevision?: number
   }) => {
     if (project.source_type === 'docker_image') {
       const deploymentRuntime = historicalImageRuntime(deployment?.metadata)
@@ -1046,15 +1026,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           ...deploymentRuntime,
           image_ref: ref,
         },
-      })
-      navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
-      return
-    }
-
-    if (project.source_type === 'compose') {
-      await redeployCompose.mutateAsync({
-        environmentId,
-        revision: composeRevision,
       })
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
       return
@@ -1465,13 +1436,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             deployment.tag ? 'tag' : deployment.branch ? 'branch' : 'commit'
           }
           defaultEnvironment={deployment.environment_id || 0}
-          isLoading={
-            createDeployment.isPending ||
-            redeployImage.isPending ||
-            redeployCompose.isPending
-          }
+          isLoading={createDeployment.isPending || redeployImage.isPending}
           imageRef={deployment.metadata?.externalImageRef}
-          composeRevision={composeRevisionForRedeploy(deployment)}
         />
       </div>
     </div>

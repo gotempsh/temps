@@ -70,24 +70,6 @@ describe('deploymentSourceSummary', () => {
     })
   })
 
-  test('describes the immutable Compose revision', () => {
-    expect(
-      deploymentSourceSummary(
-        deployment({
-          metadata: {
-            deploymentSourceType: 'compose',
-            sourceBundleId: 42,
-          },
-        }),
-        'compose'
-      )
-    ).toEqual({
-      kind: 'compose',
-      label: 'Docker Compose source',
-      detail: 'Revision 42',
-    })
-  })
-
   test('falls back to the project source for older deployment metadata', () => {
     expect(deploymentSourceSummary(deployment(), 'static_files')).toEqual({
       kind: 'static_files',

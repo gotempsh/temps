@@ -126,7 +126,6 @@ interface RedeploymentModalProps {
     tag?: string
     environmentId: number
     imageRef?: string
-    composeRevision?: number
   }) => Promise<void>
   defaultBranch?: string
   defaultType?: 'branch' | 'commit' | 'tag'
@@ -142,8 +141,6 @@ interface RedeploymentModalProps {
    * image via deploy_from_image instead of the git pipeline.
    */
   imageRef?: string | null
-  /** Immutable Compose source bundle selected by a historical deployment. */
-  composeRevision?: number
 }
 
 export function RedeploymentModal({
@@ -159,12 +156,10 @@ export function RedeploymentModal({
   isLoading,
   mode = 'new',
   imageRef,
-  composeRevision,
 }: RedeploymentModalProps) {
   // Image-based (docker_image) projects deploy a prebuilt image, not a git
   // ref — the parent routes confirmation through deploy_from_image.
   const isImageDeploy = project?.source_type === 'docker_image'
-  const isComposeDeploy = project?.source_type === 'compose'
   // Fetch project details to get repo info and main branch
   const projectQuery = useQuery({
     ...getProjectBySlugOptions({
@@ -362,13 +357,7 @@ export function RedeploymentModal({
     const environmentId = value ? parseInt(value) : null
     setSelectedEnvironment(environmentId)
 
-    if (
-      !environmentId ||
-      !environmentsQuery.data ||
-      isImageDeploy ||
-      isComposeDeploy
-    )
-      return
+    if (!environmentId || !environmentsQuery.data || isImageDeploy) return
 
     const selectedEnv = environmentsQuery.data.find(
       (env: EnvironmentResponse) => env.id === environmentId
@@ -437,17 +426,6 @@ export function RedeploymentModal({
   }
 
   const handleConfirm = async () => {
-    if (isComposeDeploy) {
-      const envId =
-        mode === 'redeploy' ? defaultEnvironment : effectiveEnvironment
-      if (!envId) {
-        toast.error('No environment specified for deployment')
-        return
-      }
-      await onConfirm({ environmentId: envId, composeRevision })
-      return
-    }
-
     // Image-based projects: only the environment matters; the parent re-pulls
     // the prebuilt image. In redeploy mode the environment is fixed; in new
     // mode the user picks it.
@@ -556,65 +534,7 @@ export function RedeploymentModal({
           </DialogTitle>
         </DialogHeader>
 
-        {isComposeDeploy ? (
-          <div className="space-y-4">
-            <p className="text-sm text-muted-foreground">
-              {composeRevision != null
-                ? `Redeploy saved Docker Compose revision #${composeRevision}.`
-                : 'Deploy the latest saved Docker Compose revision.'}{' '}
-              Edit and save the YAML in Build settings before deploying if you
-              want to change an image version or service configuration.
-            </p>
-            {mode === 'redeploy' ? (
-              <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 rounded-md border bg-muted/50 p-4">
-                <div className="text-sm font-medium">Source:</div>
-                <div className="text-sm">
-                  {composeRevision != null
-                    ? `Saved Compose revision #${composeRevision}`
-                    : 'Latest saved Compose revision'}
-                </div>
-                <div className="text-sm font-medium">Environment:</div>
-                <div className="text-sm">{environmentName || 'Loading...'}</div>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <Label htmlFor="compose-environment">Environment</Label>
-                <Select
-                  value={effectiveEnvironment?.toString() || ''}
-                  onValueChange={handleEnvironmentChange}
-                  disabled={environmentsQuery.isLoading}
-                >
-                  <SelectTrigger id="compose-environment">
-                    <SelectValue placeholder="Select environment" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {environmentsQuery.data?.map((env: EnvironmentResponse) => (
-                      <SelectItem key={env.id} value={env.id.toString()}>
-                        {env.name || env.slug}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-            <DialogFooter>
-              <Button variant="outline" onClick={onClose} disabled={isLoading}>
-                Cancel
-              </Button>
-              <Button
-                onClick={handleConfirm}
-                disabled={
-                  isLoading ||
-                  (mode === 'redeploy'
-                    ? !defaultEnvironment
-                    : !effectiveEnvironment)
-                }
-              >
-                {isLoading ? 'Deploying...' : 'Deploy Compose'}
-              </Button>
-            </DialogFooter>
-          </div>
-        ) : isImageDeploy ? (
+        {isImageDeploy ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
               {mode === 'redeploy'

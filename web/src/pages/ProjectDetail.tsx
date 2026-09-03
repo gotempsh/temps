@@ -91,7 +91,6 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ShieldAlert } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
-import { deployComposeSource } from '@/lib/compose-source-api'
 
 export function ProjectDetail() {
   const { slug } = useParams()
@@ -217,14 +216,6 @@ export function ProjectDetail() {
     meta: { errorTitle: 'Failed to deploy image' },
   })
 
-  const deployCompose = useMutation({
-    mutationFn: (environmentId: number) =>
-      project
-        ? deployComposeSource(project.id, environmentId)
-        : Promise.reject(new Error('Project is unavailable')),
-    meta: { errorTitle: 'Failed to deploy Compose source' },
-  })
-
   // Register the current project so the assistant's "new chat" defaults to it.
   useAssistantProject(
     project ? { id: project.id, slug: project.slug, name: project.name } : null
@@ -268,8 +259,6 @@ export function ProjectDetail() {
         path: { project_id: project.id, environment_id: environmentId },
         body: { ...savedRuntime, image_ref: imageRef },
       })
-    } else if (project.source_type === 'compose') {
-      await deployCompose.mutateAsync(environmentId)
     } else {
       await createDeployment.mutateAsync({
         path: { id: project.id },
@@ -422,11 +411,7 @@ export function ProjectDetail() {
             serviceTemplateDeployOverrides(project).image_ref ??
             lastDeployment?.metadata?.externalImageRef
           }
-          isLoading={
-            createDeployment.isPending ||
-            deployImage.isPending ||
-            deployCompose.isPending
-          }
+          isLoading={createDeployment.isPending || deployImage.isPending}
         />
         <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
           {/* Attack Mode Banner */}

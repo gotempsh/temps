@@ -17,7 +17,6 @@ use utoipa::ToSchema;
 /// - `DockerImage`: Pre-built Docker image from external registry
 /// - `StaticFiles`: Pre-built static files uploaded as a bundle
 /// - `UploadedSource`: Source archive uploaded without a Git repository
-/// - `Compose`: Temps-owned, editable Docker Compose document
 /// - `Manual`: Flexible type that accepts any deployment method
 #[derive(
     Debug,
@@ -57,13 +56,6 @@ pub enum SourceType {
     #[sea_orm(string_value = "uploaded_source")]
     UploadedSource,
 
-    /// A Docker Compose document owned and revisioned by Temps.
-    ///
-    /// Unlike `UploadedSource`, this is not an opaque one-shot archive. Users
-    /// can read, edit, validate, save, and redeploy the current Compose YAML.
-    #[sea_orm(string_value = "compose")]
-    Compose,
-
     /// Manual/Flexible deployments
     /// Accepts any deployment method: Docker images, static files, or Git-based
     /// Allows switching between deployment methods without recreating the project
@@ -78,7 +70,6 @@ impl std::fmt::Display for SourceType {
             SourceType::DockerImage => write!(f, "docker_image"),
             SourceType::StaticFiles => write!(f, "static_files"),
             SourceType::UploadedSource => write!(f, "uploaded_source"),
-            SourceType::Compose => write!(f, "compose"),
             SourceType::Manual => write!(f, "manual"),
         }
     }
@@ -97,7 +88,6 @@ impl SourceType {
             SourceType::Git
                 | SourceType::DockerImage
                 | SourceType::UploadedSource
-                | SourceType::Compose
                 | SourceType::Manual
         )
     }
@@ -109,7 +99,6 @@ impl SourceType {
             SourceType::Git
                 | SourceType::DockerImage
                 | SourceType::UploadedSource
-                | SourceType::Compose
                 | SourceType::Manual
         )
     }
@@ -155,7 +144,6 @@ mod tests {
         assert_eq!(SourceType::DockerImage.to_string(), "docker_image");
         assert_eq!(SourceType::StaticFiles.to_string(), "static_files");
         assert_eq!(SourceType::UploadedSource.to_string(), "uploaded_source");
-        assert_eq!(SourceType::Compose.to_string(), "compose");
         assert_eq!(SourceType::Manual.to_string(), "manual");
     }
 
@@ -165,7 +153,6 @@ mod tests {
         assert!(!SourceType::DockerImage.requires_git_info());
         assert!(!SourceType::StaticFiles.requires_git_info());
         assert!(!SourceType::UploadedSource.requires_git_info());
-        assert!(!SourceType::Compose.requires_git_info());
         assert!(!SourceType::Manual.requires_git_info());
     }
 
@@ -175,7 +162,6 @@ mod tests {
         assert!(SourceType::DockerImage.is_container_based());
         assert!(!SourceType::StaticFiles.is_container_based());
         assert!(SourceType::UploadedSource.is_container_based());
-        assert!(SourceType::Compose.is_container_based());
         assert!(SourceType::Manual.is_container_based());
     }
 
@@ -185,7 +171,6 @@ mod tests {
         assert!(!SourceType::DockerImage.is_static());
         assert!(SourceType::StaticFiles.is_static());
         assert!(!SourceType::UploadedSource.is_static());
-        assert!(!SourceType::Compose.is_static());
         assert!(!SourceType::Manual.is_static());
     }
 
@@ -195,7 +180,6 @@ mod tests {
         assert!(!SourceType::DockerImage.is_flexible());
         assert!(!SourceType::StaticFiles.is_flexible());
         assert!(!SourceType::UploadedSource.is_flexible());
-        assert!(!SourceType::Compose.is_flexible());
         assert!(SourceType::Manual.is_flexible());
     }
 
@@ -225,7 +209,6 @@ mod tests {
         assert!(SourceType::StaticFiles.allows_deployment_method(&SourceType::Git));
         assert!(SourceType::StaticFiles.allows_deployment_method(&SourceType::DockerImage));
         assert!(SourceType::UploadedSource.allows_deployment_method(&SourceType::UploadedSource));
-        assert!(SourceType::Compose.allows_deployment_method(&SourceType::Compose));
     }
 
     #[test]
@@ -246,10 +229,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SourceType::UploadedSource).unwrap(),
             "\"uploaded_source\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SourceType::Compose).unwrap(),
-            "\"compose\""
         );
     }
 
@@ -274,10 +253,6 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SourceType>("\"uploaded_source\"").unwrap(),
             SourceType::UploadedSource
-        );
-        assert_eq!(
-            serde_json::from_str::<SourceType>("\"compose\"").unwrap(),
-            SourceType::Compose
         );
     }
 }

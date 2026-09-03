@@ -3,18 +3,6 @@
 
 import type { SourceType } from '@/api/client'
 
-interface DeploymentComposeRevision {
-  metadata?: {
-    sourceBundleId?: number | null
-  } | null
-}
-
-export function composeRevisionForRedeploy(
-  deployment: DeploymentComposeRevision | null | undefined
-): number | undefined {
-  return deployment?.metadata?.sourceBundleId ?? undefined
-}
-
 export function projectDeployLaunchMode(
   sourceType: SourceType
 ): 'dialog' | 'upload' {

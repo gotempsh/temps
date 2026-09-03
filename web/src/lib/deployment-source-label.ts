@@ -9,8 +9,6 @@ export function deploymentSourceLabel(
   if (deployment.branch) return deployment.branch
 
   switch (deployment.metadata?.deploymentSourceType) {
-    case 'compose':
-      return 'Docker Compose source'
     case 'docker_image':
       return 'Docker image'
     case 'static_files':

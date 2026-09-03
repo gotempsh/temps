@@ -146,7 +146,6 @@ import {
   repositoryConnectionPath,
   repositorySelectionPath,
 } from '@/lib/repository-connection-route'
-import { ComposeSourceEditor } from './ComposeSourceEditor'
 
 interface GitSettingsProps {
   project: ProjectResponse
@@ -187,8 +186,7 @@ function GitSettingsInline({
   // ---------------- Live API data ----------------
   const isPublicRepo = project.is_public_repo
   const isUploadedSource = project.source_type === 'uploaded_source'
-  const isComposeSource = project.source_type === 'compose'
-  const isLocalSource = isUploadedSource || isComposeSource
+  const isLocalSource = isUploadedSource
   const sections = projectSettingsSections(view, project.source_type)
   const publicProvider = publicRepositoryProvider(project?.git_url)
   const publicRepository = parsePublicRepositoryUrl(project?.git_url)
@@ -790,31 +788,18 @@ function GitSettingsInline({
         <Card>
           <CardHeader>
             <CardTitle className="text-base">
-              {isComposeSource
-                ? 'Temps-owned Docker Compose source'
-                : 'No Git repository connected'}
+              No Git repository connected
             </CardTitle>
             <CardDescription>
-              {isComposeSource
-                ? 'This project deploys an editable, revisioned Compose document stored by Temps. Use Build settings to edit and redeploy it.'
-                : 'This project currently deploys source archives uploaded through Drop. Connect a repository to enable deployments from commits and branches.'}
+              This project currently deploys source archives uploaded through
+              Drop. Connect a repository to enable deployments from commits and
+              branches.
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {isComposeSource ? (
-              <Button
-                size="sm"
-                onClick={() =>
-                  navigate(`/projects/${project.slug}/build?tab=build`)
-                }
-              >
-                Open Build settings
-              </Button>
-            ) : (
-              <Button size="sm" onClick={goToChangeRepo}>
-                Connect repository
-              </Button>
-            )}
+            <Button size="sm" onClick={goToChangeRepo}>
+              Connect repository
+            </Button>
           </CardContent>
         </Card>
       )}
@@ -1239,12 +1224,6 @@ function GitSettingsInline({
       )}
 
       {/* ----------------- Compose routing and service controls ----------------- */}
-      {sections.showBuildConfiguration &&
-        isComposePreset &&
-        isComposeSource && (
-          <ComposeSourceEditor project={project} refetchProject={refetch} />
-        )}
-
       {sections.showBuildConfiguration && isComposePreset && (
         <Card>
           <CardHeader>
@@ -1262,10 +1241,9 @@ function GitSettingsInline({
               repositoryId={repositoryData?.id}
               isPublicRepo={isPublicRepo}
               isUploadedSource={isUploadedSource}
-              isComposeSource={isComposeSource}
             />
 
-            {!isLocalSource && (
+            {!isUploadedSource && (
               <Collapsible
                 open={advancedComposeOpen}
                 onOpenChange={setAdvancedComposeOpen}
@@ -2072,7 +2050,6 @@ function ExcludedServicesInline({
   repositoryId,
   isPublicRepo,
   isUploadedSource,
-  isComposeSource,
 }: {
   project: ProjectResponse
   saveGitField: (overrides: any) => Promise<void>
@@ -2080,7 +2057,6 @@ function ExcludedServicesInline({
   repositoryId: number | undefined
   isPublicRepo: boolean
   isUploadedSource: boolean
-  isComposeSource: boolean
 }) {
   const cfg: any = (project.preset_config as any) || {}
   const composePath = cfg.composePath || 'docker-compose.yml'
@@ -2273,7 +2249,7 @@ function ExcludedServicesInline({
     }
   }
 
-  if (!repositoryId && !isPublicRepo && !isUploadedSource && !isComposeSource) {
+  if (!repositoryId && !isPublicRepo && !isUploadedSource) {
     return null
   }
 
@@ -2299,21 +2275,17 @@ function ExcludedServicesInline({
           variant="ghost"
           size="sm"
           className="h-7 shrink-0 text-xs"
-          disabled={isUploadedSource || isComposeSource || isSyncing || saving}
+          disabled={isUploadedSource || isSyncing || saving}
           onClick={sync}
           title={
-            isUploadedSource || isComposeSource
-              ? isComposeSource
-                ? 'Save the Compose YAML above to refresh services'
-                : 'Upload a new source archive to refresh Compose services'
+            isUploadedSource
+              ? 'Upload a new source archive to refresh Compose services'
               : undefined
           }
         >
           <RefreshCw className={cn('h-3 w-3', isSyncing && 'animate-spin')} />
-          {isUploadedSource || isComposeSource
-            ? isComposeSource
-              ? 'Refreshed on save'
-              : 'Refresh with new upload'
+          {isUploadedSource
+            ? 'Refresh with new upload'
             : 'Sync from repository'}
         </Button>
       </div>
@@ -2321,9 +2293,7 @@ function ExcludedServicesInline({
       {services.length === 0 ? (
         <p className="text-xs text-muted-foreground italic py-2">
           No services detected yet —{' '}
-          {isComposeSource
-            ? 'save the Compose YAML above to refresh this list.'
-            : `captured automatically after your next deploy, or sync ${composePath} now.`}
+          {`captured automatically after your next deploy, or sync ${composePath} now.`}
         </p>
       ) : (
         <TooltipProvider>

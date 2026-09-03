@@ -16,10 +16,8 @@ mod mod_rs {
 
 // Re-export main types for easy access
 pub use mod_rs::docker_compose::{
-    compose_environment_name_is_secret, compose_environment_value_is_safe_connection_endpoint,
     http_healthcheck_path, list_compose_services, list_compose_services_with_override,
-    render_effective_compose_preview, validate_compose_credentials,
-    ComposeCredentialValidationError, ComposeParseError, ComposeServicePreview,
+    render_effective_compose_preview, ComposeParseError, ComposeServicePreview,
     EffectiveComposePreview,
 };
 pub use mod_rs::dockerfile_expose::detect_primary_exposed_port;

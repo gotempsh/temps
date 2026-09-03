@@ -9,7 +9,6 @@ import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   ArrowRight,
-  Braces,
   Camera,
   Container,
   ExternalLink,
@@ -40,13 +39,11 @@ export function LastDeployment({
     : null
   const sourceType = deployment.metadata?.deploymentSourceType
   const SourceIcon =
-    sourceType === 'compose'
-      ? Braces
-      : sourceType === 'docker_image'
-        ? Container
-        : sourceType === 'uploaded_source' || sourceType === 'static_files'
-          ? FileArchive
-          : GitBranch
+    sourceType === 'docker_image'
+      ? Container
+      : sourceType === 'uploaded_source' || sourceType === 'static_files'
+        ? FileArchive
+        : GitBranch
 
   return (
     <Card className="overflow-hidden">

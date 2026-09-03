@@ -93,26 +93,6 @@ async fn project_secret_preview_default(db: &DatabaseConnection) -> anyhow::Resu
     Ok(row.try_get("", "column_default")?)
 }
 
-async fn source_bundle_kind_schema_state(db: &DatabaseConnection) -> anyhow::Result<(bool, bool)> {
-    let row = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT \
-                EXISTS (SELECT 1 FROM information_schema.columns \
-                  WHERE table_schema = 'public' \
-                    AND table_name = 'source_bundles' \
-                    AND column_name = 'source_kind') AS has_column, \
-                to_regclass('idx_source_bundles_project_kind_revision') IS NOT NULL AS has_index"
-                .to_string(),
-        ))
-        .await?
-        .expect("schema-state query returns one row");
-    Ok((
-        row.try_get("", "has_column")?,
-        row.try_get("", "has_index")?,
-    ))
-}
-
 async fn managed_monitor_schema_state(db: &DatabaseConnection) -> anyhow::Result<(bool, bool)> {
     let row = db
         .query_one(sea_orm::Statement::from_string(
@@ -290,70 +270,6 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
         service_project_identity_schema_state(&db).await?,
         (true, true)
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_source_bundle_kind_migration_up_down_and_reup() -> anyhow::Result<()> {
-    if external_db_configured() {
-        println!(
-            "Skipping test_source_bundle_kind_migration_up_down_and_reup: external database configured"
-        );
-        return Ok(());
-    }
-
-    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
-        .with_wait_for(postgres_ready_wait_for())
-        .with_exposed_port(ContainerPort::Tcp(5432))
-        .with_env_var("POSTGRES_DB", "postgres")
-        .with_env_var("POSTGRES_USER", "postgres")
-        .with_env_var("POSTGRES_PASSWORD", "postgres")
-        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_cmd(vec![
-            "postgres",
-            "-c",
-            "timescaledb.max_background_workers=0",
-        ])
-        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
-        .start()
-        .await
-    {
-        Ok(container) => container,
-        Err(error) => {
-            eprintln!("Skipping source-bundle-kind migration test: Docker unavailable: {error}");
-            return Ok(());
-        }
-    };
-    let port = container.get_host_port_ipv4(5432).await?;
-    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
-    let db = connect_with_retries(&db_url).await?;
-
-    let target = "m20260831_000001_add_source_bundle_kind";
-    let pre_target_count = Migrator::migrations()
-        .iter()
-        .position(|migration| migration.name() == target)
-        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
-    Migrator::up(&db, Some(pre_target_count as u32)).await?;
-
-    let before = source_bundle_kind_schema_state(&db).await?;
-    assert!(!before.0);
-    assert!(!before.1);
-
-    Migrator::up(&db, Some(1)).await?;
-    let after_up = source_bundle_kind_schema_state(&db).await?;
-    assert!(after_up.0);
-    assert!(after_up.1);
-
-    Migrator::down(&db, Some(1)).await?;
-    let after_down = source_bundle_kind_schema_state(&db).await?;
-    assert!(!after_down.0);
-    assert!(!after_down.1);
-
-    Migrator::up(&db, Some(1)).await?;
-    let after_reup = source_bundle_kind_schema_state(&db).await?;
-    assert!(after_reup.0);
-    assert!(after_reup.1);
-
     Ok(())
 }
 

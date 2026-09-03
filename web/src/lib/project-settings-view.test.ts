@@ -14,21 +14,6 @@ describe('project settings separation', () => {
     })
   })
 
-  test('treats editable Compose as a local source without Git automation', () => {
-    expect(projectSettingsSections('git', 'compose')).toEqual({
-      showRepository: false,
-      showUploadedSource: true,
-      showBuildConfiguration: false,
-      showGitAutomation: false,
-    })
-    expect(projectSettingsSections('build', 'compose')).toEqual({
-      showRepository: false,
-      showUploadedSource: false,
-      showBuildConfiguration: true,
-      showGitAutomation: false,
-    })
-  })
-
   test('Build settings are independent of a Git connection', () => {
     expect(projectSettingsSections('build', 'uploaded_source')).toEqual({
       showRepository: false,

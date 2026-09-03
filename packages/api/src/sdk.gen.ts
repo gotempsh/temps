@@ -565,9 +565,6 @@ import type {
   DeleteWebhookData,
   DeleteWebhookErrors,
   DeleteWebhookResponses,
-  DeployComposeSourceData,
-  DeployComposeSourceErrors,
-  DeployComposeSourceResponses,
   DeployFromImageData,
   DeployFromImageErrors,
   DeployFromImageResponses,
@@ -814,9 +811,6 @@ import type {
   GetCmdData,
   GetCmdErrors,
   GetCmdResponses,
-  GetComposeSourceData,
-  GetComposeSourceErrors,
-  GetComposeSourceResponses,
   GetContainerDetailData,
   GetContainerDetailErrors,
   GetContainerDetailResponses,
@@ -2262,9 +2256,6 @@ import type {
   SaveAiProviderCredentialData,
   SaveAiProviderCredentialErrors,
   SaveAiProviderCredentialResponses,
-  SaveComposeSourceData,
-  SaveComposeSourceErrors,
-  SaveComposeSourceResponses,
   SearchLogsData,
   SearchLogsErrors,
   SearchLogsResponses,
@@ -13525,50 +13516,6 @@ export const updateAutomaticDeploy = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Read the current Temps-owned Docker Compose source.
- */
-export const getComposeSource = <ThrowOnError extends boolean = false>(
-  options: Options<GetComposeSourceData, ThrowOnError>,
-): RequestResult<
-  GetComposeSourceResponses,
-  GetComposeSourceErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).get<
-    GetComposeSourceResponses,
-    GetComposeSourceErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/projects/{project_id}/compose-source",
-    ...options,
-  });
-
-/**
- * Validate and save a new immutable revision of a Temps-owned Compose source.
- */
-export const saveComposeSource = <ThrowOnError extends boolean = false>(
-  options: Options<SaveComposeSourceData, ThrowOnError>,
-): RequestResult<
-  SaveComposeSourceResponses,
-  SaveComposeSourceErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).put<
-    SaveComposeSourceResponses,
-    SaveComposeSourceErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/projects/{project_id}/compose-source",
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-
-/**
  * List all custom domains for a project
  */
 export const listCustomDomainsForProject = <
@@ -14966,30 +14913,6 @@ export const stopContainer = <ThrowOnError extends boolean = false>(
   >({
     url: "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop",
     ...options,
-  });
-
-/**
- * Deploy the current (or explicitly selected) immutable Compose source revision.
- */
-export const deployComposeSource = <ThrowOnError extends boolean = false>(
-  options: Options<DeployComposeSourceData, ThrowOnError>,
-): RequestResult<
-  DeployComposeSourceResponses,
-  DeployComposeSourceErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).post<
-    DeployComposeSourceResponses,
-    DeployComposeSourceErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/projects/{project_id}/environments/{environment_id}/deploy/compose",
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
   });
 
 /**

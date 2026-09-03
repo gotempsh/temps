@@ -11,13 +11,7 @@ describe('deploymentSourceLabel', () => {
     )
   })
 
-  it('distinguishes editable Compose from uploaded archives', () => {
-    expect(
-      deploymentSourceLabel({
-        branch: null,
-        metadata: { deploymentSourceType: 'compose' },
-      })
-    ).toBe('Docker Compose source')
+  it('labels uploaded archives', () => {
     expect(
       deploymentSourceLabel({
         branch: null,

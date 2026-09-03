@@ -60,8 +60,6 @@ import {
   UploadCloud,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
-import { deployComposeSource } from '@/lib/compose-source-api'
-import { composeRevisionForRedeploy } from '@/lib/project-deploy-action'
 
 const ITEMS_PER_PAGE = 10
 
@@ -205,24 +203,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
-  const redeployCompose = useMutation({
-    mutationFn: ({
-      environmentId,
-      revision,
-    }: {
-      environmentId: number
-      revision?: number
-    }) => deployComposeSource(project.id, environmentId, revision),
-    meta: {
-      errorTitle: 'Failed to deploy Compose source',
-    },
-    onSuccess: () => {
-      toast.success('Compose deployment triggered successfully')
-      setIsRedeployModalOpen(false)
-      refetch()
-    },
-  })
-
   const cancelDeployment = useMutation({
     ...cancelDeploymentMutation(),
     meta: {
@@ -327,14 +307,12 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     tag,
     environmentId,
     imageRef: editedImageRef,
-    composeRevision,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
     imageRef?: string
-    composeRevision?: number
   }) => {
     // docker_image projects re-pull the given image; git projects run the pipeline.
     if (project.source_type === 'docker_image') {
@@ -352,14 +330,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       await redeployImage.mutateAsync({
         path: { project_id: project.id, environment_id: environmentId },
         body: { ...savedRuntime, image_ref: ref },
-      })
-      return
-    }
-
-    if (project.source_type === 'compose') {
-      await redeployCompose.mutateAsync({
-        environmentId,
-        revision: composeRevision,
       })
       return
     }
@@ -820,17 +790,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               (d) => d.id === selectedDeployment
             )?.environment_id ?? undefined
           }
-          isLoading={
-            createDeployment.isPending ||
-            redeployImage.isPending ||
-            redeployCompose.isPending
-          }
+          isLoading={createDeployment.isPending || redeployImage.isPending}
           imageRef={imageRef}
-          composeRevision={composeRevisionForRedeploy(
-            deploymentsData?.deployments.find(
-              (deployment) => deployment.id === selectedDeployment
-            )
-          )}
         />
       </>
     )
@@ -954,17 +915,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
             ?.environment_id ?? undefined
         }
-        isLoading={
-          createDeployment.isPending ||
-          redeployImage.isPending ||
-          redeployCompose.isPending
-        }
+        isLoading={createDeployment.isPending || redeployImage.isPending}
         imageRef={imageRef}
-        composeRevision={composeRevisionForRedeploy(
-          deploymentsData?.deployments.find(
-            (deployment) => deployment.id === selectedDeployment
-          )
-        )}
       />
 
       {/* Promote deployment dialog */}

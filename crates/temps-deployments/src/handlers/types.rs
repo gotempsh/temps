@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use crate::services::compose_source_service::ComposeSourceService;
 use crate::services::database_cron_service::DatabaseCronConfigService;
 use crate::services::node_service::NodeService;
 use crate::services::remote_deployment_service::RemoteDeploymentService;
@@ -20,7 +19,6 @@ pub struct AppState {
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
     pub remote_deployment_service: Arc<RemoteDeploymentService>,
-    pub compose_source_service: Arc<ComposeSourceService>,
     // Services for remote deployments
     pub db: Arc<DatabaseConnection>,
     pub workflow_planner: Arc<WorkflowPlanner>,

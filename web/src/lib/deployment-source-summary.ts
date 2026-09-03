@@ -11,12 +11,7 @@ export type DeploymentSourceSummary =
       message?: string
     }
   | {
-      kind:
-        | 'docker_image'
-        | 'static_files'
-        | 'uploaded_source'
-        | 'compose'
-        | 'manual'
+      kind: 'docker_image' | 'static_files' | 'uploaded_source' | 'manual'
       label: string
       detail?: string
     }
@@ -86,16 +81,6 @@ export function deploymentSourceSummary(
         metadata?.sourceBundleContentType,
         metadata?.sourceBundlePath
       ),
-    }
-  }
-
-  if (sourceType === 'compose') {
-    return {
-      kind: 'compose',
-      label: 'Docker Compose source',
-      detail: metadata?.sourceBundleId
-        ? `Revision ${metadata.sourceBundleId}`
-        : undefined,
     }
   }
 

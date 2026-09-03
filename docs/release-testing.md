@@ -577,248 +577,214 @@ Conventions used below:
 
 ---
 
-## 12. Service template catalog (Beta)
+## 12. Curated service templates (Beta)
 
-Run this section for every release that changes the service-template catalog,
-Compose deployment path, project source revisions, runtime logs, routes, or
-status monitors. Use a fresh staging database and a clean Docker host unless a
-scenario explicitly tests an upgrade.
+Run this section for every release that changes the curated service catalog,
+service-project creation or upgrades, managed-resource bindings, deployment
+telemetry, or the generic Docker Compose path. Use a fresh staging database and
+clean worker unless a scenario explicitly tests an upgrade.
 
-### 12.1 Maturity and discoverability
+Curated services are native Temps projects backed by reviewed, versioned
+templates. They are not imported from Coolify, they do not depend on an
+external catalog, and they are not editable Compose projects.
 
-- **Setup**: Admin and project-creator accounts; no catalog request made yet.
-- **Steps**: Open **New Project** and select **Services** with each account.
+### 12.1 Discoverability and catalog ownership
+
+- **Steps**: Open **New Project** and select **Services** as an account allowed
+  to create projects. Query `GET /api/templates?kind=service`.
 - **Pass**:
-  - Services is visible and carries the canonical **Beta** badge in the source
-    picker and catalog title.
-  - `GET /api/service-templates` has OpenAPI `x-maturity: beta` and requires
-    both project-create and deployment-create permissions.
-  - The UI explains Beta limits without hiding Custom Compose or unsupported
-    templates.
+  - Services is visible with a **Beta** badge.
+  - Only bundled, reviewed templates are returned (currently Keycloak and
+    Browserless); there is no Coolify CDN request or arbitrary upstream entry.
+  - Each card shows the service's real logo, description, version, runtime
+    type, required managed resources, and support status.
+  - Removing or renaming a bundled template is treated as a versioned product
+    change and is covered by upgrade tests.
 
-### 12.2 Catalog availability, bounds, and stale-cache behavior
+### 12.2 Native project identity and immutable template snapshot
 
-- **Setup**: A mock catalog endpoint plus a staging host whose outbound access
-  to `cdn.coollabs.io` can be toggled.
-- **Steps**: Load a valid catalog, exceed the response/entry/Compose limits,
-  return invalid JSON, time out, then disable outbound access after one good
-  refresh.
+- **Steps**: Create one project from every bundled service template and inspect
+  its project, source, and deployment records.
 - **Pass**:
-  - The first valid load is paginated and cached; concurrent readers cause one
-    upstream refresh.
-  - Oversized, invalid, redirected, and timed-out responses return typed,
-    actionable errors without excessive memory or task growth.
-  - A prior successful snapshot remains usable during a refresh outage; a
-    fresh host shows the retryable connectivity error and keeps Custom Compose
-    available.
-  - A catalog refresh never mutates an installed project's Compose revision.
+  - The project is stored as `project_type=service` and retains the template
+    slug, template version, logo, and immutable configuration snapshot.
+  - Docker-image templates use `source_type=docker_image`; choosing a service
+    never creates a hidden or editable Compose source.
+  - Project cards and project settings identify the project as a service and
+    display the template logo.
+  - A deployment uses its recorded template snapshot; publishing a newer
+    template cannot silently change an existing deployment.
 
-### 12.3 Compatibility inventory and host-access boundary
+### 12.3 Configuration, defaults, and secrets
 
-- **Setup**: Current production catalog snapshot.
-- **Steps**: Export every template's tier and issue codes; inspect all entries
-  containing Docker/Podman sockets, absolute bind mounts, devices, privileged
-  mode, host namespaces, external Docker resources, or guarded interpolation.
+- **Steps**: Review and edit image, command, CPU, memory request/limit, exposed
+  port, health path, and every template variable before creation. Omit each
+  required field in turn and generate credentials twice.
 - **Pass**:
-  - `standard + elevated + blocked == catalog_total`; `host_access` is reported
-    as an explicit subset of blocked templates.
-  - Every raw Docker socket and equivalent host-control request is
-    `host_access`, cannot preflight, and cannot be installed through a direct
-    API call.
-  - The final `ComposeExecutor` policy independently rejects the same document
-    even if catalog analysis is bypassed.
-  - No template can grant its own startup permissions or convert a sensitive,
-    read-only, or interpolated host path. Narrow app-owned writable paths such
-    as `/apprise-api/config:/config` become declared project named volumes;
-    Docker sockets and system paths remain blocked.
+  - Safe runtime defaults are prefilled and expandable; editable values are
+    validated before project creation.
+  - Required inputs carry a visible `*` and block creation with the exact
+    missing field. Optional integrations may remain empty.
+  - Usernames use conventional defaults such as `admin`, `postgres`, or
+    `default`; passwords and tokens are cryptographically random.
+  - Public bootstrap values such as an admin username are normal environment
+    variables. Passwords and tokens are encrypted secrets and can be revealed
+    only through the authenticated, authorized reveal action.
+  - Secrets never appear in list responses, logs, telemetry, source snapshots,
+    or generated deployment files returned to the browser.
+  - Literal connection URLs are not misclassified as credentials and are not
+    replaced with random strings.
 
-### 12.4 Standard single-service installation
+### 12.4 Managed-resource bindings
 
-- **Setup**: A standard template with one HTTP route and no writable volume.
-- **Steps**: Search, inspect, preflight, install, follow deployment logs, and
-  open the generated URL.
+- **Steps**: Create Keycloak with a new managed PostgreSQL database, then repeat
+  with an existing compatible database.
 - **Pass**:
-  - Search retains keyboard focus while debounced requests run.
-  - **View Docker Compose** reveals the complete normalized YAML, supports
-    copying it, and does not contain resolved secret values.
-  - Fixed host ports become random loopback bindings and no fixed container or
-    Compose project name survives normalization.
-  - Preflight returns the planned slug and canonical public variables; create
-    claims that exact slug or safely replans after a collision.
-  - Deployment succeeds, the route serves the expected response, and both the
-    Compose stage log stream and runtime container log stream contain data.
+  - Required managed resources are shown before creation and are provisioned or
+    selected explicitly by the user.
+  - The template maps the managed resource to its application-specific
+    variables (for Keycloak: the expected `KC_DB_*` settings); users do not
+    copy credentials manually.
+  - Bindings are stored by stable resource identity, scoped to the correct
+    project/environment, and re-resolved during deployment without exposing
+    plaintext credentials.
+  - Resource creation emits one success notification, rolls back incomplete
+    project creation safely, and does not delete a pre-existing resource.
+  - A missing, deleted, incompatible, or unauthorized resource produces a
+    typed, actionable error.
 
-### 12.5 Multi-service installation with required startup permissions
+### 12.5 One-click deployment smoke tests
 
-- **Setup**: A template with an application plus a bundled Postgres/Redis
-  dependency and writable named volumes. Include Activepieces, whose bundled
-  nginx also needs the limited profile even though the application container
-  has no writable volume.
-- **Steps**: Try preflight without confirming the required permission checkbox,
-  confirm it once for the stack, install, restart all containers, and redeploy
-  unchanged.
+Run one cold install for every bundled template on each supported architecture.
+
+- **Keycloak**: reaches its configured health endpoint, uses the managed
+  PostgreSQL database, exposes the generated public URL, and accepts the
+  generated bootstrap administrator credentials.
+- **Browserless**: reaches its health endpoint, requires its generated token,
+  exposes the correct external URL, and serves its API and documentation
+  assets without duplicated path prefixes.
+- **All templates**: deployment logs stream while the job runs, runtime
+  container logs are available after success or failure, the project monitor
+  reconciles immediately after deployment, and a restart preserves data and
+  configuration.
+
+### 12.6 Redeploy and template upgrade
+
+- **Steps**: Change user-editable runtime settings, redeploy, publish a newer
+  compatible template revision, inspect the proposed upgrade, and apply it.
 - **Pass**:
-  - Installable catalog entries appear **Ready**; discovery does not imply that
-    limited startup permissions make a template unavailable.
-  - One required checkbox (`*`) confirms every listed service. Missing
-    confirmation blocks installation with the exact services/reasons;
-    unrelated service names are ignored with a warning.
-  - Only the limited startup capability profile is restored—never privileged
-    mode, arbitrary `cap_add`, host networking, or devices.
-  - Activepieces serves port 80, reports healthy through `/api/v1/health`, and
-    does not fail because its bundled nginx cannot initialize runtime paths.
-  - Dependencies remain project-scoped, persist across restart/redeploy, and
-    do not collide with another project installed from the same template.
+  - Redeploy preserves user overrides, managed-resource bindings, secrets, and
+    persistent data.
+  - Build and deployment settings show the originating template and the same
+    editable runtime fields offered during creation, including the image.
+  - Upgrade shows image/configuration/binding changes before applying them.
+    Newly required fields must be completed; removed fields are not injected.
+  - Applying an upgrade creates a new immutable snapshot and deployment.
+    Historical deployments remain attributable to their original version.
+  - A failed upgrade leaves the previous deployment usable and produces
+    actionable logs.
 
-### 12.6 Variables, defaults, and secrets
+### 12.7 Telemetry and privacy
 
-- **Setup**: Templates containing optional variables, required `${VAR?}` and
-  `${VAR:?}` expressions, generated credentials, shared literal bootstrap
-  credentials, URL/FQDN variables, and Supabase JWT dependencies.
-- **Steps**: Leave optional fields empty, omit each required field, generate
-  values twice, install, then inspect API responses, deployment files, logs,
-  and the database.
+- **Setup**: Enable anonymous product telemetry on staging.
+- **Steps**: Trigger a successful deployment, a classified failure, a
+  cancellation, and a redeploy for each bundled template. Inspect outbound
+  telemetry envelopes.
 - **Pass**:
-  - Optional variables have no required marker and do not block preflight;
-    required variables fail with their exact name.
-  - Internal endpoints such as `redis-service:6379` remain literal endpoints
-    and never become generated password variables.
-  - Generated usernames use conventional defaults (`postgres`, Redis
-    `default`, otherwise `admin`) and remain editable; passwords and tokens
-    remain cryptographically random.
-  - Generated values use Web Crypto, preserve required equality, and are never
-    returned by catalog/preflight responses or printed in logs.
-  - Stored secrets are encrypted/write-only and Compose receives the exact
-    value, including quotes, dollar signs, and Unicode, without interpolation.
+  - Attempt, success, failure, cancellation, and redeploy events include the
+    server-attested template slug and version.
+  - Failure events contain bounded stage/code/classifier fields, never raw
+    errors or container logs.
+  - Template attribution cannot be forged by setting a project variable or
+    using a normal Docker image, Git, Drop, or Compose project.
+  - No image credentials, managed-resource URLs, environment values, project
+    names, user data, or secrets are transmitted.
+  - Disabling telemetry sends nothing and does not affect deployment behavior.
 
-### 12.7 Routes, health, and monitor convergence
+### 12.8 Multi-container boundary
 
-- **Setup**: Templates whose root path returns 404, whose Compose healthcheck
-  targets a non-root HTTP path, and whose stack exposes multiple services.
-- **Steps**: Install each template and observe deployment, route, and monitor
-  state from cold start through healthy.
+Native multi-container service templates are not part of the initial Beta.
+
 - **Pass**:
-  - The detected health path is snapshotted on the deployment and used by the
-    managed monitor; a non-200 `/` does not mark an otherwise healthy service
-    down.
-  - Deployment success triggers an immediate monitor check/reconciliation;
-    the project header and monitor detail converge without waiting for a stale
-    pre-deployment interval.
-  - Each supported public service receives the correct route and container
-    port; ambiguous multi-port services remain blocked with a specific reason.
+  - A bundled template that declares an unsupported multi-container topology is
+    rejected during catalog validation with an actionable authoring error.
+  - The UI never represents a Compose stack as a native single-container
+    service.
+  - Adding multi-container native templates requires an explicit data model for
+    per-container image, command, resources, ports, environment mappings,
+    placement, dependencies, health, logs, and upgrade diffs, plus multi-node
+    scheduling tests.
 
-### 12.8 Editable source, redeploy, and rollback
+### 12.9 Generic Git and Drop Compose regression
 
-- **Setup**: A successfully installed template with image tag `v1`.
-- **Steps**: Change the stored Compose source to `v2`, save, deploy, redeploy
-  the `v2` deployment, then redeploy/roll back to the historical `v1`
-  deployment.
+Docker Compose remains supported as a generic deployment preset for Git
+repositories and uploaded Drop archives. It is not a service-catalog storage
+format.
+
+- **Steps**: Deploy one Git repository and one Drop archive containing a
+  Compose file. Exercise service inclusion, public routes, limited startup
+  permissions, health checks, redeploy, failure retention, and deletion.
 - **Pass**:
-  - Build settings identify the source as **Compose**, show editable YAML, and
-    save an immutable revision using optimistic concurrency.
-  - Each deployment uses its selected source revision, Compose path, working
-    directory, environment snapshot, public services, and health path—not the
-    latest mutable project fields.
-  - Historical redeploy restores `v1`; a stale editor save returns 409 without
-    losing either revision.
+  - Compose is detected from the source revision and the normalized preview is
+    available without exposing resolved secrets.
+  - The immutable Git commit or uploaded archive is the deployment source;
+    there is no standalone editable-Compose source type or Compose-source API.
+  - Unsafe sockets, devices, privileged mode, host namespaces, and sensitive
+    host paths remain rejected by the final executor policy.
+  - Supported services receive correct private networking, routes, health
+    checks, and project-scoped persistent volumes.
+  - Failed containers are retained without public traffic for authenticated log
+    inspection, with inline UI access and CLI retrieval, then removed on the
+    next deployment or project/environment deletion.
+  - Deployment-stage logs and runtime container logs stream successfully; a
+    transport failure is distinguishable from a container that emitted no logs.
 
-### 12.9 Failure, cancellation, and concurrent deployment safety
+### 12.10 Authorization and API surface
 
-- **Setup**: One live stack plus candidate revisions that fail during pull,
-  create, and health wait; two simultaneous deploy requests.
-- **Steps**: Fail/cancel before teardown and after teardown begins; race two
-  deployments and restart the workflow executor between attempts.
+- **Steps**: Exercise catalog read, project creation, secret reveal, managed
+  binding, deploy, upgrade, log retrieval, and delete actions as an owner,
+  collaborator, unrelated authenticated user, and anonymous user.
 - **Pass**:
-  - Pre-teardown failure leaves the old stack and secrets live.
-  - Post-teardown failure/cancellation performs compensating container,
-    network, candidate-secret, and temporary-source cleanup with a contextual
-    deployment error.
-  - The per-data-directory/Compose-project lock serializes all executor
-    instances; no orphan stack or plaintext generation remains.
+  - Every mutation and secret/log read enforces the expected project and
+    deployment permissions and produces an audit event where required.
+  - Generated OpenAPI clients expose the native template endpoints and generic
+    project/deployment APIs.
+  - Removed Coolify catalog/preflight/install and standalone Compose-source
+    endpoints are absent from the OpenAPI document and generated clients.
+  - Error responses use RFC 7807 with contextual identifiers and no secrets.
 
-### 12.10 Lifecycle cleanup and resource isolation
+### 12.11 Beta release gate
 
-- **Setup**: Two projects from the same template, including volumes, networks,
-  env files, and random loopback ports.
-- **Steps**: Deploy both, delete one, reinstall it, and run source/stack garbage
-  collection.
-- **Pass**:
-  - Project names, containers, networks, volumes, ports, and source generations
-    do not collide.
-  - Delete removes only the selected project's containers/network and preserves
-    data according to the explicit volume-retention contract.
-  - Temporary preflight directories and obsolete secret/source generations are
-    bounded and reclaimed.
+The feature may ship as Beta only when:
 
-### 12.11 Architecture, remote worker, and resource pressure
+- Every bundled template passes its cold-install smoke test on supported
+  architectures, plus redeploy and upgrade tests where a newer version exists.
+- The managed-resource, secret, authorization, telemetry, and generic Git/Drop
+  Compose regressions above pass.
+- Generated OpenAPI specifications and all checked-in clients are current.
+- Database migrations are proven from the previous release and from a fresh
+  database.
+- No critical/high security findings, failing required checks, stale Coolify
+  references, or unsupported catalog entries remain.
 
-- **Setup**: amd64 and arm64 workers plus the 3-vCPU/4-GB reference host.
-- **Steps**: Preflight architecture-pinned templates, deploy a representative
-  standard/elevated matrix locally and remotely, refresh the catalog under 50
-  concurrent readers, and install two stacks concurrently.
-- **Pass**:
-  - Architecture mismatches fail before project creation; matching remote
-    workers receive the complete immutable source bundle and policy metadata.
-  - Catalog analysis does not block the async runtime, respects the four-slot
-    preflight limit, and stays within the documented response/memory bounds.
-  - Proxy latency and unrelated deployments remain within their release SLOs.
+There is no arbitrary template-count target. The gate applies to every curated
+template actually shipped.
 
-### 12.12 Anonymous install telemetry
+### 12.12 Stable graduation gate
 
-- **Setup**: Enable anonymous product telemetry on staging; choose one standard
-  and one elevated service template plus a Compose revision with a deterministic
-  image-pull failure.
-- **Steps**: Deploy each healthy template, redeploy one, trigger the failing
-  revision, and cancel one in-progress attempt. Inspect only the outbound
-  telemetry envelopes—not the application's private analytics data.
-- **Pass**:
-  - `deploy_attempted`, `deploy_succeeded`, `deploy_failed`, and
-    `deploy_cancelled` carry `template_source=service_catalog` and the exact
-    public `template_slug` attested by the server against the first saved
-    Compose revision.
-  - Failure events include fixed `failure_stage`, `failure_code`, and
-    `classifier_version` properties; no raw error text is transmitted.
-  - A forged provider, source URL, install-plan digest, private slug, mismatched
-    first Compose source, or normal Custom Compose project never emits a
-    service-catalog slug.
-  - Telemetry disabled by the operator produces no outbound request and never
-    changes installation behavior, latency, or the user-visible result.
-  - Funnel counts reconcile: attempts equal terminal successes, failures, and
-    explicit cancellations plus deployments still in progress at query time.
+Remove the Beta label only after all of the following hold for two consecutive
+releases:
 
-### 12.13 Beta release gate
-
-The feature may ship as Beta only when all scenarios above that apply to the
-changed surface pass, zero critical/high security findings remain, and the
-qualification matrix records three cold installs for at least 30 installable
-templates spanning every represented category, bundled dependency kind, and
-both compatibility tiers. Record every failure with template revision,
-architecture, stage, and sanitized logs; do not relabel a failing template as
-supported to improve the percentage.
-
-### 12.14 Stable graduation gate
-
-Remove the Beta label only after all of the following are true for two
-consecutive releases:
-
-- A pinned nightly matrix automatically preflights every catalog entry and
-  cold-deploys every installable entry on amd64; architecture-compatible entries
-  also run on arm64.
-- At least 95% of entries classified installable complete three consecutive
-  cold installs, reach their declared health target, stream deployment and
-  runtime logs, and converge their managed monitor. Any remaining failure is
-  reclassified with a reviewed, actionable reason before release.
-- Source edit/redeploy/rollback, cancellation compensation, catalog outage,
-  catalog drift, RBAC, and cross-project isolation have dedicated automated
-  end-to-end coverage.
-- A seven-day staging soak shows no orphan containers/networks, plaintext
-  generations, stuck deployments, stale monitors, or unbounded catalog/cache
-  growth.
-- The public API/source-revision contract is frozen for the documented
-  compatibility window, upgrade/rollback migrations are proven, operator and
-  troubleshooting docs are published, and security review approves the final
-  host-access boundary.
-
+- Every shipped template passes automated cold install, redeploy, restart,
+  health, monitor, logs, authorization, and supported-architecture tests.
+- Template upgrades, managed-resource replacement/failure, secret rotation,
+  rollback, and deletion have automated end-to-end coverage.
+- A seven-day staging soak shows no orphan containers, leaked credentials,
+  stuck deployments, stale monitors, or unbounded telemetry/log growth.
+- The template schema and upgrade contract are documented and versioned, and
+  unsupported multi-container or multi-node behavior is stated clearly.
+- Operator and troubleshooting documentation is published and the final
+  security review is approved.
 ## How to use this document
 
 1. Open a `RELEASE_CHECKLIST_vX.Y.Z.md` for the release in flight.

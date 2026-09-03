@@ -104,7 +104,7 @@ function BuildSourceIcon({ kind }: { kind: ProjectBuildSource['kind'] }) {
   if (kind === 'git') {
     return <GitFork className="size-4 shrink-0 text-muted-foreground" />
   }
-  if (kind === 'docker' || kind === 'compose') {
+  if (kind === 'docker') {
     return <Container className="size-4 shrink-0 text-muted-foreground" />
   }
   return <FileUp className="size-4 shrink-0 text-muted-foreground" />

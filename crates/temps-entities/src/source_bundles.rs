@@ -15,9 +15,6 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub project_id: i32,
-    /// Ownership model for this immutable revision. `uploaded_source` is an
-    /// opaque user upload; `compose` is an editable Temps-owned document.
-    pub source_kind: String,
     pub archive_path: String,
     pub original_filename: Option<String>,
     pub content_type: String,

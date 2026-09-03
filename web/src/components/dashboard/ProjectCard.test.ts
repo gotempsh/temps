@@ -198,16 +198,6 @@ describe('projectBuildSource', () => {
       })
     ).toEqual({ kind: 'docker', label: 'Docker image' })
 
-    expect(
-      projectBuildSource({
-        source_type: 'compose',
-        git_url: null,
-        repo_owner: null,
-        repo_name: null,
-        git_provider_type: null,
-      })
-    ).toEqual({ kind: 'compose', label: 'Docker Compose' })
-
     for (const source_type of [
       'static_files',
       'uploaded_source',
