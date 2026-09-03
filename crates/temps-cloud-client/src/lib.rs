@@ -446,7 +446,7 @@ impl CloudClient {
                     return decode_managed_response(response).await;
                 }
                 Ok(response) => {
-                    last_failure = Some(format!("managed backend returned {}", response.status()));
+                    last_failure = Some(describe_failed_response(response).await);
                 }
                 Err(error) => last_failure = Some(error.without_url().to_string()),
             }
@@ -757,7 +757,7 @@ impl CloudClient {
                     return decode_managed_response(response).await;
                 }
                 Ok(response) => {
-                    last_failure = Some(format!("managed backend returned {}", response.status()));
+                    last_failure = Some(describe_failed_response(response).await);
                 }
                 Err(error) => last_failure = Some(error.without_url().to_string()),
             }
@@ -1130,6 +1130,34 @@ async fn inspect_local_backup(path: &Path) -> Result<(u64, String), CloudError> 
     Ok((bytes, checksum_sha256))
 }
 
+/// Render a non-success response as an operator-readable reason, keeping the
+/// Problem Details `detail` Cloud sent with it.
+///
+/// A retryable status is not automatically an opaque one: Cloud answers a 503
+/// with a specific reason (which object storage call failed, for which key),
+/// and dropping it left a self-hosted operator with nothing but
+/// "returned 503 Service Unavailable" to debug a permanently stuck mirror.
+async fn describe_failed_response(response: reqwest::Response) -> String {
+    let status = response.status();
+    match managed_detail(response).await {
+        Some(detail) => format!("managed backend returned {status}: {detail}"),
+        None => format!("managed backend returned {status}"),
+    }
+}
+
+/// Extract the RFC 7807 `detail` from a managed response body, if it has one.
+async fn managed_detail(response: reqwest::Response) -> Option<String> {
+    let detail = response
+        .json::<serde_json::Value>()
+        .await
+        .ok()?
+        .get("detail")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!detail.is_empty()).then_some(detail)
+}
+
 async fn decode_managed_response<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, CloudError> {
@@ -1147,15 +1175,12 @@ async fn decode_managed_response<T: serde::de::DeserializeOwned>(
     }
     if matches!(status.as_u16(), 429 | 500..=599) {
         return Err(CloudError::Unreachable {
-            reason: format!("managed backend returned {status}"),
+            reason: describe_failed_response(response).await,
             spooled_bytes: 0,
         });
     }
-    let detail = response
-        .json::<serde_json::Value>()
+    let detail = managed_detail(response)
         .await
-        .ok()
-        .and_then(|value| value["detail"].as_str().map(str::to_string))
         .unwrap_or_else(|| format!("managed backend returned {status}"));
     Err(CloudError::Rejected { detail })
 }
@@ -1431,6 +1456,116 @@ mod tests {
                 .expect("notification source ids lock")
                 .as_slice(),
             [source_id, "stable-private-source-id".to_string()]
+        );
+    }
+
+    /// A retryable status is where Cloud puts its most operationally useful
+    /// reasons (which object-storage call failed, for which key). Dropping the
+    /// body left an operator staring at a bare "returned 503 Service
+    /// Unavailable" while a backup mirror retried for an hour.
+    #[tokio::test]
+    async fn an_exhausted_backup_retry_reports_the_reason_cloud_sent() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping backup detail test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind backup detail stub: {error}"),
+        };
+        let address = listener.local_addr().expect("backup detail stub address");
+        let app = Router::new().route(
+            "/v1/backups/walg/objects/complete",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "title": "Backups Unavailable",
+                        "detail": "Backups are not configured: Object storage failed while \
+                                   inspect uploaded object for repository/base/00: provider \
+                                   returned HTTP 404 Not Found"
+                    })),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve backup detail stub");
+        });
+        let client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback backup backend"),
+        )
+        .expect("cloud client");
+
+        let error = client
+            .complete_walg_object(
+                "instance-token",
+                &WalGObjectCompleted {
+                    backup_id: Uuid::new_v4(),
+                    relative_key: "repository/base/00".into(),
+                    bytes: 1,
+                    checksum_sha256: "0".repeat(64),
+                },
+            )
+            .await
+            .expect_err("a 503 on every attempt is a failure");
+
+        assert!(error.is_retryable(), "a 503 stays retryable: {error}");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("provider returned HTTP 404 Not Found"),
+            "the operator must see Cloud's own reason, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("503"),
+            "the status still belongs in the message, got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retryable_failure_without_a_body_still_names_the_status() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping bodyless retry test: sandbox denied TCP bind");
+                return;
+            }
+            Err(error) => panic!("bind bodyless stub: {error}"),
+        };
+        let address = listener.local_addr().expect("bodyless stub address");
+        let app = Router::new().route(
+            "/v1/backups/walg/objects/complete",
+            post(|| async { StatusCode::BAD_GATEWAY }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve bodyless stub");
+        });
+        let client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback bodyless backend"),
+        )
+        .expect("cloud client");
+
+        let error = client
+            .complete_walg_object(
+                "instance-token",
+                &WalGObjectCompleted {
+                    backup_id: Uuid::new_v4(),
+                    relative_key: "repository/base/00".into(),
+                    bytes: 1,
+                    checksum_sha256: "0".repeat(64),
+                },
+            )
+            .await
+            .expect_err("a 502 on every attempt is a failure");
+
+        assert!(
+            error.to_string().contains("502"),
+            "a body-less failure still names its status, got: {error}"
         );
     }
 
