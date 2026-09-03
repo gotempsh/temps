@@ -6,6 +6,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { monitoringSectionLabel } from '@/components/monitoring/monitoring-sections'
 import { useEffect } from 'react'
 import { Outlet, useLocation } from 'react-router'
+import { PageContainer } from '@/components/layout/PageContainer'
 
 export function Monitoring() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -24,9 +25,9 @@ export function Monitoring() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-6">
+      <PageContainer innerClassName="space-y-6">
         <Outlet />
-      </div>
+      </PageContainer>
     </div>
   )
 }

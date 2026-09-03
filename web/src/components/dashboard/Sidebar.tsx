@@ -20,14 +20,11 @@ import {
 import {
   Activity,
   ArrowLeft,
-  ArrowUpCircle,
   BadgeCheck,
   BarChart3,
-  Bell,
   Bot,
   Boxes,
   ChevronsUpDown,
-  Clock,
   Check,
   Database,
   DatabaseBackup,
@@ -36,31 +33,24 @@ import {
   GitBranch,
   GitFork,
   Globe,
-  HardDrive,
   Home,
-  Key,
   KeyRound,
   Layers,
   LogOut,
   Monitor,
   Moon,
   Network,
-  Puzzle,
   Search,
   ScrollText,
   MessageSquare,
   Server,
   Settings,
   Settings2,
-  Shield,
   ShieldAlert,
   Sun,
   Sparkles,
   Terminal,
-  Users,
-  UsersRound,
   Wand2,
-  Waypoints,
 } from 'lucide-react'
 
 import { ProjectResponse } from '@/api/client'
@@ -101,6 +91,7 @@ import {
 } from '../ui/dropdown-menu'
 import { useTheme } from 'next-themes'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
+import { settingsNavigationGroups } from '@/components/settings/settings-navigation'
 
 interface PlatformNavItem {
   title: string
@@ -155,95 +146,6 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
         url: '/tools',
         icon: Boxes,
         activeWhen: isPlatformToolsRoute,
-      },
-    ],
-  },
-]
-
-// Full grouped settings tree — mirrors SettingsLayout
-interface SettingsGroupDef {
-  label: string
-  items: PlatformNavItem[]
-}
-// Settings drill-down contains instance configuration rather than runtime
-// tools, which live on the All platform tools page.
-const settingsGroups: SettingsGroupDef[] = [
-  {
-    label: 'General',
-    items: [
-      { title: 'Platform', url: '/settings', icon: Settings2 },
-      { title: 'Version', url: '/settings/version', icon: ArrowUpCircle },
-      { title: 'Notifications', url: '/settings/notifications', icon: Bell },
-    ],
-  },
-  {
-    label: 'Access',
-    items: [
-      { title: 'Users', url: '/settings/users', icon: Users },
-      {
-        title: 'Teams',
-        url: '/settings/teams',
-        icon: UsersRound,
-        featureKey: 'teams',
-      },
-      { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
-      { title: 'API Keys', url: '/settings/keys', icon: Key },
-    ],
-  },
-  {
-    label: 'Infrastructure',
-    items: [
-      { title: 'Load Balancer', url: '/settings/load-balancer', icon: Server },
-      {
-        title: 'Docker Registry',
-        url: '/settings/docker-registry',
-        icon: Boxes,
-      },
-      { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
-      {
-        title: 'Request Timeouts',
-        url: '/settings/request-timeouts',
-        icon: Clock,
-      },
-      {
-        title: 'Worker Nodes',
-        url: '/settings/nodes',
-        icon: Network,
-        featureKey: 'multi-node-worker-join',
-      },
-      {
-        title: 'Traefik Discovery',
-        url: '/settings/traefik-discovery',
-        icon: Waypoints,
-      },
-      {
-        title: 'Plugins',
-        url: '/settings/plugins',
-        icon: Puzzle,
-        featureKey: 'plugin-system',
-      },
-      { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
-    ],
-  },
-  {
-    label: 'Security',
-    items: [
-      { title: 'Security Headers', url: '/settings/security', icon: Shield },
-      { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
-      {
-        title: 'Disk Monitoring',
-        url: '/settings/disk-monitoring',
-        icon: HardDrive,
-      },
-      {
-        title: 'Metrics Monitoring',
-        url: '/settings/metrics-monitoring',
-        icon: BarChart3,
-      },
-      {
-        title: 'OTel Pipeline',
-        url: '/settings/otel-pipeline',
-        icon: Activity,
       },
     ],
   },
@@ -976,13 +878,13 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
   // Every url across every settings group. Each section gets the list
   // minus its own items so active-state resolution sees the full tree
   // (prevents `/settings` lighting up on `/settings/keys`).
-  const allSettingsUrls = settingsGroups.flatMap((g) =>
+  const allSettingsUrls = settingsNavigationGroups.flatMap((g) =>
     g.items.map((i) => i.url)
   )
   return (
     <>
       <SwapHeader title="Settings" onBack={onBack} backLabel="Back to menu" />
-      {settingsGroups.map((group) => {
+      {settingsNavigationGroups.map((group) => {
         const ownUrls = new Set(group.items.map((i) => i.url))
         const siblings = allSettingsUrls.filter((u) => !ownUrls.has(u))
         return (

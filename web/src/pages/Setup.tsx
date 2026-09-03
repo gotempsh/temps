@@ -32,6 +32,7 @@ import {
 } from '@/hooks/useGettingStarted'
 import { useActivationSignals } from '@/hooks/useActivationSignals'
 import { nextIncompleteGettingStartedItem } from '@/components/dashboard/onboarding-next-step'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 
 // Per-step icon so the checklist reads visually, not just as text rows.
 const STEP_ICONS: Record<string, LucideIcon> = {
@@ -149,15 +150,11 @@ export function Setup() {
   }
 
   return (
-    <div className="p-4 sm:p-8 space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Finish setting up
-        </h1>
-        <p className="text-sm text-muted-foreground mt-1">
-          A few one-time steps to get your platform production-ready.
-        </p>
-      </div>
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader
+        title="Finish setting up"
+        description="A few one-time steps to get your platform production-ready."
+      />
 
       {!isLoaded ? (
         <div className="space-y-6">
@@ -344,7 +341,7 @@ export function Setup() {
           </div>
         </>
       )}
-    </div>
+    </PageContainer>
   )
 }
 

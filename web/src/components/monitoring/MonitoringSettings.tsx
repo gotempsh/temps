@@ -28,7 +28,7 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
@@ -52,6 +52,7 @@ import {
   MONITORING_SECTIONS,
   monitoringSectionLabel,
 } from './monitoring-sections'
+import { PageHeader } from '@/components/layout/PageContainer'
 
 interface AlertComponentProps<T> {
   onSave: (data: T) => Promise<void>
@@ -649,7 +650,10 @@ function WeeklyDigest({
     form.reset(data)
   }
 
-  const digestEnabled = form.watch('weeklyDigestEnabled')
+  const digestEnabled = useWatch({
+    control: form.control,
+    name: 'weeklyDigestEnabled',
+  })
 
   return (
     <Form {...form}>
@@ -1159,12 +1163,10 @@ export function MonitoringSettings() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-lg font-semibold">Monitoring & Alerts</h2>
-        <p className="text-sm text-muted-foreground">
-          Configure monitoring thresholds and alert notifications
-        </p>
-      </div>
+      <PageHeader
+        title="Monitoring & Alerts"
+        description="Configure monitoring thresholds and alert notifications"
+      />
 
       {/* Mobile Select */}
       <div className="sm:hidden">

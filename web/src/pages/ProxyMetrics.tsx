@@ -68,6 +68,7 @@ import {
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { DateRange } from 'react-day-picker'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import {
   CartesianGrid,
   Line,
@@ -424,7 +425,7 @@ function useResolvedWindow(
 ) {
   return useMemo(
     () => resolveProxyWindow(range, custom, new Date()),
-    [range, custom?.from?.getTime(), custom?.to?.getTime()]
+    [range, custom]
   )
 }
 
@@ -1295,49 +1296,45 @@ export default function ProxyMetrics() {
 
   usePageTitle('Proxy')
 
-  // Full-width like Monitoring.tsx — the app layout wrapper supplies the
-  // outer padding, so no container/max-w here.
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-6">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-2xl font-bold tracking-tight">Proxy</h2>
-            <p className="text-muted-foreground">
-              Hot-path traffic and latency metrics for the control-plane proxy
-            </p>
-          </div>
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <FilterBar filter={filter} onChange={setFilter} />
-            <div className="flex items-center gap-1">
-              {PROXY_RANGE_PRESETS.map((opt) => (
+      <PageContainer innerClassName="space-y-6">
+        <PageHeader
+          title="Proxy"
+          description="Hot-path traffic and latency metrics for the control-plane proxy"
+          actions={
+            <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+              <FilterBar filter={filter} onChange={setFilter} />
+              <div className="flex items-center gap-1">
+                {PROXY_RANGE_PRESETS.map((opt) => (
+                  <Button
+                    key={opt.value}
+                    variant={range === opt.value ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setRange(opt.value)}
+                  >
+                    {opt.label}
+                  </Button>
+                ))}
                 <Button
-                  key={opt.value}
-                  variant={range === opt.value ? 'default' : 'outline'}
+                  variant={range === 'custom' ? 'default' : 'outline'}
                   size="sm"
-                  onClick={() => setRange(opt.value)}
+                  onClick={() => setRange('custom')}
                 >
-                  {opt.label}
+                  Custom
                 </Button>
-              ))}
-              <Button
-                variant={range === 'custom' ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setRange('custom')}
-              >
-                Custom
-              </Button>
+              </div>
+              {range === 'custom' && (
+                <DateRangePicker
+                  date={customRange}
+                  onDateChange={setCustomRange}
+                  showTime
+                  className="w-full sm:w-[300px]"
+                />
+              )}
             </div>
-            {range === 'custom' && (
-              <DateRangePicker
-                date={customRange}
-                onDateChange={setCustomRange}
-                showTime
-                className="w-full sm:w-[300px]"
-              />
-            )}
-          </div>
-        </div>
+          }
+        />
 
         {tooWide ? (
           <p className="rounded-md border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
@@ -1393,7 +1390,7 @@ export default function ProxyMetrics() {
         )}
 
         {!tooWide && <TrafficByProject window={resolved} filter={filter} />}
-      </div>
+      </PageContainer>
     </div>
   )
 }

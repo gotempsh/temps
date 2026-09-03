@@ -4,16 +4,25 @@
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { Sparkles, X } from 'lucide-react'
-import {
-  type CSSProperties,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate, useParams } from 'react-router'
+import { useIsMobile } from '@/components/hooks/use-mobile'
+import {
+  getProjectTourCardStyle,
+  PROJECT_TOUR_EVENT,
+  setProjectTourActive,
+} from '@/lib/project-tour'
+
+// Keep the existing module API for consumers while the shared state lives in a
+// non-component module that remains safe for React Fast Refresh.
+/* eslint-disable react-refresh/only-export-components */
+export {
+  PROJECT_TOUR_EVENT,
+  isProjectTourActive,
+  useProjectTourActive,
+} from '@/lib/project-tour'
+/* eslint-enable react-refresh/only-export-components */
 
 /**
  * A lightweight, dependency-free guided tour for new projects. It walks the user
@@ -25,30 +34,6 @@ import { useNavigate, useParams } from 'react-router'
  */
 
 const SEEN_KEY = 'temps.project-tour.v1'
-export const PROJECT_TOUR_EVENT = 'temps:project-tour'
-
-// Shared active-state so pages the tour visits (analytics, errors) can skip
-// their own "no data yet, redirect to setup" logic while the tour is
-// showing them off — otherwise the tour lands on a page that immediately
-// navigates itself away to a /setup route the tour never asked for.
-let tourActive = false
-const tourActiveListeners = new Set<() => void>()
-function setTourActive(value: boolean) {
-  tourActive = value
-  for (const listener of tourActiveListeners) listener()
-}
-export function isProjectTourActive() {
-  return tourActive
-}
-export function useProjectTourActive() {
-  return useSyncExternalStore(
-    (listener) => {
-      tourActiveListeners.add(listener)
-      return () => tourActiveListeners.delete(listener)
-    },
-    () => tourActive
-  )
-}
 
 interface TourStep {
   route: string
@@ -96,12 +81,10 @@ const STEPS: TourStep[] = [
   },
 ]
 
-const CARD_WIDTH = 320 // matches w-80
-const CARD_EST_HEIGHT = 180
-
 export function ProjectTour() {
   const navigate = useNavigate()
   const { slug } = useParams<{ slug: string }>()
+  const isMobile = useIsMobile()
   const [active, setActive] = useState(false)
   const [idx, setIdx] = useState(0)
   const [rect, setRect] = useState<DOMRect | null>(null)
@@ -109,12 +92,12 @@ export function ProjectTour() {
   const start = useCallback(() => {
     setIdx(0)
     setActive(true)
-    setTourActive(true)
+    setProjectTourActive(true)
   }, [])
 
   const finish = useCallback(() => {
     setActive(false)
-    setTourActive(false)
+    setProjectTourActive(false)
     try {
       window.localStorage.setItem(SEEN_KEY, '1')
     } catch {
@@ -141,13 +124,14 @@ export function ProjectTour() {
     const onHomePage =
       !!slug &&
       (path === `/projects/${slug}` || path === `/projects/${slug}/project`)
-    const timer = seen || !onHomePage ? undefined : window.setTimeout(start, 800)
+    const timer =
+      seen || !onHomePage ? undefined : window.setTimeout(start, 800)
 
     return () => {
       window.removeEventListener(PROJECT_TOUR_EVENT, onStart)
       if (timer) window.clearTimeout(timer)
     }
-  }, [start])
+  }, [slug, start])
 
   // Navigate to each step's page as the tour advances, so the user sees it.
   //
@@ -204,19 +188,16 @@ export function ProjectTour() {
   const step = STEPS[idx]
   const isLast = idx === STEPS.length - 1
 
-  const cardStyle: CSSProperties = rect
-    ? {
-        top: Math.min(
-          Math.max(12, rect.top),
-          window.innerHeight - CARD_EST_HEIGHT - 12
-        ),
-        left: Math.min(rect.right + 12, window.innerWidth - CARD_WIDTH - 12),
-      }
-    : { top: 88, left: 24 }
+  const cardStyle = getProjectTourCardStyle({
+    isMobile,
+    anchor: rect,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  })
 
   return createPortal(
     <>
-      {rect && (
+      {rect && !isMobile && (
         <div
           className="pointer-events-none fixed z-[95] rounded-md ring-2 ring-primary ring-offset-2 ring-offset-background transition-all"
           style={{
@@ -228,7 +209,8 @@ export function ProjectTour() {
         />
       )}
       <div
-        className="fixed z-[100] w-80 rounded-xl border bg-popover p-4 text-popover-foreground shadow-2xl"
+        data-testid="project-tour-card"
+        className="fixed z-[100] w-auto rounded-xl border bg-popover p-4 text-popover-foreground shadow-2xl md:w-80"
         style={cardStyle}
       >
         <div className="flex items-center justify-between">

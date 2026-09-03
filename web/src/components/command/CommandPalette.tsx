@@ -31,6 +31,11 @@ import {
   toCommandExtendedQuery,
   type CommandDestination,
 } from '@/lib/command-navigation'
+import {
+  mergeNavigationItems,
+  platformToolNavigationItems,
+  settingsPageNavigationItems,
+} from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
@@ -45,7 +50,6 @@ import {
   Boxes,
   Cloud,
   CreditCard,
-  CornerDownLeft,
   Database,
   DatabaseBackup,
   FileLock2,
@@ -95,6 +99,30 @@ interface NavigationItem {
   url: string
   icon: LucideIcon
   keywords?: string[]
+}
+
+export function CommandPaletteSuggestions({
+  queries,
+  onSelect,
+}: {
+  queries: string[]
+  onSelect: (query: string) => void
+}) {
+  return (
+    <CommandGroup heading="Suggested searches">
+      {queries.map((query) => (
+        <CommandItem
+          key={query}
+          value={`suggestion-${query}`}
+          onSelect={() => onSelect(query)}
+          className="gap-3 py-2.5"
+        >
+          <Search className="size-4 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 truncate">{query}</span>
+        </CommandItem>
+      ))}
+    </CommandGroup>
+  )
 }
 
 interface CommandAction {
@@ -623,6 +651,16 @@ const observeNavItems: NavigationItem[] = [
     keywords: ['logs', 'audit', 'history', 'activity'],
   },
 ]
+
+const observeUrls = new Set(observeNavItems.map((item) => item.url))
+const indexedMainNavItems = mergeNavigationItems(
+  mainNavItems,
+  platformToolNavigationItems.filter((item) => !observeUrls.has(item.url))
+)
+const indexedSettingsNavItems = mergeNavigationItems(
+  settingsNavItems,
+  settingsPageNavigationItems
+)
 
 const accountNavItems: NavigationItem[] = [
   {
@@ -1176,8 +1214,16 @@ export function CommandPalette() {
   // Create Fuse instances for fuzzy search
   const navFuse = useMemo(() => {
     const allNavItems = [
-      ...mainNavItems.map((item) => ({ ...item, category: 'Navigation' })),
-      ...settingsNavItems.map((item) => ({ ...item, category: 'Settings' })),
+      ...indexedMainNavItems
+        .filter((item) => canViewAuditLogs || item.url !== '/audit-logs')
+        .map((item) => ({
+          ...item,
+          category: 'Navigation',
+        })),
+      ...indexedSettingsNavItems.map((item) => ({
+        ...item,
+        category: 'Settings',
+      })),
       ...observeNavItems
         .filter((item) => canViewAuditLogs || item.url !== '/audit-logs')
         .map((item) => ({ ...item, category: 'Observe' })),
@@ -1307,8 +1353,10 @@ export function CommandPalette() {
         : []
 
     return {
-      navigation: mainNavItems,
-      settings: settingsNavItems,
+      navigation: indexedMainNavItems.filter(
+        (item) => canViewAuditLogs || item.url !== '/audit-logs'
+      ),
+      settings: indexedSettingsNavItems,
       observe: observeNavItems.filter(
         (item) => canViewAuditLogs || item.url !== '/audit-logs'
       ),
@@ -1695,8 +1743,10 @@ export function CommandPalette() {
   const recentItems = useMemo<RecentEntry[]>(() => {
     if (search) return []
     const allNavItems: NavigationItem[] = [
-      ...mainNavItems,
-      ...settingsNavItems,
+      ...indexedMainNavItems.filter(
+        (item) => canViewAuditLogs || item.url !== '/audit-logs'
+      ),
+      ...indexedSettingsNavItems,
       ...observeNavItems,
       ...accountNavItems,
       ...pluginNavItems,
@@ -1783,6 +1833,7 @@ export function CommandPalette() {
     projects,
     globalSkills,
     globalMcpServers,
+    canViewAuditLogs,
     navigate,
   ])
 
@@ -1820,76 +1871,30 @@ export function CommandPalette() {
     <CommandDialog
       open={open}
       onOpenChange={handleOpenChange}
-      contentClassName="!inset-0 !left-0 !top-0 !h-dvh !max-h-dvh !w-screen !max-w-none !translate-x-0 !translate-y-0 gap-0 overflow-hidden !rounded-none !border-0 p-0 shadow-none sm:!inset-auto sm:!left-1/2 sm:!top-[12%] sm:!h-auto sm:!max-h-[calc(100dvh-1rem)] sm:!w-full sm:!max-w-3xl sm:!-translate-x-1/2 sm:!rounded-3xl sm:!border sm:border-white/40 sm:shadow-[0_32px_100px_rgba(16,20,30,0.28)]"
+      contentClassName="!bottom-auto !left-3 !right-3 !top-3 !h-auto !max-h-[calc(100dvh-1.5rem)] !w-auto !max-w-none !translate-x-0 !translate-y-0 gap-0 overflow-hidden rounded-xl p-0 shadow-lg dark:shadow-none sm:!inset-auto sm:!left-1/2 sm:!top-[18%] sm:!h-auto sm:!max-h-[min(70dvh,36rem)] sm:!w-full sm:!max-w-xl sm:!-translate-x-1/2"
     >
       <Command
-        className="rounded-none border-0 shadow-none"
+        className="rounded-xl border-0 shadow-none"
         loop
         shouldFilter={false}
         value={activeValue}
         onValueChange={setActiveValue}
       >
-        <div className="relative overflow-hidden border-b bg-muted/40 px-5 pb-4 pt-5 sm:px-6">
-          <div className="pointer-events-none absolute -right-16 -top-24 size-64 rounded-full bg-blue-500/10 blur-3xl" />
-          <div className="relative mb-4 flex items-center gap-3 pr-10">
-            <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-foreground text-background">
-              <Search className="size-5" />
-            </span>
-            <div className="min-w-0">
-              <p className="truncate text-base font-semibold sm:text-lg">
-                Search this Temps instance
-              </p>
-              <p className="hidden text-xs text-muted-foreground sm:block">
-                Find projects, environments, services, settings, and tools
-              </p>
-            </div>
-            <span
-              className="ml-auto shrink-0 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-300"
-              title="Instant local navigation is ready"
-            >
-              search · ready
-            </span>
-          </div>
-          <CommandInput
-            placeholder={'Try “production environment for project-slug”'}
-            value={search}
-            onValueChange={setSearch}
-            className="h-14 text-base font-medium"
-          />
-          <div className="mt-2 flex justify-end gap-2 pr-1 text-[10px] text-muted-foreground">
-            <kbd className="rounded-md border bg-background/70 px-2 py-1 font-mono">
-              <CornerDownLeft className="mr-1 inline size-3" /> open
-            </kbd>
-          </div>
-        </div>
-        <CommandList className="max-h-none min-h-0 flex-1 p-3 sm:max-h-[56vh] sm:min-h-80 sm:flex-none">
+        <CommandInput
+          aria-label="Search this Temps instance"
+          placeholder="Search projects, services, settings, and tools…"
+          value={search}
+          onValueChange={setSearch}
+          className="h-12 pr-10 text-base sm:text-sm"
+        />
+        <CommandList className="max-h-[calc(100dvh-7rem)] min-h-0 p-2 sm:max-h-[28rem] sm:min-h-72">
           {search && <CommandEmpty>No results found.</CommandEmpty>}
 
           {!search && (
-            <div className="p-2">
-              <p className="mb-3 font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                Ask in your own words
-              </p>
-              <div className="grid gap-2 sm:grid-cols-2">
-                {sampleQueries.map((query) => (
-                  <button
-                    key={query}
-                    type="button"
-                    onClick={() => setSearch(query)}
-                    className="group flex min-h-20 items-start gap-3 rounded-xl border bg-muted/25 p-4 text-left transition-colors hover:border-ring/30 hover:bg-accent"
-                  >
-                    <Search className="mt-0.5 size-4 shrink-0 text-muted-foreground group-hover:text-foreground" />
-                    <span className="text-sm font-medium leading-relaxed">
-                      {query}
-                    </span>
-                  </button>
-                ))}
-              </div>
-              <div className="mt-4 flex items-center gap-3 rounded-xl bg-muted/50 px-4 py-3 text-xs text-muted-foreground">
-                <span className="size-2 shrink-0 rounded-full bg-emerald-500" />
-                Search is instant and matched locally against this instance.
-              </div>
-            </div>
+            <CommandPaletteSuggestions
+              queries={sampleQueries}
+              onSelect={setSearch}
+            />
           )}
 
           {/* Typing: one list, best match first, regardless of section. The
@@ -2192,11 +2197,14 @@ export function CommandPalette() {
               </CommandGroup>
             )}
         </CommandList>
-        <div className="flex items-center gap-2 border-t bg-muted/30 px-5 py-3 text-[10px] text-muted-foreground sm:text-xs">
-          <span className="size-1.5 rounded-full bg-emerald-500" />
-          <span>Local search</span>
-          <span className="hidden sm:inline">
-            {commandDestinations.length} destinations indexed
+        <div className="flex items-center justify-between gap-3 border-t px-3 py-2 text-xs text-muted-foreground">
+          <span className="truncate">
+            {commandDestinations.length} destinations
+          </span>
+          <span className="flex shrink-0 items-center gap-3">
+            <span>↑↓ navigate</span>
+            <span>↵ open</span>
+            <span className="hidden sm:inline">esc close</span>
           </span>
         </div>
       </Command>

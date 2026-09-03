@@ -15,6 +15,7 @@ import {
   type PlatformToolGroup,
 } from '@/components/platform/platform-tools'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 
 export function PlatformTools() {
   const [query, setQuery] = useState('')
@@ -65,28 +66,24 @@ export function PlatformTools() {
     .filter((group) => group.items.length > 0)
 
   return (
-    <div className="mx-auto w-full max-w-7xl space-y-8 pb-12">
-      <div className="flex flex-col gap-5 border-b pb-6 lg:flex-row lg:items-end lg:justify-between">
-        <div className="max-w-2xl">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            All platform tools
-          </h1>
-          <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-            Every Temps capability remains available here while the main sidebar
-            stays focused on daily work.
-          </p>
-        </div>
-        <div className="relative w-full lg:max-w-md">
-          <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search domains, backups, email, proxy…"
-            className="h-11 pl-10"
-            aria-label="Search platform tools"
-          />
-        </div>
-      </div>
+    <PageContainer width="wide" innerClassName="space-y-8 pb-6">
+      <PageHeader
+        title="All platform tools"
+        description="Every Temps capability remains available here while the main sidebar stays focused on daily work."
+        className="border-b pb-6 lg:items-end"
+        actions={
+          <div className="relative w-full sm:w-96 lg:w-[28rem]">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search domains, backups, email, proxy…"
+              className="h-11 pl-10"
+              aria-label="Search platform tools"
+            />
+          </div>
+        }
+      />
 
       {!normalizedQuery && (
         <section aria-labelledby="common-platform-tasks">
@@ -184,6 +181,6 @@ export function PlatformTools() {
           and search across projects, services, settings, and tools.
         </p>
       </div>
-    </div>
+    </PageContainer>
   )
 }

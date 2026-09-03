@@ -41,6 +41,7 @@ import {
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
+import { PageHeader } from '@/components/layout/PageContainer'
 
 type SettingsFormData = Pick<
   PlatformSettings,
@@ -175,6 +176,10 @@ export function Settings() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+      <PageHeader
+        title="Settings"
+        description="Configure this Temps instance"
+      />
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -224,7 +229,9 @@ export function Settings() {
           </div>
 
           <div className="space-y-2 pt-4">
-            <Label htmlFor="console-force-https">Redirect console to HTTPS</Label>
+            <Label htmlFor="console-force-https">
+              Redirect console to HTTPS
+            </Label>
             <Select
               value={consoleForceHttpsValue}
               onValueChange={(value) =>
@@ -235,7 +242,10 @@ export function Settings() {
                 )
               }
             >
-              <SelectTrigger id="console-force-https" className="w-full sm:w-[280px]">
+              <SelectTrigger
+                id="console-force-https"
+                className="w-full sm:w-[280px]"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -248,8 +258,8 @@ export function Settings() {
             </Select>
             <p className="text-sm text-muted-foreground">
               Applies to plain-HTTP requests for the host above.{' '}
-              <strong>Automatic</strong> redirects only once that hostname has
-              a certificate issued through Temps, so HTTP-only installs keep
+              <strong>Automatic</strong> redirects only once that hostname has a
+              certificate issued through Temps, so HTTP-only installs keep
               working. Choose <strong>Always</strong> only if Temps itself
               terminates TLS — if a CDN or reverse proxy in front of Temps does,
               it will loop, because Temps sees a plain-HTTP connection and
