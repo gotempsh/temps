@@ -19,47 +19,46 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 // REST, or the SDK. Keep the three examples behaviorally identical so a
 // reader can pick whichever fits their workflow and expect the same result.
 
-const CLI_EXAMPLE = `# Authenticate once (cached in ~/.config/temps/auth.json)
-export TEMPS_API_URL="https://your-temps-instance.com"
-export TEMPS_API_TOKEN="temps_pat_..."
+export const SANDBOX_CLI_EXAMPLE = `# Authenticate once (cached in ~/.temps/.contexts.json)
+bunx @temps-sdk/cli login https://your-temps-instance.com --context my-instance
 
 # Create a sandbox with a 2h idle timeout
-bunx @temps-sdk/cli sandbox create --timeout-secs 7200 --name my-sandbox
+bunx @temps-sdk/cli --target-context my-instance sandbox create --timeout-secs 7200 --name my-sandbox
 
 # List, show details, or exec a command inside it
-bunx @temps-sdk/cli sandbox list
-bunx @temps-sdk/cli sandbox show sbx_abc123
-bunx @temps-sdk/cli sandbox exec sbx_abc123 -- node --version
+bunx @temps-sdk/cli --target-context my-instance sandbox list
+bunx @temps-sdk/cli --target-context my-instance sandbox show sbx_abc123
+bunx @temps-sdk/cli --target-context my-instance sandbox exec sbx_abc123 -- node --version
 
 # Remove the sandbox when done (aliases: \`stop\`, \`destroy\`)
-bunx @temps-sdk/cli sandbox rm sbx_abc123`
+bunx @temps-sdk/cli --target-context my-instance sandbox rm sbx_abc123`
 
-const WORKSPACE_EXAMPLE = `# From a linked checkout, nothing else is needed: the project comes
-# from .temps/config.json, the repo and branch from your git remote.
+export const SANDBOX_WORKSPACE_EXAMPLE = `# Use the named context created in the CLI tab. From a linked checkout,
+# the project comes from .temps/config.json, the repo and branch from your git remote.
 cd ~/code/my-repo
-bunx @temps-sdk/cli sandbox create --workspace
+bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace
 
 # Name the project explicitly, and start a fresh branch
-bunx @temps-sdk/cli sandbox create --workspace \\
+bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace \\
   --project my-api --branch main --new-branch feat/checkout
 
 # A repo that has no temps project — resolved off your git connection,
 # so private repos clone without you handling a token
-bunx @temps-sdk/cli sandbox create --workspace --repo acme/internal-tools
+bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace --repo acme/internal-tools
 
 # Any other URL
-bunx @temps-sdk/cli sandbox create --workspace \\
+bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace \\
   --git-url https://github.com/org/repo.git --branch develop
 
 # Come back days later — this wakes the workspace automatically
-bunx @temps-sdk/cli sandbox exec sbx_abc123 -- git status
+bunx @temps-sdk/cli --target-context my-instance sandbox exec sbx_abc123 -- git status
 
 # The image ships claude, codex, opencode, gh and glab. Supply your own
 # key at create time until credential injection lands (ADR-036). Pass it by
 # reference so the secret stays out of your shell history.
-bunx @temps-sdk/cli sandbox create --workspace -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
 
-bunx @temps-sdk/cli sandbox list --workspace`
+bunx @temps-sdk/cli --target-context my-instance sandbox list --workspace`
 
 const REST_EXAMPLE = `# Create
 curl -X POST https://your-temps-instance.com/v1/sandbox \\
@@ -117,7 +116,9 @@ interface CreateSandboxDocsProps {
   variant?: Variant
 }
 
-export function CreateSandboxDocs({ variant = 'full' }: CreateSandboxDocsProps) {
+export function CreateSandboxDocs({
+  variant = 'full',
+}: CreateSandboxDocsProps) {
   const [open, setOpen] = useState(variant === 'full')
 
   const body = (
@@ -131,23 +132,22 @@ export function CreateSandboxDocs({ variant = 'full' }: CreateSandboxDocsProps) 
       <TabsContent value="cli" className="space-y-2">
         <p className="text-xs text-muted-foreground">
           Run via{' '}
-          <code className="bg-muted px-1 rounded">bunx @temps-sdk/cli</code>{' '}
-          — no install step needed. All subcommands read{' '}
-          <code className="bg-muted px-1 rounded">TEMPS_API_URL</code> and{' '}
-          <code className="bg-muted px-1 rounded">TEMPS_API_TOKEN</code>{' '}
-          from the environment.
+          <code className="bg-muted px-1 rounded">bunx @temps-sdk/cli</code> —
+          no install step needed. Log in once to store a named context, then
+          pass <code className="bg-muted px-1 rounded">--target-context</code>{' '}
+          so every command reaches the intended server.
         </p>
-        <CodeBlock code={CLI_EXAMPLE} language="bash" />
+        <CodeBlock code={SANDBOX_CLI_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="workspace" className="space-y-2">
         <p className="text-xs text-muted-foreground">
-          A <strong>workspace</strong> is a sandbox you keep. It still
-          suspends after its idle timeout so it doesn't hold memory on the
-          host, but the next command wakes it automatically and your files
-          are exactly as you left them. Nothing deletes it until you run{' '}
+          A <strong>workspace</strong> is a sandbox you keep. It still suspends
+          after its idle timeout so it doesn&apos;t hold memory on the host, but
+          the next command wakes it automatically and your files are exactly as
+          you left them. Nothing deletes it until you run{' '}
           <code className="bg-muted px-1 rounded">sandbox rm</code>.
         </p>
-        <CodeBlock code={WORKSPACE_EXAMPLE} language="bash" />
+        <CodeBlock code={SANDBOX_WORKSPACE_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="rest" className="space-y-2">
         <p className="text-xs text-muted-foreground">
@@ -164,10 +164,12 @@ export function CreateSandboxDocs({ variant = 'full' }: CreateSandboxDocsProps) 
         <p className="text-xs text-muted-foreground">
           The Node SDK wraps the REST API and exposes ergonomic helpers for{' '}
           <code className="bg-muted px-1 rounded">exec</code>,{' '}
-          <code className="bg-muted px-1 rounded">domain(port)</code>,
-          file I/O, and detached jobs. Install with{' '}
-          <code className="bg-muted px-1 rounded">bun add @temps-sdk/sandbox</code>.
-          Shape is drop-in compatible with{' '}
+          <code className="bg-muted px-1 rounded">domain(port)</code>, file I/O,
+          and detached jobs. Install with{' '}
+          <code className="bg-muted px-1 rounded">
+            bun add @temps-sdk/sandbox
+          </code>
+          . Shape is drop-in compatible with{' '}
           <code className="bg-muted px-1 rounded">@vercel/sandbox</code>.
         </p>
         <CodeBlock code={SDK_EXAMPLE} language="typescript" />
