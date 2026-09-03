@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
@@ -95,7 +95,8 @@ export function ProjectDetailHeader({
   // own build succeeded once.
   const hasCompletedDeployment =
     !!lastDeployment?.is_current &&
-    (lastDeployment?.status === 'completed' || lastDeployment?.status === 'deployed')
+    (lastDeployment?.status === 'completed' ||
+      lastDeployment?.status === 'deployed')
   const repositoryUrl = repositoryCloneUrl
     ? repositoryWebUrl(repositoryCloneUrl)
     : null
@@ -126,10 +127,7 @@ export function ProjectDetailHeader({
               />
             </div>
           ) : (
-            <Avatar className="size-8">
-              <AvatarImage src={`/api/projects/${project.id}/favicon`} />
-              <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
-            </Avatar>
+            <ProjectAvatar name={project.name} className="size-8" />
           )}
           <div className="flex items-center gap-2 min-w-0">
             <h1 className="text-base sm:text-lg font-semibold truncate">

@@ -115,6 +115,45 @@ fn build_public_compose_backend_addr(
     ))
 }
 
+/// Build the route backend for a Traefik-label discovered container.
+///
+/// Returns `None` when this deployment mode cannot actually reach the
+/// container, in which case the caller must skip the route rather than build an
+/// address that points somewhere else.
+///
+/// Discovered containers are always local to this node (remote workers run
+/// their own discovery against their own daemon), so there is never a node
+/// private address to fall back to. What is left is exactly the distinction
+/// [`build_public_compose_backend_addr`] already encodes:
+///
+/// * **Docker mode** — Temps runs on the Docker network and reaches the
+///   container as `container_name:target_port` over the internal DNS. The
+///   container port is genuinely reachable, published or not.
+/// * **Baremetal mode** — Temps runs on the host and
+///   [`build_container_backend_addr`] would resolve to
+///   `127.0.0.1:<host_port>`. With no published host port it falls back to
+///   `host_port.unwrap_or(container_port)`, i.e. `127.0.0.1:<container port>`,
+///   which is a *different, unrelated service on the host* — very possibly a
+///   database or the Docker API. Refuse to build an address at all.
+fn build_discovered_backend_addr(
+    container_name: &str,
+    container_port: i32,
+    host_port: Option<i32>,
+    runtime_context: &RuntimeContext,
+) -> Option<String> {
+    if runtime_context.execution_environment() == ExecutionEnvironment::Host && host_port.is_none()
+    {
+        return None;
+    }
+    Some(build_container_backend_addr(
+        container_name,
+        container_port,
+        host_port,
+        None,
+        runtime_context,
+    ))
+}
+
 fn build_public_compose_backend_entry(
     container: &temps_entities::deployment_containers::Model,
     node_private_address: Option<&str>,
@@ -192,6 +231,14 @@ fn build_container_backend_addr(
         endpoint.authority()
     }
 }
+
+/// Serializes tests that mutate the process-global `DEPLOYMENT_MODE` env var.
+///
+/// Lives at module scope (not inside `mod tests`) because `route_table_test.rs`
+/// needs the same lock: its database-backed tests assert addresses that depend
+/// on the deployment mode, and would race a unit test flipping it.
+#[cfg(test)]
+pub(crate) static DEPLOYMENT_MODE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Information about a sleeping on-demand environment, returned from route loading.
 #[derive(Clone, Debug)]
@@ -456,6 +503,21 @@ pub struct CachedPeerTable {
     /// generation bump rather than spinning. Awoken on every
     /// `load_routes()` success.
     generation_changed: Arc<tokio::sync::Notify>,
+
+    /// Docker network this process adopts Traefik-labelled containers from, or
+    /// `None` when label discovery is not enabled here.
+    ///
+    /// Section 6 of [`Self::load_routes`] loads **nothing** while this is
+    /// `None`, and only rows for this exact network otherwise. That is what
+    /// makes turning discovery off (or repointing it at another network)
+    /// actually take effect: `traefik_discovered_routes` rows outlive the
+    /// configuration that created them, and a disabled reconciler will never
+    /// come back to delete them.
+    ///
+    /// Deliberately injected by the process bootstrap (`temps serve` /
+    /// `temps proxy`) rather than read from the environment here — this crate
+    /// does not parse configuration.
+    traefik_discovery_network: RwLock<Option<String>>,
 }
 
 impl CachedPeerTable {
@@ -480,7 +542,38 @@ impl CachedPeerTable {
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
             generation_changed: Arc::new(tokio::sync::Notify::new()),
+            // Off until the bootstrap says otherwise: label discovery is
+            // opt-in, so the safe default is "adopt nothing".
+            traefik_discovery_network: RwLock::new(None),
         }
+    }
+
+    /// Point Section 6 of `load_routes()` at the Docker network this process
+    /// adopts Traefik-labelled containers from.
+    ///
+    /// `Some(network)` when label discovery is enabled here, `None` (the
+    /// default) to load no discovered routes at all. Call it before the initial
+    /// route load; the next `load_routes()` picks it up.
+    ///
+    /// The split-mode `temps proxy` process must set this too even though it
+    /// never runs the reconciler: it is a *reader* of `traefik_discovered_routes`
+    /// and would otherwise serve none of them.
+    pub fn set_traefik_discovery_network(&self, network: Option<String>) {
+        let network = network
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
+        match &network {
+            Some(n) => info!(
+                "Traefik label discovery is enabled for this process: routes discovered on Docker \
+                 network '{}' will be served",
+                n
+            ),
+            None => debug!(
+                "Traefik label discovery is not enabled for this process: no discovered routes \
+                 will be served"
+            ),
+        }
+        *self.traefik_discovery_network.write() = network;
     }
 
     /// Current in-memory route table generation. Bumped on every
@@ -1756,6 +1849,148 @@ impl CachedPeerTable {
         debug!("Loaded all active deployments. Final cache: {} projects, {} environments, {} deployments",
             projects_cache.len(), environments_cache.len(), deployments_cache.len());
 
+        // 6. Load Traefik-label discovered routes (containers Temps did NOT
+        // deploy — an operator's existing docker-compose/Coolify/Dokploy
+        // stack). Written by `temps_deployer::traefik_discovery`; opt-in via
+        // TEMPS_TRAEFIK_DISCOVERY_ENABLED, so this section is empty on a
+        // default install.
+        //
+        // Loaded LAST on purpose. The discovery reconciler already refuses to
+        // write a host owned by a deployment, custom route, custom domain, or
+        // environment subdomain, but that check races a concurrent write and
+        // cannot see rows another control plane node added a millisecond ago.
+        // This merge is the authoritative precedence rule: a discovered route
+        // is only ever placed on a hostname that no DB-driven route claimed in
+        // this same rebuild. An adversarial (or merely careless) workload can
+        // therefore never take a real deployment's domain by relabelling
+        // itself — the worst it can do is fail to be routed and get logged.
+        //
+        // Scoped to the network this node is *currently* configured to adopt
+        // from, and skipped entirely when discovery is off here. Without that
+        // scope, turning discovery off (or repointing it at another network)
+        // would leave every previously-adopted row still routing forever: the
+        // rows outlive the configuration that created them, and only the
+        // reconciler — which no longer runs — would ever delete them.
+        let discovery_network = self.traefik_discovery_network.read().clone();
+        let discovered_routes = match discovery_network.as_deref() {
+            Some(network) => {
+                temps_entities::traefik_discovered_routes::Entity::find()
+                    .filter(temps_entities::traefik_discovered_routes::Column::Enabled.eq(true))
+                    .filter(
+                        temps_entities::traefik_discovered_routes::Column::Network
+                            .eq(network.to_string()),
+                    )
+                    .all(self.db.as_ref())
+                    .await?
+            }
+            None => Vec::new(),
+        };
+
+        if !discovered_routes.is_empty() {
+            debug!(
+                "Section 6: Loading {} Traefik-discovered routes (network={})",
+                discovered_routes.len(),
+                discovery_network.as_deref().unwrap_or("<disabled>")
+            );
+        }
+
+        for discovered in discovered_routes {
+            let host = discovered.host.trim().to_ascii_lowercase();
+            if host.is_empty() {
+                continue;
+            }
+
+            // Precedence: any DB-driven route for this host wins, whether it
+            // is an exact HTTP/TLS route, a wildcard pattern that covers the
+            // host, or a legacy environment/custom-domain entry.
+            let claimed_by = if routes.contains_key(&host) {
+                Some("environment or custom domain route")
+            } else if http_routes_map.contains_key(&host) {
+                Some("HTTP custom route")
+            } else if tls_routes_map.contains_key(&host) {
+                Some("TLS custom route")
+            } else if http_wildcards_matcher.match_domain(&host).is_some() {
+                Some("HTTP wildcard custom route")
+            } else if tls_wildcards_matcher.match_domain(&host).is_some() {
+                Some("TLS wildcard custom route")
+            } else {
+                None
+            };
+            if let Some(owner) = claimed_by {
+                warn!(
+                    "Ignoring Traefik-discovered route for '{}' (container '{}'): the host \
+                     already resolves to a {}. The existing route is kept.",
+                    host, discovered.target_container_name, owner
+                );
+                continue;
+            }
+
+            // Same address construction as Temps-deployed containers, so
+            // baremetal installs (where the proxy cannot resolve Docker's
+            // internal DNS) use the published host port. The discovered
+            // container is always local to this node — remote workers run their
+            // own discovery against their own daemon.
+            //
+            // `None` means this deployment mode genuinely cannot reach the
+            // container. Say so loudly instead of routing the host somewhere
+            // else: a baremetal install has no way to reach an unpublished
+            // container port, and guessing `127.0.0.1:<container port>` lands
+            // on whatever unrelated service owns that port on the host.
+            let Some(address) = build_discovered_backend_addr(
+                &discovered.target_container_name,
+                discovered.target_port,
+                discovered.target_host_port,
+                self.runtime_context.as_ref(),
+            ) else {
+                warn!(
+                    "Skipping Traefik-discovered route for '{}' (container '{}', port {}): this \
+                     install runs outside Docker (baremetal mode) and the container publishes no \
+                     host port, so there is no address that reaches it. Publish the port on the \
+                     container (e.g. `ports: - \"8080:{}\"`) or run Temps in Docker mode.",
+                    host,
+                    discovered.target_container_name,
+                    discovered.target_port,
+                    discovered.target_port
+                );
+                continue;
+            };
+
+            routes.insert(
+                host.clone(),
+                RouteInfo {
+                    backend: BackendType::Upstream {
+                        backends: vec![BackendEntry {
+                            address: address.clone(),
+                            container_id: Some(discovered.target_container_id.clone()),
+                            container_name: Some(discovered.target_container_name.clone()),
+                        }],
+                        round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                    },
+                    redirect_to: None,
+                    status_code: None,
+                    // Not a Temps deployment: no project/environment/deployment
+                    // context exists for these containers by definition.
+                    project: None,
+                    environment: None,
+                    deployment: None,
+                    // TODO(security): pre-merge review finding — a discovered
+                    // container's own `traefik...tls` label used to be mirrored
+                    // here, which let any container on the watched network
+                    // drive ACME issuance for a hostname *it* chose, burning
+                    // Let's Encrypt rate limits and minting certs the operator
+                    // never asked for. Hard-coded off until issuance for
+                    // discovered hosts is gated on an explicit operator
+                    // allowlist. `discovered.tls` is still persisted and shown
+                    // in the admin API, so nothing is lost but auto-issuance.
+                    cert_eligible: false,
+                },
+            );
+            debug!(
+                "Loaded Traefik-discovered route: {} -> {} (container={}, network={}, tls={})",
+                host, address, discovered.target_container_name, discovered.network, discovered.tls
+            );
+        }
+
         // The console hostname is owned by the control plane, never by a
         // project. A route pointing it at a deployment locks the operator out
         // of the console entirely (issue #478) — the create/update API now
@@ -2439,6 +2674,37 @@ mod tests {
         let addr =
             build_container_backend_addr("my-app", 3000, Some(8080), None, &RuntimeContext::host());
         assert_eq!(addr, "127.0.0.1:8080");
+    }
+
+    // ── Traefik-discovered backend addresses ─────────────────────────────
+
+    #[test]
+    fn discovered_backend_addr_uses_the_published_host_port_on_baremetal() {
+        let addr =
+            build_discovered_backend_addr("whoami", 8000, Some(18000), &RuntimeContext::host());
+        assert_eq!(addr.as_deref(), Some("127.0.0.1:18000"));
+    }
+
+    /// The SSRF case: without a published host port, `127.0.0.1:<container
+    /// port>` is a *different service on the Temps host* — Postgres on 5432,
+    /// the Docker API on 2375, the console. Refuse to build an address at all.
+    #[test]
+    fn discovered_backend_addr_refuses_an_unpublished_port_on_baremetal() {
+        let addr = build_discovered_backend_addr("whoami", 5432, None, &RuntimeContext::host());
+        assert_eq!(
+            addr, None,
+            "a container port must never be reinterpreted as a loopback port on the host"
+        );
+    }
+
+    /// In Docker mode the container really is reachable at
+    /// `container_name:container_port` over the network's internal DNS, so an
+    /// unpublished port is fine — the restriction is mode-specific, exactly as
+    /// `build_public_compose_backend_addr` already encodes it.
+    #[test]
+    fn discovered_backend_addr_allows_an_unpublished_port_in_docker_mode() {
+        let addr = build_discovered_backend_addr("whoami", 8000, None, &RuntimeContext::docker());
+        assert_eq!(addr.as_deref(), Some("whoami:8000"));
     }
 
     fn route_test_container(

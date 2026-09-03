@@ -110,6 +110,8 @@ pub mod static_asset_cache;
 pub mod static_bundles;
 pub mod suppressed_recipients;
 pub mod tls_acme_certificates;
+pub mod traefik_discovered_routes;
+pub mod traefik_route_certificates;
 pub mod types;
 pub mod upstream_config;
 pub mod user_roles;

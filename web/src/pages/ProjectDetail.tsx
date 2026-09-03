@@ -51,6 +51,7 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
+import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import {
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
@@ -509,6 +510,15 @@ export function ProjectDetail() {
             <Route
               path="storage"
               element={<ProjectStorage project={project} />}
+            />
+            <Route
+              path="databases"
+              element={
+                <Navigate
+                  to={legacyDatabasesRedirectPath(project.slug)}
+                  replace
+                />
+              }
             />
             <Route
               path="services/*"

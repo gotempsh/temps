@@ -428,6 +428,11 @@ const OtelPipelineStatusPage = lazy(() =>
     default: m.OtelPipelineStatusPage,
   }))
 )
+const TraefikDiscoveryPage = lazy(() =>
+  import('./pages/settings/TraefikDiscoveryPage').then((m) => ({
+    default: m.TraefikDiscoveryPage,
+  }))
+)
 const GlobalMcpServerDetailPage = lazy(() =>
   import('./pages/settings/GlobalMcpServerDetail').then((m) => ({
     default: m.GlobalMcpServerDetail,
@@ -700,6 +705,10 @@ const FullAppRoutes = () => {
                       <Route
                         path="otel-pipeline"
                         element={<OtelPipelineStatusPage />}
+                      />
+                      <Route
+                        path="traefik-discovery"
+                        element={<TraefikDiscoveryPage />}
                       />
                       <Route path="mcp-server" element={<McpServerPage />} />
                     </Route>

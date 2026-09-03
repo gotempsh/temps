@@ -4,17 +4,91 @@
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// TLS certificate stored in the `domains` table.
+///
+/// ## Key material hygiene
+///
+/// `private_key_pem` is sensitive material. Two mechanisms enforce this rather
+/// than relying on prose promises (ADR-041 §6):
+///
+/// - **Hand-written `Debug`** redacts both `private_key_pem` and
+///   `certificate_pem`. A struct that cannot be printed with its secret cannot
+///   leak it through a later `debug!("{:?}", cert)`.
+/// - **`Serialize` is deliberately NOT derived.** Use `CertificateSummary` for
+///   API responses. A type that is not serializable cannot be handed to
+///   `Json(cert)` by a future handler.
+///
+/// The `Deserialize` derive is kept so the model can be built from test data
+/// and from internal-only code paths that own the source of truth.
+#[derive(Clone, Deserialize)]
 pub struct Certificate {
     pub id: i32,
     pub domain: String,
+    /// Full PEM chain (leaf first). Stored verbatim; served verbatim by the
+    /// proxy. Not secret, but redacted in `Debug` to prevent accidental
+    /// inclusion in log payloads that travel out-of-band.
     pub certificate_pem: String,
+    /// Decrypted private key PEM. Secret — encrypted at rest by
+    /// `CertificateRepository::save_certificate` via `EncryptionService`.
+    /// Never serialized, never logged.
     pub private_key_pem: String,
     pub expiration_time: UtcDateTime,
     pub last_renewed: Option<UtcDateTime>,
     pub is_wildcard: bool,
     pub verification_method: String,
     pub status: CertificateStatus,
+}
+
+/// Hand-written `Debug` for `Certificate` that redacts secret fields.
+///
+/// This replaces the derive to make it structurally impossible to leak key
+/// material via `debug!("{:?}", cert)` added anywhere in the codebase.
+impl std::fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Certificate")
+            .field("id", &self.id)
+            .field("domain", &self.domain)
+            .field("certificate_pem", &"[REDACTED]")
+            .field("private_key_pem", &"[REDACTED]")
+            .field("expiration_time", &self.expiration_time)
+            .field("last_renewed", &self.last_renewed)
+            .field("is_wildcard", &self.is_wildcard)
+            .field("verification_method", &self.verification_method)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+/// Non-secret summary of a certificate for API responses.
+///
+/// Contains only derived, non-secret metadata — no PEM material, no private
+/// key. Every endpoint added by ADR-041 that surfaces certificate information
+/// returns this type, not `Certificate` directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificateSummary {
+    pub id: i32,
+    pub domain: String,
+    pub expiration_time: UtcDateTime,
+    pub last_renewed: Option<UtcDateTime>,
+    pub is_wildcard: bool,
+    pub verification_method: String,
+    pub status: CertificateStatus,
+    pub days_remaining: i64,
+}
+
+impl From<&Certificate> for CertificateSummary {
+    fn from(cert: &Certificate) -> Self {
+        Self {
+            id: cert.id,
+            domain: cert.domain.clone(),
+            expiration_time: cert.expiration_time,
+            last_renewed: cert.last_renewed,
+            is_wildcard: cert.is_wildcard,
+            verification_method: cert.verification_method.clone(),
+            status: cert.status.clone(),
+            days_remaining: cert.days_until_expiry(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -156,26 +230,31 @@ pub enum RenewalStatus {
     Failed,
 }
 
-/// Result of a certificate renewal request
+/// Result of a certificate renewal request.
+///
+/// Uses `CertificateSummary` (not `Certificate`) for all embedded certificate
+/// fields: `RenewalResult` is serialized for API responses, and `Certificate`
+/// is deliberately not `Serialize` to prevent accidental key-material leakage
+/// (ADR-041 §6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RenewalResult {
     /// Certificate doesn't need renewal yet
     NotNeeded {
         days_remaining: i64,
-        current_certificate: Certificate,
+        current_certificate: CertificateSummary,
     },
 
     /// HTTP-01 renewal completed automatically
     Completed {
-        certificate: Certificate,
+        certificate: CertificateSummary,
         renewed_at: UtcDateTime,
     },
 
     /// DNS-01 renewal started, awaiting user DNS update
     /// CRITICAL: current_certificate remains Active
     AwaitingDnsValidation {
-        current_certificate: Certificate, // Still Active!
+        current_certificate: CertificateSummary, // Still Active!
         challenge_data: DnsChallengeData,
         instructions: String,
         renewal_id: i32,
@@ -183,7 +262,7 @@ pub enum RenewalResult {
 
     /// HTTP-01 challenge initiated, awaiting validation
     AwaitingHttpValidation {
-        current_certificate: Certificate, // Still Active!
+        current_certificate: CertificateSummary, // Still Active!
         challenge_data: HttpChallengeData,
         instructions: String,
         renewal_id: i32,

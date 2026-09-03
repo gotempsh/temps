@@ -331,11 +331,13 @@ fn deployment_url_from_settings(
 impl DeploymentService {
     /// Return the currently served deployment media for each requested project.
     ///
-    /// Deployment rows are selected in one ranked `DISTINCT ON` query. A
+    /// Media rows are selected in one ranked `DISTINCT ON` query. A
     /// non-preview production current deployment wins, followed by another
     /// current deployment, then the newest historical deployment with a
     /// screenshot. Historical fallbacks omit their URL because they are not
-    /// guaranteed to be routable.
+    /// guaranteed to be routable. The newest attempt status is selected
+    /// independently because a failed attempt does not replace the older
+    /// deployment that remains live.
     pub async fn get_latest_deployment_media(
         &self,
         project_ids: &[i32],
@@ -359,7 +361,13 @@ impl DeploymentService {
         let statement = sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "WITH candidates AS ( \
+                "WITH latest_attempts AS ( \
+                    SELECT DISTINCT ON (d.project_id) \
+                        d.project_id, d.state AS latest_attempt_status \
+                    FROM deployments d \
+                    WHERE d.project_id IN ({placeholders}) \
+                    ORDER BY d.project_id, d.created_at DESC, d.id DESC \
+                 ), candidates AS ( \
                     SELECT d.project_id, d.slug, d.screenshot_location, TRUE AS is_current, \
                         CASE WHEN e.slug = 'production' AND NOT e.is_preview THEN 0 ELSE 1 END AS priority, \
                         e.updated_at AS candidate_updated_at, d.created_at, d.id \
@@ -375,11 +383,17 @@ impl DeploymentService {
                     FROM deployments d \
                     WHERE d.project_id IN ({placeholders}) \
                       AND d.screenshot_location IS NOT NULL \
+                 ), selected_media AS ( \
+                    SELECT DISTINCT ON (project_id) \
+                        project_id, slug, screenshot_location, is_current \
+                    FROM candidates \
+                    ORDER BY project_id, priority, candidate_updated_at DESC, created_at DESC, id DESC \
                  ) \
-                 SELECT DISTINCT ON (project_id) \
-                    project_id, slug, screenshot_location, is_current \
-                 FROM candidates \
-                 ORDER BY project_id, priority, candidate_updated_at DESC, created_at DESC, id DESC"
+                 SELECT latest_attempts.project_id, latest_attempts.latest_attempt_status, \
+                    selected_media.slug, selected_media.screenshot_location, \
+                    COALESCE(selected_media.is_current, FALSE) AS is_current \
+                 FROM latest_attempts \
+                 LEFT JOIN selected_media USING (project_id)"
             ),
             project_ids.iter().copied().map(Into::into),
         );
@@ -406,11 +420,18 @@ impl DeploymentService {
                     ),
                 }
             })?;
-            let slug: String =
+            let slug: Option<String> =
                 row.try_get("", "slug")
                     .map_err(|error| DeploymentError::DatabaseError {
                         reason: format!(
                             "Failed to decode deployment slug for project {project_id}: {error}"
+                        ),
+                    })?;
+            let latest_attempt_status: String =
+                row.try_get("", "latest_attempt_status")
+                    .map_err(|error| DeploymentError::DatabaseError {
+                        reason: format!(
+                            "Failed to decode latest deployment attempt status for project {project_id}: {error}"
                         ),
                     })?;
             let screenshot_location = row.try_get("", "screenshot_location").map_err(|error| {
@@ -427,12 +448,22 @@ impl DeploymentService {
                     ),
                 }
             })?;
+            let url = if is_current {
+                let slug = slug.ok_or_else(|| DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Current deployment media for project {project_id} is missing its deployment slug"
+                    ),
+                })?;
+                Some(deployment_url_from_settings(&settings, proxy_port, &slug))
+            } else {
+                None
+            };
             media_by_project.insert(
                 project_id,
                 LatestDeploymentMedia {
                     project_id,
-                    url: is_current
-                        .then(|| deployment_url_from_settings(&settings, proxy_port, &slug)),
+                    latest_attempt_status,
+                    url,
                     screenshot_location,
                 },
             );
@@ -5289,7 +5320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_deployment_media_returns_current_deployment_per_project() {
+    async fn latest_deployment_media_keeps_current_media_and_reports_latest_attempt() {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
@@ -5301,6 +5332,16 @@ mod tests {
         let (project, environment, old_deployment) = setup_test_data(&db)
             .await
             .expect("create deployment fixtures");
+        let service = create_deployment_service_for_test(db.clone());
+        let status_without_media = service
+            .get_latest_deployment_media(&[project.id])
+            .await
+            .expect("query a latest attempt without current or historical media");
+        assert_eq!(status_without_media.len(), 1);
+        assert_eq!(status_without_media[0].latest_attempt_status, "deployed");
+        assert_eq!(status_without_media[0].url, None);
+        assert_eq!(status_without_media[0].screenshot_location, None);
+
         let old_screenshot = "screenshots/old.webp".to_string();
         let mut old: deployments::ActiveModel = old_deployment.into();
         old.screenshot_location = Set(Some(old_screenshot));
@@ -5334,7 +5375,6 @@ mod tests {
             .await
             .expect("set current deployment");
 
-        let service = create_deployment_service_for_test(db.clone());
         let media = service
             .get_latest_deployment_media(&[project.id, i32::MAX])
             .await
@@ -5342,6 +5382,7 @@ mod tests {
 
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].project_id, project.id);
+        assert_eq!(media[0].latest_attempt_status, "completed");
         assert_eq!(
             media[0].screenshot_location.as_deref(),
             Some(newest_screenshot.as_str())
@@ -5350,6 +5391,37 @@ mod tests {
             .url
             .as_deref()
             .is_some_and(|url| url.contains(&newest_slug)));
+
+        let failed_attempt = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("failed-attempt".to_string()),
+            state: Set("failed".to_string()),
+            screenshot_location: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            updated_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert failed latest attempt");
+        let media_after_failure = service
+            .get_latest_deployment_media(&[project.id])
+            .await
+            .expect("query current media after a failed attempt");
+        assert_eq!(media_after_failure[0].latest_attempt_status, "failed");
+        assert_eq!(
+            media_after_failure[0].screenshot_location.as_deref(),
+            Some(newest_screenshot.as_str())
+        );
+        assert!(media_after_failure[0]
+            .url
+            .as_deref()
+            .is_some_and(|url| url.contains(&newest_slug)));
+        assert_ne!(failed_attempt.id, newest.id);
 
         let mut environment: environments::ActiveModel = environment.into();
         environment.current_deployment_id = Set(None);
@@ -5362,6 +5434,7 @@ mod tests {
             .await
             .expect("query historical screenshot fallback");
         assert_eq!(historical_media.len(), 1);
+        assert_eq!(historical_media[0].latest_attempt_status, "failed");
         assert_eq!(historical_media[0].url, None);
         assert_eq!(
             historical_media[0].screenshot_location.as_deref(),

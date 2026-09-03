@@ -18,7 +18,7 @@ describe('telemetryFreshnessSummary', () => {
     )
   })
 
-  test('recognizes a realistic RustFS beta.6 application metric', () => {
+  test('recognizes a realistic metric from the pinned RustFS image', () => {
     expect(
       telemetryFreshnessSummary(
         'rustfs',

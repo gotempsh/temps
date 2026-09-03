@@ -1803,6 +1803,31 @@ mod tests {
     }
 
     #[test]
+    fn managed_s3_and_rustfs_defaults_use_the_provider_image() {
+        for strategy in [
+            &S3ParameterStrategy as &dyn ParameterStrategy,
+            &RustfsParameterStrategy as &dyn ParameterStrategy,
+        ] {
+            let mut params = HashMap::new();
+            strategy
+                .auto_generate_missing(&mut params)
+                .expect("managed defaults must be generated");
+            assert_eq!(
+                params.get("docker_image").and_then(JsonValue::as_str),
+                Some(DEFAULT_RUSTFS_IMAGE)
+            );
+            assert_eq!(
+                strategy.get_schema().and_then(|schema| {
+                    schema["properties"]["docker_image"]["default"]
+                        .as_str()
+                        .map(str::to_owned)
+                }),
+                Some(DEFAULT_RUSTFS_IMAGE.to_string())
+            );
+        }
+    }
+
+    #[test]
     fn minio_rejects_client_supplied_container_name() {
         let strategy = MinioParameterStrategy;
         let mut params = HashMap::new();

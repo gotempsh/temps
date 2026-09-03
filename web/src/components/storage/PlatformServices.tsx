@@ -46,6 +46,7 @@ import {
 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from 'sonner'
+import { DEFAULT_RUSTFS_IMAGE } from '@/lib/service-images'
 
 type ServiceType = 'kv' | 'blob'
 
@@ -53,7 +54,8 @@ interface EditDockerImageDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   serviceName: string
-  currentImage: string
+  dockerImage: string
+  onDockerImageChange: (image: string) => void
   onSave: (newImage: string) => void
   isPending: boolean
 }
@@ -62,12 +64,11 @@ function EditDockerImageDialog({
   open,
   onOpenChange,
   serviceName,
-  currentImage,
+  dockerImage,
+  onDockerImageChange,
   onSave,
   isPending,
 }: EditDockerImageDialogProps) {
-  const [dockerImage, setDockerImage] = useState(currentImage)
-
   const handleSave = () => {
     if (dockerImage.trim()) {
       onSave(dockerImage.trim())
@@ -90,25 +91,32 @@ function EditDockerImageDialog({
             <Input
               id="docker-image"
               value={dockerImage}
-              onChange={(e) => setDockerImage(e.target.value)}
+              onChange={(e) => onDockerImageChange(e.target.value)}
               placeholder={
                 serviceName === 'KV Store'
                   ? 'redis:8-alpine'
-                  : 'rustfs/rustfs:1.0.0-beta.6'
+                  : DEFAULT_RUSTFS_IMAGE
               }
             />
             <p className="text-xs text-muted-foreground">
               {serviceName === 'KV Store'
-                ? 'Examples: redis:8-alpine, redis:8-alpine, valkey/valkey:8-alpine'
-                : 'Examples: rustfs/rustfs:1.0.0-beta.6, rustfs/rustfs:latest'}
+                ? 'Examples: redis:8-alpine, valkey/valkey:8-alpine'
+                : `Examples: ${DEFAULT_RUSTFS_IMAGE}, rustfs/rustfs:latest`}
             </p>
           </div>
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isPending}>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={isPending}
+          >
             Cancel
           </Button>
-          <Button onClick={handleSave} disabled={isPending || !dockerImage.trim()}>
+          <Button
+            onClick={handleSave}
+            disabled={isPending || !dockerImage.trim()}
+          >
             {isPending ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
@@ -128,6 +136,7 @@ export function PlatformServices() {
   const queryClient = useQueryClient()
   const [editDialogOpen, setEditDialogOpen] = useState(false)
   const [editingService, setEditingService] = useState<ServiceType | null>(null)
+  const [editDockerImage, setEditDockerImage] = useState('')
 
   // Fetch KV status
   const { data: kvStatus, isLoading: kvLoading } = useQuery({
@@ -216,11 +225,13 @@ export function PlatformServices() {
   const isLoading = kvLoading || blobLoading
 
   const handleEditKv = () => {
+    setEditDockerImage(kvStatus?.docker_image || 'redis:8-alpine')
     setEditingService('kv')
     setEditDialogOpen(true)
   }
 
   const handleEditBlob = () => {
+    setEditDockerImage(blobStatus?.docker_image || DEFAULT_RUSTFS_IMAGE)
     setEditingService('blob')
     setEditDialogOpen(true)
   }
@@ -244,11 +255,8 @@ export function PlatformServices() {
     )
   }
 
-  const currentServiceName = editingService === 'kv' ? 'KV Store' : 'Blob Storage'
-  const currentImage =
-    editingService === 'kv'
-      ? kvStatus?.docker_image || 'redis:8-alpine'
-      : blobStatus?.docker_image || 'rustfs/rustfs:1.0.0-beta.6'
+  const currentServiceName =
+    editingService === 'kv' ? 'KV Store' : 'Blob Storage'
 
   return (
     <div className="space-y-6">
@@ -256,9 +264,9 @@ export function PlatformServices() {
         <Info className="h-4 w-4" />
         <AlertTitle>Platform Services</AlertTitle>
         <AlertDescription>
-          These services are shared across all projects. Each project&apos;s data
-          is isolated by namespace. Enable a service to make it available for
-          all projects.
+          These services are shared across all projects. Each project’s data is
+          isolated by namespace. Enable a service to make it available for all
+          projects.
         </AlertDescription>
       </Alert>
 
@@ -310,14 +318,14 @@ export function PlatformServices() {
 
       {/* Edit Docker Image Dialog */}
       <EditDockerImageDialog
-        key={`${editingService ?? 'none'}:${currentImage}`}
         open={editDialogOpen}
         onOpenChange={(open) => {
           setEditDialogOpen(open)
           if (!open) setEditingService(null)
         }}
         serviceName={currentServiceName}
-        currentImage={currentImage}
+        dockerImage={editDockerImage}
+        onDockerImageChange={setEditDockerImage}
         onSave={handleSaveDockerImage}
         isPending={kvUpdateMut.isPending || blobUpdateMut.isPending}
       />
@@ -369,7 +377,9 @@ function ServiceCard({
             <div>
               <CardTitle className="text-lg">{name}</CardTitle>
               <Badge
-                variant={enabled ? (healthy ? 'default' : 'destructive') : 'secondary'}
+                variant={
+                  enabled ? (healthy ? 'default' : 'destructive') : 'secondary'
+                }
                 className="mt-1"
               >
                 {enabled ? (

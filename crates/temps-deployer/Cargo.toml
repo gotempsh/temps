@@ -34,6 +34,9 @@ num_cpus = "1.16"
 sea-orm = { workspace = true }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
+# Traefik label discovery persists its routes as `traefik_discovered_routes`
+# rows so the existing route-table NOTIFY machinery propagates them.
+temps-entities = { path = "../temps-entities" }
 temps-network = { path = "../temps-network" }
 # ADR-024: control-plane DNS resolver bootstrap (CP-only path; workers wire DNS
 # via `temps agent`).
@@ -50,3 +53,9 @@ env_logger = "0.11"
 tokio-test = "0.4"
 mockall = "0.15"
 serial_test = "4.0"
+# Traefik discovery integration tests: real Postgres (schema-isolated) plus
+# real labelled containers on a real Docker network, asserted through the real
+# route table. All skip gracefully when Docker is unavailable.
+testcontainers = { workspace = true }
+temps-database = { path = "../temps-database" }
+temps-routes = { path = "../temps-routes" }

@@ -9,6 +9,7 @@ import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { DropButton } from '@/components/dashboard/DropButton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
+import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { featureKeyForPath } from '@/lib/feature-maturity'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
@@ -24,7 +25,6 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from '../ui/breadcrumb'
-import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
   Command,
   CommandEmpty,
@@ -65,12 +65,11 @@ function ProjectRowIcon({
     )
   }
   return (
-    <Avatar className="size-5 rounded-sm">
-      <AvatarImage src={`/api/projects/${projectId}/favicon`} />
-      <AvatarFallback className="rounded-sm bg-muted text-[10px] font-medium text-muted-foreground">
-        {name.slice(0, 1).toUpperCase()}
-      </AvatarFallback>
-    </Avatar>
+    <ProjectAvatar
+      name={name}
+      className="size-5 rounded-sm"
+      fallbackClassName="rounded-sm bg-muted text-[10px] text-muted-foreground"
+    />
   )
 }
 

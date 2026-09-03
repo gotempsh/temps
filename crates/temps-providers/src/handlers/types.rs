@@ -411,9 +411,37 @@ impl ProviderMetadata {
     }
 
     pub fn get_by_type(service_type: &ServiceTypeRoute) -> Option<Self> {
-        Self::get_all()
+        let metadata = Self::get_all()
             .into_iter()
-            .find(|p| &p.service_type == service_type)
+            .find(|p| &p.service_type == service_type);
+        if metadata.is_some() {
+            return metadata;
+        }
+
+        match service_type {
+            ServiceTypeRoute::Rustfs => Some(Self {
+                service_type: ServiceTypeRoute::Rustfs,
+                display_name: "RustFS".to_string(),
+                description: "High-performance S3-compatible object storage".to_string(),
+                icon_url: "/providers/s3.svg".to_string(),
+                color: "#C72E49".to_string(),
+            }),
+            ServiceTypeRoute::Kv => Some(Self {
+                service_type: ServiceTypeRoute::Kv,
+                display_name: "KV Store".to_string(),
+                description: "Managed key-value storage backed by Redis".to_string(),
+                icon_url: "/providers/redis.svg".to_string(),
+                color: "#DC382D".to_string(),
+            }),
+            ServiceTypeRoute::Blob => Some(Self {
+                service_type: ServiceTypeRoute::Blob,
+                display_name: "Blob Storage".to_string(),
+                description: "Managed S3-compatible object storage backed by RustFS".to_string(),
+                icon_url: "/providers/s3.svg".to_string(),
+                color: "#C72E49".to_string(),
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -436,6 +464,24 @@ mod tests {
             ServiceTypeRoute::Minio
         );
         assert!(ProviderMetadata::get_by_type(&ServiceTypeRoute::Minio).is_some());
+    }
+
+    #[test]
+    fn managed_service_aliases_have_detail_metadata_without_duplicate_cards() {
+        let creatable = ProviderMetadata::get_creatable();
+
+        for service_type in [
+            ServiceTypeRoute::Kv,
+            ServiceTypeRoute::Blob,
+            ServiceTypeRoute::Rustfs,
+        ] {
+            let metadata = ProviderMetadata::get_by_type(&service_type)
+                .expect("managed service alias should have detail metadata");
+            assert_eq!(metadata.service_type, service_type);
+            assert!(creatable
+                .iter()
+                .all(|provider| provider.service_type != service_type));
+        }
     }
 
     #[test]

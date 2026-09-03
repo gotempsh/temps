@@ -20,7 +20,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -91,18 +91,16 @@ function metaFor(contextType: string) {
 }
 
 /**
- * Project favicon with a small context-type badge (deployment/alert/project)
+ * Project identity with a small context-type badge (deployment/alert/project)
  * overlaid in the corner. Shared by the conversation list and the open-chat
  * header so a chat looks the same in both places.
  */
 function ContextAvatar({
-  projectId,
   projectName,
   contextType,
   className,
   badgeClassName,
 }: {
-  projectId: number
   projectName?: string
   contextType: string
   className?: string
@@ -111,15 +109,11 @@ function ContextAvatar({
   const { label, Icon } = metaFor(contextType)
   return (
     <div className="relative shrink-0">
-      <Avatar className={cn('size-8 rounded-md', className)}>
-        <AvatarImage
-          src={`/api/projects/${projectId}/favicon`}
-          alt={projectName ?? 'Project'}
-        />
-        <AvatarFallback className="rounded-md bg-primary/10 text-xs font-medium text-primary">
-          {(projectName ?? label).slice(0, 1).toUpperCase()}
-        </AvatarFallback>
-      </Avatar>
+      <ProjectAvatar
+        name={projectName ?? label}
+        className={cn('size-8 rounded-md', className)}
+        fallbackClassName="rounded-md bg-primary/10 text-xs text-primary"
+      />
       <span
         className={cn(
           'absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-background bg-muted text-muted-foreground',
@@ -644,7 +638,6 @@ export function DockBody({
               )}
               {inConversation && active && (
                 <ContextAvatar
-                  projectId={active.projectId}
                   projectName={active.projectName}
                   contextType={active.contextType}
                   className="size-7"
@@ -973,7 +966,6 @@ function ConversationList({
               className="flex min-w-0 flex-1 items-center gap-3 px-2 py-2.5 text-left"
             >
               <ContextAvatar
-                projectId={c.project_id}
                 projectName={c.project_name ?? undefined}
                 contextType={c.context_type}
               />
@@ -1166,15 +1158,11 @@ function ProjectPicker({
               }
               className="group flex w-full items-center gap-3 rounded-md border border-transparent px-2 py-2.5 text-left transition-colors hover:border-border hover:bg-accent disabled:opacity-60"
             >
-              <Avatar className="size-8 rounded-md">
-                <AvatarImage
-                  src={`/api/projects/${p.id}/favicon`}
-                  alt={p.name}
-                />
-                <AvatarFallback className="rounded-md bg-primary/10 text-xs font-medium text-primary">
-                  {p.name.slice(0, 1).toUpperCase()}
-                </AvatarFallback>
-              </Avatar>
+              <ProjectAvatar
+                name={p.name}
+                className="size-8 rounded-md"
+                fallbackClassName="rounded-md bg-primary/10 text-xs text-primary"
+              />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium">{p.name}</div>
                 {p.slug && (

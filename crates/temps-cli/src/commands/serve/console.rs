@@ -36,6 +36,7 @@ use temps_core::templates::TemplateService;
 use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
+use temps_deployer::traefik_discovery::DriftAlarmSink;
 use temps_deployments::DeploymentsPlugin;
 use temps_dns::DnsPlugin;
 use temps_domains::DomainsPlugin;
@@ -1244,6 +1245,17 @@ pub struct ConsoleApiParams {
     /// resolved exactly once per process; registered below for ConfigPlugin's
     /// `GET/POST /settings/update`.
     pub self_updater: Arc<crate::commands::serve::self_update::BinarySelfUpdater>,
+    /// Startup-resolved state of Traefik label discovery. Built by
+    /// `commands/serve/mod.rs` (which decides whether the watcher actually
+    /// runs) and registered into the service registry below so
+    /// `GET /traefik-discovery/status` can report the truth — including
+    /// `configured: false` plus the reason and the env vars that would enable
+    /// it, rather than the endpoint disappearing on a default install.
+    ///
+    /// Read-only status metadata: it never influences routing, auth, or
+    /// connection handling. The watcher's writes reach the route table through
+    /// the `route_table_changes` NOTIFY path, not through this handle.
+    pub traefik_discovery: Arc<temps_deployer::traefik_discovery::TraefikDiscoveryHandle>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -2118,6 +2130,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         project_ip_gate_slot,
         update_status,
         self_updater,
+        traefik_discovery,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -2248,6 +2261,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // Registered behind the trait so temps-config depends only on the
     // temps-core contract, never on the CLI crate that implements it.
     service_context.register_service(self_updater.clone() as Arc<dyn temps_core::SelfUpdater>);
+    // Traefik label discovery status, resolved in serve/mod.rs. Pre-registered
+    // before any plugin runs so DeploymentsPlugin's `/traefik-discovery/*`
+    // handlers report this process's real state instead of falling back to a
+    // handle rebuilt from the environment.
+    service_context.register_service(traefik_discovery.clone());
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts
@@ -2781,6 +2799,224 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         tracing::warn!(
             "ConfigService or AlarmService not available - disk space monitoring disabled."
         );
+    }
+
+    // ADR-041 §2a: wire the alarm service into the Traefik discovery watcher so
+    // certificate-drift events are visible in the alarm panel, not just in logs.
+    // This must run after MonitoringPlugin (step 9.8) has registered AlarmService.
+    // We bridge via `DriftAlarmSink` to avoid a dependency cycle
+    // (temps-monitoring depends on temps-deployer).
+    if let Some(alarm_service) = service_context.get_service::<AlarmService>() {
+        struct AlarmServiceDriftSink(Arc<AlarmService>);
+        #[async_trait::async_trait]
+        impl DriftAlarmSink for AlarmServiceDriftSink {
+            async fn notify_container_drift(
+                &self,
+                host: String,
+                authorized_container: String,
+                current_container: String,
+            ) {
+                use temps_monitoring::alarm_service::{AlarmSeverity, AlarmType, FireAlarmRequest};
+                let detail = format!(
+                    "Host '{host}' is now served by container '{current}' but TLS was \
+                     authorized for container '{authorized}'. The certificate is still \
+                     valid but may be delivered to the wrong container if the new one is \
+                     not legitimate. Deauthorize and re-authorize once the correct \
+                     container is confirmed.",
+                    host = host,
+                    current = current_container,
+                    authorized = authorized_container,
+                );
+                let metadata = serde_json::json!({
+                    "host": host,
+                    "authorized_container": authorized_container,
+                    "current_container": current_container,
+                });
+                let request = FireAlarmRequest {
+                    project_id: None,
+                    environment_id: None,
+                    deployment_id: None,
+                    container_id: None,
+                    service_id: None,
+                    alarm_type: AlarmType::TraefikContainerDrift,
+                    severity: AlarmSeverity::Critical,
+                    title: format!("Certificate drift: {host}"),
+                    message: detail,
+                    metadata: Some(metadata),
+                };
+                if let Err(e) = self.0.fire_alarm(request).await {
+                    tracing::error!(
+                        host = %host,
+                        error = %e,
+                        "Failed to fire TraefikContainerDrift alarm; drift is still \
+                         recorded in the database"
+                    );
+                }
+            }
+        }
+        traefik_discovery.inject_alarm_sink(Arc::new(AlarmServiceDriftSink(alarm_service)));
+    }
+
+    // ADR-041 §8: wire the TLS provisioner for Traefik label discovery.
+    //
+    // `temps-deployments` cannot depend on `temps-domains` directly (that would
+    // introduce a dependency cycle), so the trait `DiscoveredHostTlsProvisioner`
+    // is declared in `temps-deployments` and implemented here — in the serve
+    // wiring layer that already depends on both crates — following the same
+    // adapter pattern used above for `AlarmServiceDriftSink`.
+    //
+    // Both DomainService and CertificateRepository are registered by
+    // DomainsPlugin::register_services, which has already run by this point
+    // (all plugins run register_services before initialize_plugins returns).
+    // If DomainsPlugin is absent the require_service below will panic at
+    // startup with a clear error, which is the correct behaviour for a missing
+    // required dependency (CLAUDE.md: "Use `Arc<T>` and fail at startup if missing").
+    {
+        use temps_deployments::services::traefik_discovery_service::{
+            DiscoveredHostTlsProvisioner, TlsProvisionerError,
+        };
+        use temps_domains::tls::models::{Certificate, CertificateStatus};
+        use temps_domains::tls::repository::CertificateRepository;
+        use temps_domains::DomainService;
+
+        struct TraefikTlsProvisioner {
+            domain_service: Arc<DomainService>,
+            cert_repo: Arc<dyn CertificateRepository>,
+            config_service: Arc<temps_config::ConfigService>,
+            dns_provider_service: Arc<temps_dns::services::DnsProviderService>,
+        }
+
+        impl TraefikTlsProvisioner {
+            /// Read `letsencrypt.email` from settings — mirrors TlsService::get_acme_email.
+            async fn get_acme_email(&self) -> String {
+                if let Ok(settings) = self.config_service.get_settings().await {
+                    if let Some(email) = settings.letsencrypt.email {
+                        let email = email.trim().to_string();
+                        if !email.is_empty() {
+                            return email;
+                        }
+                    }
+                }
+                String::new()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl DiscoveredHostTlsProvisioner for TraefikTlsProvisioner {
+            async fn request_acme_cert(
+                &self,
+                host: &str,
+                challenge_type: &str,
+            ) -> Result<(), TlsProvisionerError> {
+                let email = self.get_acme_email().await;
+
+                // Check whether a domains row already exists for this host.
+                let existing = self.cert_repo.find_certificate(host).await.map_err(|e| {
+                    TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+
+                match existing {
+                    None => {
+                        // No row yet — create one with the declared challenge
+                        // type. If the ACME challenge request below fails, this
+                        // row is deliberately left in place rather than rolled
+                        // back: `TraefikDiscoveryAdminService::authorize_acme_cert`
+                        // already wrote a `traefik_route_certificates` claim for
+                        // this host before calling here, so a retry is never
+                        // blocked by the host-ownership check, and it reuses
+                        // this same pending row via the branch below.
+                        self.domain_service
+                            .create_domain(host, challenge_type)
+                            .await
+                            .map_err(|e| TlsProvisionerError::Failed {
+                                host: host.to_string(),
+                                reason: e.to_string(),
+                            })?;
+                    }
+                    Some(cert) if cert.verification_method == challenge_type => {
+                        // Row exists with a matching method — reuse it as-is.
+                    }
+                    Some(cert) => {
+                        // Row exists but the stored method differs — 409.
+                        return Err(TlsProvisionerError::VerificationMethodConflict {
+                            host: host.to_string(),
+                            stored: cert.verification_method,
+                            declared: challenge_type.to_string(),
+                        });
+                    }
+                };
+
+                self.domain_service
+                    .request_challenge(host, &email)
+                    .await
+                    .map_err(|e| TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    })?;
+
+                Ok(())
+            }
+
+            async fn save_imported_cert(
+                &self,
+                host: &str,
+                certificate_pem: &str,
+                key_pem: &str,
+                renewal_method: &str,
+                not_after: chrono::DateTime<chrono::Utc>,
+            ) -> Result<i32, TlsProvisionerError> {
+                let cert = Certificate {
+                    id: 0,
+                    domain: host.to_string(),
+                    certificate_pem: certificate_pem.to_string(),
+                    private_key_pem: key_pem.to_string(),
+                    expiration_time: not_after,
+                    last_renewed: Some(chrono::Utc::now()),
+                    is_wildcard: false,
+                    verification_method: renewal_method.to_string(),
+                    status: CertificateStatus::Active,
+                };
+                let saved = self.cert_repo.save_certificate(cert).await.map_err(|e| {
+                    TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                Ok(saved.id)
+            }
+
+            async fn dns_zone_is_auto_managed(
+                &self,
+                host: &str,
+            ) -> Result<bool, TlsProvisionerError> {
+                self.dns_provider_service
+                    .find_provider_for_domain(host)
+                    .await
+                    .map(|found| found.is_some())
+                    .map_err(|e| TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    })
+            }
+        }
+
+        let domain_service = service_context.require_service::<DomainService>();
+        let cert_repo = service_context.require_service::<dyn CertificateRepository>();
+        let config_service_for_provisioner =
+            service_context.require_service::<temps_config::ConfigService>();
+        let dns_provider_service_for_provisioner =
+            service_context.require_service::<temps_dns::services::DnsProviderService>();
+        let provisioner: Arc<dyn DiscoveredHostTlsProvisioner> = Arc::new(TraefikTlsProvisioner {
+            domain_service,
+            cert_repo,
+            config_service: config_service_for_provisioner,
+            dns_provider_service: dns_provider_service_for_provisioner,
+        });
+        service_context.register_service(provisioner);
+        debug!("Traefik TLS provisioner (ADR-041 §8) registered");
     }
 
     // Start alarm service, outage detection, and container health monitoring.

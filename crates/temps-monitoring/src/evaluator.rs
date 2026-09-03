@@ -1159,7 +1159,7 @@ fn mongodb_default_seeds() -> Vec<RuleSeed> {
 }
 
 fn rustfs_default_seeds() -> Vec<RuleSeed> {
-    // RustFS beta.6 exports these exact names through OTLP. Do not use the
+    // The pinned RustFS image exports these exact names through OTLP. Do not use the
     // legacy `s3.*` Prometheus aliases here: RustFS has no functional MinIO
     // `/minio/v2/metrics/cluster` scrape path, so those rules never receive
     // samples for a managed RustFS service.

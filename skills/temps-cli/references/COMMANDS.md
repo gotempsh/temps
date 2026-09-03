@@ -109,6 +109,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
 - [`revenue`](#revenue) - Manage revenue integrations and import historical data
 - [`session-replay`](#session-replay) - Manage session replay recordings
+- [`traefik-discovery`](#traefik-discovery) - Route containers Temps did not deploy by reading their Traefik labels (an existing docker-compose / Coolify / Dokploy stack)
 - [`init`](#init) - Initialize a Temps project in the current directory
 - [`link`](#link) - Link current directory to a Temps project
 - [`up`](#up) - Deploy the current project (runs setup wizard if not linked)
@@ -2008,6 +2009,7 @@ Manage external services (databases, caches, storage)
 - `logs` - View persisted logs for an external service
 - `slow-queries` - Show slowest PostgreSQL queries from pg_stat_statements
 - `enable-pg-stat-statements` - Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)
+- `metrics` - Resource and engine metrics for a database/cache/storage service
 - `restore-capabilities` - Show what restore modes a service supports (in-place / new service / PITR)
 - `list-backups` - List backups stored on an S3 source
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
@@ -2254,6 +2256,159 @@ Enable pg_stat_statements on a standalone Postgres service by restarting its con
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
 | `-y, --yes` | Skip the restart confirmation prompt (for automation) | - | No |
+
+### `services metrics`
+
+Resource and engine metrics for a database/cache/storage service
+
+**Subcommands:**
+
+- `latest` - Show the most recent value of every tracked metric
+- `range` - Show a time-series range for a single metric
+- `status` - Show when metrics were last received for a service
+- `by-database` - Per-database metric breakdown (PostgreSQL services only)
+- `enable` - Enable metric collection for a service (seeds default alert rules)
+- `disable` - Disable metric collection for a service
+- `alert-rules` - Manage monitoring alert rules for a service
+
+#### `services metrics latest`
+
+Show the most recent value of every tracked metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics range`
+
+Show a time-series range for a single metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-r, --range <window>` | Time window: 1h, 6h, 24h, 7d (default: 24h) | - | No |
+| `-p, --percentile <n>` | Histogram percentile (0-100) instead of a plain average | - | No |
+| `--json` | Output raw JSON instead of a formatted table | - | No |
+
+#### `services metrics status`
+
+Show when metrics were last received for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics by-database`
+
+Per-database metric breakdown (PostgreSQL services only)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics enable`
+
+Enable metric collection for a service (seeds default alert rules)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics disable`
+
+Disable metric collection for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics alert-rules`
+
+Manage monitoring alert rules for a service
+
+**Subcommands:**
+
+- `list` (`ls`) - List alert rules for a service
+- `create` (`add`) - Create an alert rule for a service
+- `update` - Update an existing alert rule
+- `remove` (`rm`) - Delete an alert rule
+
+##### `services metrics alert-rules list` (alias: `ls`)
+
+List alert rules for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules create` (alias: `add`)
+
+Create an alert rule for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | Yes |
+| `-t, --threshold <n>` | Threshold value that triggers the alert | - | Yes |
+| `-s, --severity <level>` | warning or critical (default: warning) | - | No |
+| `--for-duration <secs>` | Seconds the breach must persist before firing (default: 0) | - | No |
+| `--disabled` | Create the rule disabled | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules update`
+
+Update an existing alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | No |
+| `-m, --metric <name>` | Metric name | - | No |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | No |
+| `-t, --threshold <n>` | Threshold value | - | No |
+| `-s, --severity <level>` | warning or critical | - | No |
+| `--for-duration <secs>` | Seconds the breach must persist before firing | - | No |
+| `--enable` | Enable the rule | - | No |
+| `--disable` | Disable the rule | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules remove` (alias: `rm`)
+
+Delete an alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-y, --yes` | Skip confirmation prompt | - | No |
 
 ### `services restore-capabilities`
 
@@ -2981,7 +3136,7 @@ Manage project containers in environments
 - `start` - Start a stopped container
 - `stop` - Stop a running container
 - `restart` - Restart a container
-- `history` - List every container that has ever run in an environment, including ones replaced by a later redeploy
+- `history` - List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 - `metrics` - Get container resource metrics (all containers if no container ID specified)
 
 ### `containers list` (alias: `ls`)
@@ -3048,7 +3203,7 @@ Restart a container
 
 ### `containers history`
 
-List every container that has ever run in an environment, including ones replaced by a later redeploy
+List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 
 **Options:**
 
@@ -3056,6 +3211,8 @@ List every container that has ever run in an environment, including ones replace
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
+| `-d, --deployment-id <id>` | Only list containers belonging to this deployment | - | No |
+| `-l, --limit <count>` | Max REPLACED container rows to return on top of the running ones, newest first (default 20, max 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `containers metrics`
@@ -6777,6 +6934,114 @@ Delete a session replay
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-y, --yes` | Skip confirmation prompt | - | No |
+
+## `traefik-discovery`
+
+Route containers Temps did not deploy by reading their Traefik labels (an existing docker-compose / Coolify / Dokploy stack)
+
+**Subcommands:**
+
+- `status` - Show whether Traefik label discovery is enabled on this server, which Docker network it watches, and what the last reconciliation found
+- `routes` - Inspect and suppress individual auto-discovered routes
+- `tls` - Manage HTTPS certificates for Traefik-discovered routes (ADR-041). A discovered host has cert_eligible=false by design — no container label ever causes issuance. These commands let an operator explicitly authorize it.
+
+### `traefik-discovery status`
+
+Show whether Traefik label discovery is enabled on this server, which Docker network it watches, and what the last reconciliation found
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `traefik-discovery routes`
+
+Inspect and suppress individual auto-discovered routes
+
+**Subcommands:**
+
+- `list` (`ls`) - List every route discovered from Traefik labels, including the labelled containers that were found but not routed, and why
+- `enable` - Restore a previously suppressed discovered route
+- `disable` - Stop routing one discovered host without touching the container labels; the route stays listed so you can see what was found
+
+#### `traefik-discovery routes list` (alias: `ls`)
+
+List every route discovered from Traefik labels, including the labelled containers that were found but not routed, and why
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Page size (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `traefik-discovery routes enable`
+
+Restore a previously suppressed discovered route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `traefik-discovery routes disable`
+
+Stop routing one discovered host without touching the container labels; the route stays listed so you can see what was found
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `traefik-discovery tls`
+
+Manage HTTPS certificates for Traefik-discovered routes (ADR-041). A discovered host has cert_eligible=false by design — no container label ever causes issuance. These commands let an operator explicitly authorize it.
+
+**Subcommands:**
+
+- `request` - Authorize Temps to obtain a Let's Encrypt certificate for a discovered route (Path A). The certificate renews automatically using the declared challenge type.
+- `revoke` - Remove TLS authorization for a discovered route. Stops Temps from attempting renewal. Does NOT delete the certificate — use `temps domains delete <host>` to remove the certificate itself.
+- `import` - Import certificates from a Traefik acme.json file (Path B). Use this to get HTTPS immediately at cutover — Traefik already holds the cert, so there is no outage window. Each host is validated (8-step X.509 chain) and a per-host result is returned. Add --dry-run to preview without writing.
+
+#### `traefik-discovery tls request`
+
+Authorize Temps to obtain a Let's Encrypt certificate for a discovered route (Path A). The certificate renews automatically using the declared challenge type.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--challenge-type <type>` | Challenge type: http-01 (default) or dns-01 | `http-01` | No |
+| `--acknowledge-manual-dns-renewal` | Confirm you accept manual DNS renewal when no auto-manage DNS zone is configured | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `traefik-discovery tls revoke`
+
+Remove TLS authorization for a discovered route. Stops Temps from attempting renewal. Does NOT delete the certificate — use `temps domains delete <host>` to remove the certificate itself.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `traefik-discovery tls import`
+
+Import certificates from a Traefik acme.json file (Path B). Use this to get HTTPS immediately at cutover — Traefik already holds the cert, so there is no outage window. Each host is validated (8-step X.509 chain) and a per-host result is returned. Add --dry-run to preview without writing.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--hosts <hosts>` | Comma-separated list of hostnames to import | - | Yes |
+| `--renewal-method <method>` | How Temps will renew when the imported cert expires: http-01 (default) or dns-01 | `http-01` | No |
+| `--acknowledge-manual-dns-renewal` | Confirm you accept manual DNS renewal when no auto-manage DNS zone is configured | - | No |
+| `--dry-run` | Validate and preview; do not write any certificate | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `init`
 
