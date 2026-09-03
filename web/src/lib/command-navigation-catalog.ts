@@ -12,6 +12,12 @@ export interface IndexedNavigationItem {
   keywords?: string[]
 }
 
+export const AUDIT_LOGS_URL = '/audit-logs'
+
+export function isSettingsNavigationUrl(url: string): boolean {
+  return url === '/settings' || url.startsWith('/settings/')
+}
+
 export const platformToolNavigationItems: IndexedNavigationItem[] =
   platformToolGroups.flatMap((group) =>
     group.items.map((item) => ({
@@ -60,4 +66,32 @@ export function mergeNavigationItems(
     })
   }
   return [...byUrl.values()]
+}
+
+export function excludeNavigationUrls<T extends { url: string }>(
+  items: readonly T[],
+  excludedUrls: ReadonlySet<string>
+): T[] {
+  return items.filter((item) => !excludedUrls.has(item.url))
+}
+
+export function filterRestrictedNavigationItems<T extends { url: string }>(
+  items: readonly T[],
+  canViewAuditLogs: boolean
+): T[] {
+  return canViewAuditLogs
+    ? [...items]
+    : items.filter((item) => item.url !== AUDIT_LOGS_URL)
+}
+
+export function buildAccessibleNavigationMap<T extends { url: string }>(
+  items: readonly T[],
+  canViewAuditLogs: boolean
+): Map<string, T> {
+  return new Map(
+    filterRestrictedNavigationItems(items, canViewAuditLogs).map((item) => [
+      item.url,
+      item,
+    ])
+  )
 }

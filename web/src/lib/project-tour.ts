@@ -27,6 +27,34 @@ export function useProjectTourActive() {
   )
 }
 
+export function isProjectTourHomePage(
+  slug: string | undefined,
+  pathname: string
+): boolean {
+  return (
+    !!slug &&
+    (pathname === `/projects/${slug}` ||
+      pathname === `/projects/${slug}/project`)
+  )
+}
+
+export function getProjectTourNavigationTarget({
+  active,
+  slug,
+  route,
+  lastTarget,
+}: {
+  active: boolean
+  slug: string | undefined
+  route: string
+  lastTarget: string | null
+}): string | null {
+  if (!active || !slug) return null
+
+  const target = `/projects/${slug}/${route}`
+  return target === lastTarget ? null : target
+}
+
 const CARD_WIDTH = 320
 const CARD_EST_HEIGHT = 180
 const CARD_GUTTER = 16

@@ -32,6 +32,10 @@ import {
   type CommandDestination,
 } from '@/lib/command-navigation'
 import {
+  buildAccessibleNavigationMap,
+  excludeNavigationUrls,
+  filterRestrictedNavigationItems,
+  isSettingsNavigationUrl,
   mergeNavigationItems,
   platformToolNavigationItems,
   settingsPageNavigationItems,
@@ -652,14 +656,21 @@ const observeNavItems: NavigationItem[] = [
   },
 ]
 
-const observeUrls = new Set(observeNavItems.map((item) => item.url))
-const indexedMainNavItems = mergeNavigationItems(
-  mainNavItems,
-  platformToolNavigationItems.filter((item) => !observeUrls.has(item.url))
-)
 const indexedSettingsNavItems = mergeNavigationItems(
-  settingsNavItems,
+  settingsNavItems.filter((item) => isSettingsNavigationUrl(item.url)),
   settingsPageNavigationItems
+)
+const secondaryNavigationUrls = new Set([
+  ...observeNavItems.map((item) => item.url),
+  ...indexedSettingsNavItems.map((item) => item.url),
+])
+const indexedMainNavItems = excludeNavigationUrls(
+  mergeNavigationItems(
+    mainNavItems,
+    settingsNavItems.filter((item) => !isSettingsNavigationUrl(item.url)),
+    platformToolNavigationItems
+  ),
+  secondaryNavigationUrls
 )
 
 const accountNavItems: NavigationItem[] = [
@@ -1210,23 +1221,26 @@ export function CommandPalette() {
   )
 
   const canViewAuditLogs = useCanViewAuditLogs()
+  const visibleObserveNavItems = useMemo(
+    () => filterRestrictedNavigationItems(observeNavItems, canViewAuditLogs),
+    [canViewAuditLogs]
+  )
 
   // Create Fuse instances for fuzzy search
   const navFuse = useMemo(() => {
     const allNavItems = [
-      ...indexedMainNavItems
-        .filter((item) => canViewAuditLogs || item.url !== '/audit-logs')
-        .map((item) => ({
-          ...item,
-          category: 'Navigation',
-        })),
+      ...indexedMainNavItems.map((item) => ({
+        ...item,
+        category: 'Navigation',
+      })),
       ...indexedSettingsNavItems.map((item) => ({
         ...item,
         category: 'Settings',
       })),
-      ...observeNavItems
-        .filter((item) => canViewAuditLogs || item.url !== '/audit-logs')
-        .map((item) => ({ ...item, category: 'Observe' })),
+      ...visibleObserveNavItems.map((item) => ({
+        ...item,
+        category: 'Observe',
+      })),
       ...accountNavItems.map((item) => ({ ...item, category: 'Account' })),
       ...pluginNavItems.map((item) => ({ ...item, category: 'Plugins' })),
     ]
@@ -1261,7 +1275,7 @@ export function CommandPalette() {
     currentProject,
     pluginNavItems,
     projectPluginNavItems,
-    canViewAuditLogs,
+    visibleObserveNavItems,
   ])
 
   const projectsFuse = useMemo(() => {
@@ -1353,13 +1367,9 @@ export function CommandPalette() {
         : []
 
     return {
-      navigation: indexedMainNavItems.filter(
-        (item) => canViewAuditLogs || item.url !== '/audit-logs'
-      ),
+      navigation: indexedMainNavItems,
       settings: indexedSettingsNavItems,
-      observe: observeNavItems.filter(
-        (item) => canViewAuditLogs || item.url !== '/audit-logs'
-      ),
+      observe: visibleObserveNavItems,
       account: accountNavItems,
       plugins: pluginNavItems,
       projectNav: projectNavigation,
@@ -1376,7 +1386,7 @@ export function CommandPalette() {
     projectPluginNavItems,
     currentProjectSlug,
     currentProject,
-    canViewAuditLogs,
+    visibleObserveNavItems,
   ])
 
   const commandDestinations = useMemo(() => {
@@ -1743,11 +1753,9 @@ export function CommandPalette() {
   const recentItems = useMemo<RecentEntry[]>(() => {
     if (search) return []
     const allNavItems: NavigationItem[] = [
-      ...indexedMainNavItems.filter(
-        (item) => canViewAuditLogs || item.url !== '/audit-logs'
-      ),
+      ...indexedMainNavItems,
       ...indexedSettingsNavItems,
-      ...observeNavItems,
+      ...visibleObserveNavItems,
       ...accountNavItems,
       ...pluginNavItems,
     ]
@@ -1758,10 +1766,10 @@ export function CommandPalette() {
             url: `/projects/${currentProjectSlug}/${item.url}`,
           }))
         : []
-    const navByUrl = new Map<string, NavigationItem>()
-    for (const nav of [...allNavItems, ...projectNavigation]) {
-      navByUrl.set(nav.url, nav)
-    }
+    const navByUrl = buildAccessibleNavigationMap(
+      [...allNavItems, ...projectNavigation],
+      canViewAuditLogs
+    )
     const projectsById = new Map(projects.map((p) => [String(p.id), p]))
     const skillsBySlug = new Map(globalSkills.map((s) => [s.slug, s]))
     const mcpBySlug = new Map(globalMcpServers.map((m) => [m.slug, m]))
@@ -1834,6 +1842,7 @@ export function CommandPalette() {
     globalSkills,
     globalMcpServers,
     canViewAuditLogs,
+    visibleObserveNavItems,
     navigate,
   ])
 

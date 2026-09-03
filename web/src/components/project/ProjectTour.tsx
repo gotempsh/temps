@@ -9,7 +9,9 @@ import { createPortal } from 'react-dom'
 import { useNavigate, useParams } from 'react-router'
 import { useIsMobile } from '@/components/hooks/use-mobile'
 import {
+  getProjectTourNavigationTarget,
   getProjectTourCardStyle,
+  isProjectTourHomePage,
   PROJECT_TOUR_EVENT,
   setProjectTourActive,
 } from '@/lib/project-tour'
@@ -120,10 +122,7 @@ export function ProjectTour() {
     // Only auto-start from the project's home page. A deep link straight into a
     // specific sub-page — a shared deployment URL, a bookmark, browser back —
     // must never be hijacked by the tour's own forced navigation to "project".
-    const path = window.location.pathname
-    const onHomePage =
-      !!slug &&
-      (path === `/projects/${slug}` || path === `/projects/${slug}/project`)
+    const onHomePage = isProjectTourHomePage(slug, window.location.pathname)
     const timer =
       seen || !onHomePage ? undefined : window.setTimeout(start, 800)
 
@@ -147,8 +146,13 @@ export function ProjectTour() {
       navigatedFor.current = null
       return
     }
-    const target = `/projects/${slug}/${STEPS[idx].route}`
-    if (navigatedFor.current === target) return
+    const target = getProjectTourNavigationTarget({
+      active,
+      slug,
+      route: STEPS[idx].route,
+      lastTarget: navigatedFor.current,
+    })
+    if (!target) return
     navigatedFor.current = target
     navigate(target)
   }, [active, idx, slug, navigate])
