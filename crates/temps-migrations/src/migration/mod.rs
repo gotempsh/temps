@@ -219,6 +219,7 @@ mod m20260902_000001_backup_safety_and_provenance;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
 mod m20260831_000001_add_source_bundle_kind;
 mod m20260831_000002_add_managed_status_monitors;
+mod m20260903_000002_add_service_project_identity;
 
 pub struct Migrator;
 
@@ -481,6 +482,7 @@ impl MigratorTrait for Migrator {
             ),
             Box::new(m20260831_000001_add_source_bundle_kind::Migration),
             Box::new(m20260831_000002_add_managed_status_monitors::Migration),
+            Box::new(m20260903_000002_add_service_project_identity::Migration),
         ]
     }
 }
@@ -523,6 +525,10 @@ mod registry_tests {
             (
                 "m20260831_000001_add_source_bundle_kind",
                 "m20260831_000002_add_managed_status_monitors",
+            ),
+            (
+                "m20260831_000002_add_managed_status_monitors",
+                "m20260903_000001_add_service_project_identity",
             ),
         ] {
             let shipped_position = names

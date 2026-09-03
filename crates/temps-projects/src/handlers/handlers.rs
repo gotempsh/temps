@@ -7,9 +7,6 @@ use super::audit::{
 };
 use utoipa::OpenApi;
 
-use super::service_templates::{
-    get_service_template, list_service_templates, preflight_service_template,
-};
 use super::AppState;
 use axum::Router;
 use axum::{
@@ -32,11 +29,12 @@ use tracing::{debug, error, info, warn};
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
     ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse,
+    ServiceTemplateChangeKind, ServiceTemplateInstanceResponse, ServiceTemplateUpgradeChange,
     SetAlternateSourcesRequest, TriggerPipelinePayload, TriggerPipelineResponse,
     UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
     UpdateProjectSettingsRequest, UpdateServiceTemplateRuntimeRequest,
+    UpgradeServiceTemplateRequest,
 };
-use crate::services::service_templates::{prepare_template, COOLIFY_CATALOG_URL};
 use crate::services::types::CreateProjectEnvVar;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
@@ -84,15 +82,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/templates", get(list_project_templates))
         .route("/templates/tags", get(list_project_template_tags))
         .route("/templates/{slug}", get(get_project_template))
-        // Runtime-synced Docker Compose service catalog
-        .route("/service-templates", get(list_service_templates))
-        // The generated client preserves the nested OpenAPI root slash.
-        .route("/service-templates/", get(list_service_templates))
-        .route("/service-templates/{slug}", get(get_service_template))
-        .route(
-            "/service-templates/{slug}/preflight",
-            post(preflight_service_template),
-        )
         // Pipeline trigger route
         .route(
             "/projects/{id}/trigger-pipeline",
@@ -116,6 +105,14 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             patch(update_service_template_runtime),
         )
         .route(
+            "/projects/{project_id}/service-template",
+            get(get_project_service_template),
+        )
+        .route(
+            "/projects/{project_id}/service-template/upgrade",
+            post(upgrade_project_service_template),
+        )
+        .route(
             "/projects/{project_id}/gitlab/reinstall-webhook",
             post(reinstall_gitlab_webhook),
         )
@@ -127,6 +124,201 @@ fn storage_service_access_denied() -> Problem {
     problemdetails::new(StatusCode::FORBIDDEN)
         .with_title("Insufficient Permissions")
         .with_detail("You do not have access to one or more selected databases")
+}
+
+fn text_option(value: Option<impl ToString>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
+fn production_environment_variable_names(
+    variables: &[crate::services::types::EnvVarWithEnvironments],
+) -> BTreeSet<String> {
+    variables
+        .iter()
+        .filter(|variable| {
+            variable.environments.is_empty()
+                || variable
+                    .environments
+                    .iter()
+                    .any(|environment| environment.name.eq_ignore_ascii_case("production"))
+        })
+        .map(|variable| variable.key.clone())
+        .collect()
+}
+
+fn push_template_change(
+    changes: &mut Vec<ServiceTemplateUpgradeChange>,
+    field: impl Into<String>,
+    current: Option<String>,
+    target: Option<String>,
+) {
+    if current == target {
+        return;
+    }
+    let kind = match (&current, &target) {
+        (None, Some(_)) => ServiceTemplateChangeKind::Added,
+        (Some(_), None) => ServiceTemplateChangeKind::Removed,
+        _ => ServiceTemplateChangeKind::Changed,
+    };
+    changes.push(ServiceTemplateUpgradeChange {
+        field: field.into(),
+        kind,
+        current,
+        target,
+    });
+}
+
+fn template_input_summary(input: &temps_core::templates::EnvVarTemplate) -> String {
+    let mut parts = vec![if input.required {
+        "required"
+    } else {
+        "optional"
+    }
+    .to_string()];
+    if let Some(generator) = input.default_generator.as_deref() {
+        parts.push(format!("generator={generator}"));
+    } else if let Some(default) = input.default.as_deref().filter(|_| !input.is_secret()) {
+        parts.push(format!("default={default}"));
+    }
+    parts.join(", ")
+}
+
+fn service_template_changes(
+    applied: &temps_core::templates::ProjectTemplate,
+    target: &temps_core::templates::ProjectTemplate,
+) -> Vec<ServiceTemplateUpgradeChange> {
+    let mut changes = Vec::new();
+    push_template_change(
+        &mut changes,
+        "image",
+        applied.image.clone(),
+        target.image.clone(),
+    );
+    push_template_change(
+        &mut changes,
+        "command",
+        applied.command.as_ref().map(|value| value.join(" ")),
+        target.command.as_ref().map(|value| value.join(" ")),
+    );
+    push_template_change(
+        &mut changes,
+        "health_check_path",
+        applied.health_check_path.clone(),
+        target.health_check_path.clone(),
+    );
+    push_template_change(
+        &mut changes,
+        "exposed_port",
+        text_option(applied.exposed_port),
+        text_option(target.exposed_port),
+    );
+
+    let applied_resources = applied.resources.as_ref();
+    let target_resources = target.resources.as_ref();
+    for (field, current, next) in [
+        (
+            "resources.cpu_request",
+            applied_resources.and_then(|value| value.cpu_request),
+            target_resources.and_then(|value| value.cpu_request),
+        ),
+        (
+            "resources.cpu_limit",
+            applied_resources.and_then(|value| value.cpu_limit),
+            target_resources.and_then(|value| value.cpu_limit),
+        ),
+        (
+            "resources.memory_request",
+            applied_resources.and_then(|value| value.memory_request),
+            target_resources.and_then(|value| value.memory_request),
+        ),
+        (
+            "resources.memory_limit",
+            applied_resources.and_then(|value| value.memory_limit),
+            target_resources.and_then(|value| value.memory_limit),
+        ),
+    ] {
+        push_template_change(&mut changes, field, text_option(current), text_option(next));
+    }
+
+    let applied_inputs = applied
+        .env_vars
+        .iter()
+        .map(|input| (input.name.as_str(), input))
+        .collect::<BTreeMap<_, _>>();
+    let target_inputs = target
+        .env_vars
+        .iter()
+        .map(|input| (input.name.as_str(), input))
+        .collect::<BTreeMap<_, _>>();
+    let input_names = applied_inputs
+        .keys()
+        .chain(target_inputs.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for name in input_names {
+        let current = applied_inputs
+            .get(name)
+            .map(|input| template_input_summary(input));
+        let next = target_inputs
+            .get(name)
+            .map(|input| template_input_summary(input));
+        if applied_inputs.get(name) != target_inputs.get(name) {
+            push_template_change(&mut changes, format!("configuration.{name}"), current, next);
+        }
+    }
+
+    let applied_services = applied.services.iter().collect::<BTreeSet<_>>();
+    let target_services = target.services.iter().collect::<BTreeSet<_>>();
+    for service in applied_services.union(&target_services) {
+        push_template_change(
+            &mut changes,
+            format!("managed_service.{service}"),
+            applied_services
+                .contains(service)
+                .then(|| "required".to_string()),
+            target_services
+                .contains(service)
+                .then(|| "required".to_string()),
+        );
+    }
+
+    let applied_bindings = applied
+        .managed_service_bindings
+        .iter()
+        .flat_map(|(service, bindings)| {
+            bindings
+                .iter()
+                .map(move |(target, source)| ((service.as_str(), target.as_str()), source.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let target_bindings = target
+        .managed_service_bindings
+        .iter()
+        .flat_map(|(service, bindings)| {
+            bindings
+                .iter()
+                .map(move |(target, source)| ((service.as_str(), target.as_str()), source.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for binding in applied_bindings
+        .keys()
+        .chain(target_bindings.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let (service, target_variable) = binding;
+        push_template_change(
+            &mut changes,
+            format!("managed_service_binding.{service}.{target_variable}"),
+            applied_bindings
+                .get(&binding)
+                .map(|source| (*source).to_string()),
+            target_bindings
+                .get(&binding)
+                .map(|source| (*source).to_string()),
+        );
+    }
+    changes
 }
 
 async fn require_storage_services_access(
@@ -268,6 +460,8 @@ async fn authorize_storage_service_scopes(
         update_automatic_deploy,
         update_project_deployment_config,
         update_service_template_runtime,
+        get_project_service_template,
+        upgrade_project_service_template,
         reinstall_gitlab_webhook,
         trigger_project_pipeline,
         get_project_statistics,
@@ -318,8 +512,7 @@ async fn authorize_storage_service_scopes(
         (name = "Templates", description = "Project template endpoints")
     ),
     nest(
-        (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc),
-        (path = "/service-templates", api = super::service_templates::ServiceTemplatesApiDoc)
+        (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc)
     )
 )]
 pub struct ApiDoc;
@@ -693,40 +886,6 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     Ok(manifests)
 }
 
-fn service_template_origin_attestation(
-    origin: &temps_entities::preset::ComposeTemplateOrigin,
-    actual_install_plan_digest: &str,
-    compose: &str,
-) -> Option<String> {
-    if origin.provider != "coolify"
-        || origin.source_url != COOLIFY_CATALOG_URL
-        || origin.install_plan_digest.as_deref() != Some(actual_install_plan_digest)
-    {
-        return None;
-    }
-    temps_core::templates::pending_service_catalog_template_provenance(&origin.slug, compose)
-}
-
-async fn attested_service_template_provenance(
-    state: &AppState,
-    project: &CreateProjectRequest,
-) -> Option<String> {
-    if project.source_type != SourceType::Compose || project.preset != "docker-compose" {
-        return None;
-    }
-    let config: temps_presets::preset_config_schema::DockerComposePresetConfig =
-        serde_json::from_value(project.preset_config.clone()?).ok()?;
-    let origin = config.template_origin?;
-    let (template, _) = state
-        .service_template_catalog
-        .get(&origin.slug)
-        .await
-        .ok()?;
-    let prepared = prepare_template(&origin.slug, &template).ok()?;
-    let actual_install_plan_digest = prepared.install_plan_digest(&template);
-    service_template_origin_attestation(&origin, &actual_install_plan_digest, &prepared.compose)
-}
-
 /// Create a new project
 #[utoipa::path(
     post,
@@ -770,15 +929,6 @@ pub async fn create_project(
             ));
     }
 
-    // The generic project API deliberately ignores client-provided template
-    // labels. For catalog services the backend persists a pending, source-bound
-    // marker only after replaying the catalog digest attestation. The first
-    // immutable Compose save promotes it to telemetry provenance only when its
-    // exact bytes match, so arbitrary user text cannot leave the instance as a
-    // template slug and unrelated Compose cannot poison install metrics.
-    let service_template_provenance =
-        attested_service_template_provenance(state.as_ref(), &project).await;
-
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name,
         expected_slug: project.expected_slug,
@@ -802,7 +952,7 @@ pub async fn create_project(
         memory_request: None,
         memory_limit: None,
         source_type: project.source_type,
-        template_slug: service_template_provenance,
+        template_slug: None,
     };
 
     let new_project = state
@@ -1833,6 +1983,249 @@ pub async fn update_project_deployment_config(
 /// profile. This endpoint is deliberately separate from generic project
 /// settings because these fields form one deployable configuration.
 #[utoipa::path(
+    get,
+    path = "/projects/{project_id}/service-template",
+    tag = "Projects",
+    responses(
+        (status = 200, description = "Applied service release and upgrade preview", body = ServiceTemplateInstanceResponse),
+        (status = 400, description = "Project is not a service"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found")
+    ),
+    params(("project_id" = i32, Path, description = "Project ID")),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_project_service_template(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let applied = state
+        .project_service
+        .get_applied_service_template(project_id)
+        .await
+        .map_err(Problem::from)?;
+    let configured_names = production_environment_variable_names(
+        &state
+            .project_service
+            .get_environment_variables(project_id)
+            .await
+            .map_err(Problem::from)?,
+    );
+    let linked_service_types = state
+        .project_service
+        .get_linked_service_types(project_id)
+        .await
+        .map_err(Problem::from)?;
+    let latest = state
+        .template_service
+        .get_service_template_instance(&applied.slug)
+        .await
+        .ok();
+    let catalog_drift = latest.as_ref().is_some_and(|latest| {
+        latest.version == applied.version && latest.template != applied.template
+    });
+    let upgrade_available = latest
+        .as_ref()
+        .is_some_and(|latest| latest.is_newer_than(&applied).unwrap_or(false));
+    let changes = latest
+        .as_ref()
+        .map(|latest| service_template_changes(&applied.template, &latest.template))
+        .unwrap_or_default();
+    let required_configuration = latest
+        .as_ref()
+        .map(|latest| missing_required_template_configuration(&latest.template, &configured_names))
+        .unwrap_or_default();
+    let missing_services = latest
+        .as_ref()
+        .map(|latest| {
+            latest
+                .template
+                .services
+                .iter()
+                .filter(|service| !linked_service_types.contains(&service.to_ascii_lowercase()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Json(ServiceTemplateInstanceResponse {
+        project_id,
+        applied,
+        latest,
+        upgrade_available,
+        catalog_drift,
+        changes,
+        required_configuration,
+        missing_services,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/service-template/upgrade",
+    tag = "Projects",
+    request_body = UpgradeServiceTemplateRequest,
+    responses(
+        (status = 200, description = "Service template upgraded", body = ProjectResponse),
+        (status = 400, description = "Invalid or stale upgrade"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project or template not found")
+    ),
+    params(("project_id" = i32, Path, description = "Project ID")),
+    security(("bearer_auth" = []))
+)]
+pub async fn upgrade_project_service_template(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpgradeServiceTemplateRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, EnvironmentsCreate);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let project = state
+        .project_service
+        .get_project(project_id)
+        .await
+        .map_err(Problem::from)?;
+    let applied = state
+        .project_service
+        .get_applied_service_template(project_id)
+        .await
+        .map_err(Problem::from)?;
+    let target = state
+        .template_service
+        .get_service_template_instance(&applied.slug)
+        .await
+        .map_err(|error| {
+            temps_core::error_builder::not_found()
+                .title("Service Template Not Found")
+                .detail(error.to_string())
+                .build()
+        })?;
+    if target.version != request.target_version {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Template Upgrade Changed")
+            .detail(format!(
+                "Requested {}@{}, but the current catalog release is {}@{}. Refresh the preview before upgrading.",
+                applied.slug, request.target_version, target.slug, target.version
+            ))
+            .build());
+    }
+    if target.version == applied.version && target.template != applied.template {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Template Version Was Not Updated")
+            .detail(format!(
+                "Template '{}' changed without incrementing version {}. Publish a new template version before applying it.",
+                target.slug, target.version
+            ))
+            .build());
+    }
+
+    let linked_service_types = state
+        .project_service
+        .get_linked_service_types(project_id)
+        .await
+        .map_err(Problem::from)?;
+    let missing_services = target
+        .template
+        .services
+        .iter()
+        .filter(|service| !linked_service_types.contains(&service.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_services.is_empty() {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Managed Service Required")
+            .detail(format!(
+                "Link a {} service to this project before applying {}@{}",
+                missing_services.join(", "),
+                target.slug,
+                target.version
+            ))
+            .build());
+    }
+    let configured_names = production_environment_variable_names(
+        &state
+            .project_service
+            .get_environment_variables(project_id)
+            .await
+            .map_err(Problem::from)?,
+    );
+    let generated_app_url = if upgrade_needs_generated_app_url(
+        &target.template,
+        &request.environment_variables,
+        &configured_names,
+    ) {
+        Some(canonical_template_app_url(state.as_ref(), &project.slug).await?)
+    } else {
+        None
+    };
+    let new_environment_variables = canonicalize_template_upgrade_environment_variables(
+        &target.template,
+        &request.environment_variables,
+        &configured_names,
+        generated_app_url.as_deref(),
+    )
+    .map_err(|error| {
+        if matches!(&error, TemplateEnvironmentError::SecureGeneration { .. }) {
+            error!(project_id, %error, "Secure template upgrade generation failed");
+            temps_core::error_builder::internal_server_error()
+                .title("Template Secret Generation Failed")
+                .detail("Could not securely generate the required template credentials")
+                .build()
+        } else {
+            temps_core::error_builder::bad_request()
+                .title("Invalid Template Upgrade Configuration")
+                .detail(error.to_string())
+                .build()
+        }
+    })?;
+
+    let updated_project = state
+        .project_service
+        .upgrade_service_template(
+            project_id,
+            target,
+            new_environment_variables,
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+        )
+        .await
+        .map_err(Problem::from)?;
+
+    let audit_event = super::audit::DeploymentConfigUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        project_id: updated_project.id,
+        project_name: updated_project.name.clone(),
+        project_slug: updated_project.slug.clone(),
+        updated_fields: [("service_template".to_string(), "upgraded".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit_event).await {
+        error!(project_id, %error, "Failed to create service upgrade audit log");
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated_project)))
+}
+
+#[utoipa::path(
     patch,
     path = "/projects/{project_id}/service-runtime",
     tag = "Projects",
@@ -2599,6 +2992,12 @@ enum TemplateEnvironmentError {
     UnsupportedGenerator { name: String, generator: String },
     #[error("Could not securely generate environment variable '{name}': {reason}")]
     SecureGeneration { name: String, reason: String },
+    #[error(
+        "Environment variable '{name}' is already configured; edit it in project settings instead"
+    )]
+    AlreadyConfigured { name: String },
+    #[error("Environment variable '{name}' is not declared by the target template")]
+    Unknown { name: String },
 }
 
 fn require_template_creation_permissions(auth: &AuthContext) -> Result<(), Problem> {
@@ -2610,48 +3009,7 @@ fn require_template_creation_permissions(auth: &AuthContext) -> Result<(), Probl
 fn template_environment_variable_is_secret(
     variable: &temps_core::templates::EnvVarTemplate,
 ) -> bool {
-    if variable
-        .default_generator
-        .as_deref()
-        .is_some_and(|generator| generator.contains("secret"))
-    {
-        return true;
-    }
-
-    let key = variable.name.to_ascii_uppercase();
-    let secret_segment = key.split('_').any(|segment| {
-        matches!(
-            segment,
-            "SECRET" | "PASSWORD" | "PASSWD" | "TOKEN" | "PRIVATEKEY"
-        )
-    });
-    secret_segment
-        || key.ends_with("_API_KEY")
-        || key.ends_with("_PRIVATE_KEY")
-        || key.ends_with("_ACCESS_KEY")
-        || key.ends_with("_DATABASE_URL")
-        || key.ends_with("_POSTGRES_URL")
-        || key.ends_with("_MYSQL_URL")
-        || key.ends_with("_MONGODB_URL")
-        || key.ends_with("_MONGODB_URI")
-        || key.ends_with("_REDIS_URL")
-        || key.ends_with("_AMQP_URL")
-        || key.ends_with("_CONNECTION_STRING")
-        || key.ends_with("_DSN")
-        || key.ends_with("_WEBHOOK_URL")
-        || matches!(
-            key.as_str(),
-            "DATABASE_URL"
-                | "POSTGRES_URL"
-                | "MYSQL_URL"
-                | "MONGODB_URL"
-                | "MONGODB_URI"
-                | "REDIS_URL"
-                | "AMQP_URL"
-                | "CONNECTION_STRING"
-                | "DSN"
-                | "WEBHOOK_URL"
-        )
+    variable.is_secret()
 }
 
 fn secure_template_value(
@@ -2753,6 +3111,118 @@ fn canonicalize_template_environment_variables(
     Ok(resolved)
 }
 
+fn canonicalize_template_upgrade_environment_variables(
+    template: &temps_core::templates::ProjectTemplate,
+    requested: &[super::templates::EnvVarInput],
+    configured_names: &BTreeSet<String>,
+    generated_app_url: Option<&str>,
+) -> Result<Vec<CreateProjectEnvVar>, TemplateEnvironmentError> {
+    let mut requested_by_name = BTreeMap::new();
+    for variable in requested {
+        if configured_names.contains(&variable.name) {
+            return Err(TemplateEnvironmentError::AlreadyConfigured {
+                name: variable.name.clone(),
+            });
+        }
+        if requested_by_name
+            .insert(
+                variable.name.clone(),
+                (variable.value.clone(), variable.is_secret),
+            )
+            .is_some()
+        {
+            return Err(TemplateEnvironmentError::Duplicate {
+                name: variable.name.clone(),
+            });
+        }
+    }
+
+    let mut resolved = Vec::new();
+    for variable in &template.env_vars {
+        if configured_names.contains(&variable.name) {
+            continue;
+        }
+        let requested_value = requested_by_name.remove(&variable.name);
+        let explicitly_supplied = requested_value.is_some();
+        let requested_secret = requested_value
+            .as_ref()
+            .is_some_and(|(_, is_secret)| *is_secret);
+        let mut value = requested_value.map(|(value, _)| value);
+
+        if value.as_deref().is_none_or(str::is_empty) {
+            value = variable.default.clone();
+        }
+        if value.as_deref().is_none_or(str::is_empty) {
+            value = match variable.default_generator.as_deref() {
+                Some("app_url") => generated_app_url.map(str::to_string),
+                Some(generator @ ("random_secret" | "random_hex_32")) => {
+                    Some(secure_template_value(&variable.name, generator)?)
+                }
+                Some(generator) => {
+                    return Err(TemplateEnvironmentError::UnsupportedGenerator {
+                        name: variable.name.clone(),
+                        generator: generator.to_string(),
+                    });
+                }
+                None => None,
+            };
+        }
+
+        if variable.required && value.as_deref().is_none_or(str::is_empty) {
+            return Err(TemplateEnvironmentError::MissingRequired {
+                name: variable.name.clone(),
+            });
+        }
+        if let Some(value) = value {
+            if !value.is_empty() || explicitly_supplied {
+                resolved.push(CreateProjectEnvVar {
+                    key: variable.name.clone(),
+                    value,
+                    is_secret: requested_secret || variable.is_secret(),
+                });
+            }
+        }
+    }
+
+    if let Some((name, _)) = requested_by_name.into_iter().next() {
+        return Err(TemplateEnvironmentError::Unknown { name });
+    }
+    Ok(resolved)
+}
+
+fn missing_required_template_configuration(
+    template: &temps_core::templates::ProjectTemplate,
+    configured_names: &BTreeSet<String>,
+) -> Vec<temps_core::templates::EnvVarTemplate> {
+    template
+        .env_vars
+        .iter()
+        .filter(|variable| {
+            variable.required
+                && !configured_names.contains(&variable.name)
+                && variable.default.as_deref().is_none_or(str::is_empty)
+                && variable.default_generator.is_none()
+        })
+        .cloned()
+        .collect()
+}
+
+fn upgrade_needs_generated_app_url(
+    template: &temps_core::templates::ProjectTemplate,
+    requested: &[super::templates::EnvVarInput],
+    configured_names: &BTreeSet<String>,
+) -> bool {
+    template.env_vars.iter().any(|variable| {
+        !configured_names.contains(&variable.name)
+            && variable.default_generator.as_deref() == Some("app_url")
+            && requested
+                .iter()
+                .find(|requested| requested.name == variable.name)
+                .is_none_or(|requested| requested.value.is_empty())
+            && variable.default.as_deref().is_none_or(str::is_empty)
+    })
+}
+
 fn template_needs_generated_app_url(
     template: &temps_core::templates::ProjectTemplate,
     requested: &[super::templates::EnvVarInput],
@@ -2846,7 +3316,30 @@ pub async fn create_project_from_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
-    let template_provenance = temps_core::templates::template_provenance(&template).to_string();
+    let service_template_instance = if template.kind == temps_core::templates::TemplateKind::Service
+    {
+        Some(
+            state
+                .template_service
+                .get_service_template_instance(&request.template_slug)
+                .await
+                .map_err(|error| {
+                    temps_core::error_builder::bad_request()
+                        .title("Invalid Service Template")
+                        .detail(error.to_string())
+                        .build()
+                })?,
+        )
+    } else {
+        None
+    };
+    // Service projects need the actual local slug for future upgrades. The
+    // telemetry path still applies its fixed bundled allowlist before emitting
+    // this value, so operator-defined slugs remain private.
+    let template_provenance = service_template_instance
+        .as_ref()
+        .map(|instance| instance.slug.clone())
+        .unwrap_or_else(|| temps_core::templates::template_provenance(&template).to_string());
     let image_runtime = resolve_image_template_runtime(&template, &request).map_err(|error| {
         temps_core::error_builder::bad_request()
             .title("Invalid Template Runtime Configuration")
@@ -3132,11 +3625,15 @@ pub async fn create_project_from_template(
         (create_request, repository_url, deploy_mode, None)
     };
 
-    let project = state
-        .project_service
-        .create_project(create_request)
-        .await
-        .map_err(Problem::from)?;
+    let project = if let Some(service_template) = service_template_instance {
+        state
+            .project_service
+            .create_service_project(create_request, service_template)
+            .await
+    } else {
+        state.project_service.create_project(create_request).await
+    }
+    .map_err(Problem::from)?;
 
     // 4. Image mode: docker_image projects don't auto-deploy on create (no Git
     //    push), so explicitly queue the image deploy. The deployments side
@@ -3233,16 +3730,17 @@ pub async fn create_project_from_template(
 mod tests {
     use super::{
         authorize_storage_service_scopes, canonicalize_template_environment_variables,
-        compose_path_for_candidate, drop_preset_candidate_from, image_template_preset_config,
-        parse_owner_repo_from_git_url, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, require_template_creation_permissions,
-        resolve_image_template_runtime, service_template_origin_attestation,
-        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
-        TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
+        drop_preset_candidate_from, image_template_preset_config,
+        missing_required_template_configuration, parse_owner_repo_from_git_url,
+        project_created_from_template_telemetry_event, require_git_settings_permissions,
+        require_template_creation_permissions, resolve_image_template_runtime,
+        service_template_changes, validate_template_service_selection, DropPresetCandidate,
+        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use temps_auth::{AuthContext, Permission};
     use temps_entities::users;
     use temps_providers::ExternalServiceProjectScope;
@@ -3289,6 +3787,36 @@ mod tests {
             ),
             Err(TemplateServiceSelectionError::Ambiguous(required))
         );
+    }
+
+    #[test]
+    fn service_template_change_preview_includes_bindings_and_input_defaults() {
+        let applied = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be bundled");
+        let mut target = applied.clone();
+        target
+            .managed_service_bindings
+            .get_mut("postgres")
+            .expect("PostgreSQL bindings should exist")
+            .insert("KC_DB_USERNAME".to_string(), "POSTGRES_ROLE".to_string());
+        target
+            .env_vars
+            .iter_mut()
+            .find(|variable| variable.name == "KC_HOSTNAME_STRICT")
+            .expect("hostname input should exist")
+            .default = Some("true".to_string());
+
+        let changes = service_template_changes(&applied, &target);
+        assert!(changes.iter().any(|change| {
+            change.field == "managed_service_binding.postgres.KC_DB_USERNAME"
+                && change.current.as_deref() == Some("POSTGRES_USER")
+                && change.target.as_deref() == Some("POSTGRES_ROLE")
+        }));
+        assert!(changes.iter().any(|change| {
+            change.field == "configuration.KC_HOSTNAME_STRICT"
+                && change.current.as_deref() == Some("required, default=false")
+                && change.target.as_deref() == Some("required, default=true")
+        }));
     }
 
     #[test]
@@ -3835,39 +4363,84 @@ mod tests {
     }
 
     #[test]
-    fn service_catalog_provenance_requires_exact_server_attestation() {
-        let compose = "services:\n  keycloak:\n    image: quay.io/keycloak/keycloak:26.3.2\n";
-        let origin = temps_entities::preset::ComposeTemplateOrigin {
-            provider: "coolify".to_string(),
-            slug: "keycloak".to_string(),
-            source_url: crate::services::service_templates::COOLIFY_CATALOG_URL.to_string(),
-            install_plan_digest: Some("reviewed-digest".to_string()),
-            source_revision: Some("public-revision".to_string()),
-            template_last_updated_at: None,
-        };
+    fn template_upgrade_only_accepts_new_declared_configuration() {
+        let mut template = temps_core::templates::bundled_template_by_slug("browserless")
+            .expect("browserless template must be bundled");
+        template
+            .env_vars
+            .push(temps_core::templates::EnvVarTemplate {
+                name: "NEW_API_KEY".to_string(),
+                example: None,
+                default: None,
+                description: Some("New integration credential".to_string()),
+                required: true,
+                default_generator: None,
+            });
+        let configured = BTreeSet::from(["TOKEN".to_string()]);
 
-        let pending = service_template_origin_attestation(&origin, "reviewed-digest", compose)
-            .expect("matching catalog metadata should create pending provenance");
+        let missing = missing_required_template_configuration(&template, &configured);
         assert_eq!(
-            temps_core::templates::resolve_pending_service_catalog_template_provenance(
-                &pending, compose
-            ),
-            temps_core::templates::PendingServiceCatalogResolution::Matched(
-                "service_catalog:keycloak".to_string()
-            )
+            missing
+                .iter()
+                .map(|variable| variable.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["NEW_API_KEY"]
         );
 
-        let mut mismatched = origin.clone();
-        mismatched.install_plan_digest = Some("different-digest".to_string());
-        assert!(
-            service_template_origin_attestation(&mismatched, "reviewed-digest", compose).is_none()
-        );
+        let resolved = canonicalize_template_upgrade_environment_variables(
+            &template,
+            &[crate::handlers::templates::EnvVarInput {
+                name: "NEW_API_KEY".to_string(),
+                value: "integration-secret".to_string(),
+                is_secret: false,
+            }],
+            &configured,
+            Some("https://browser.example.test"),
+        )
+        .expect("new declared configuration should resolve");
+        assert!(resolved.iter().any(|variable| {
+            variable.key == "NEW_API_KEY"
+                && variable.value == "integration-secret"
+                && variable.is_secret
+        }));
+        assert!(resolved.iter().any(|variable| variable.key == "EXTERNAL"));
+    }
 
-        let mut untrusted = origin;
-        untrusted.slug = "customer@example.com".to_string();
-        assert!(
-            service_template_origin_attestation(&untrusted, "reviewed-digest", compose).is_none()
+    #[test]
+    fn template_upgrade_cannot_overwrite_existing_or_inject_unknown_configuration() {
+        let template = temps_core::templates::bundled_template_by_slug("browserless")
+            .expect("browserless template must be bundled");
+        let configured = BTreeSet::from(["TOKEN".to_string()]);
+
+        let overwrite = canonicalize_template_upgrade_environment_variables(
+            &template,
+            &[crate::handlers::templates::EnvVarInput {
+                name: "TOKEN".to_string(),
+                value: "replacement".to_string(),
+                is_secret: true,
+            }],
+            &configured,
+            None,
         );
+        assert!(matches!(
+            overwrite,
+            Err(TemplateEnvironmentError::AlreadyConfigured { .. })
+        ));
+
+        let unknown = canonicalize_template_upgrade_environment_variables(
+            &template,
+            &[crate::handlers::templates::EnvVarInput {
+                name: "UNDECLARED".to_string(),
+                value: "value".to_string(),
+                is_secret: false,
+            }],
+            &configured,
+            Some("https://browser.example.test"),
+        );
+        assert!(matches!(
+            unknown,
+            Err(TemplateEnvironmentError::Unknown { .. })
+        ));
     }
 
     /// Regression test for ADR-028 finding #2: `get_project_by_slug` guard bypass.
@@ -3913,6 +4486,25 @@ mod tests {
             "get_project_by_slug must call project_access_guard! on the resolved project.id \
              to enforce team-based access (the same guard get_project applies)"
         );
+    }
+
+    #[test]
+    fn service_template_upgrade_requires_project_and_environment_permissions() {
+        let source = include_str!("handlers.rs");
+        let fn_start = source
+            .find("pub async fn upgrade_project_service_template")
+            .expect("service template upgrade handler not found in source");
+        let after_start = &source[fn_start + 1..];
+        let next_fn_offset = after_start
+            .find("pub async fn")
+            .unwrap_or(after_start.len());
+        let fn_body = &source[fn_start..fn_start + 1 + next_fn_offset];
+
+        assert!(fn_body.contains("permission_guard!(auth, ProjectsWrite)"));
+        assert!(fn_body.contains("permission_guard!(auth, EnvironmentsCreate)"));
+        assert!(fn_body.contains("project_scope_guard!(auth, project_id)"));
+        assert!(fn_body
+            .contains("project_access_guard!(auth, project_id, state.project_access_checker)"));
     }
 
     #[test]

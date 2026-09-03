@@ -92,6 +92,15 @@ pub enum DeploymentEnvResolutionError {
     },
 
     #[error(
+        "Stored service template for project {project_id}, environment {environment_id} is invalid: {reason}"
+    )]
+    InvalidServiceTemplate {
+        project_id: i32,
+        environment_id: i32,
+        reason: String,
+    },
+
+    #[error(
         "Secrets-manager resolution failed for project {project_id}, environment {environment_id}: {reason}. Verify provider connectivity and credentials"
     )]
     SecretsManager {
@@ -195,16 +204,31 @@ pub(super) fn merge_environment_variable_layers(
 /// merged afterwards and can override these defaults.
 fn apply_managed_service_bindings(
     linked_service_vars: &mut HashMap<String, String>,
-    template_slug: Option<&str>,
+    service_template: Option<&serde_json::Value>,
     project_id: i32,
     environment_id: i32,
 ) -> Result<(), DeploymentEnvResolutionError> {
-    let Some(template_slug) = template_slug else {
+    let Some(value) = service_template else {
         return Ok(());
     };
-    let Some(template) = temps_core::templates::bundled_template_by_slug(template_slug) else {
-        return Ok(());
-    };
+    let instance =
+        serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(value.clone())
+            .map_err(
+                |error| DeploymentEnvResolutionError::InvalidServiceTemplate {
+                    project_id,
+                    environment_id,
+                    reason: error.to_string(),
+                },
+            )?;
+    instance.validate().map_err(
+        |error| DeploymentEnvResolutionError::InvalidServiceTemplate {
+            project_id,
+            environment_id,
+            reason: error.to_string(),
+        },
+    )?;
+    let template = instance.template;
+    let template_slug = template.slug.clone();
 
     for (service, bindings) in template.managed_service_bindings {
         for (target, source) in bindings {
@@ -212,7 +236,7 @@ fn apply_managed_service_bindings(
                 DeploymentEnvResolutionError::ManagedServiceBindingMissing {
                     project_id,
                     environment_id,
-                    template_slug: template_slug.to_string(),
+                    template_slug: template_slug.clone(),
                     service: service.clone(),
                     target: target.clone(),
                     source_variable: source.clone(),
@@ -233,13 +257,13 @@ pub(super) fn merge_managed_service_environment(
     resolved: &mut HashMap<String, String>,
     mut linked_service_vars: HashMap<String, String>,
     explicit_project_vars: HashMap<String, String>,
-    template_slug: Option<&str>,
+    service_template: Option<&serde_json::Value>,
     project_id: i32,
     environment_id: i32,
 ) -> Result<(), DeploymentEnvResolutionError> {
     apply_managed_service_bindings(
         &mut linked_service_vars,
-        template_slug,
+        service_template,
         project_id,
         environment_id,
     )?;
@@ -444,7 +468,7 @@ impl DeploymentEnvResolver {
             &mut env_vars_map,
             linked_service_vars,
             explicit_project_vars,
-            project.template_slug.as_deref(),
+            project.service_template.as_ref(),
             project.id,
             environment.id,
         )?;
@@ -675,6 +699,15 @@ mod tests {
         merge_managed_service_environment, otel_exporter_headers, DeploymentEnvResolutionError,
     };
 
+    fn keycloak_release_json() -> serde_json::Value {
+        serde_json::to_value(temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_core::templates::bundled_template_by_slug("keycloak")
+                .expect("Keycloak service template must be bundled"),
+        ))
+        .expect("service release should serialize")
+    }
+
     struct TestSecretsResolver {
         result: Result<HashMap<String, String>, String>,
     }
@@ -735,11 +768,12 @@ mod tests {
         ]);
 
         let mut resolved = HashMap::new();
+        let service_template = keycloak_release_json();
         merge_managed_service_environment(
             &mut resolved,
             linked,
             HashMap::new(),
-            Some("keycloak"),
+            Some(&service_template),
             4,
             8,
         )
@@ -761,7 +795,8 @@ mod tests {
     #[test]
     fn missing_required_managed_binding_fails_with_context() {
         let mut linked = HashMap::new();
-        let error = apply_managed_service_bindings(&mut linked, Some("keycloak"), 4, 8)
+        let service_template = keycloak_release_json();
+        let error = apply_managed_service_bindings(&mut linked, Some(&service_template), 4, 8)
             .expect_err("missing managed PostgreSQL values must fail closed");
 
         assert!(matches!(

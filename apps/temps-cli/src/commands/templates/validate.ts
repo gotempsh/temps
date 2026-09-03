@@ -10,19 +10,13 @@ export interface NativeTemplateValidationResult {
 const SUPPORTED_KINDS = new Set(["starter", "service"]);
 const SUPPORTED_MANAGED_SERVICES = new Set([
   "postgres",
-  "mysql",
   "mariadb",
   "redis",
   "mongodb",
-  "minio",
-  "rabbitmq",
-  "memcached",
-  "clickhouse",
-  "influxdb",
-  "cassandra",
-  "neo4j",
-  "opensearch",
-  "valkey",
+  "s3",
+  "kv",
+  "blob",
+  "rustfs",
 ]);
 const SUPPORTED_PRESETS = new Set([
   "nextjs",
@@ -53,6 +47,24 @@ const SUPPORTED_PRESETS = new Set([
   "docker-compose",
   "nodejs",
 ]);
+const SEMANTIC_VERSION =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+function isSemanticVersion(version: string): boolean {
+  if (!SEMANTIC_VERSION.test(version)) return false;
+  const [withoutBuild = version] = version.split("+", 1);
+  const prereleaseStart = withoutBuild.indexOf("-");
+  if (prereleaseStart < 0) return true;
+  return withoutBuild
+    .slice(prereleaseStart + 1)
+    .split(".")
+    .every(
+      (identifier) =>
+        !/^\d+$/.test(identifier) ||
+        identifier === "0" ||
+        !identifier.startsWith("0"),
+    );
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -70,6 +82,50 @@ function pinnedImageReference(image: string): boolean {
     return false;
   }
   return image.slice(tagSeparator + 1).toLowerCase() !== "latest";
+}
+
+function isSecretEnvironmentVariable(variable: Record<string, unknown>): boolean {
+  const generator = variable.default_generator;
+  if (typeof generator === "string" && generator.includes("secret")) {
+    return true;
+  }
+
+  const name = typeof variable.name === "string" ? variable.name.toUpperCase() : "";
+  const secretSegment = name.split("_").some((segment) =>
+    ["SECRET", "PASSWORD", "PASSWD", "TOKEN", "PRIVATEKEY"].includes(segment),
+  );
+  const secretSuffixes = [
+    "_API_KEY",
+    "_PRIVATE_KEY",
+    "_ACCESS_KEY",
+    "_DATABASE_URL",
+    "_POSTGRES_URL",
+    "_MYSQL_URL",
+    "_MONGODB_URL",
+    "_MONGODB_URI",
+    "_REDIS_URL",
+    "_AMQP_URL",
+    "_CONNECTION_STRING",
+    "_DSN",
+    "_WEBHOOK_URL",
+  ];
+  const exactSecretNames = new Set([
+    "DATABASE_URL",
+    "POSTGRES_URL",
+    "MYSQL_URL",
+    "MONGODB_URL",
+    "MONGODB_URI",
+    "REDIS_URL",
+    "AMQP_URL",
+    "CONNECTION_STRING",
+    "DSN",
+    "WEBHOOK_URL",
+  ]);
+  return (
+    secretSegment ||
+    secretSuffixes.some((suffix) => name.endsWith(suffix)) ||
+    exactSecretNames.has(name)
+  );
 }
 
 /**
@@ -119,6 +175,13 @@ export function validateNativeTemplateConfig(
     }
     if (typeof value.kind !== "string" || !SUPPORTED_KINDS.has(value.kind)) {
       errors.push(`${prefix}.kind must be starter or service`);
+    }
+    if (value.kind === "service") {
+      if (typeof value.version !== "string" || value.version.trim() === "") {
+        errors.push(`${prefix}.version is required for service templates`);
+      } else if (!isSemanticVersion(value.version)) {
+        errors.push(`${prefix}.version must use Semantic Versioning`);
+      }
     }
 
     if (!isRecord(value.git)) {
@@ -228,6 +291,22 @@ export function validateNativeTemplateConfig(
         );
       }
     });
+
+    if (value.env_vars !== undefined && !Array.isArray(value.env_vars)) {
+      errors.push(`${prefix}.env_vars must be an array`);
+    } else if (Array.isArray(value.env_vars)) {
+      value.env_vars.forEach((variable, variableIndex) => {
+        if (!isRecord(variable)) return;
+        if (
+          isSecretEnvironmentVariable(variable) &&
+          Object.prototype.hasOwnProperty.call(variable, "default")
+        ) {
+          errors.push(
+            `${prefix}.env_vars[${variableIndex}] is secret and cannot declare a literal default; use a secure generator or require user input`,
+          );
+        }
+      });
+    }
 
     if (
       value.managed_service_bindings !== undefined &&

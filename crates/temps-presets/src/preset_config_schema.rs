@@ -8,8 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use temps_entities::preset::{
-    ComposePublicPort, ComposeTemplateOrigin, DockerfileVariant, ImageRuntimeConfig,
-    NixpacksProvider,
+    ComposePublicPort, DockerfileVariant, ImageRuntimeConfig, NixpacksProvider,
 };
 
 #[cfg(feature = "openapi")]
@@ -55,13 +54,6 @@ pub struct DockerComposePresetConfig {
     /// User-provided docker-compose.override.yml content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_override: Option<String>,
-
-    /// Catalog origin captured when a service template creates the project.
-    /// Its digest and the first saved Compose source are revalidated for
-    /// anonymous telemetry provenance, but this is not a general-purpose audit
-    /// attestation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub template_origin: Option<ComposeTemplateOrigin>,
 
     /// Compose service ports that should be publicly routed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -191,7 +183,6 @@ mod tests {
         let config = DockerComposePresetConfig {
             compose_path: Some("deploy/compose.yml".to_string()),
             compose_override: None,
-            template_origin: None,
             public_ports: vec![ComposePublicPort {
                 service: "web".to_string(),
                 port: 3000,

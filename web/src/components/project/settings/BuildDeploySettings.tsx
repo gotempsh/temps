@@ -73,7 +73,7 @@ export function BuildDeploySettings({
         </TabsContent>
 
         <TabsContent value="build" className="space-y-6">
-          {project.source_type === 'docker_image' && project.template_slug ? (
+          {project.project_type === 'service' ? (
             <ServiceTemplateRuntimeCard project={project} refetch={refetch} />
           ) : (
             <BuildSettings project={project} refetch={refetch} embedded />

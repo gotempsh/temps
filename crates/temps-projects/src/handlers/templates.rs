@@ -45,6 +45,8 @@ pub struct TemplateResponse {
     pub slug: String,
     /// Display name
     pub name: String,
+    /// Immutable release identifier for service templates.
+    pub version: String,
     /// Gallery this template belongs to.
     pub kind: TemplateKind,
     /// Short description
@@ -118,6 +120,7 @@ impl From<ProjectTemplate> for TemplateResponse {
         Self {
             slug: template.slug,
             name: template.name,
+            version: template.version,
             kind: template.kind,
             description: template.description,
             image_url: template.image_url,
@@ -442,6 +445,7 @@ mod tests {
         ProjectTemplate {
             slug: "test-template".to_string(),
             name: "Test Template".to_string(),
+            version: "1.0.0".to_string(),
             kind: TemplateKind::Starter,
             description: Some("A test template".to_string()),
             image_url: Some("/templates/test.png".to_string()),

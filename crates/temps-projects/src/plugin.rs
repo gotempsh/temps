@@ -14,7 +14,6 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::custom_domains::CustomDomainService;
 use crate::services::project::ProjectService;
-use crate::services::service_templates::ServiceTemplateCatalog;
 
 /// Projects Plugin for managing project lifecycle and configurations
 pub struct ProjectsPlugin;
@@ -64,14 +63,6 @@ impl TempsPlugin for ProjectsPlugin {
             ));
             context.register_service(project_service);
 
-            let service_template_catalog =
-                Arc::new(ServiceTemplateCatalog::new().map_err(|error| {
-                    PluginError::InitializationFailed(format!(
-                        "Projects service-template catalog client: {error}"
-                    ))
-                })?);
-            context.register_service(service_template_catalog);
-
             // Create CustomDomainService
             let custom_domain_service = Arc::new(CustomDomainService::new(db.clone()));
             context.register_service(custom_domain_service);
@@ -91,7 +82,6 @@ impl TempsPlugin for ProjectsPlugin {
         let custom_domain_service = context.require_service::<CustomDomainService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let template_service = context.require_service::<TemplateService>();
-        let service_template_catalog = context.require_service::<ServiceTemplateCatalog>();
         let config_service = context.require_service::<temps_config::ConfigService>();
         let public_hostname_resolver = context
             .get_service::<dyn temps_core::PublicHostnameResolver>()
@@ -118,7 +108,6 @@ impl TempsPlugin for ProjectsPlugin {
             custom_domain_service,
             audit_service,
             template_service,
-            service_template_catalog,
             config_service,
             public_hostname_resolver,
             project_archive_cleaner,

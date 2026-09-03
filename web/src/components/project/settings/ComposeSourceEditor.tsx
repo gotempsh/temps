@@ -230,16 +230,6 @@ export function ComposeSourceEditor({
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        {source.origin && (
-          <p className="text-xs text-muted-foreground">
-            Initially imported from {source.origin.provider} template{' '}
-            <span className="font-medium text-foreground">
-              {source.origin.slug}
-            </span>
-            . The saved source is now independent of that catalog.
-          </p>
-        )}
-
         <div className="overflow-hidden rounded-lg border bg-background dark:bg-zinc-950">
           <Editor
             height="30rem"

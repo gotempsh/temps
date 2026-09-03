@@ -428,8 +428,9 @@ pub struct DeployImageJob {
     /// Candidate metadata is persisted on a failed readiness check so the
     /// authenticated container-log endpoints can still resolve the container.
     failed_candidates: Arc<Mutex<Vec<FailedContainerCandidate>>>,
-    /// Set only after retained-container rows commit successfully. Workflow
-    /// cleanup must leave those registered candidates alive for inspection.
+    /// Set only after stopped retained-container rows commit successfully.
+    /// Workflow cleanup leaves those registered candidates available for
+    /// authenticated inspection without consuming runtime resources.
     retained_failure: Arc<AtomicBool>,
     /// A remote agent that cannot prove private-only port binding must never
     /// be retained, even if another replica was otherwise safe to keep.
@@ -1165,6 +1166,22 @@ impl DeployImageJob {
         };
 
         self.stop_background_log_stream(context).await?;
+        let replica_deployers = self.replica_deployers.lock().unwrap().clone();
+        for candidate in &candidates {
+            let deployer = replica_deployers
+                .get(&candidate.container_id)
+                .cloned()
+                .unwrap_or_else(|| self.container_deployer.clone());
+            deployer
+                .stop_container(&candidate.container_id)
+                .await
+                .map_err(|error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to stop app container '{}' before retaining its logs for deployment {deployment_id}: {error}",
+                        candidate.container_id
+                    ))
+                })?;
+        }
         let transaction = db.begin().await.map_err(|error| {
             WorkflowError::JobExecutionFailed(format!(
                 "Failed to begin retained app-container registration for deployment {deployment_id}: {error}"
@@ -1180,7 +1197,7 @@ impl DeployImageJob {
                 container_port: Set(i32::from(candidate.container_port)),
                 host_port: Set(Some(i32::from(candidate.host_port))),
                 image_name: Set(Some(candidate.image_name.clone())),
-                status: Set(Some("retained:failed-readiness".to_string())),
+                status: Set(Some("retained:stopped-after-failed-readiness".to_string())),
                 service_name: Set(Some(self.config.service_name.clone())),
                 created_at: Set(now),
                 deployed_at: Set(now),
@@ -1213,7 +1230,7 @@ impl DeployImageJob {
             .log(
             context,
             format!(
-                "Retained {} failed app container(s) for authenticated log inspection. They are not routed publicly and the next successful deployment removes them.",
+                "Stopped and retained {} failed app container(s) for authenticated log inspection. They are not routed publicly and the next deployment removes them.",
                 candidates.len()
             ),
         )
@@ -3511,12 +3528,14 @@ mod tests {
 
     struct TrackingMockContainerDeployer {
         deployed_containers: Arc<StdMutex<Vec<String>>>,
+        stopped_containers: Arc<StdMutex<Vec<String>>>,
     }
 
     impl TrackingMockContainerDeployer {
         fn new() -> Self {
             Self {
                 deployed_containers: Arc::new(StdMutex::new(Vec::new())),
+                stopped_containers: Arc::new(StdMutex::new(Vec::new())),
             }
         }
     }
@@ -3561,7 +3580,11 @@ mod tests {
             Ok(())
         }
 
-        async fn stop_container(&self, _container_id: &str) -> Result<(), DeployerError> {
+        async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
+            self.stopped_containers
+                .lock()
+                .unwrap()
+                .push(container_id.to_string());
             Ok(())
         }
 
@@ -3676,7 +3699,7 @@ mod tests {
                 }])
                 .into_connection(),
         );
-        let deployer: Arc<dyn ContainerDeployer> = Arc::new(TrackingMockContainerDeployer::new());
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
         let job = DeployImageJobBuilder::new()
             .job_id("deploy".to_string())
             .build_job_id("build".to_string())
@@ -3686,7 +3709,7 @@ mod tests {
             })
             .service_name("checkout".to_string())
             .failed_container_retention(db.clone(), 42)
-            .build(deployer)
+            .build(deployer.clone())
             .expect("valid deploy job");
         job.failed_candidates
             .lock()
@@ -3705,6 +3728,11 @@ mod tests {
             .await
             .expect("failed candidate should remain available for logs");
         assert!(job.retained_failure.load(Ordering::Acquire));
+        assert_eq!(
+            deployer.stopped_containers.lock().unwrap().as_slice(),
+            ["failed-app-id"],
+            "retained failures must be stopped before their ownership rows are committed"
+        );
 
         drop(job);
         let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
@@ -3723,7 +3751,7 @@ mod tests {
 
         assert!(rendered.contains("failed-app-id"));
         assert!(rendered.contains("checkout-production"));
-        assert!(rendered.contains("retained:failed-readiness"));
+        assert!(rendered.contains("retained:stopped-after-failed-readiness"));
         assert!(rendered.contains("checkout:broken"));
         assert!(rendered.contains("18080"));
         assert!(rendered.contains("3000"));

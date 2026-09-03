@@ -252,18 +252,13 @@ impl TelemetryEvent {
     }
 
     /// Attach bounded template provenance without allowing operator-defined
-    /// slugs to leave the instance. Service-catalog slugs are included only
-    /// after the catalog metadata and first saved Compose source are attested.
+    /// slugs to leave the instance. Only reviewed bundled slugs are emitted.
     pub fn with_template_provenance(self, provenance: Option<&str>) -> Self {
         let (source, safe_slug) = match provenance {
             None => ("none", None),
             Some(value) => {
                 if let Some(slug) = crate::templates::telemetry_safe_template_slug(value) {
                     ("bundled", Some(slug))
-                } else if let Some(slug) =
-                    crate::templates::telemetry_safe_service_catalog_slug(value)
-                {
-                    ("service_catalog", Some(slug))
                 } else {
                     ("custom", None)
                 }
@@ -367,15 +362,10 @@ mod tests {
     }
 
     #[test]
-    fn template_provenance_exposes_only_reviewed_or_attested_public_slugs() {
-        let service_provenance =
-            crate::templates::service_catalog_template_provenance("keycloak").unwrap();
+    fn template_provenance_exposes_only_reviewed_public_slugs() {
         let service_event = TelemetryEvent::new(TelemetryEventKind::DeployAttempted)
-            .with_template_provenance(Some(&service_provenance));
-        assert_eq!(
-            service_event.properties["template_source"],
-            "service_catalog"
-        );
+            .with_template_provenance(Some("keycloak"));
+        assert_eq!(service_event.properties["template_source"], "bundled");
         assert_eq!(service_event.properties["template_slug"], "keycloak");
 
         let private = "customer-private-template";

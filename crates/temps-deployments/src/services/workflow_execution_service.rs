@@ -3575,18 +3575,13 @@ mod tests {
             .contains_key("template_slug"));
         assert!(!serialized.contains(private_slug));
 
-        let service_provenance =
-            temps_core::templates::service_catalog_template_provenance("keycloak").unwrap();
         let service_failure = deploy_failed_telemetry_event(
             Some("failed to pull image: manifest unknown"),
             Some("compose".to_string()),
             Some("docker-compose".to_string()),
-            Some(service_provenance),
+            Some("keycloak".to_string()),
         );
-        assert_eq!(
-            service_failure.properties["template_source"],
-            "service_catalog"
-        );
+        assert_eq!(service_failure.properties["template_source"], "bundled");
         assert_eq!(service_failure.properties["template_slug"], "keycloak");
         assert_eq!(service_failure.properties["failure_stage"], "image");
         assert_eq!(

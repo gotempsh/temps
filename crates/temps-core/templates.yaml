@@ -139,6 +139,7 @@ templates:
   # an application-local Compose stack.
   - slug: keycloak
     name: Keycloak
+    version: 1.0.0
     kind: service
     description: Production-ready identity and access management backed by a Temps-managed PostgreSQL database.
     git:
@@ -209,6 +210,7 @@ templates:
   # public HTTP/WebSocket endpoint and it has no hidden Compose dependencies.
   - slug: browserless
     name: Browserless
+    version: 1.0.0
     kind: service
     description: Remote Chromium for Playwright, Puppeteer, screenshots, PDFs, and browser automation. Review Browserless licensing for commercial or proprietary workloads.
     git:

@@ -115,6 +115,8 @@ mod tests {
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,

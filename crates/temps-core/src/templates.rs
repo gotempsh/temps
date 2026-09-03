@@ -7,7 +7,6 @@
 //! Templates are defined in a YAML configuration file for easy customization.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -37,6 +36,59 @@ pub struct EnvVarTemplate {
     /// `random_hex_32` (32-byte hex). Unknown values are ignored client-side.
     #[serde(default)]
     pub default_generator: Option<String>,
+}
+
+impl EnvVarTemplate {
+    /// Whether values for this template input must use the secret reveal path.
+    ///
+    /// Templates do not get to weaken this policy by omission: credential-like
+    /// names and secret generators are always treated as sensitive. Ordinary
+    /// configuration is still encrypted at rest, but remains readable in the
+    /// project environment-variable UI.
+    pub fn is_secret(&self) -> bool {
+        if self
+            .default_generator
+            .as_deref()
+            .is_some_and(|generator| generator.contains("secret"))
+        {
+            return true;
+        }
+
+        let key = self.name.to_ascii_uppercase();
+        let secret_segment = key.split('_').any(|segment| {
+            matches!(
+                segment,
+                "SECRET" | "PASSWORD" | "PASSWD" | "TOKEN" | "PRIVATEKEY"
+            )
+        });
+        secret_segment
+            || key.ends_with("_API_KEY")
+            || key.ends_with("_PRIVATE_KEY")
+            || key.ends_with("_ACCESS_KEY")
+            || key.ends_with("_DATABASE_URL")
+            || key.ends_with("_POSTGRES_URL")
+            || key.ends_with("_MYSQL_URL")
+            || key.ends_with("_MONGODB_URL")
+            || key.ends_with("_MONGODB_URI")
+            || key.ends_with("_REDIS_URL")
+            || key.ends_with("_AMQP_URL")
+            || key.ends_with("_CONNECTION_STRING")
+            || key.ends_with("_DSN")
+            || key.ends_with("_WEBHOOK_URL")
+            || matches!(
+                key.as_str(),
+                "DATABASE_URL"
+                    | "POSTGRES_URL"
+                    | "MYSQL_URL"
+                    | "MONGODB_URL"
+                    | "MONGODB_URI"
+                    | "REDIS_URL"
+                    | "AMQP_URL"
+                    | "CONNECTION_STRING"
+                    | "DSN"
+                    | "WEBHOOK_URL"
+            )
+    }
 }
 
 /// Git repository reference (supports any git provider: GitHub, GitLab, Bitbucket, etc.)
@@ -93,6 +145,11 @@ pub struct ProjectTemplate {
     pub slug: String,
     /// Display name
     pub name: String,
+    /// Version of this template release. Service projects pin this value and
+    /// the complete resolved definition so catalog updates are always an
+    /// explicit, reviewable upgrade rather than a silent runtime mutation.
+    #[serde(default)]
+    pub version: String,
     /// Gallery this template belongs to. Older configurations default to a
     /// source-code starter, preserving their existing behaviour.
     #[serde(default)]
@@ -167,6 +224,85 @@ pub struct ProjectTemplate {
     /// Sort order for display (lower = first)
     #[serde(default)]
     pub sort_order: i32,
+}
+
+/// Immutable template release attached to a service project.
+///
+/// The resolved definition is deliberately stored with the project. The live
+/// catalog is only needed to discover a newer release; deployments, edits and
+/// rollbacks continue to work if the catalog later changes or disappears.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ServiceTemplateInstance {
+    /// Catalog schema used to deserialize `template`.
+    pub schema_version: String,
+    /// Stable service family identifier.
+    pub slug: String,
+    /// Applied template release.
+    pub version: String,
+    /// Exact resolved release from which this project was created/upgraded.
+    pub template: ProjectTemplate,
+}
+
+/// Snapshot schema understood by this binary. A future schema must introduce
+/// an explicit migration/decoder before projects can persist it.
+pub const SERVICE_TEMPLATE_SCHEMA_VERSION: &str = "2";
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceTemplateInstanceError {
+    #[error("unsupported service template schema '{found}'; expected '{expected}'")]
+    UnsupportedSchema {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("service template release identity does not match its resolved definition")]
+    IdentityMismatch,
+    #[error("service template {slug}@{version} has an invalid release version: {source}")]
+    InvalidVersion {
+        slug: String,
+        version: String,
+        #[source]
+        source: semver::Error,
+    },
+}
+
+impl ServiceTemplateInstance {
+    pub fn new(schema_version: impl Into<String>, template: ProjectTemplate) -> Self {
+        Self {
+            schema_version: schema_version.into(),
+            slug: template.slug.clone(),
+            version: template.version.clone(),
+            template,
+        }
+    }
+
+    /// Parse the persisted release identifier using Semantic Versioning.
+    pub fn release_version(&self) -> Result<semver::Version, semver::Error> {
+        semver::Version::parse(&self.version)
+    }
+
+    pub fn validate(&self) -> Result<(), ServiceTemplateInstanceError> {
+        if self.schema_version != SERVICE_TEMPLATE_SCHEMA_VERSION {
+            return Err(ServiceTemplateInstanceError::UnsupportedSchema {
+                found: self.schema_version.clone(),
+                expected: SERVICE_TEMPLATE_SCHEMA_VERSION,
+            });
+        }
+        if self.slug != self.template.slug || self.version != self.template.version {
+            return Err(ServiceTemplateInstanceError::IdentityMismatch);
+        }
+        self.release_version().map(|_| ()).map_err(|source| {
+            ServiceTemplateInstanceError::InvalidVersion {
+                slug: self.slug.clone(),
+                version: self.version.clone(),
+                source,
+            }
+        })
+    }
+
+    /// Whether this release is a strictly newer release of the same service.
+    pub fn is_newer_than(&self, applied: &Self) -> Result<bool, semver::Error> {
+        Ok(self.slug == applied.slug && self.release_version()? > applied.release_version()?)
+    }
 }
 
 /// Root configuration for templates
@@ -254,21 +390,26 @@ impl TemplatesConfig {
 
 /// Known valid services that templates can depend on
 pub const VALID_SERVICES: &[&str] = &[
-    "postgres",
-    "mysql",
-    "mariadb",
-    "redis",
-    "mongodb",
-    "minio",
-    "rabbitmq",
-    "memcached",
-    "clickhouse",
-    "influxdb",
-    "cassandra",
-    "neo4j",
-    "opensearch",
-    "valkey",
+    "postgres", "mariadb", "redis", "mongodb", "s3", "kv", "blob", "rustfs",
 ];
+
+fn is_pinned_image_reference(image: &str) -> bool {
+    if let Some((_, digest)) = image.rsplit_once('@') {
+        return digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    let last_slash = image.rfind('/');
+    let Some(tag_separator) = image.rfind(':') else {
+        return false;
+    };
+    if last_slash.is_some_and(|slash| tag_separator <= slash) {
+        return false;
+    }
+    let tag = &image[tag_separator + 1..];
+    !tag.is_empty() && !tag.eq_ignore_ascii_case("latest")
+}
 
 /// Presets accepted by project creation. Kept here so invalid bundled YAML is
 /// rejected before a user reaches the install form.
@@ -334,26 +475,6 @@ const BUNDLED_TEMPLATES: &str = include_str!("../templates.yaml");
 /// Maximum template slug length accepted by the catalog and project schema.
 pub const MAX_TEMPLATE_SLUG_CHARS: usize = 255;
 
-/// Prefix used for server-attested service-catalog provenance stored on a
-/// project. The suffix is a public catalog slug that was matched against the
-/// catalog and install-plan digest by the project-creation handler.
-pub const SERVICE_CATALOG_TEMPLATE_PREFIX: &str = "service_catalog:";
-
-/// Internal marker held only between project creation and the first saved
-/// Compose revision. It binds server-validated catalog metadata to the exact
-/// normalized Compose bytes before telemetry attribution is promoted.
-const PENDING_SERVICE_CATALOG_TEMPLATE_PREFIX: &str = "service_catalog_pending:";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingServiceCatalogResolution {
-    /// The stored value is not a pending service-catalog marker.
-    NotPending,
-    /// The first saved Compose source matches the server-attested template.
-    Matched(String),
-    /// The marker is malformed or the saved source does not match.
-    Mismatched,
-}
-
 /// Fixed, reviewable labels that are safe to include in anonymous telemetry.
 ///
 /// Operators can load private templates with arbitrary slugs. Those slugs must
@@ -386,73 +507,6 @@ pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
     BUNDLED_TELEMETRY_TEMPLATE_SLUGS
         .contains(&slug)
         .then_some(slug)
-}
-
-fn valid_service_catalog_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() + SERVICE_CATALOG_TEMPLATE_PREFIX.len() <= MAX_TEMPLATE_SLUG_CHARS
-        && slug.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
-        })
-}
-
-/// Build bounded provenance for a service-catalog template after the caller
-/// has verified the slug and install-plan digest against the live catalog.
-///
-/// This validates only the storage/wire shape. Callers must not use it as a
-/// substitute for catalog attestation because arbitrary user text must never
-/// be promoted into anonymous telemetry.
-pub fn service_catalog_template_provenance(slug: &str) -> Option<String> {
-    valid_service_catalog_slug(slug).then(|| format!("{SERVICE_CATALOG_TEMPLATE_PREFIX}{slug}"))
-}
-
-/// Build a server-only pending provenance marker bound to the exact Compose
-/// source returned by the catalog detail endpoint.
-pub fn pending_service_catalog_template_provenance(slug: &str, compose: &str) -> Option<String> {
-    if !valid_service_catalog_slug(slug) {
-        return None;
-    }
-    let checksum = hex::encode(Sha256::digest(compose.as_bytes()));
-    let provenance = format!("{PENDING_SERVICE_CATALOG_TEMPLATE_PREFIX}{slug}:{checksum}");
-    (provenance.len() <= MAX_TEMPLATE_SLUG_CHARS).then_some(provenance)
-}
-
-/// Resolve pending catalog provenance when the first immutable Compose source
-/// is saved. A mismatch is terminal: callers should clear the pending marker
-/// so unrelated content can never inherit a catalog template label later.
-pub fn resolve_pending_service_catalog_template_provenance(
-    provenance: &str,
-    compose: &str,
-) -> PendingServiceCatalogResolution {
-    let Some(payload) = provenance.strip_prefix(PENDING_SERVICE_CATALOG_TEMPLATE_PREFIX) else {
-        return PendingServiceCatalogResolution::NotPending;
-    };
-    let Some((slug, expected_checksum)) = payload.rsplit_once(':') else {
-        return PendingServiceCatalogResolution::Mismatched;
-    };
-    if !valid_service_catalog_slug(slug)
-        || expected_checksum.len() != 64
-        || !expected_checksum
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return PendingServiceCatalogResolution::Mismatched;
-    }
-    let actual_checksum = hex::encode(Sha256::digest(compose.as_bytes()));
-    if actual_checksum != expected_checksum {
-        return PendingServiceCatalogResolution::Mismatched;
-    }
-    service_catalog_template_provenance(slug)
-        .map(PendingServiceCatalogResolution::Matched)
-        .unwrap_or(PendingServiceCatalogResolution::Mismatched)
-}
-
-/// Recover the public service-catalog slug from previously attested project
-/// provenance. Other provenance values, including operator templates, remain
-/// private and return `None`.
-pub fn telemetry_safe_service_catalog_slug(provenance: &str) -> Option<&str> {
-    let slug = provenance.strip_prefix(SERVICE_CATALOG_TEMPLATE_PREFIX)?;
-    valid_service_catalog_slug(slug).then_some(slug)
 }
 
 /// Return the public bundled slug only when the selected template exactly
@@ -522,6 +576,19 @@ impl TemplateService {
 
         info!("Loading templates from external file {:?}", path);
         let config = TemplatesConfig::from_file(path)?;
+        if !matches!(
+            config.version.as_str(),
+            "1" | SERVICE_TEMPLATE_SCHEMA_VERSION
+        ) {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Unsupported template catalog schema '{}'; supported versions are '1' and '{}'",
+                config.version, SERVICE_TEMPLATE_SCHEMA_VERSION
+            )));
+        }
+        let validation_errors = Self::validate_config(&config);
+        if !validation_errors.is_empty() {
+            return Err(TemplateConfigError::ValidationErrors(validation_errors));
+        }
         info!(
             "Loaded {} templates from external file",
             config.templates.len()
@@ -553,6 +620,66 @@ impl TemplateService {
         // Check for empty name
         if template.name.is_empty() {
             errors.push("Name cannot be empty".to_string());
+        }
+
+        if template.kind == TemplateKind::Service {
+            if template.version.trim().is_empty() {
+                errors.push("Service template version cannot be empty".to_string());
+            } else if let Err(error) = semver::Version::parse(&template.version) {
+                errors.push(format!(
+                    "Service template version '{}' is not valid Semantic Versioning: {error}",
+                    template.version
+                ));
+            }
+            if template.preset != "dockerfile" {
+                errors.push(
+                    "Service templates must use the dockerfile preset until native multi-container workloads are supported"
+                        .to_string(),
+                );
+            }
+            if template
+                .image
+                .as_deref()
+                .is_none_or(|image| image.trim().is_empty())
+            {
+                errors.push("Service templates must declare a container image".to_string());
+            } else if template
+                .image
+                .as_deref()
+                .is_some_and(|image| !is_pinned_image_reference(image))
+            {
+                errors.push(
+                    "Service templates must use a version-pinned image tag or sha256 digest"
+                        .to_string(),
+                );
+            }
+            if template
+                .exposed_port
+                .is_none_or(|port| !(1..=65_535).contains(&port))
+            {
+                errors.push(
+                    "Service templates must declare an exposed port between 1 and 65535"
+                        .to_string(),
+                );
+            }
+        }
+
+        let mut environment_variable_names = std::collections::BTreeSet::new();
+        for variable in &template.env_vars {
+            if variable.name.trim().is_empty() {
+                errors.push("Environment variable name cannot be empty".to_string());
+            } else if !environment_variable_names.insert(variable.name.as_str()) {
+                errors.push(format!(
+                    "Environment variable '{}' is declared more than once",
+                    variable.name
+                ));
+            }
+            if variable.is_secret() && variable.default.is_some() {
+                errors.push(format!(
+                    "Secret environment variable '{}' cannot declare a literal default; use a secure generator or require user input",
+                    variable.name
+                ));
+            }
         }
 
         // Check for valid git URL
@@ -747,8 +874,43 @@ impl TemplateService {
         let config = self.config.read().await;
         config
             .get_by_slug(slug)
+            .filter(|template| template.is_public)
             .cloned()
             .ok_or_else(|| TemplateConfigError::NotFound(slug.to_string()))
+    }
+
+    /// Resolve a service release together with the catalog schema that
+    /// interpreted it. This is the only shape persisted on service projects.
+    pub async fn get_service_template_instance(
+        &self,
+        slug: &str,
+    ) -> Result<ServiceTemplateInstance, TemplateConfigError> {
+        let config = self.config.read().await;
+        if config.version != SERVICE_TEMPLATE_SCHEMA_VERSION {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Unsupported template catalog schema '{}'; expected '{}'",
+                config.version, SERVICE_TEMPLATE_SCHEMA_VERSION
+            )));
+        }
+        let template = config
+            .get_by_slug(slug)
+            .filter(|template| template.is_public && template.kind == TemplateKind::Service)
+            .cloned()
+            .ok_or_else(|| TemplateConfigError::NotFound(slug.to_string()))?;
+        let instance = ServiceTemplateInstance::new(config.version.clone(), template);
+        instance
+            .validate()
+            .map_err(|error| TemplateConfigError::ParseError(error.to_string()))?;
+        let validation_errors = Self::validate_template(&instance.template);
+        if !validation_errors.is_empty() {
+            return Err(TemplateConfigError::ValidationErrors(vec![
+                TemplateValidationError {
+                    slug: instance.slug.clone(),
+                    errors: validation_errors,
+                },
+            ]));
+        }
+        Ok(instance)
     }
 
     /// Get all available tags
@@ -1074,6 +1236,7 @@ templates:
             templates: vec![ProjectTemplate {
                 slug: "test".to_string(),
                 name: "Test Template".to_string(),
+                version: "1.0.0".to_string(),
                 kind: TemplateKind::Starter,
                 description: Some("A test template".to_string()),
                 image_url: None,
@@ -1142,6 +1305,45 @@ templates:
         assert_eq!(python_templates.len(), 1);
     }
 
+    #[tokio::test]
+    async fn private_templates_are_not_available_through_public_lookups() {
+        let service = TemplateService::new(None);
+        let mut template = bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be part of the reviewed catalog");
+        template.is_public = false;
+        service
+            .set_config(TemplatesConfig {
+                version: SERVICE_TEMPLATE_SCHEMA_VERSION.to_string(),
+                templates: vec![template],
+            })
+            .await;
+
+        assert!(matches!(
+            service.get_template("keycloak").await,
+            Err(TemplateConfigError::NotFound(_))
+        ));
+        assert!(matches!(
+            service.get_service_template_instance("keycloak").await,
+            Err(TemplateConfigError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_version_one_starter_catalogs_remain_supported() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temporary template catalog");
+        file.write_all(SAMPLE_CONFIG.as_bytes())
+            .expect("write version-one catalog");
+        let service = TemplateService::new(Some(file.path().to_path_buf()));
+
+        service
+            .load()
+            .await
+            .expect("existing starter-only catalogs must remain loadable");
+        assert_eq!(service.list_templates().await.len(), 2);
+    }
+
     #[test]
     fn test_bundled_templates_parse_and_validate() {
         // The bundled templates.yaml is embedded at compile time and loaded on
@@ -1204,71 +1406,6 @@ templates:
     }
 
     #[test]
-    fn service_catalog_provenance_is_bounded_and_round_trips_public_slugs() {
-        let provenance = service_catalog_template_provenance("keycloak").unwrap();
-        assert_eq!(provenance, "service_catalog:keycloak");
-        assert_eq!(
-            telemetry_safe_service_catalog_slug(&provenance),
-            Some("keycloak")
-        );
-
-        let too_long = "x".repeat(MAX_TEMPLATE_SLUG_CHARS);
-        for invalid in [
-            "",
-            "Private Service",
-            "../private",
-            "customer@example.com",
-            too_long.as_str(),
-        ] {
-            assert!(service_catalog_template_provenance(invalid).is_none());
-        }
-        assert!(telemetry_safe_service_catalog_slug("custom").is_none());
-    }
-
-    #[test]
-    fn pending_service_catalog_provenance_requires_the_exact_first_source() {
-        let compose = "services:\n  keycloak:\n    image: quay.io/keycloak/keycloak:26.3.2\n";
-        let pending = pending_service_catalog_template_provenance("keycloak", compose)
-            .expect("public catalog slug should produce pending provenance");
-
-        assert_eq!(
-            resolve_pending_service_catalog_template_provenance(&pending, compose),
-            PendingServiceCatalogResolution::Matched("service_catalog:keycloak".to_string())
-        );
-        assert_eq!(
-            resolve_pending_service_catalog_template_provenance(
-                &pending,
-                "services:\n  unrelated:\n    image: example/unrelated:latest\n"
-            ),
-            PendingServiceCatalogResolution::Mismatched
-        );
-        assert_eq!(
-            resolve_pending_service_catalog_template_provenance(
-                "service_catalog:keycloak",
-                compose
-            ),
-            PendingServiceCatalogResolution::NotPending
-        );
-        assert!(telemetry_safe_service_catalog_slug(&pending).is_none());
-    }
-
-    #[test]
-    fn pending_service_catalog_provenance_rejects_malformed_or_oversized_values() {
-        assert_eq!(
-            resolve_pending_service_catalog_template_provenance(
-                "service_catalog_pending:keycloak:not-a-sha256",
-                "services: {}\n"
-            ),
-            PendingServiceCatalogResolution::Mismatched
-        );
-        let oversized_slug = "x".repeat(MAX_TEMPLATE_SLUG_CHARS);
-        assert!(
-            pending_service_catalog_template_provenance(&oversized_slug, "services: {}\n")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn external_override_reusing_bundled_slug_is_custom_provenance() {
         let mut config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
             .expect("bundled templates.yaml must parse");
@@ -1295,6 +1432,104 @@ templates:
         let errors = TemplateService::validate_config(&config);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].errors.iter().any(|error| error.contains("255")));
+    }
+
+    #[test]
+    fn service_template_release_is_complete_and_uses_catalog_schema() {
+        let instance = ServiceTemplateInstance::new(
+            SERVICE_TEMPLATE_SCHEMA_VERSION,
+            bundled_template_by_slug("keycloak").expect("keycloak service release must be bundled"),
+        );
+
+        assert_eq!(instance.slug, "keycloak");
+        assert_eq!(instance.version, "1.0.0");
+        assert_eq!(instance.schema_version, "2");
+        assert_eq!(instance.template.kind, TemplateKind::Service);
+        assert!(instance.template.image.is_some());
+    }
+
+    #[test]
+    fn service_template_release_comparison_requires_same_family_and_newer_version() {
+        let applied = ServiceTemplateInstance::new(
+            SERVICE_TEMPLATE_SCHEMA_VERSION,
+            bundled_template_by_slug("keycloak").expect("keycloak service release must be bundled"),
+        );
+        let mut newer = applied.clone();
+        newer.version = "1.1.0".to_string();
+        newer.template.version = newer.version.clone();
+
+        assert!(newer.is_newer_than(&applied).unwrap());
+        assert!(!applied.is_newer_than(&newer).unwrap());
+
+        let mut other_family = newer;
+        other_family.slug = "browserless".to_string();
+        assert!(!other_family.is_newer_than(&applied).unwrap());
+    }
+
+    #[test]
+    fn service_template_validation_rejects_mutable_or_ambiguous_inputs() {
+        let mut template = bundled_template_by_slug("keycloak")
+            .expect("keycloak service template must be bundled");
+        template.version.clear();
+        template.env_vars.push(template.env_vars[0].clone());
+
+        let errors = TemplateService::validate_template(&template);
+        assert!(errors
+            .iter()
+            .any(|error| error == "Service template version cannot be empty"));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("declared more than once")));
+
+        template.version = "next".to_string();
+        template.env_vars.pop();
+        let errors = TemplateService::validate_template(&template);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("not valid Semantic Versioning")));
+
+        template.version = "1.0.0".to_string();
+        template.image = Some("example.test/keycloak:latest".to_string());
+        let errors = TemplateService::validate_template(&template);
+        assert!(errors.iter().any(|error| error.contains("version-pinned")));
+    }
+
+    #[test]
+    fn service_input_secret_policy_distinguishes_credentials_from_configuration() {
+        let template = bundled_template_by_slug("keycloak")
+            .expect("keycloak service template must be bundled");
+        let password = template
+            .env_vars
+            .iter()
+            .find(|variable| variable.name == "KC_BOOTSTRAP_ADMIN_PASSWORD")
+            .expect("password input must exist");
+        let username = template
+            .env_vars
+            .iter()
+            .find(|variable| variable.name == "KC_BOOTSTRAP_ADMIN_USERNAME")
+            .expect("username input must exist");
+
+        assert!(password.is_secret());
+        assert!(!username.is_secret());
+    }
+
+    #[test]
+    fn service_template_validation_rejects_literal_secret_defaults() {
+        let mut template = bundled_template_by_slug("keycloak")
+            .expect("keycloak service template must be bundled");
+        let password = template
+            .env_vars
+            .iter_mut()
+            .find(|variable| variable.name == "KC_BOOTSTRAP_ADMIN_PASSWORD")
+            .expect("password input must exist");
+        password.default_generator = None;
+        password.default = Some("do-not-publish-me".to_string());
+
+        let errors = TemplateService::validate_template(&template);
+        assert!(errors.iter().any(|error| {
+            error.contains("KC_BOOTSTRAP_ADMIN_PASSWORD")
+                && error.contains("cannot declare a literal default")
+        }));
     }
 
     #[test]

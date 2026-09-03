@@ -133,6 +133,157 @@ async fn managed_monitor_schema_state(db: &DatabaseConnection) -> anyhow::Result
     ))
 }
 
+async fn service_project_identity_schema_state(
+    db: &DatabaseConnection,
+) -> anyhow::Result<(bool, bool)> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' \
+                    AND table_name = 'projects' \
+                    AND column_name = 'project_type') AS has_project_type, \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' \
+                    AND table_name = 'projects' \
+                    AND column_name = 'service_template') AS has_service_template"
+                .to_string(),
+        ))
+        .await?
+        .expect("schema-state query returns one row");
+    Ok((
+        row.try_get("", "has_project_type")?,
+        row.try_get("", "has_service_template")?,
+    ))
+}
+
+#[tokio::test]
+async fn test_service_project_identity_migration_defaults_down_and_reup() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping service-project identity migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping service-project identity migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260903_000001_add_service_project_identity";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (false, false)
+    );
+
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, template_slug) \
+         VALUES \
+         ('Keycloak', '', '', '.', 'main', 'dockerfile', now(), now(), 'keycloak-test', 'keycloak'), \
+         ('Static', '', '', '.', 'main', 'static', now(), now(), 'static-test', NULL), \
+         ('Server', '', '', '.', 'main', 'nodejs', now(), now(), 'server-test', NULL)",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (true, true)
+    );
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT slug, project_type FROM projects \
+             WHERE slug IN ('keycloak-test', 'static-test', 'server-test') ORDER BY slug"
+                .to_string(),
+        ))
+        .await?;
+    let project_types = rows
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String>("", "slug")?,
+                row.try_get::<String>("", "project_type")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+    assert_eq!(
+        project_types,
+        vec![
+            ("keycloak-test".to_string(), "server".to_string()),
+            ("server-test".to_string(), "server".to_string()),
+            ("static-test".to_string(), "static".to_string()),
+        ]
+    );
+
+    let service_without_release = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type) \
+             VALUES ('Invalid service', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                     'invalid-service', 'service')",
+        )
+        .await;
+    assert!(
+        service_without_release.is_err(),
+        "a service project must persist its exact template release"
+    );
+
+    let server_with_release = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type, service_template) \
+             VALUES ('Invalid server', '', '', '.', 'main', 'nodejs', now(), now(), \
+                     'invalid-server', 'server', '{}'::jsonb)",
+        )
+        .await;
+    assert!(
+        server_with_release.is_err(),
+        "a regular project cannot carry service-template identity"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (false, false)
+    );
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (true, true)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_source_bundle_kind_migration_up_down_and_reup() -> anyhow::Result<()> {
     if external_db_configured() {

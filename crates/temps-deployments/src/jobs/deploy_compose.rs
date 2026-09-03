@@ -435,7 +435,7 @@ impl DeployComposeJob {
                     .unwrap_or(0)),
                 host_port: Set(binding.map(|port| i32::from(port.host_port))),
                 image_name: Set(Some(service.image_name.clone())),
-                status: Set(Some(format!("retained:{}", service.status))),
+                status: Set(Some("retained:stopped-after-failure".to_string())),
                 service_name: Set(Some(service.service_name.clone())),
                 created_at: Set(now),
                 deployed_at: Set(now),
@@ -1194,18 +1194,29 @@ impl DeployComposeJob {
                 let retained = if containers.is_empty() {
                     false
                 } else {
-                    match self.register_retained_containers(&containers).await {
-                        Ok(()) => true,
-                        Err(registration_error) => {
+                    match self.compose_executor.stop(&project_name).await {
+                        Err(stop_error) => {
                             tracing::error!(
                                 deployment_id = self.deployment_id,
                                 project_id = self.project_id,
                                 environment_id = self.environment_id,
-                                error = %registration_error,
-                                "Failed to register retained Compose containers; tearing down untracked candidate"
+                                error = %stop_error,
+                                "Failed to stop failed Compose candidate before retention"
                             );
-                            if let Some(ref log_id) = self.log_id {
-                                let _ = self
+                            false
+                        }
+                        Ok(()) => match self.register_retained_containers(&containers).await {
+                            Ok(()) => true,
+                            Err(registration_error) => {
+                                tracing::error!(
+                                    deployment_id = self.deployment_id,
+                                    project_id = self.project_id,
+                                    environment_id = self.environment_id,
+                                    error = %registration_error,
+                                    "Failed to register retained Compose containers; tearing down untracked candidate"
+                                );
+                                if let Some(ref log_id) = self.log_id {
+                                    let _ = self
                                     .log_service
                                     .log_error(
                                         log_id,
@@ -1214,9 +1225,10 @@ impl DeployComposeJob {
                                         ),
                                     )
                                     .await;
+                                }
+                                false
                             }
-                            false
-                        }
+                        },
                     }
                 };
 
@@ -1227,7 +1239,7 @@ impl DeployComposeJob {
                             .log_warning(
                                 log_id,
                                 &format!(
-                                    "Retained {} failed Compose container(s) for authenticated log inspection. They are not routed publicly and will be removed by the next deployment or when the project/environment is deleted.",
+                                    "Stopped and retained {} failed Compose container(s) for authenticated log inspection. They are not routed publicly and will be removed by the next deployment or when the project/environment is deleted.",
                                     containers.len()
                                 ),
                             )
@@ -1635,8 +1647,10 @@ mod tests {
         assert_eq!(statements.len(), 2, "one insert is required per service");
         assert!(rendered.contains("failed-web-id"));
         assert!(rendered.contains("failed-worker-id"));
-        assert!(rendered.contains("retained:running"));
-        assert!(rendered.contains("retained:exited"));
+        assert_eq!(
+            rendered.matches("retained:stopped-after-failure").count(),
+            2
+        );
         assert!(rendered.contains("18080"));
         assert!(rendered.contains("8080"));
         assert!(

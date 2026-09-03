@@ -114,7 +114,6 @@ pub struct ComposeSourceResponse {
     #[schema(value_type = String, format = DateTime)]
     pub updated_at: UtcDateTime,
     pub services: Vec<ComposeSourceServiceResponse>,
-    pub origin: Option<temps_entities::preset::ComposeTemplateOrigin>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -188,7 +187,6 @@ fn compose_source_response(document: ComposeSourceDocument) -> ComposeSourceResp
         checksum: document.bundle.checksum,
         updated_at: document.bundle.created_at,
         services: compose_service_responses(&document.services),
-        origin: document.origin,
     }
 }
 
@@ -1180,25 +1178,6 @@ fn persisted_project_image_runtime(
     None
 }
 
-fn should_load_current_template_runtime(
-    template_slug: Option<&str>,
-    persisted_runtime: Option<&temps_entities::preset::ImageRuntimeConfig>,
-) -> bool {
-    template_slug.is_some() && persisted_runtime.is_none()
-}
-
-fn bundled_image_runtime(
-    template_slug: Option<&str>,
-) -> Option<temps_entities::preset::ImageRuntimeConfig> {
-    let slug = template_slug?;
-    let template = temps_core::templates::bundled_template_by_slug(slug)?;
-    Some(temps_entities::preset::ImageRuntimeConfig {
-        image_ref: template.image?,
-        command: template.command,
-        health_check_path: template.health_check_path,
-    })
-}
-
 // Response Types
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1354,10 +1333,9 @@ pub async fn deploy_from_image(
                 .with_detail(format!("Project {} not found", project_id))
         })?;
 
-    // Resolve the target environment before consulting deployment history. A
-    // template migration fallback may only use the environment's current,
-    // successful deployment; failed or superseded attempts must never donate
-    // argv or health settings to a different image.
+    // Reject cross-project or deleted environments before creating the
+    // deployment. Runtime defaults come only from the project's persisted
+    // configuration; catalog state and deployment history are never inferred.
     let environment = environments::Entity::find_by_id(environment_id)
         .filter(environments::Column::ProjectId.eq(project_id))
         .filter(environments::Column::DeletedAt.is_null())
@@ -1375,45 +1353,7 @@ pub async fn deploy_from_image(
                 .with_detail(format!("Environment {} not found", environment_id))
         })?;
 
-    let persisted_runtime = persisted_project_image_runtime(project.preset_config.as_ref());
-    let previous_deployment = if should_load_current_template_runtime(
-        project.template_slug.as_deref(),
-        persisted_runtime.as_ref(),
-    ) {
-        if let Some(current_deployment_id) = environment.current_deployment_id {
-            deployments::Entity::find_by_id(current_deployment_id)
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.is_in(["completed", "deployed"]))
-            .filter(deployments::Column::ImageName.is_not_null())
-            .one(state.db.as_ref())
-            .await
-            .map_err(|error| {
-                error!(%error, project_id, environment_id, "Could not load previous image deployment");
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Database Error")
-                    .with_detail(error.to_string())
-            })?
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let previous_runtime = previous_deployment.as_ref().and_then(|deployment| {
-        let metadata = deployment.metadata.as_ref();
-        deployment
-            .image_name
-            .clone()
-            .map(|image_ref| temps_entities::preset::ImageRuntimeConfig {
-                image_ref,
-                command: metadata.and_then(|value| value.command.clone()),
-                health_check_path: metadata.and_then(|value| value.health_check_path.clone()),
-            })
-    });
-    let saved_runtime = persisted_runtime
-        .or(previous_runtime)
-        .or_else(|| bundled_image_runtime(project.template_slug.as_deref()));
+    let saved_runtime = persisted_project_image_runtime(project.preset_config.as_ref());
 
     let effective_command = match req.command.as_ref() {
         Some(command) if command.is_empty() => None,
@@ -3280,31 +3220,6 @@ mod tests {
         assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:27.0.0");
         assert_eq!(runtime.command, None);
         assert_eq!(runtime.health_check_path.as_deref(), Some("/ready"));
-    }
-
-    #[test]
-    fn legacy_image_template_uses_bundled_runtime_snapshot() {
-        let runtime = bundled_image_runtime(Some("keycloak"))
-            .expect("bundled Keycloak runtime should resolve");
-        assert!(runtime.image_ref.starts_with("quay.io/keycloak/keycloak:"));
-        assert_eq!(runtime.command, Some(vec!["start".to_string()]));
-        assert_eq!(runtime.health_check_path.as_deref(), Some("/realms/master"));
-    }
-
-    #[test]
-    fn ordinary_image_projects_never_inherit_historical_template_runtime() {
-        assert!(!should_load_current_template_runtime(None, None));
-
-        let stored = temps_entities::preset::ImageRuntimeConfig {
-            image_ref: "example.test/app:1".to_string(),
-            command: None,
-            health_check_path: Some("/ready".to_string()),
-        };
-        assert!(!should_load_current_template_runtime(
-            Some("keycloak"),
-            Some(&stored)
-        ));
-        assert!(should_load_current_template_runtime(Some("keycloak"), None));
     }
 
     #[test]

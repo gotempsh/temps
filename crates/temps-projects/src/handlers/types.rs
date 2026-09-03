@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use temps_core::templates::TemplateService;
+use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
 use temps_entities::source_type::SourceType;
@@ -10,7 +10,6 @@ use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
 use crate::services::project::ProjectService;
-use crate::services::service_templates::ServiceTemplateCatalog;
 use crate::services::types::{CreateProjectEnvVar, ProjectError};
 use http::StatusCode;
 use std::sync::Arc;
@@ -27,7 +26,6 @@ pub struct AppState {
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
-    pub service_template_catalog: Arc<ServiceTemplateCatalog>,
     pub config_service: Arc<temps_config::ConfigService>,
     pub public_hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
     pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
@@ -327,11 +325,22 @@ pub struct ProjectResponse {
     pub directory: String,
     pub main_branch: String,
     pub preset: Option<String>,
+    /// Product lifecycle classification. `service` projects are tied to a
+    /// persisted, versioned template release; this is independent from the
+    /// deployment transport in `source_type`.
+    pub project_type: String,
     /// Bundled template slug that created this project. Clients use this to
     /// present template-specific runtime configuration instead of generic
     /// source-build controls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template_slug: Option<String>,
+    /// Logo from the immutable service-template release applied to this
+    /// project. Clients should prefer it over a deployed site's favicon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_template_image_url: Option<String>,
+    /// Exact service-template version currently applied to the project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_template_version: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<PresetConfigSchema>)]
@@ -430,7 +439,10 @@ impl ProjectResponse {
             directory: project.directory,
             main_branch: project.main_branch,
             preset: project.preset,
+            project_type: project.project_type,
             template_slug: project.template_slug,
+            service_template_image_url: project.service_template_image_url,
+            service_template_version: project.service_template_version,
             preset_config: project.preset_config,
             created_at: project.created_at.timestamp_millis(),
             updated_at: project.updated_at.timestamp_millis(),
@@ -726,6 +738,57 @@ pub struct UpdateServiceTemplateRuntimeRequest {
     pub memory_request: Option<i32>,
     pub memory_limit: Option<i32>,
     pub exposed_port: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTemplateChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+/// One reviewable change between the project's applied service release and
+/// the current catalog release. Values contain public template metadata only;
+/// project environment values and secrets never enter this response.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ServiceTemplateUpgradeChange {
+    pub field: String,
+    pub kind: ServiceTemplateChangeKind,
+    pub current: Option<String>,
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ServiceTemplateInstanceResponse {
+    pub project_id: i32,
+    pub applied: ServiceTemplateInstance,
+    /// Latest release for the same service family. Absent when the catalog no
+    /// longer carries the template; the applied snapshot is still usable.
+    pub latest: Option<ServiceTemplateInstance>,
+    pub upgrade_available: bool,
+    /// The catalog definition changed without a version bump. Applying it is
+    /// intentionally blocked because mutable releases make upgrades and
+    /// rollbacks non-reproducible.
+    pub catalog_drift: bool,
+    pub changes: Vec<ServiceTemplateUpgradeChange>,
+    /// Required target inputs that are not currently configured and cannot be
+    /// filled from a template default or generator.
+    pub required_configuration: Vec<EnvVarTemplate>,
+    /// Managed service families that must be linked before this release can be
+    /// applied. Existing links are never removed automatically.
+    pub missing_services: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct UpgradeServiceTemplateRequest {
+    /// Optimistic target selected from the preview. The server rejects a stale
+    /// target if the catalog changes between preview and apply.
+    pub target_version: String,
+    /// Values for inputs introduced by the target release. Existing project
+    /// values are preserved and cannot be overwritten through this endpoint.
+    #[serde(default)]
+    pub environment_variables: Vec<super::templates::EnvVarInput>,
 }
 
 /// Deserialize a PATCH integer field while preserving the distinction between

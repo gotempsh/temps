@@ -546,7 +546,7 @@ impl WorkflowPlanner {
             &mut env_vars_map,
             linked_service_vars,
             explicit_project_vars,
-            project.template_slug.as_deref(),
+            project.service_template.as_ref(),
             project.id,
             environment.id,
         )?;

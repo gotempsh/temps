@@ -3,10 +3,8 @@
 
 //! Persist curated-template provenance on projects.
 //!
-//! The value is a reviewed bundled slug, the fixed `custom` marker, a temporary
-//! source-bound catalog marker, or an attested
-//! `service_catalog:<public-slug>` marker. It lets deployment telemetry
-//! distinguish bundled, service-catalog, custom-template, and ordinary
+//! The value is a reviewed bundled slug or the fixed `custom` marker. It lets
+//! deployment telemetry distinguish bundled, custom-template, and ordinary
 //! projects without sending operator-defined slugs, repository names, URLs, or
 //! other user-controlled text.
 

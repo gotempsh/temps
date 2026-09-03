@@ -48,6 +48,11 @@ pub struct Project {
     pub preset: Option<String>,
     /// Bundled template provenance persisted on the project row.
     pub template_slug: Option<String>,
+    /// Logo captured in the applied service-template release. This remains
+    /// stable even when the live catalog changes.
+    pub service_template_image_url: Option<String>,
+    /// Exact applied service-template version.
+    pub service_template_version: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     pub preset_config: Option<serde_json::Value>,
     pub created_at: UtcDateTime,
