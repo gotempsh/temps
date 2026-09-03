@@ -5,27 +5,9 @@
 //!
 //! HTTP handlers for template-related endpoints.
 
-use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use temps_auth::RequireAuth;
-use temps_core::{
-    problemdetails::{self, Problem},
-    templates::{
-        EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateResources, TemplateService,
-    },
-};
-use utoipa::{OpenApi, ToSchema};
-
-/// State for template handlers
-pub struct TemplateAppState {
-    pub template_service: Arc<TemplateService>,
-}
+use temps_core::templates::{EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateResources};
+use utoipa::ToSchema;
 
 /// Query parameters for listing templates
 #[derive(Debug, Deserialize, ToSchema)]
@@ -294,156 +276,10 @@ pub struct CreateProjectFromTemplateResponse {
     pub message: String,
 }
 
-/// Configure template routes
-pub fn configure_routes() -> Router<Arc<TemplateAppState>> {
-    Router::new()
-        .route("/templates", get(list_templates))
-        .route("/templates/tags", get(list_tags))
-        .route("/templates/{slug}", get(get_template))
-}
-
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        list_templates,
-        get_template,
-        list_tags,
-    ),
-    components(
-        schemas(
-            ListTemplatesQuery,
-            TemplateResponse,
-            GitRefResponse,
-            EnvVarTemplateResponse,
-            ListTemplatesResponse,
-            ListTagsResponse,
-            CreateProjectFromTemplateRequest,
-            EnvVarInput,
-            CreateProjectFromTemplateResponse,
-        )
-    ),
-    tags(
-        (name = "Templates", description = "Project template endpoints")
-    )
-)]
-pub struct TemplatesApiDoc;
-
-/// List all available templates
-///
-/// Returns a list of all public templates, optionally filtered by tag or featured status.
-#[utoipa::path(
-    get,
-    path = "/templates",
-    tag = "Templates",
-    operation_id = "list_templates",
-    params(
-        ("tag" = Option<String>, Query, description = "Filter templates by tag"),
-        ("featured" = Option<bool>, Query, description = "Only return featured templates"),
-        ("kind" = Option<TemplateKind>, Query, description = "Filter by gallery: starter or service")
-    ),
-    responses(
-        (status = 200, description = "List of templates", body = ListTemplatesResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn list_templates(
-    State(state): State<Arc<TemplateAppState>>,
-    RequireAuth(_auth): RequireAuth,
-    Query(query): Query<ListTemplatesQuery>,
-) -> Result<impl IntoResponse, Problem> {
-    let mut templates = state.template_service.list_templates().await;
-    if let Some(kind) = query.kind {
-        templates.retain(|template| template.kind == kind);
-    }
-    if query.featured == Some(true) {
-        templates.retain(|template| template.is_featured);
-    }
-    if let Some(tag) = query.tag {
-        templates.retain(|template| {
-            template
-                .tags
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(&tag))
-        });
-    }
-
-    let total = templates.len();
-    let response = ListTemplatesResponse {
-        templates: templates.into_iter().map(TemplateResponse::from).collect(),
-        total,
-    };
-
-    Ok(Json(response))
-}
-
-/// Get a specific template by slug
-///
-/// Returns detailed information about a single template.
-#[utoipa::path(
-    get,
-    path = "/templates/{slug}",
-    tag = "Templates",
-    operation_id = "get_template",
-    params(
-        ("slug" = String, Path, description = "Template slug")
-    ),
-    responses(
-        (status = 200, description = "Template details", body = TemplateResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Template not found"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn get_template(
-    State(state): State<Arc<TemplateAppState>>,
-    RequireAuth(_auth): RequireAuth,
-    Path(slug): Path<String>,
-) -> Result<impl IntoResponse, Problem> {
-    let template = state
-        .template_service
-        .get_template(&slug)
-        .await
-        .map_err(|e| {
-            problemdetails::new(http::StatusCode::NOT_FOUND)
-                .with_title("Template Not Found")
-                .with_detail(e.to_string())
-        })?;
-
-    Ok(Json(TemplateResponse::from(template)))
-}
-
-/// List all available tags
-///
-/// Returns a list of all unique tags used by public templates.
-#[utoipa::path(
-    get,
-    path = "/templates/tags",
-    tag = "Templates",
-    operation_id = "list_template_tags",
-    responses(
-        (status = 200, description = "List of tags", body = ListTagsResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn list_tags(
-    State(state): State<Arc<TemplateAppState>>,
-    RequireAuth(_auth): RequireAuth,
-) -> Result<impl IntoResponse, Problem> {
-    let tags = state.template_service.list_tags().await;
-    let total = tags.len();
-
-    Ok(Json(ListTagsResponse { tags, total }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::templates::{GitRef, TemplatesConfig};
+    use temps_core::templates::{GitRef, TemplateService, TemplatesConfig};
 
     fn create_test_template() -> ProjectTemplate {
         ProjectTemplate {
@@ -575,15 +411,11 @@ templates:
         let templates = service.list_templates().await;
         assert_eq!(templates.len(), 2);
 
-        // Test list_featured_templates
-        let featured = service.list_featured_templates().await;
-        assert_eq!(featured.len(), 1);
-        assert_eq!(featured[0].slug, "test-1");
-
-        // Test list_templates_by_tag
-        let python_templates = service.list_templates_by_tag("python").await;
-        assert_eq!(python_templates.len(), 1);
-        assert_eq!(python_templates[0].slug, "test-2");
+        assert!(templates[0].is_featured);
+        assert!(templates[1]
+            .tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("python")));
 
         // Test get_template
         let template = service.get_template("test-1").await.unwrap();

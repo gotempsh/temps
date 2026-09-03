@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { lstat, readdir, readFile } from "node:fs/promises";
+import { basename, extname, join, relative, sep } from "node:path";
+
 export interface NativeTemplateValidationResult {
   valid: boolean;
   errors: string[];
@@ -8,6 +11,9 @@ export interface NativeTemplateValidationResult {
 }
 
 const SUPPORTED_KINDS = new Set(["starter", "service"]);
+const MAX_TEMPLATE_DIRECTORY_DEPTH = 16;
+const MAX_TEMPLATE_FILES = 1_000;
+const MAX_TEMPLATE_YAML_BYTES = 1024 * 1024;
 const SUPPORTED_MANAGED_SERVICES = new Set([
   "postgres",
   "mariadb",
@@ -78,17 +84,22 @@ function pinnedImageReference(image: string): boolean {
   );
 }
 
-function isSecretEnvironmentVariable(variable: Record<string, unknown>): boolean {
+function isSecretEnvironmentVariable(
+  variable: Record<string, unknown>,
+): boolean {
   if (variable.secret === true) return true;
   const generator = variable.default_generator;
   if (typeof generator === "string" && generator.includes("secret")) {
     return true;
   }
 
-  const name = typeof variable.name === "string" ? variable.name.toUpperCase() : "";
-  const secretSegment = name.split("_").some((segment) =>
-    ["SECRET", "PASSWORD", "PASSWD", "TOKEN", "PRIVATEKEY"].includes(segment),
-  );
+  const name =
+    typeof variable.name === "string" ? variable.name.toUpperCase() : "";
+  const secretSegment = name
+    .split("_")
+    .some((segment) =>
+      ["SECRET", "PASSWORD", "PASSWD", "TOKEN", "PRIVATEKEY"].includes(segment),
+    );
   const secretSuffixes = [
     "_API_KEY",
     "_PRIVATE_KEY",
@@ -141,16 +152,20 @@ export function validateNativeTemplateConfig(
     };
   }
 
-  if (document.version !== "2") {
+  const catalog = Array.isArray(document.templates)
+    ? document
+    : { version: "2", templates: [document] };
+
+  if (catalog.version !== "2") {
     errors.push('version must be "2"');
   }
-  if (!Array.isArray(document.templates)) {
+  if (!Array.isArray(catalog.templates)) {
     errors.push("templates must be an array");
     return { valid: false, errors, templateCount: 0 };
   }
 
   const seenSlugs = new Set<string>();
-  document.templates.forEach((value, index) => {
+  catalog.templates.forEach((value, index) => {
     const prefix = `templates[${index}]`;
     if (!isRecord(value)) {
       errors.push(`${prefix} must be an object`);
@@ -340,30 +355,133 @@ export function validateNativeTemplateConfig(
   return {
     valid: errors.length === 0,
     errors,
-    templateCount: document.templates.length,
+    templateCount: catalog.templates.length,
   };
 }
 
-export async function readAndValidateTemplateFile(
+async function yamlFilesIn(
+  path: string,
+  depth = 0,
+  files: string[] = [],
+): Promise<string[]> {
+  if (depth > MAX_TEMPLATE_DIRECTORY_DEPTH) {
+    throw new Error(
+      `Template directory exceeds the maximum depth of ${MAX_TEMPLATE_DIRECTORY_DEPTH}`,
+    );
+  }
+
+  const metadata = await lstat(path);
+  if (metadata.isSymbolicLink()) {
+    throw new Error(`Symbolic links are not allowed in template paths: ${path}`);
+  }
+  if (metadata.isFile()) {
+    if (extname(path) !== ".yaml") return files;
+    if (metadata.size > MAX_TEMPLATE_YAML_BYTES) {
+      throw new Error(
+        `Template YAML exceeds the ${MAX_TEMPLATE_YAML_BYTES}-byte limit: ${path}`,
+      );
+    }
+    if (files.length >= MAX_TEMPLATE_FILES) {
+      throw new Error(
+        `Template directory exceeds the ${MAX_TEMPLATE_FILES}-file limit`,
+      );
+    }
+    files.push(path);
+    return files;
+  }
+  if (!metadata.isDirectory()) return files;
+
+  const entries = await readdir(path, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    await yamlFilesIn(join(path, entry.name), depth + 1, files);
+  }
+  return files;
+}
+
+export async function readAndValidateTemplatePath(
   path: string,
 ): Promise<NativeTemplateValidationResult> {
-  const file = Bun.file(path);
-  if (!(await file.exists())) {
-    return {
-      valid: false,
-      errors: [`File not found: ${path}`],
-      templateCount: 0,
-    };
-  }
+  let files: string[];
   try {
-    return validateNativeTemplateConfig(Bun.YAML.parse(await file.text()));
+    files = await yamlFilesIn(path);
   } catch (error) {
     return {
       valid: false,
       errors: [
-        `Invalid YAML: ${error instanceof Error ? error.message : String(error)}`,
+        `Cannot read template path ${path}: ${error instanceof Error ? error.message : String(error)}`,
       ],
       templateCount: 0,
     };
   }
+
+  if (files.length === 0) {
+    return {
+      valid: false,
+      errors: [`No .yaml template files found at: ${path}`],
+      templateCount: 0,
+    };
+  }
+
+  if (files.length === 1 && files[0] === path) {
+    try {
+      return validateNativeTemplateConfig(
+        Bun.YAML.parse(await readFile(path, "utf8")),
+      );
+    } catch (error) {
+      return {
+        valid: false,
+        errors: [
+          `Invalid YAML: ${error instanceof Error ? error.message : String(error)}`,
+        ],
+        templateCount: 0,
+      };
+    }
+  }
+
+  const templates: unknown[] = [];
+  const errors: string[] = [];
+  for (const file of files) {
+    const filePath = relative(path, file).split(sep).join("/");
+    try {
+      const document = Bun.YAML.parse(await readFile(file, "utf8"));
+      if (!isRecord(document) || Array.isArray(document.templates)) {
+        errors.push(`${filePath} must contain one template object directly`);
+        continue;
+      }
+      const directory = filePath.split("/", 1)[0];
+      const expectedKind =
+        directory === "services"
+          ? "service"
+          : directory === "starters"
+            ? "starter"
+            : undefined;
+      if (!expectedKind) {
+        errors.push(`${filePath} must be under services/ or starters/`);
+      } else if (document.kind !== expectedKind) {
+        errors.push(
+          `${filePath} declares kind "${String(document.kind)}" but its directory requires "${expectedKind}"`,
+        );
+      }
+      const expectedFilename =
+        typeof document.slug === "string" ? `${document.slug}.yaml` : undefined;
+      if (expectedFilename && basename(file) !== expectedFilename) {
+        errors.push(
+          `${filePath} must use its slug as the filename (${expectedFilename})`,
+        );
+      }
+      templates.push(document);
+    } catch (error) {
+      errors.push(
+        `${filePath}: invalid YAML: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  const result = validateNativeTemplateConfig({ version: "2", templates });
+  return {
+    valid: errors.length === 0 && result.valid,
+    errors: [...errors, ...result.errors],
+    templateCount: templates.length,
+  };
 }

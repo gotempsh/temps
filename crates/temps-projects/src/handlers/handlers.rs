@@ -354,7 +354,7 @@ async fn require_storage_services_access(
         .external_service_manager
         .project_scopes_for_services(service_ids)
         .await
-        .map_err(|error| match error {
+        .map_err(|error| match &error {
             temps_providers::ExternalServiceError::ServiceNotFound { .. } => {
                 storage_service_access_denied()
             }
@@ -2147,11 +2147,21 @@ pub async fn upgrade_project_service_template(
         .template_service
         .get_service_template_instance(&applied.slug)
         .await
-        .map_err(|error| {
-            temps_core::error_builder::not_found()
-                .title("Service Template Not Found")
-                .detail(error.to_string())
-                .build()
+        .map_err(|error| match error {
+            temps_core::templates::TemplateConfigError::NotFound(_) => {
+                temps_core::error_builder::not_found()
+                    .title("Service Template Not Found")
+                    .detail(error.to_string())
+                    .build()
+            }
+            temps_core::templates::TemplateConfigError::IoError(_)
+            | temps_core::templates::TemplateConfigError::ParseError(_)
+            | temps_core::templates::TemplateConfigError::ValidationErrors(_) => {
+                temps_core::error_builder::internal_server_error()
+                    .title("Service Template Catalog Invalid")
+                    .detail(error.to_string())
+                    .build()
+            }
         })?;
     let previous_template_version = applied.version.clone();
     let previous_template_image = applied.template.image.clone();

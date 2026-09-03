@@ -461,6 +461,22 @@ struct FailedContainerCandidate {
     node_id: Option<i32>,
 }
 
+fn lock_deployment_state<'a, T>(
+    mutex: &'a Mutex<T>,
+    state_name: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(
+                state_name,
+                "Recovering poisoned deployment state lock to preserve container cleanup"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 impl std::fmt::Debug for DeployImageJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeployImageJob")
@@ -1061,7 +1077,7 @@ impl DeployImageJob {
         context: &WorkflowContext,
     ) -> Result<(), WorkflowError> {
         let should_log = {
-            let mut task_handle = self.log_stream_task.lock().unwrap();
+            let mut task_handle = lock_deployment_state(&self.log_stream_task, "log_stream_task");
             if let Some(handle) = task_handle.take() {
                 handle.abort();
                 true
@@ -1084,7 +1100,7 @@ impl DeployImageJob {
 
         // Then clean up all containers
         let container_ids = {
-            let guard = self.container_ids.lock().unwrap();
+            let guard = lock_deployment_state(&self.container_ids, "container_ids");
             guard.clone()
         };
 
@@ -1102,7 +1118,8 @@ impl DeployImageJob {
 
                 // Use per-replica deployer if available, otherwise fall back to local
                 let deployer = {
-                    let deployers = self.replica_deployers.lock().unwrap();
+                    let deployers =
+                        lock_deployment_state(&self.replica_deployers, "replica_deployers");
                     deployers
                         .get(container_id)
                         .cloned()
@@ -1151,7 +1168,8 @@ impl DeployImageJob {
         if self.retention_forbidden.load(Ordering::Acquire) {
             return self.cleanup_container(context).await;
         }
-        let candidates = self.failed_candidates.lock().unwrap().clone();
+        let candidates =
+            lock_deployment_state(&self.failed_candidates, "failed_candidates").clone();
         if candidates.is_empty() {
             return self.cleanup_container(context).await;
         }
@@ -1166,7 +1184,8 @@ impl DeployImageJob {
         };
 
         self.stop_background_log_stream(context).await?;
-        let replica_deployers = self.replica_deployers.lock().unwrap().clone();
+        let replica_deployers =
+            lock_deployment_state(&self.replica_deployers, "replica_deployers").clone();
         for candidate in &candidates {
             let deployer = replica_deployers
                 .get(&candidate.container_id)
@@ -1248,10 +1267,7 @@ impl DeployImageJob {
         self.retained_failure.store(false, Ordering::Release);
         self.cleanup_container(context).await?;
 
-        let candidate_ids = self
-            .failed_candidates
-            .lock()
-            .unwrap()
+        let candidate_ids = lock_deployment_state(&self.failed_candidates, "failed_candidates")
             .iter()
             .map(|candidate| candidate.container_id.clone())
             .collect::<Vec<_>>();
@@ -1916,11 +1932,11 @@ impl DeployImageJob {
 
         // CRITICAL: Store container_id immediately for cleanup on failure/cancellation
         {
-            let mut container_ids = self.container_ids.lock().unwrap();
+            let mut container_ids = lock_deployment_state(&self.container_ids, "container_ids");
             container_ids.push(deploy_result.container_id.clone());
         }
         {
-            let mut deployers = self.replica_deployers.lock().unwrap();
+            let mut deployers = lock_deployment_state(&self.replica_deployers, "replica_deployers");
             deployers.insert(deploy_result.container_id.clone(), deployer.clone());
         }
 
@@ -1951,7 +1967,8 @@ impl DeployImageJob {
             }
         }
         {
-            let mut candidates = self.failed_candidates.lock().unwrap();
+            let mut candidates =
+                lock_deployment_state(&self.failed_candidates, "failed_candidates");
             candidates.push(FailedContainerCandidate {
                 container_id: deploy_result.container_id.clone(),
                 container_name: deploy_result.container_name.clone(),
@@ -2144,7 +2161,7 @@ impl DeployImageJob {
 
         // Store the task handle for cleanup on cancellation
         {
-            let mut task_handle = self.log_stream_task.lock().unwrap();
+            let mut task_handle = lock_deployment_state(&self.log_stream_task, "log_stream_task");
             *task_handle = Some(log_task);
         }
 
@@ -2947,6 +2964,21 @@ mod tests {
         fn stage_id(&self) -> i32 {
             1
         }
+    }
+
+    #[test]
+    fn poisoned_deployment_state_is_recovered_for_cleanup() {
+        let state = Arc::new(Mutex::new(vec!["candidate".to_string()]));
+        let poison_target = Arc::clone(&state);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_target.lock().expect("initial lock");
+            panic!("poison deployment state for regression coverage");
+        });
+
+        let mut recovered = lock_deployment_state(&state, "test_state");
+        recovered.push("cleanup".to_string());
+
+        assert_eq!(recovered.as_slice(), ["candidate", "cleanup"]);
     }
 
     fn build_output_with_tags(tags: &[(&str, &str)]) -> BuildImageOutput {

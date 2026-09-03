@@ -205,7 +205,7 @@ pub fn list_compose_services(yaml: &str) -> Result<Vec<ComposeServicePreview>, C
 /// Extract one unambiguous HTTP path from a Compose healthcheck that probes a
 /// loopback address. We intentionally ignore remote hosts, non-HTTP commands,
 /// and checks with multiple different paths.
-pub fn http_healthcheck_path(healthcheck: &serde_yaml::Value) -> Option<String> {
+fn http_healthcheck_path(healthcheck: &serde_yaml::Value) -> Option<String> {
     let mut paths = std::collections::BTreeSet::new();
     visit_healthcheck_strings(healthcheck, &mut |text| {
         for scheme in ["http://", "https://"] {

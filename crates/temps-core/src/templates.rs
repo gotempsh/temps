@@ -4,10 +4,13 @@
 //! Project Templates Configuration
 //!
 //! Curated project templates that users can use to quickly create new projects.
-//! Templates are defined in a YAML configuration file for easy customization.
+//! Bundled templates are individual YAML files grouped by template kind.
+//! Operators may still provide a single catalog file for local customization.
 
+use include_dir::{include_dir, Dir};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -371,33 +374,9 @@ impl TemplatesConfig {
         self.templates.iter().filter(|t| t.is_public).collect()
     }
 
-    /// Get featured templates
-    pub fn featured_templates(&self) -> Vec<&ProjectTemplate> {
-        self.templates
-            .iter()
-            .filter(|t| t.is_public && t.is_featured)
-            .collect()
-    }
-
-    /// Get templates by tag
-    pub fn templates_by_tag(&self, tag: &str) -> Vec<&ProjectTemplate> {
-        self.templates
-            .iter()
-            .filter(|t| t.is_public && t.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)))
-            .collect()
-    }
-
     /// Get a template by slug
     pub fn get_by_slug(&self, slug: &str) -> Option<&ProjectTemplate> {
         self.templates.iter().find(|t| t.slug == slug)
-    }
-
-    /// Get public templates for one gallery.
-    pub fn templates_by_kind(&self, kind: TemplateKind) -> Vec<&ProjectTemplate> {
-        self.templates
-            .iter()
-            .filter(|template| template.is_public && template.kind == kind)
-            .collect()
     }
 
     /// Get all unique tags
@@ -485,33 +464,139 @@ pub enum TemplateConfigError {
     ValidationErrors(Vec<TemplateValidationError>),
 }
 
-/// Bundled default templates (embedded at compile time)
-const BUNDLED_TEMPLATES: &str = include_str!("../templates.yaml");
+/// Bundled templates are embedded recursively so adding a catalog entry only
+/// requires a new YAML file. Directory names are part of the schema: starters
+/// live in `templates/starters` and native services in `templates/services`.
+static BUNDLED_TEMPLATE_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/templates");
+
+static BUNDLED_TEMPLATES: Lazy<Result<TemplatesConfig, TemplateConfigError>> =
+    Lazy::new(load_bundled_templates);
+
+fn collect_bundled_yaml_files(
+    directory: &'static Dir<'static>,
+    files: &mut Vec<(&'static str, &'static str)>,
+) -> Result<(), TemplateConfigError> {
+    for file in directory.files() {
+        if file
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("yaml")
+        {
+            continue;
+        }
+        let path = file.path().to_str().ok_or_else(|| {
+            TemplateConfigError::ParseError(
+                "Bundled template path contains invalid UTF-8".to_string(),
+            )
+        })?;
+        let yaml = file.contents_utf8().ok_or_else(|| {
+            TemplateConfigError::ParseError(format!(
+                "Bundled template '{path}' contains invalid UTF-8"
+            ))
+        })?;
+        files.push((path, yaml));
+    }
+    for child in directory.dirs() {
+        collect_bundled_yaml_files(child, files)?;
+    }
+    Ok(())
+}
+
+fn load_bundled_templates() -> Result<TemplatesConfig, TemplateConfigError> {
+    let mut files = Vec::new();
+    collect_bundled_yaml_files(&BUNDLED_TEMPLATE_DIR, &mut files)?;
+    parse_bundled_templates(files)
+}
+
+fn parse_bundled_templates(
+    mut files: Vec<(&str, &str)>,
+) -> Result<TemplatesConfig, TemplateConfigError> {
+    files.sort_unstable_by_key(|(path, _)| *path);
+
+    let mut templates = Vec::with_capacity(files.len());
+    let mut slug_sources = BTreeMap::new();
+    for (path, yaml) in files {
+        let template: ProjectTemplate = serde_yaml::from_str(yaml).map_err(|error| {
+            TemplateConfigError::ParseError(format!(
+                "Failed to parse bundled template '{path}': {error}"
+            ))
+        })?;
+        let expected_kind = if path.starts_with("services/") {
+            TemplateKind::Service
+        } else if path.starts_with("starters/") {
+            TemplateKind::Starter
+        } else {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Bundled template '{path}' must be placed under templates/services or templates/starters"
+            )));
+        };
+        if template.kind != expected_kind {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Bundled template '{}' declares kind '{:?}' but is stored in '{}'",
+                template.slug, template.kind, path
+            )));
+        }
+        let file_stem = Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| {
+                TemplateConfigError::ParseError(format!(
+                    "Bundled template '{path}' does not have a valid UTF-8 filename"
+                ))
+            })?;
+        if file_stem != template.slug {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Bundled template '{path}' must use its slug '{}' as the filename",
+                template.slug
+            )));
+        }
+        if let Some(previous_path) = slug_sources.insert(template.slug.clone(), path) {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Bundled template slug '{}' is duplicated in '{previous_path}' and '{path}'",
+                template.slug
+            )));
+        }
+        templates.push(template);
+    }
+
+    if templates.is_empty() {
+        return Err(TemplateConfigError::ParseError(
+            "Bundled template directory contains no YAML templates".to_string(),
+        ));
+    }
+
+    let config = TemplatesConfig {
+        version: SERVICE_TEMPLATE_SCHEMA_VERSION.to_string(),
+        templates,
+    };
+    let validation_errors = TemplateService::validate_config(&config);
+    if validation_errors.is_empty() {
+        Ok(config)
+    } else {
+        Err(TemplateConfigError::ValidationErrors(validation_errors))
+    }
+}
+
+fn bundled_templates_config() -> Result<&'static TemplatesConfig, TemplateConfigError> {
+    BUNDLED_TEMPLATES.as_ref().map_err(Clone::clone)
+}
 
 /// Maximum template slug length accepted by the catalog and project schema.
 pub const MAX_TEMPLATE_SLUG_CHARS: usize = 255;
 
-/// Fixed, reviewable labels that are safe to include in anonymous telemetry.
-///
-/// Operators can load private templates with arbitrary slugs. Those slugs must
-/// never leave the instance, so telemetry callers must pass them through
-/// [`telemetry_safe_template_slug`] and treat `None` as a custom template.
-const BUNDLED_TELEMETRY_TEMPLATE_SLUGS: &[&str] = &[
-    "observability-starter",
-    "nextjs-saas-starter",
-    "nextjs-docs-template",
-    "keycloak",
-    "browserless",
-];
-
 /// Return a bundled template only when the slug is part of the embedded,
 /// reviewed catalog. Runtime configuration files cannot influence this lookup.
+/// This is public solely for cross-crate test fixtures; production code must
+/// resolve templates through [`TemplateService`].
+#[doc(hidden)]
 pub fn bundled_template_by_slug(slug: &str) -> Option<ProjectTemplate> {
-    TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
+    bundled_templates_config()
         .ok()?
         .templates
-        .into_iter()
+        .iter()
         .find(|template| template.slug == slug)
+        .cloned()
 }
 
 /// Stored provenance marker for projects created from an operator-defined
@@ -520,8 +605,11 @@ pub const CUSTOM_TEMPLATE_PROVENANCE: &str = "custom";
 
 /// Return the slug only when it is a fixed label from the bundled catalog.
 pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
-    BUNDLED_TELEMETRY_TEMPLATE_SLUGS
-        .contains(&slug)
+    bundled_templates_config()
+        .ok()?
+        .templates
+        .iter()
+        .any(|template| template.slug == slug && template.is_public)
         .then_some(slug)
 }
 
@@ -534,7 +622,7 @@ pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
 /// matches a public label.
 pub fn bundled_telemetry_template_slug(template: &ProjectTemplate) -> Option<&str> {
     telemetry_safe_template_slug(&template.slug)?;
-    let bundled = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES).ok()?;
+    let bundled = bundled_templates_config().ok()?;
     bundled
         .templates
         .iter()
@@ -558,10 +646,10 @@ impl TemplateService {
     /// Bundled templates are loaded automatically; external file can override them
     pub fn new(config_path: Option<std::path::PathBuf>) -> Self {
         // Load bundled templates by default
-        let config = match TemplatesConfig::from_yaml(BUNDLED_TEMPLATES) {
+        let config = match bundled_templates_config() {
             Ok(config) => {
                 info!("Loaded {} bundled templates", config.templates.len());
-                config
+                config.clone()
             }
             Err(e) => {
                 warn!("Failed to parse bundled templates: {}", e);
@@ -800,9 +888,16 @@ impl TemplateService {
     /// Validate all templates in a config and return validation errors
     pub fn validate_config(config: &TemplatesConfig) -> Vec<TemplateValidationError> {
         let mut validation_errors = Vec::new();
+        let mut slugs = BTreeSet::new();
 
         for template in &config.templates {
-            let errors = Self::validate_template(template);
+            let mut errors = Self::validate_template(template);
+            if !slugs.insert(template.slug.as_str()) {
+                errors.push(format!(
+                    "Template slug '{}' is declared more than once",
+                    template.slug
+                ));
+            }
             if !errors.is_empty() {
                 validation_errors.push(TemplateValidationError {
                     slug: template.slug.clone(),
@@ -878,34 +973,6 @@ impl TemplateService {
         templates
     }
 
-    /// Get featured templates
-    pub async fn list_featured_templates(&self) -> Vec<ProjectTemplate> {
-        let config = self.config.read().await;
-        let mut templates: Vec<_> = config.featured_templates().into_iter().cloned().collect();
-        templates.sort_by_key(|a| a.sort_order);
-        templates
-    }
-
-    /// Get templates filtered by tag
-    pub async fn list_templates_by_tag(&self, tag: &str) -> Vec<ProjectTemplate> {
-        let config = self.config.read().await;
-        let mut templates: Vec<_> = config.templates_by_tag(tag).into_iter().cloned().collect();
-        templates.sort_by_key(|a| a.sort_order);
-        templates
-    }
-
-    /// Get public templates for one gallery.
-    pub async fn list_templates_by_kind(&self, kind: TemplateKind) -> Vec<ProjectTemplate> {
-        let config = self.config.read().await;
-        let mut templates: Vec<_> = config
-            .templates_by_kind(kind)
-            .into_iter()
-            .cloned()
-            .collect();
-        templates.sort_by_key(|template| template.sort_order);
-        templates
-    }
-
     /// Get a template by slug
     pub async fn get_template(&self, slug: &str) -> Result<ProjectTemplate, TemplateConfigError> {
         let config = self.config.read().await;
@@ -938,15 +1005,6 @@ impl TemplateService {
         instance
             .validate()
             .map_err(|error| TemplateConfigError::ParseError(error.to_string()))?;
-        let validation_errors = Self::validate_template(&instance.template);
-        if !validation_errors.is_empty() {
-            return Err(TemplateConfigError::ValidationErrors(vec![
-                TemplateValidationError {
-                    slug: instance.slug.clone(),
-                    errors: validation_errors,
-                },
-            ]));
-        }
         Ok(instance)
     }
 
@@ -1086,31 +1144,6 @@ templates:
         let config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).unwrap();
         let public = config.public_templates();
         assert_eq!(public.len(), 2);
-    }
-
-    #[test]
-    fn test_featured_templates() {
-        let config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).unwrap();
-        let featured = config.featured_templates();
-        assert_eq!(featured.len(), 1);
-        assert_eq!(featured[0].slug, "nextjs-saas-starter");
-    }
-
-    #[test]
-    fn test_templates_by_tag() {
-        let config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).unwrap();
-
-        let saas = config.templates_by_tag("saas");
-        assert_eq!(saas.len(), 1);
-        assert_eq!(saas[0].slug, "nextjs-saas-starter");
-
-        let python = config.templates_by_tag("python");
-        assert_eq!(python.len(), 1);
-        assert_eq!(python[0].slug, "fastapi-backend");
-
-        // Case insensitive
-        let backend = config.templates_by_tag("BACKEND");
-        assert_eq!(backend.len(), 1);
     }
 
     #[test]
@@ -1337,10 +1370,6 @@ templates:
         // Should be sorted by sort_order
         assert_eq!(templates[0].slug, "nextjs-saas-starter");
 
-        // Test list_featured_templates
-        let featured = service.list_featured_templates().await;
-        assert_eq!(featured.len(), 1);
-
         // Test get_template
         let template = service.get_template("fastapi-backend").await.unwrap();
         assert_eq!(template.name, "FastAPI Backend");
@@ -1352,10 +1381,6 @@ templates:
         // Test list_tags
         let tags = service.list_tags().await;
         assert!(!tags.is_empty());
-
-        // Test list_templates_by_tag
-        let python_templates = service.list_templates_by_tag("python").await;
-        assert_eq!(python_templates.len(), 1);
     }
 
     #[tokio::test]
@@ -1447,17 +1472,16 @@ templates:
 
     #[test]
     fn test_bundled_templates_parse_and_validate() {
-        // The bundled templates.yaml is embedded at compile time and loaded on
-        // every startup. Guard against YAML breakage and invalid template
-        // definitions (bad git URLs, unknown services, etc.).
-        let config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
-            .expect("bundled templates.yaml must parse");
+        // Every YAML file in the bundled template directory is embedded at
+        // compile time. Guard against malformed files, duplicate slugs, folder
+        // mismatches, invalid git URLs, and unknown managed services.
+        let config = bundled_templates_config().expect("bundled templates must parse");
         assert!(
             !config.templates.is_empty(),
             "bundled templates should not be empty"
         );
 
-        let errors = TemplateService::validate_config(&config);
+        let errors = TemplateService::validate_config(config);
         assert!(
             errors.is_empty(),
             "bundled templates have validation errors: {:?}",
@@ -1484,16 +1508,138 @@ templates:
     }
 
     #[test]
+    fn bundled_template_files_are_sorted_deterministically() {
+        let alpha = r#"
+slug: alpha
+name: Alpha
+kind: starter
+git:
+  url: https://example.com/alpha.git
+preset: nextjs
+sort_order: 10
+"#;
+        let zulu = r#"
+slug: zulu
+name: Zulu
+kind: service
+version: 1.0.0
+git:
+  url: https://example.com/zulu.git
+preset: dockerfile
+image: example.com/zulu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+exposed_port: 3000
+sort_order: 0
+"#;
+
+        let config = parse_bundled_templates(vec![
+            ("services/zulu.yaml", zulu),
+            ("starters/alpha.yaml", alpha),
+        ])
+        .expect("valid template files should load");
+
+        assert_eq!(
+            config
+                .templates
+                .iter()
+                .map(|template| template.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zulu", "alpha"]
+        );
+    }
+
+    #[test]
+    fn bundled_template_folder_must_match_declared_kind() {
+        let yaml = r#"
+slug: misplaced
+name: Misplaced
+kind: service
+version: 1.0.0
+git:
+  url: https://example.com/misplaced.git
+preset: dockerfile
+image: example.com/misplaced@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+exposed_port: 3000
+"#;
+
+        let error = parse_bundled_templates(vec![("starters/misplaced.yaml", yaml)])
+            .expect_err("a service in the starter directory must be rejected");
+
+        assert!(
+            matches!(error, TemplateConfigError::ParseError(message) if message.contains("declares kind"))
+        );
+    }
+
+    #[test]
+    fn bundled_template_filename_must_match_slug() {
+        let yaml = r#"
+slug: actual-slug
+name: Actual slug
+kind: starter
+git:
+  url: https://example.com/actual.git
+preset: nextjs
+"#;
+
+        let error = parse_bundled_templates(vec![("starters/wrong-name.yaml", yaml)])
+            .expect_err("a mismatched filename must be rejected");
+
+        assert!(
+            matches!(error, TemplateConfigError::ParseError(message) if message.contains("must use its slug"))
+        );
+    }
+
+    #[test]
+    fn bundled_template_slugs_must_be_unique_across_subdirectories() {
+        let yaml = r#"
+slug: duplicate
+name: Duplicate
+kind: starter
+git:
+  url: https://example.com/duplicate.git
+preset: nextjs
+"#;
+
+        let error = parse_bundled_templates(vec![
+            ("starters/product/duplicate.yaml", yaml),
+            ("starters/framework/duplicate.yaml", yaml),
+        ])
+        .expect_err("duplicate slugs must be rejected across the whole catalog");
+
+        assert!(
+            matches!(error, TemplateConfigError::ParseError(message) if message.contains("duplicated"))
+        );
+    }
+
+    #[test]
+    fn template_config_rejects_duplicate_slugs() {
+        let mut config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).expect("sample config parses");
+        config.templates.push(config.templates[0].clone());
+
+        let errors = TemplateService::validate_config(&config);
+
+        assert!(errors.iter().any(|error| {
+            error.slug == config.templates[0].slug
+                && error
+                    .errors
+                    .iter()
+                    .any(|message| message.contains("declared more than once"))
+        }));
+    }
+
+    #[test]
     fn telemetry_slug_allowlist_exactly_matches_bundled_catalog() {
-        let config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
-            .expect("bundled templates.yaml must parse");
+        let config = bundled_templates_config().expect("bundled templates must parse");
         let bundled: std::collections::BTreeSet<&str> = config
             .templates
             .iter()
+            .filter(|template| template.is_public)
             .map(|template| template.slug.as_str())
             .collect();
-        let allowlisted: std::collections::BTreeSet<&str> =
-            BUNDLED_TELEMETRY_TEMPLATE_SLUGS.iter().copied().collect();
+        let allowlisted: std::collections::BTreeSet<&str> = bundled
+            .iter()
+            .copied()
+            .filter(|slug| telemetry_safe_template_slug(slug).is_some())
+            .collect();
 
         assert_eq!(
             allowlisted, bundled,
@@ -1508,8 +1654,9 @@ templates:
 
     #[test]
     fn external_override_reusing_bundled_slug_is_custom_provenance() {
-        let mut config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
-            .expect("bundled templates.yaml must parse");
+        let mut config = bundled_templates_config()
+            .expect("bundled templates must parse")
+            .clone();
         let template = config
             .templates
             .iter_mut()

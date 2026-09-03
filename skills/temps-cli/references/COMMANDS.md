@@ -264,7 +264,7 @@ Manage projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (name, slug, attack mode, preview environments, image retention)
+- `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
 - `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
 - `config` - Update deployment configuration (resources, replicas)
@@ -397,7 +397,7 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (name, slug, attack mode, preview environments, image retention)
+Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 
 **Options:**
 
@@ -410,6 +410,8 @@ Update project settings (name, slug, attack mode, preview environments, image re
 | `--no-attack-mode` | Disable attack mode | - | No |
 | `--preview-envs` | Enable preview environments | - | No |
 | `--no-preview-envs` | Disable preview environments | - | No |
+| `--vulnerability-scanning` | Enable Trivy vulnerability scanning of deployed Docker images (post-deploy + daily) | - | No |
+| `--no-vulnerability-scanning` | Disable vulnerability scanning | - | No |
 | `--image-retention-hours <hours>` | Hours to keep built images before nightly cleanup removes them (1-8760). Images are needed to roll back, so this is the project rollback window | - | No |
 | `--reset-image-retention` | Clear the per-project image retention override and use the system default | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -2461,7 +2463,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
-| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service. | - | No |
+| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -5687,6 +5689,7 @@ Browse deployment templates
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
+- `validate` - Validate a Temps-native template YAML file or directory offline
 
 ### `templates list` (alias: `ls`)
 
@@ -5697,7 +5700,17 @@ List available templates
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--type <type>` | Filter by project type (server, static) | - | No |
+| `--kind <kind>` | Filter by template gallery (starter, service) | - | No |
+
+### `templates validate`
+
+Validate a Temps-native template YAML file or directory offline
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ## `platform` (alias: `plat`)
 

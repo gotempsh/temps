@@ -112,7 +112,7 @@ sea-orm = { workspace = true }
 # `temps proxy` picks up admin-gate edits made in another process.
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
-include_dir = "0.7"
+include_dir = { workspace = true }
 ipnet = "2.10"
 mime_guess = "2.0"
 thiserror = { workspace = true }

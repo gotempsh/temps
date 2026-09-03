@@ -295,28 +295,6 @@ pub struct CreateProjectRequest {
     pub template_slug: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateGithubRepoRequest {
-    pub name: String,
-    pub private: bool,
-    #[serde(rename = "auto_init")]
-    pub auto_init: bool,
-}
-
-// Types are defined directly in this file for simplicity
-
 #[derive(Error, Debug)]
 pub enum ProjectError {
     #[error("Database connection error: {0}")]
@@ -327,9 +305,6 @@ pub enum ProjectError {
 
     #[error("Git provider connection {connection_id} not found or not accessible")]
     GitProviderConnectionNotFound { connection_id: i32 },
-
-    #[error("Template not found")]
-    TemplateNotFound,
 
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },

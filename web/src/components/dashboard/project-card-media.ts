@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-export type ProjectCardMediaKind = 'template' | 'favicon' | 'screenshot'
+type ProjectCardMediaKind = 'template' | 'favicon' | 'screenshot'
 
-export interface ProjectCardMediaSource {
+interface ProjectCardMediaSource {
   kind: ProjectCardMediaKind
   src: string
 }

@@ -1,12 +1,39 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from "bun:test";
-import { validateNativeTemplateConfig } from "./validate.js";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  readAndValidateTemplatePath,
+  validateNativeTemplateConfig,
+} from "./validate.js";
 
 const PINNED_IMAGE = `example.test/app@sha256:${"a".repeat(64)}`;
+const tempDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    tempDirectories
+      .splice(0)
+      .map((path) => rm(path, { recursive: true, force: true })),
+  );
+});
 
 describe("validateNativeTemplateConfig", () => {
+  test("accepts one standalone template document", () => {
+    const result = validateNativeTemplateConfig({
+      slug: "standalone",
+      name: "Standalone",
+      kind: "starter",
+      git: { url: "https://example.test/standalone.git" },
+      preset: "nextjs",
+    });
+
+    expect(result).toEqual({ valid: true, errors: [], templateCount: 1 });
+  });
+
   test("accepts a pinned PostgreSQL-backed service", () => {
     const result = validateNativeTemplateConfig({
       version: "2",
@@ -316,5 +343,82 @@ describe("validateNativeTemplateConfig", () => {
     expect(result.errors).toContain(
       "templates[0].version must use Semantic Versioning",
     );
+  });
+});
+
+describe("readAndValidateTemplatePath", () => {
+  test("validates a recursively split starter and service catalog", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "temps-template-catalog-"));
+    tempDirectories.push(directory);
+    await mkdir(join(directory, "starters"));
+    await mkdir(join(directory, "services", "identity"), { recursive: true });
+    await writeFile(
+      join(directory, "starters", "starter.yaml"),
+      JSON.stringify({
+        slug: "starter",
+        name: "Starter",
+        kind: "starter",
+        git: { url: "https://example.test/starter.git" },
+        preset: "nextjs",
+      }),
+    );
+    await writeFile(
+      join(directory, "services", "identity", "service.yaml"),
+      JSON.stringify({
+        slug: "service",
+        name: "Service",
+        kind: "service",
+        version: "1.0.0",
+        git: { url: "https://example.test/service.git" },
+        preset: "dockerfile",
+        image: PINNED_IMAGE,
+        exposed_port: 3000,
+      }),
+    );
+
+    const result = await readAndValidateTemplatePath(directory);
+
+    expect(result).toEqual({ valid: true, errors: [], templateCount: 2 });
+  });
+
+  test("rejects a template stored under the wrong gallery", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "temps-template-catalog-"));
+    tempDirectories.push(directory);
+    await mkdir(join(directory, "starters"));
+    await writeFile(
+      join(directory, "starters", "service.yaml"),
+      JSON.stringify({
+        slug: "service",
+        name: "Service",
+        kind: "service",
+        version: "1.0.0",
+        git: { url: "https://example.test/service.git" },
+        preset: "dockerfile",
+        image: PINNED_IMAGE,
+        exposed_port: 3000,
+      }),
+    );
+
+    const result = await readAndValidateTemplatePath(directory);
+
+    expect(result.valid).toBeFalse();
+    expect(result.errors).toContain(
+      'starters/service.yaml declares kind "service" but its directory requires "starter"',
+    );
+  });
+
+  test("rejects symbolic links instead of traversing outside the catalog", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "temps-template-catalog-"));
+    const externalDirectory = await mkdtemp(
+      join(tmpdir(), "temps-template-external-"),
+    );
+    tempDirectories.push(directory, externalDirectory);
+    await mkdir(join(directory, "services"));
+    await symlink(externalDirectory, join(directory, "services", "external"));
+
+    const result = await readAndValidateTemplatePath(directory);
+
+    expect(result.valid).toBeFalse();
+    expect(result.errors.some((error) => error.includes("Symbolic links"))).toBeTrue();
   });
 });

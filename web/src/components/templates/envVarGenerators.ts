@@ -4,7 +4,7 @@
 /**
  * Frontend-side default-value generators for template environment variables.
  *
- * Templates can declare `default_generator` per env var (see `temps-core/templates.yaml`).
+ * Templates can declare `default_generator` per env var (see `temps-core/templates/`).
  * The Configurator uses this to (a) auto-fill empty values once the user has typed a
  * repository name and (b) render a "Generate" button on the value field.
  */
