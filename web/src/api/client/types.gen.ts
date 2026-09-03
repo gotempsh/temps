@@ -3891,8 +3891,9 @@ export type CreateBackupScheduleRequest = {
     /**
      * When `true` (default), the schedule backs up every external service
      * on the host — including databases created in the future. When
-     * `false`, the schedule backs up only the services explicitly attached
-     * via `POST /backups/schedules/{id}/services`. Omit to use the default.
+     * `false`, the schedule backs up only the services supplied in
+     * `service_ids` (or later attached through the schedule-services API).
+     * Omit to use the default.
      */
     target_all_services?: boolean | null;
 };
@@ -7184,6 +7185,11 @@ export type EnvVarTemplate = {
      * Whether this variable is required
      */
     required?: boolean;
+    /**
+     * Explicit sensitivity classification for credentials whose names do not
+     * match the conservative built-in heuristic.
+     */
+    secret?: boolean;
 };
 
 /**
@@ -7215,6 +7221,10 @@ export type EnvVarTemplateResponse = {
      * Whether this variable is required
      */
     required: boolean;
+    /**
+     * Whether values must use the protected secret reveal path.
+     */
+    secret: boolean;
 };
 
 /**
@@ -17527,6 +17537,11 @@ export type ServiceTemplateInstanceResponse = {
      * rollbacks non-reproducible.
      */
     catalog_drift: boolean;
+    /**
+     * User-safe explanation when the active catalog could not provide this
+     * service family. The applied snapshot remains authoritative and editable.
+     */
+    catalog_error?: string | null;
     changes: Array<ServiceTemplateUpgradeChange>;
     latest?: null | ServiceTemplateInstance;
     /**

@@ -212,22 +212,48 @@ fn resolve_preset_slug(
         .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset: {}", error)))
 }
 
+/// Derive the durable project lifecycle from the resolved runtime preset.
+///
+/// Several framework presets (Vite, Create React App, Docusaurus and Rsbuild)
+/// deploy static output even though their stored preset is not the literal
+/// `static` variant. Nixpacks can also switch between server and static based
+/// on its provider configuration, so callers must classify the complete
+/// resolved preset rather than matching only its enum discriminator.
+fn project_type_for_resolved_preset(
+    resolved: &temps_presets::StoredPreset,
+) -> Result<ProjectType, ProjectError> {
+    let runtime_preset =
+        temps_presets::get_preset_for_storage(resolved.preset, resolved.config.as_ref())
+            .map_err(|error| {
+                ProjectError::InvalidInput(format!(
+                    "Could not resolve project lifecycle for preset '{}': {error}",
+                    resolved.preset.as_str()
+                ))
+            })?
+            .ok_or_else(|| {
+                ProjectError::InvalidInput(format!(
+                    "Preset '{}' does not provide a deployable runtime",
+                    resolved.preset.as_str()
+                ))
+            })?;
+
+    Ok(match runtime_preset.project_type() {
+        temps_presets::ProjectType::Static => ProjectType::Static,
+        temps_presets::ProjectType::Server => ProjectType::Server,
+    })
+}
+
 /// Apply a canonical preset selection to a project update.
 fn apply_resolved_preset(
     active: &mut projects::ActiveModel,
     resolved: temps_presets::StoredPreset,
-) {
+) -> Result<(), ProjectError> {
     if active.project_type.as_ref() != &ProjectType::Service {
-        active.project_type = Set(
-            if resolved.preset == temps_entities::preset::Preset::Static {
-                ProjectType::Static
-            } else {
-                ProjectType::Server
-            },
-        );
+        active.project_type = Set(project_type_for_resolved_preset(&resolved)?);
     }
     active.preset = Set(resolved.preset);
     active.preset_config = Set(resolved.config);
+    Ok(())
 }
 
 /// Preserve discriminator-like fields when a partial config patch omits them.
@@ -627,6 +653,17 @@ fn validate_service_binding_compatibility(
     applied: &temps_core::templates::ProjectTemplate,
     target: &temps_core::templates::ProjectTemplate,
 ) -> Result<(), ProjectError> {
+    for required_service in &applied.services {
+        if !target
+            .services
+            .iter()
+            .any(|target_service| target_service.eq_ignore_ascii_case(required_service))
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template upgrade cannot remove required managed service '{required_service}'; older deployments require it for safe rollback"
+            )));
+        }
+    }
     for (service_type, applied_bindings) in &applied.managed_service_bindings {
         let target_bindings = target.managed_service_bindings.get(service_type);
         for (application_variable, service_variable) in applied_bindings {
@@ -645,6 +682,7 @@ fn validate_service_binding_compatibility(
     Ok(())
 }
 
+#[cfg(test)]
 fn production_configured_variable_keys(
     variables: &[env_vars::Model],
     links: &[env_var_environments::Model],
@@ -839,13 +877,11 @@ impl ProjectService {
             None,
         )?;
         let preset = resolved.preset;
-        let preset_config = resolved.config;
+        let preset_config = resolved.config.clone();
         let project_type = if service_template.is_some() {
             ProjectType::Service
-        } else if preset == temps_entities::preset::Preset::Static {
-            ProjectType::Static
         } else {
-            ProjectType::Server
+            project_type_for_resolved_preset(&resolved)?
         };
         let service_template_json = service_template
             .as_ref()
@@ -1473,7 +1509,7 @@ impl ProjectService {
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
         active_project.directory = Set(normalized_directory);
         active_project.main_branch = Set(request.main_branch);
-        apply_resolved_preset(&mut active_project, resolved);
+        apply_resolved_preset(&mut active_project, resolved)?;
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
@@ -2105,7 +2141,7 @@ impl ProjectService {
                     preset_config.as_ref(),
                     existing_preset_config.as_ref(),
                 )?;
-                apply_resolved_preset(&mut active_project, resolved);
+                apply_resolved_preset(&mut active_project, resolved)?;
             } else if let Some(config_value) = preset_config.as_ref() {
                 let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
                     active_project.preset.as_ref(),
@@ -2125,6 +2161,13 @@ impl ProjectService {
                     merged,
                     Some(config_value),
                 )?;
+                let resolved = temps_presets::StoredPreset {
+                    preset: *active_project.preset.as_ref(),
+                    config: Some(merged.clone()),
+                };
+                if active_project.project_type.as_ref() != &ProjectType::Service {
+                    active_project.project_type = Set(project_type_for_resolved_preset(&resolved)?);
+                }
                 active_project.preset_config = Set(Some(merged));
             }
             if let Some(dir) = directory {
@@ -2385,7 +2428,7 @@ impl ProjectService {
                 preset_config.as_ref(),
                 existing_preset_config.as_ref(),
             )?;
-            apply_resolved_preset(&mut active_project, resolved);
+            apply_resolved_preset(&mut active_project, resolved)?;
         } else if let Some(config_value) = preset_config.as_ref() {
             let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
                 &project_preset,
@@ -2397,6 +2440,13 @@ impl ProjectService {
             let merged =
                 merge_preset_config(existing_preset_config.as_ref(), parsed, config_value, true);
             let merged = validate_preset_config(project_preset, merged, Some(config_value))?;
+            let resolved = temps_presets::StoredPreset {
+                preset: project_preset,
+                config: Some(merged.clone()),
+            };
+            if active_project.project_type.as_ref() != &ProjectType::Service {
+                active_project.project_type = Set(project_type_for_resolved_preset(&resolved)?);
+            }
             active_project.preset_config = Set(Some(merged));
         }
 
@@ -4094,11 +4144,62 @@ impl ProjectService {
                 .all(&txn)
                 .await?
         };
-        let mut configured_keys = production_configured_variable_keys(
-            &existing_variables,
-            &variable_links,
-            production_environment.id,
-        );
+        let linked_ids = variable_links
+            .iter()
+            .map(|link| link.env_var_id)
+            .collect::<HashSet<_>>();
+        let production_linked_ids = variable_links
+            .iter()
+            .filter(|link| link.environment_id == production_environment.id)
+            .map(|link| link.env_var_id)
+            .collect::<HashSet<_>>();
+        let applies_to_production = |variable: &env_vars::Model| {
+            variable.environment_id == Some(production_environment.id)
+                || production_linked_ids.contains(&variable.id)
+                || (variable.environment_id.is_none() && !linked_ids.contains(&variable.id))
+        };
+        let mut production_variables = BTreeMap::<String, Vec<env_vars::Model>>::new();
+        for variable in existing_variables
+            .iter()
+            .filter(|variable| applies_to_production(variable))
+        {
+            production_variables
+                .entry(variable.key.clone())
+                .or_default()
+                .push(variable.clone());
+        }
+        let is_production_specific = |variable: &env_vars::Model| {
+            variable.environment_id == Some(production_environment.id)
+                || production_linked_ids.contains(&variable.id)
+        };
+        let effective_index = |variables: &[env_vars::Model]| {
+            variables
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, variable)| (is_production_specific(variable), variable.id))
+                .map(|(index, _)| index)
+        };
+        let mut configured_keys = HashSet::new();
+        for (key, variables) in &production_variables {
+            let Some(variable) = effective_index(variables).map(|index| &variables[index]) else {
+                continue;
+            };
+            let cleartext = if variable.is_encrypted {
+                self.encryption_service
+                    .decrypt_string(&variable.value)
+                    .map_err(|error| {
+                        ProjectError::Other(format!(
+                            "Failed to decrypt production environment variable '{}' while upgrading project {project_id}: {error}",
+                            variable.key
+                        ))
+                    })?
+            } else {
+                variable.value.clone()
+            };
+            if !cleartext.is_empty() {
+                configured_keys.insert(key.clone());
+            }
+        }
 
         let definitions = target
             .template
@@ -4107,6 +4208,7 @@ impl ProjectService {
             .map(|definition| (definition.name.as_str(), definition))
             .collect::<BTreeMap<_, _>>();
         let mut pending_keys = HashSet::new();
+        let mut pending_non_empty_keys = HashSet::new();
         for variable in &new_environment_variables {
             if !pending_keys.insert(variable.key.clone()) {
                 return Err(ProjectError::InvalidInput(format!(
@@ -4120,6 +4222,9 @@ impl ProjectService {
                     variable.key, target.slug, target.version
                 )));
             }
+            if !variable.value.is_empty() {
+                pending_non_empty_keys.insert(variable.key.clone());
+            }
         }
         for definition in target
             .template
@@ -4128,12 +4233,32 @@ impl ProjectService {
             .filter(|definition| definition.required)
         {
             if !configured_keys.contains(&definition.name)
-                && !pending_keys.contains(&definition.name)
+                && !pending_non_empty_keys.contains(&definition.name)
             {
                 return Err(ProjectError::InvalidInput(format!(
                     "Required environment variable '{}' has no production value for template {}@{}",
                     definition.name, target.slug, target.version
                 )));
+            }
+        }
+
+        // A newer release may classify an existing configuration key as a
+        // credential. Sensitivity is project/key-wide, so promote matching
+        // rows in every scope before the snapshot changes; never leave a
+        // preview/staging duplicate readable or demote an existing secret.
+        for definition in target
+            .template
+            .env_vars
+            .iter()
+            .filter(|definition| definition.is_secret())
+        {
+            for existing in existing_variables
+                .iter()
+                .filter(|variable| variable.key == definition.name && !variable.is_secret)
+            {
+                let mut active: env_vars::ActiveModel = existing.clone().into();
+                active.is_secret = Set(true);
+                active.update(&txn).await?;
             }
         }
 
@@ -4165,6 +4290,23 @@ impl ProjectService {
                         variable.key
                     ))
                 })?;
+            if let Some(existing_variables) = production_variables.get_mut(&variable.key) {
+                let existing_index = effective_index(existing_variables).ok_or_else(|| {
+                    ProjectError::Other(format!(
+                        "No effective production row found for environment variable '{}' while upgrading project {project_id}",
+                        variable.key
+                    ))
+                })?;
+                let existing = &mut existing_variables[existing_index];
+                let mut active: env_vars::ActiveModel = existing.clone().into();
+                active.value = Set(encrypted_value);
+                active.is_encrypted = Set(true);
+                active.is_secret =
+                    Set(existing.is_secret || variable.is_secret || definition.is_secret());
+                *existing = active.update(&txn).await?;
+                configured_keys.insert(variable.key);
+                continue;
+            }
             let inserted = env_vars::ActiveModel {
                 project_id: Set(project_id),
                 environment_id: Set(None),
@@ -4831,6 +4973,47 @@ fn base_project_slug(name: &str) -> String {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    #[test]
+    fn resolved_framework_and_nixpacks_presets_get_their_runtime_project_type() {
+        let vite = temps_presets::StoredPreset {
+            preset: temps_entities::preset::Preset::Vite,
+            config: Some(temps_entities::preset::PresetConfig::Vite(
+                temps_entities::preset::ViteConfig::default(),
+            )),
+        };
+        assert_eq!(
+            project_type_for_resolved_preset(&vite).expect("Vite is deployable"),
+            ProjectType::Static
+        );
+
+        let nixpacks_static = temps_presets::StoredPreset {
+            preset: temps_entities::preset::Preset::Nixpacks,
+            config: Some(temps_entities::preset::PresetConfig::Nixpacks(
+                temps_entities::preset::NixpacksConfig {
+                    providers: vec![temps_entities::preset::NixpacksProvider::Static],
+                    ..Default::default()
+                },
+            )),
+        };
+        assert_eq!(
+            project_type_for_resolved_preset(&nixpacks_static)
+                .expect("static Nixpacks is deployable"),
+            ProjectType::Static
+        );
+
+        let nixpacks_auto = temps_presets::StoredPreset {
+            preset: temps_entities::preset::Preset::Nixpacks,
+            config: Some(temps_entities::preset::PresetConfig::Nixpacks(
+                temps_entities::preset::NixpacksConfig::default(),
+            )),
+        };
+        assert_eq!(
+            project_type_for_resolved_preset(&nixpacks_auto)
+                .expect("automatic Nixpacks is deployable"),
+            ProjectType::Server
+        );
+    }
 
     #[test]
     fn service_upgrade_replaces_only_an_unmodified_template_default() {
@@ -6465,11 +6648,23 @@ mod tests {
         let db = test_db.db.clone();
         let mock_queue = Arc::new(MockJobQueue::new());
         let project_service = create_test_services(db.clone(), mock_queue).await;
-        let applied = temps_core::templates::ServiceTemplateInstance::new(
+        let mut applied = temps_core::templates::ServiceTemplateInstance::new(
             temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
             temps_core::templates::bundled_template_by_slug("browserless")
                 .expect("bundled Browserless release"),
         );
+        applied
+            .template
+            .env_vars
+            .push(temps_core::templates::EnvVarTemplate {
+                name: "OPTIONAL_SETTING".to_string(),
+                example: None,
+                default: None,
+                description: Some("Becomes required and sensitive in the next release".to_string()),
+                required: false,
+                secret: false,
+                default_generator: None,
+            });
         let mut request = create_request("Browserless upgrade");
         request.preset = Preset::Dockerfile.to_string();
         request.source_type = temps_entities::source_type::SourceType::DockerImage;
@@ -6525,6 +6720,11 @@ mod tests {
                 value: "2".to_string(),
                 is_secret: false,
             },
+            CreateProjectEnvVar {
+                key: "OPTIONAL_SETTING".to_string(),
+                value: String::new(),
+                is_secret: false,
+            },
         ]);
 
         let created = project_service
@@ -6552,19 +6752,104 @@ mod tests {
             applied.version
         );
 
+        // A legacy/global fallback can coexist with a production-scoped row.
+        // The production row remains authoritative even when empty, and every
+        // applicable duplicate must be promoted if the template later marks
+        // the key sensitive.
+        let encrypted_global = project_service
+            .encryption_service
+            .encrypt_string("global-readable")
+            .expect("encrypt global fallback");
+        env_vars::ActiveModel {
+            project_id: Set(created.id),
+            environment_id: Set(None),
+            key: Set("OPTIONAL_SETTING".to_string()),
+            value: Set(encrypted_global),
+            include_in_preview: Set(false),
+            is_encrypted: Set(true),
+            is_secret: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert global duplicate");
+        let production_environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(created.id))
+            .filter(environments::Column::IsPreview.eq(false))
+            .one(db.as_ref())
+            .await
+            .expect("query production environment")
+            .expect("production environment");
+        let mut preview_environment: environments::ActiveModel = production_environment.into();
+        preview_environment.id = sea_orm::NotSet;
+        preview_environment.name = Set("Preview".to_string());
+        preview_environment.slug = Set("preview-secret-promotion".to_string());
+        preview_environment.subdomain = Set("preview-secret-promotion".to_string());
+        preview_environment.host = Set("preview-secret-promotion.localho.st".to_string());
+        preview_environment.branch = Set(Some("preview-secret-promotion".to_string()));
+        preview_environment.is_preview = Set(true);
+        preview_environment.current_deployment_id = Set(None);
+        preview_environment.last_deployment = Set(None);
+        let preview_environment = preview_environment
+            .insert(db.as_ref())
+            .await
+            .expect("insert preview environment");
+        let encrypted_preview = project_service
+            .encryption_service
+            .encrypt_string("preview-readable")
+            .expect("encrypt preview value");
+        env_vars::ActiveModel {
+            project_id: Set(created.id),
+            environment_id: Set(Some(preview_environment.id)),
+            key: Set("OPTIONAL_SETTING".to_string()),
+            value: Set(encrypted_preview),
+            include_in_preview: Set(true),
+            is_encrypted: Set(true),
+            is_secret: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert preview duplicate");
+
         let mut target = applied.clone();
         target.version = "1.1.0".to_string();
         target.template.version = target.version.clone();
-        target.template.image = Some("ghcr.io/browserless/chromium:v2.57.0".to_string());
+        target.template.image = Some(
+            "ghcr.io/browserless/chromium@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+        );
         target.template.exposed_port = Some(3100);
         target.template.health_check_path = Some("/ready".to_string());
         target.template.resources.as_mut().unwrap().memory_limit = Some(2_560);
+        let promoted_definition = target
+            .template
+            .env_vars
+            .iter_mut()
+            .find(|definition| definition.name == "OPTIONAL_SETTING")
+            .expect("optional setting definition");
+        promoted_definition.required = true;
+        promoted_definition.secret = true;
+
+        let missing_value = project_service
+            .upgrade_service_template(
+                created.id,
+                target.clone(),
+                Vec::new(),
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await;
+        assert!(matches!(missing_value, Err(ProjectError::InvalidInput(_))));
 
         project_service
             .upgrade_service_template(
                 created.id,
                 target.clone(),
-                Vec::new(),
+                vec![CreateProjectEnvVar {
+                    key: "OPTIONAL_SETTING".to_string(),
+                    value: "configured-after-upgrade".to_string(),
+                    is_secret: false,
+                }],
                 temps_core::CeilingEnforcement::Bypass,
             )
             .await
@@ -6592,6 +6877,36 @@ mod tests {
         let deployment = upgraded.deployment_config.unwrap();
         assert_eq!(deployment.exposed_port, Some(3100));
         assert_eq!(deployment.memory_limit, Some(2_560));
+        let promoted = env_vars::Entity::find()
+            .filter(env_vars::Column::ProjectId.eq(created.id))
+            .filter(env_vars::Column::Key.eq("OPTIONAL_SETTING"))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            promoted.len() == 3 && promoted.iter().all(|variable| variable.is_secret),
+            "upgrade must protect every project-scoped duplicate"
+        );
+        let values = promoted
+            .iter()
+            .map(|variable| {
+                project_service
+                    .encryption_service
+                    .decrypt_string(&variable.value)
+                    .expect("decrypt promoted value")
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            values,
+            [
+                "configured-after-upgrade",
+                "global-readable",
+                "preview-readable",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
     }
 
     fn create_request(name: &str) -> CreateProjectRequest {
@@ -6663,6 +6978,20 @@ mod tests {
             .get_mut("postgres")
             .expect("target PostgreSQL bindings")
             .insert(existing_alias, "REMAPPED_SOURCE".to_string());
+        assert!(matches!(
+            validate_service_binding_compatibility(&applied, &target),
+            Err(ProjectError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn service_upgrade_cannot_remove_required_service_without_custom_bindings() {
+        let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("bundled Keycloak release");
+        applied.managed_service_bindings.clear();
+        let mut target = applied.clone();
+        target.services.clear();
+
         assert!(matches!(
             validate_service_binding_compatibility(&applied, &target),
             Err(ProjectError::InvalidInput(_))

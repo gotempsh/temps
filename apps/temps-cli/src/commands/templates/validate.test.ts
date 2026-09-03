@@ -4,6 +4,8 @@
 import { describe, expect, test } from "bun:test";
 import { validateNativeTemplateConfig } from "./validate.js";
 
+const PINNED_IMAGE = `example.test/app@sha256:${"a".repeat(64)}`;
+
 describe("validateNativeTemplateConfig", () => {
   test("accepts a pinned PostgreSQL-backed service", () => {
     const result = validateNativeTemplateConfig({
@@ -19,7 +21,7 @@ describe("validateNativeTemplateConfig", () => {
             ref: "26.7.2",
           },
           preset: "dockerfile",
-          image: "quay.io/keycloak/keycloak:26.7.2",
+          image: PINNED_IMAGE,
           exposed_port: 8080,
           resources: {
             cpu_request: 500000,
@@ -60,7 +62,7 @@ describe("validateNativeTemplateConfig", () => {
 
     expect(result.valid).toBeFalse();
     expect(result.errors).toContain(
-      "templates[0].image must be a version-pinned image reference",
+      "templates[0].image must use an immutable sha256 digest",
     );
     expect(result.errors).toContain(
       "templates[0].managed_service_bindings.postgres must also be listed in services",
@@ -86,7 +88,30 @@ describe("validateNativeTemplateConfig", () => {
 
     expect(result.valid).toBeFalse();
     expect(result.errors).toContain(
-      "templates[0].image must be a version-pinned image reference",
+      "templates[0].image must use an immutable sha256 digest",
+    );
+  });
+
+  test("rejects mutable version tags for curated services", () => {
+    const result = validateNativeTemplateConfig({
+      version: "2",
+      templates: [
+        {
+          slug: "mutable-version",
+          name: "Mutable version",
+          kind: "service",
+          version: "1.0.0",
+          git: { url: "https://example.test/mutable-version.git" },
+          preset: "dockerfile",
+          image: "example.test/app:1.0.0",
+          exposed_port: 3000,
+        },
+      ],
+    });
+
+    expect(result.valid).toBeFalse();
+    expect(result.errors).toContain(
+      "templates[0].image must use an immutable sha256 digest",
     );
   });
 
@@ -121,7 +146,7 @@ describe("validateNativeTemplateConfig", () => {
           version: "1.0.0",
           git: { url: "https://example.test/scalar-services.git" },
           preset: "dockerfile",
-          image: "example.test/app:1.0.0",
+          image: PINNED_IMAGE,
           exposed_port: 3000,
           services: "postgres",
           managed_service_bindings: "postgres",
@@ -147,10 +172,11 @@ describe("validateNativeTemplateConfig", () => {
           version: "1.0.0",
           git: { url: "https://example.test/unsafe-secret.git" },
           preset: "dockerfile",
-          image: "example.test/app:1.0.0",
+          image: PINNED_IMAGE,
           exposed_port: 3000,
           env_vars: [
             { name: "ADMIN_PASSWORD", default: "published-password" },
+            { name: "SMTP_PASS", secret: true, default: "also-published" },
           ],
         },
       ],
@@ -159,6 +185,9 @@ describe("validateNativeTemplateConfig", () => {
     expect(result.valid).toBeFalse();
     expect(result.errors).toContain(
       "templates[0].env_vars[0] is secret and cannot declare a literal default; use a secure generator or require user input",
+    );
+    expect(result.errors).toContain(
+      "templates[0].env_vars[1] is secret and cannot declare a literal default; use a secure generator or require user input",
     );
   });
 
@@ -190,7 +219,7 @@ describe("validateNativeTemplateConfig", () => {
           version: "1.0.0",
           git: { url: "local/path" },
           preset: "made-up",
-          image: "example.test/app:1.0.0",
+          image: PINNED_IMAGE,
           command: [],
           exposed_port: 3000,
           resources: {
@@ -231,7 +260,7 @@ describe("validateNativeTemplateConfig", () => {
           kind: "service",
           git: { url: "https://example.test/unversioned-service.git" },
           preset: "dockerfile",
-          image: "example.test/app:1.0.0",
+          image: PINNED_IMAGE,
           exposed_port: 3000,
         },
       ],
@@ -254,7 +283,7 @@ describe("validateNativeTemplateConfig", () => {
           version: "next",
           git: { url: "https://example.test/invalid-version.git" },
           preset: "dockerfile",
-          image: "example.test/app:1.0.0",
+          image: PINNED_IMAGE,
           exposed_port: 3000,
         },
       ],
@@ -277,7 +306,7 @@ describe("validateNativeTemplateConfig", () => {
           version: "1.0.0-01",
           git: { url: "https://example.test/invalid-prerelease.git" },
           preset: "dockerfile",
-          image: "example.test/app:1.0.0",
+          image: PINNED_IMAGE,
           exposed_port: 3000,
         },
       ],

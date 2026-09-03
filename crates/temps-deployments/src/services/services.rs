@@ -876,6 +876,43 @@ impl DeploymentService {
         }
     }
 
+    fn resource_usage_from_snapshot(
+        snapshot: &temps_entities::deployment_config::DeploymentConfigSnapshot,
+    ) -> crate::jobs::ResourceUsage {
+        crate::jobs::ResourceUsage {
+            cpu_limit: snapshot.cpu_limit.map(|value| format!("{value}u")),
+            memory_limit: snapshot.memory_limit.map(|value| format!("{value}Mi")),
+            cpu_request: snapshot.cpu_request.map(|value| format!("{value}u")),
+            memory_request: snapshot.memory_request.map(|value| format!("{value}Mi")),
+        }
+    }
+
+    fn rollback_snapshot_port_and_replicas(
+        snapshot: &temps_entities::deployment_config::DeploymentConfigSnapshot,
+        deployment_id: i32,
+    ) -> Result<(Option<u16>, u32), DeploymentError> {
+        let port = snapshot
+            .exposed_port
+            .map(u16::try_from)
+            .transpose()
+            .map_err(|error| {
+                DeploymentError::InvalidDeploymentState(format!(
+                    "Target deployment {deployment_id} has invalid exposed port {:?}: {error}",
+                    snapshot.exposed_port
+                ))
+            })?;
+        let replicas = u32::try_from(snapshot.replicas)
+            .ok()
+            .filter(|replicas| *replicas > 0)
+            .ok_or_else(|| {
+                DeploymentError::InvalidDeploymentState(format!(
+                    "Target deployment {deployment_id} has invalid replica count {}",
+                    snapshot.replicas
+                ))
+            })?;
+        Ok((port, replicas))
+    }
+
     pub fn new(
         db: Arc<temps_database::DbConnection>,
         log_service: Arc<temps_logs::LogService>,
@@ -2410,8 +2447,31 @@ impl DeploymentService {
 
             // Step 1: Execute DeployImageJob with external image
             // Use the NEW rollback slug as the container name (not the old deployment's slug)
-            let configured_port =
-                super::port_resolver::configured_port_override(&environment, &project);
+            let (configured_port, rollback_replicas, rollback_resources) =
+                if let Some(snapshot) = target_deployment.deployment_config.as_ref() {
+                    let (port, replicas) =
+                        Self::rollback_snapshot_port_and_replicas(snapshot, deployment_id)?;
+                    (port, replicas, Self::resource_usage_from_snapshot(snapshot))
+                } else {
+                    (
+                        super::port_resolver::configured_port_override(&environment, &project),
+                        environment
+                            .deployment_config
+                            .as_ref()
+                            .map(|config| config.replicas as u32)
+                            .or_else(|| {
+                                project
+                                    .deployment_config
+                                    .as_ref()
+                                    .map(|config| config.replicas as u32)
+                            })
+                            .unwrap_or(1),
+                        Self::resolve_resource_usage(
+                            environment.deployment_config.as_ref(),
+                            project.deployment_config.as_ref(),
+                        ),
+                    )
+                };
             let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
@@ -2424,19 +2484,7 @@ impl DeploymentService {
                 .health_check_path(None)
                 .health_check_path_override(rollback_health_check_path)
                 .command(rollback_command)
-                .replicas(
-                    environment
-                        .deployment_config
-                        .as_ref()
-                        .map(|c| c.replicas as u32)
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .map(|c| c.replicas as u32)
-                        })
-                        .unwrap_or(1),
-                )
+                .replicas(rollback_replicas)
                 .port(exposed_port)
                 .configured_port(configured_port)
                 .log_id(deploy_log_id.clone())
@@ -2459,10 +2507,7 @@ impl DeploymentService {
             // would inherit `ResourceUsage::default()` (now all-None) and silently
             // drop a configured limit — or, before the default was fixed, cap an
             // unconfigured environment.
-            deploy_builder = deploy_builder.resources(Self::resolve_resource_usage(
-                environment.deployment_config.as_ref(),
-                project.deployment_config.as_ref(),
-            ));
+            deploy_builder = deploy_builder.resources(rollback_resources);
 
             // Resolve the environment's env vars exactly as a normal deploy does,
             // so the rolled-back container boots with the full set (user vars,
@@ -8520,6 +8565,52 @@ mod tests {
             DeploymentService::resolve_resource_usage(Some(&empty_env), Some(&cfg(None, None)));
         assert_eq!(still_none.cpu_limit, None);
         assert_eq!(still_none.memory_limit, None);
+    }
+
+    #[test]
+    fn rollback_runtime_uses_target_deployment_snapshot() {
+        let snapshot = temps_entities::deployment_config::DeploymentConfigSnapshot {
+            exposed_port: Some(8080),
+            replicas: 3,
+            cpu_request: Some(500_000),
+            cpu_limit: Some(1_000_000),
+            memory_request: Some(512),
+            memory_limit: Some(1_536),
+            ..Default::default()
+        };
+
+        let (port, replicas) =
+            DeploymentService::rollback_snapshot_port_and_replicas(&snapshot, 42)
+                .expect("valid deployment snapshot");
+        let resources = DeploymentService::resource_usage_from_snapshot(&snapshot);
+
+        assert_eq!(port, Some(8080));
+        assert_eq!(replicas, 3);
+        assert_eq!(resources.cpu_request.as_deref(), Some("500000u"));
+        assert_eq!(resources.cpu_limit.as_deref(), Some("1000000u"));
+        assert_eq!(resources.memory_request.as_deref(), Some("512Mi"));
+        assert_eq!(resources.memory_limit.as_deref(), Some("1536Mi"));
+    }
+
+    #[test]
+    fn rollback_rejects_invalid_target_snapshot_runtime() {
+        let invalid_port = temps_entities::deployment_config::DeploymentConfigSnapshot {
+            exposed_port: Some(70_000),
+            ..Default::default()
+        };
+        assert!(matches!(
+            DeploymentService::rollback_snapshot_port_and_replicas(&invalid_port, 42),
+            Err(DeploymentError::InvalidDeploymentState(_))
+        ));
+
+        let invalid_replicas = temps_entities::deployment_config::DeploymentConfigSnapshot {
+            replicas: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            DeploymentService::rollback_snapshot_port_and_replicas(&invalid_replicas, 42),
+            Err(DeploymentError::InvalidDeploymentState(_))
+        ));
     }
 
     /// `stop_environment_containers` (pre-rollback cleanup) has the same

@@ -410,7 +410,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        use std::collections::HashMap;
+        use std::collections::{BTreeMap, HashMap};
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
@@ -479,7 +479,8 @@ impl WorkflowPlanner {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
-        let mut linked_service_vars = HashMap::new();
+        let mut linked_service_vars: BTreeMap<String, Vec<HashMap<String, String>>> =
+            BTreeMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -488,6 +489,18 @@ impl WorkflowPlanner {
                 project_service.service_id, project.id, environment.id
             );
 
+            let service = match self
+                .external_service_manager
+                .get_service(project_service.service_id)
+                .await
+            {
+                Ok(service) => service,
+                Err(error) => {
+                    failed_services.push((project_service.service_id, error.to_string()));
+                    continue;
+                }
+            };
+            let service_type = service.service_type.to_ascii_lowercase();
             match self
                 .external_service_manager
                 .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
@@ -504,7 +517,10 @@ impl WorkflowPlanner {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    linked_service_vars.extend(service_env_vars);
+                    linked_service_vars
+                        .entry(service_type)
+                        .or_default()
+                        .push(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails

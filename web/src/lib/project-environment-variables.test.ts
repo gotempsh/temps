@@ -130,4 +130,15 @@ describe('templateEnvironmentVariableDefaultsToSecret', () => {
       })
     ).toBe(true)
   })
+
+  test('protects an explicitly classified secret with a non-heuristic name', () => {
+    expect(
+      templateEnvironmentVariableDefaultsToSecret({
+        templateKind: 'service',
+        key: 'ADMIN_CREDENTIAL',
+        defaultGenerator: undefined,
+        explicitSecret: true,
+      })
+    ).toBe(true)
+  })
 })

@@ -147,7 +147,7 @@ templates:
       ref: 26.7.2
     preset: dockerfile
     image_url: /templates/keycloak.svg
-    image: quay.io/keycloak/keycloak:26.7.2
+    image: quay.io/keycloak/keycloak@sha256:9d1f1b2b7261ff53c66cb1092dfcdc34a5fb77e81f9e6a6e75b8b6a795de8067
     command:
       - start
     resources:
@@ -188,6 +188,7 @@ templates:
       - name: KC_BOOTSTRAP_ADMIN_PASSWORD
         description: Initial administrator password
         required: true
+        secret: true
         default_generator: random_secret
       - name: KC_HOSTNAME_STRICT
         description: Resolve the public hostname from Temps reverse-proxy headers
@@ -218,7 +219,7 @@ templates:
       ref: v2.56.0
     preset: dockerfile
     image_url: /templates/browserless.svg
-    image: ghcr.io/browserless/chromium:v2.56.0
+    image: ghcr.io/browserless/chromium@sha256:6f3149efabf5e04a44385974448c85264398db416bc63f884564316d0fcadc3e
     resources:
       cpu_request: 1000000
       cpu_limit: 2000000
@@ -242,6 +243,7 @@ templates:
       - name: TOKEN
         description: Access token required by every Browserless API and WebSocket connection
         required: true
+        secret: true
         default_generator: random_secret
       - name: EXTERNAL
         description: Public Temps URL used when Browserless generates HTTP and WebSocket endpoints

@@ -3041,7 +3041,6 @@ export type ComposeSourceResponse = {
      * Editable Docker Compose YAML owned by Temps.
      */
     content: string;
-    origin?: null | ComposeTemplateOrigin;
     /**
      * Immutable source-bundle ID. Deployments snapshot this revision.
      */
@@ -3057,25 +3056,6 @@ export type ComposeSourceServiceResponse = {
     looks_like_database: boolean;
     name: string;
     ports: Array<ComposePortMapping>;
-};
-
-/**
- * Informational catalog origin captured from the install request.
- *
- * The server preserves it after creation, but it is not a cryptographic
- * attestation: API clients can supply project configuration directly.
- */
-export type ComposeTemplateOrigin = {
-    /**
-     * Digest of the complete normalized install plan reviewed during
-     * preflight. Used to attest anonymous catalog telemetry at creation time.
-     */
-    installPlanDigest?: string | null;
-    provider: string;
-    slug: string;
-    sourceRevision?: string | null;
-    sourceUrl: string;
-    templateLastUpdatedAt?: string | null;
 };
 
 /**
@@ -3911,8 +3891,9 @@ export type CreateBackupScheduleRequest = {
     /**
      * When `true` (default), the schedule backs up every external service
      * on the host — including databases created in the future. When
-     * `false`, the schedule backs up only the services explicitly attached
-     * via `POST /backups/schedules/{id}/services`. Omit to use the default.
+     * `false`, the schedule backs up only the services supplied in
+     * `service_ids` (or later attached through the schedule-services API).
+     * Omit to use the default.
      */
     target_all_services?: boolean | null;
 };
@@ -6457,7 +6438,6 @@ export type DockerComposePresetConfig = {
      * Services granted the limited startup capability profile after explicit approval.
      */
     relaxedCapabilityServices?: Array<string>;
-    templateOrigin?: null | ComposeTemplateOrigin;
 };
 
 export type DockerRegistrySettings = {
@@ -7176,6 +7156,43 @@ export type EnvVarResponse = {
 };
 
 /**
+ * Environment variable template definition
+ */
+export type EnvVarTemplate = {
+    /**
+     * Default value if not provided by user
+     */
+    default?: string | null;
+    /**
+     * Frontend-side generator for the default value. Recognised values:
+     * `app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),
+     * `random_hex_32` (32-byte hex). Unknown values are ignored client-side.
+     */
+    default_generator?: string | null;
+    /**
+     * Description of what this variable is used for
+     */
+    description?: string | null;
+    /**
+     * Example value for documentation
+     */
+    example?: string | null;
+    /**
+     * Name of the environment variable
+     */
+    name: string;
+    /**
+     * Whether this variable is required
+     */
+    required?: boolean;
+    /**
+     * Explicit sensitivity classification for credentials whose names do not
+     * match the conservative built-in heuristic.
+     */
+    secret?: boolean;
+};
+
+/**
  * Environment variable template response
  */
 export type EnvVarTemplateResponse = {
@@ -7204,6 +7221,10 @@ export type EnvVarTemplateResponse = {
      * Whether this variable is required
      */
     required: boolean;
+    /**
+     * Whether values must use the protected secret reveal path.
+     */
+    secret: boolean;
 };
 
 /**
@@ -9127,6 +9148,25 @@ export type GitPushEvent = {
 };
 
 /**
+ * Git repository reference (supports any git provider: GitHub, GitLab, Bitbucket, etc.)
+ */
+export type GitRef = {
+    /**
+     * Path within the repository (for monorepos)
+     * Also accepts "subfolder" as an alias in YAML/JSON
+     */
+    path?: string | null;
+    /**
+     * Git reference (branch, tag, or commit)
+     */
+    ref?: string;
+    /**
+     * Git repository URL (e.g., "https://github.com/owner/repo.git" or "https://gitlab.com/owner/repo.git")
+     */
+    url: string;
+};
+
+/**
  * Git repository reference response
  */
 export type GitRefResponse = {
@@ -9579,7 +9619,7 @@ export type ImageRuntimeConfig = {
     /**
      * `None` explicitly means "use the image's default command". Keep the
      * serialized `null` when a runtime snapshot exists so clients can
-     * distinguish that choice from a legacy project with no snapshot.
+     * distinguish that choice from an omitted runtime setting.
      */
     command?: Array<string> | null;
     healthCheckPath?: string | null;
@@ -10610,54 +10650,6 @@ export type ListScansQuery = {
 export type ListSecretsResponse = {
     items: Array<SecretResponse>;
     total: number;
-};
-
-export type ListServiceTemplatesQuery = {
-    /**
-     * Exact case-insensitive category filter.
-     */
-    category?: string | null;
-    /**
-     * One-based page number. Defaults to 1.
-     */
-    page?: number | null;
-    /**
-     * Results per page. Defaults to 24 and is capped at 100.
-     */
-    per_page?: number | null;
-    /**
-     * Case-insensitive search across name, description, category, and tags.
-     */
-    search?: string | null;
-    /**
-     * Exact normalized discovery-tag filter.
-     */
-    tag?: string | null;
-};
-
-export type ListServiceTemplatesResponse = {
-    catalog_fetched_at: string;
-    /**
-     * Total entries in the upstream catalog before filters are applied.
-     */
-    catalog_total: number;
-    categories: Array<string>;
-    compatibility: ServiceTemplateCompatibilitySummaryResponse;
-    page: number;
-    per_page: number;
-    /**
-     * Most common normalized tags across the complete catalog.
-     */
-    popular_tags: Array<ServiceTemplateDiscoveryTagResponse>;
-    source_repository_url: string;
-    source_revision?: string | null;
-    source_url: string;
-    templates: Array<ServiceTemplateSummaryResponse>;
-    /**
-     * Total entries matching the current search and category filters.
-     */
-    total: number;
-    total_pages: number;
 };
 
 /**
@@ -13571,45 +13563,6 @@ export type PostgresWalHealth = {
     warnings: Array<WalWarning>;
 };
 
-export type PreflightServiceTemplateRequest = {
-    /**
-     * Services for which the user explicitly approved limited startup capabilities.
-     */
-    approved_capability_services?: Array<string>;
-    /**
-     * Digest returned by the detail endpoint; prevents validating a newer install plan.
-     */
-    expected_install_plan_digest: string;
-    /**
-     * Project name used to plan the exact slug and canonical route hostnames.
-     */
-    project_name: string;
-    /**
-     * Final environment values the project would persist. Values are never returned.
-     */
-    variables?: {
-        [key: string]: string;
-    };
-};
-
-export type PreflightServiceTemplateResponse = {
-    architecture: string;
-    compose_validated: boolean;
-    errors: Array<string>;
-    /**
-     * Optimistically allocated slug that must be claimed with `expected_slug`.
-     */
-    planned_project_slug: string;
-    /**
-     * Canonical URL/FQDN variables calculated from the allocated slug and hostname strategy.
-     */
-    public_variables: {
-        [key: string]: string;
-    };
-    ready: boolean;
-    warnings: Array<string>;
-};
-
 /**
  * Union type for preset configurations
  * Use the appropriate configuration type based on your preset
@@ -14137,8 +14090,23 @@ export type ProjectResponse = {
      * Wake timeout (seconds) for on-demand preview environments.
      */
     preview_envs_wake_timeout_seconds: number;
+    /**
+     * Product lifecycle classification. `service` projects are tied to a
+     * persisted, versioned template release; this is independent from the
+     * deployment transport in `source_type`.
+     */
+    project_type: string;
     repo_name?: string | null;
     repo_owner?: string | null;
+    /**
+     * Logo from the immutable service-template release applied to this
+     * project. Clients should prefer it over a deployed site's favicon.
+     */
+    service_template_image_url?: string | null;
+    /**
+     * Exact service-template version currently applied to the project.
+     */
+    service_template_version?: string | null;
     slug: string;
     /**
      * Source type for deployments (git, docker_image, or static_files)
@@ -14202,6 +14170,122 @@ export type ProjectStatsBreakdown = {
     total_page_views: number;
     total_visits: number;
     unique_visitors: number;
+};
+
+/**
+ * A curated project template
+ */
+export type ProjectTemplate = {
+    /**
+     * Optional command passed to the container image. This is needed for
+     * production images whose default command is intentionally a development
+     * mode (for example Keycloak).
+     */
+    command?: Array<string> | null;
+    /**
+     * Short description
+     */
+    description?: string | null;
+    /**
+     * Environment variables template
+     */
+    env_vars?: Array<EnvVarTemplate>;
+    /**
+     * Container port the prebuilt image listens on (used for routing when
+     * deploying from `image`). Falls back to the image's EXPOSE / 3000 default.
+     */
+    exposed_port?: number | null;
+    /**
+     * Feature highlights
+     */
+    features?: Array<string>;
+    /**
+     * Git repository reference (supports any git provider). Always present as
+     * the source-of-truth / build fallback, even for image-based templates.
+     */
+    git: GitRef;
+    /**
+     * HTTP health-check path probed after the container starts (image deploys
+     * can't read `.temps.yaml`). Must start with '/'. Defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
+     * Prebuilt Docker image reference (e.g. "ghcr.io/org/app:latest"). When set,
+     * the one-click deploy pulls and runs this image directly (source_type
+     * docker_image) instead of building from `git` — instant, no BuildKit. When
+     * absent, the template builds from source.
+     */
+    image?: string | null;
+    /**
+     * URL to template image/icon
+     */
+    image_url?: string | null;
+    /**
+     * Whether the template is featured/promoted
+     */
+    is_featured?: boolean;
+    /**
+     * Whether the template is publicly visible
+     */
+    is_public?: boolean;
+    /**
+     * Gallery this template belongs to. Older configurations default to a
+     * source-code starter, preserving their existing behaviour.
+     */
+    kind?: TemplateKind;
+    /**
+     * Environment aliases populated from a linked managed service. The outer
+     * key is the Temps service type and each inner entry maps an application
+     * variable to a variable supplied by that service.
+     *
+     * Example: `postgres.KC_DB_USERNAME: POSTGRES_USER`.
+     */
+    managed_service_bindings?: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
+    /**
+     * Display name
+     */
+    name: string;
+    /**
+     * Framework/preset to use (e.g., "nextjs", "fastapi", "dockerfile")
+     */
+    preset: string;
+    /**
+     * Preset-specific configuration
+     */
+    preset_config?: unknown;
+    resources?: null | TemplateResources;
+    /**
+     * URL to a full screenshot/banner preview of the deployed template (e.g.
+     * `/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the
+     * template card; optional — templates without one show no banner.
+     */
+    screenshot_url?: string | null;
+    /**
+     * Required external services (e.g., ["postgres", "redis"])
+     */
+    services?: Array<string>;
+    /**
+     * Unique identifier for the template (used in URLs)
+     */
+    slug: string;
+    /**
+     * Sort order for display (lower = first)
+     */
+    sort_order?: number;
+    /**
+     * Tags/categories for filtering
+     */
+    tags?: Array<string>;
+    /**
+     * Version of this template release. Service projects pin this value and
+     * the complete resolved definition so catalog updates are always an
+     * explicit, reviewable upgrade rather than a silent runtime mutation.
+     */
+    version?: string;
 };
 
 /**
@@ -17417,117 +17501,73 @@ export type ServiceStatsReport = {
     topology: string;
 };
 
-export type ServiceTemplateBackingServiceResponse = {
-    /**
-     * Temps service family: `postgres`, `redis`, `mongodb`, or `s3`.
-     */
-    kind: string;
-    /**
-     * Bundled services remain in this Compose snapshot. Safe managed-service
-     * replacement requires a template adapter that rewrites its connection contract.
-     */
-    mode: string;
-    /**
-     * Compose service name that provides this dependency.
-     */
-    service: string;
-};
+export type ServiceTemplateChangeKind = 'added' | 'removed' | 'changed';
 
-export type ServiceTemplateCapabilityRequirementResponse = {
-    capability: string;
-    reason: string;
-    service: string;
-};
-
-export type ServiceTemplateCompatibilitySummaryResponse = {
+/**
+ * Immutable template release attached to a service project.
+ *
+ * The resolved definition is deliberately stored with the project. The live
+ * catalog is only needed to discover a newer release; deployments, edits and
+ * rollbacks continue to work if the catalog later changes or disappears.
+ */
+export type ServiceTemplateInstance = {
     /**
-     * All non-installable templates, including `host_access` entries.
+     * Catalog schema used to deserialize `template`.
      */
-    blocked: number;
-    elevated: number;
+    schema_version: string;
     /**
-     * Blocked templates that require administrator-level host authority.
-     * This is a subset of `blocked`.
+     * Stable service family identifier.
      */
-    host_access: number;
-    standard: number;
-};
-
-export type ServiceTemplateDetailResponse = ServiceTemplateSummaryResponse & {
-    capability_requirements: Array<ServiceTemplateCapabilityRequirementResponse>;
-    catalog_fetched_at: string;
-    /**
-     * Normalized Compose copied into the new project when installed.
-     */
-    compose: string;
-    /**
-     * SHA-256 of the exact normalized Compose and deployment-critical route metadata.
-     */
-    install_plan_digest: string;
-    routes: Array<ServiceTemplateRouteResponse>;
-    source_repository_url: string;
-    source_revision?: string | null;
-    source_url: string;
-    transformations: Array<ServiceTemplateTransformationResponse>;
-    variables: Array<ServiceTemplateVariableResponse>;
-};
-
-export type ServiceTemplateDiscoveryTagResponse = {
-    count: number;
-    name: string;
-};
-
-export type ServiceTemplateRouteResponse = {
-    /**
-     * HTTP path detected from this service's Compose healthcheck.
-     */
-    health_check_path?: string | null;
-    port: number;
-    service: string;
-    variable_names: Array<string>;
-};
-
-export type ServiceTemplateSummaryResponse = {
-    amd_only: boolean;
-    arm_only: boolean;
-    backing_services: Array<ServiceTemplateBackingServiceResponse>;
-    category: string;
-    compatibility_issues: Array<string>;
-    /**
-     * `standard`, `elevated`, `host_access`, or `blocked`.
-     */
-    compatibility_tier: string;
-    description?: string | null;
-    documentation_url?: string | null;
-    installable: boolean;
-    logo_url?: string | null;
-    name: string;
-    port?: number | null;
-    service_count: number;
     slug: string;
-    tags: Array<string>;
     /**
-     * Upstream timestamp as supplied by Coolify.
+     * Exact resolved release from which this project was created/upgraded.
      */
-    template_last_updated_at?: string | null;
-    warnings: Array<string>;
+    template: ProjectTemplate;
+    /**
+     * Applied template release.
+     */
+    version: string;
 };
 
-export type ServiceTemplateTransformationResponse = {
-    code: string;
-    description: string;
+export type ServiceTemplateInstanceResponse = {
+    applied: ServiceTemplateInstance;
+    /**
+     * The catalog definition changed without a version bump. Applying it is
+     * intentionally blocked because mutable releases make upgrades and
+     * rollbacks non-reproducible.
+     */
+    catalog_drift: boolean;
+    /**
+     * User-safe explanation when the active catalog could not provide this
+     * service family. The applied snapshot remains authoritative and editable.
+     */
+    catalog_error?: string | null;
+    changes: Array<ServiceTemplateUpgradeChange>;
+    latest?: null | ServiceTemplateInstance;
+    /**
+     * Managed service families that must be linked before this release can be
+     * applied. Existing links are never removed automatically.
+     */
+    missing_services: Array<string>;
+    project_id: number;
+    /**
+     * Required target inputs that are not currently configured and cannot be
+     * filled from a template default or generator.
+     */
+    required_configuration: Array<EnvVarTemplate>;
+    upgrade_available: boolean;
 };
 
-export type ServiceTemplateVariableResponse = {
-    default_value?: string | null;
-    is_secret: boolean;
-    /**
-     * Generator/input type used by the installer.
-     */
-    kind: string;
-    name: string;
-    required: boolean;
-    route_service?: string | null;
+/**
+ * One reviewable change between the project's applied service release and
+ * the current catalog release. Values contain public template metadata only;
+ * project environment values and secrets never enter this response.
+ */
+export type ServiceTemplateUpgradeChange = {
+    current?: string | null;
+    field: string;
+    kind: ServiceTemplateChangeKind;
+    target?: string | null;
 };
 
 export type ServiceTypeInfo = {
@@ -19298,6 +19338,10 @@ export type TemplateResponse = {
      * Tags/categories for filtering
      */
     tags: Array<string>;
+    /**
+     * Immutable release identifier for service templates.
+     */
+    version: string;
 };
 
 /**
@@ -21458,6 +21502,19 @@ export type UpgradeRequest = {
      * Empty resets to default.
      */
     image: string;
+};
+
+export type UpgradeServiceTemplateRequest = {
+    /**
+     * Values for inputs introduced by the target release. Existing project
+     * values are preserved and cannot be overwritten through this endpoint.
+     */
+    environment_variables?: Array<EnvVarInput>;
+    /**
+     * Optimistic target selected from the preview. The server rejects a stale
+     * target if the catalog changes between preview and apply.
+     */
+    target_version: string;
 };
 
 export type UpsertAgentRequest = {
@@ -50098,6 +50155,86 @@ export type UpdateServiceTemplateRuntimeResponses = {
 
 export type UpdateServiceTemplateRuntimeResponse = UpdateServiceTemplateRuntimeResponses[keyof UpdateServiceTemplateRuntimeResponses];
 
+export type GetProjectServiceTemplateData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-template';
+};
+
+export type GetProjectServiceTemplateErrors = {
+    /**
+     * Project is not a service
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+};
+
+export type GetProjectServiceTemplateResponses = {
+    /**
+     * Applied service release and upgrade preview
+     */
+    200: ServiceTemplateInstanceResponse;
+};
+
+export type GetProjectServiceTemplateResponse = GetProjectServiceTemplateResponses[keyof GetProjectServiceTemplateResponses];
+
+export type UpgradeProjectServiceTemplateData = {
+    body: UpgradeServiceTemplateRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-template/upgrade';
+};
+
+export type UpgradeProjectServiceTemplateErrors = {
+    /**
+     * Invalid or stale upgrade
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project or template not found
+     */
+    404: unknown;
+};
+
+export type UpgradeProjectServiceTemplateResponses = {
+    /**
+     * Service template upgraded
+     */
+    200: ProjectResponse;
+};
+
+export type UpgradeProjectServiceTemplateResponse = UpgradeProjectServiceTemplateResponses[keyof UpgradeProjectServiceTemplateResponses];
+
 export type UpdateProjectSettingsData = {
     body: UpdateProjectSettingsRequest;
     path: {
@@ -53043,158 +53180,6 @@ export type RevenueListProvidersResponses = {
 };
 
 export type RevenueListProvidersResponse = RevenueListProvidersResponses[keyof RevenueListProvidersResponses];
-
-export type ListServiceTemplatesData = {
-    body?: never;
-    path?: never;
-    query?: {
-        /**
-         * Search name, description, category, and tags
-         */
-        search?: string;
-        /**
-         * Filter by category
-         */
-        category?: string;
-        /**
-         * Filter by exact normalized discovery tag
-         */
-        tag?: string;
-        /**
-         * One-based page number
-         */
-        page?: number;
-        /**
-         * Results per page, maximum 100
-         */
-        per_page?: number;
-    };
-    url: '/service-templates/';
-};
-
-export type ListServiceTemplatesErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Upstream catalog unavailable
-     */
-    502: unknown;
-};
-
-export type ListServiceTemplatesResponses = {
-    /**
-     * Paginated service template catalog
-     */
-    200: ListServiceTemplatesResponse;
-};
-
-export type ListServiceTemplatesResponse2 = ListServiceTemplatesResponses[keyof ListServiceTemplatesResponses];
-
-export type GetServiceTemplateData = {
-    body?: never;
-    path: {
-        /**
-         * Coolify template slug
-         */
-        slug: string;
-    };
-    query?: never;
-    url: '/service-templates/{slug}';
-};
-
-export type GetServiceTemplateErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Template not found
-     */
-    404: unknown;
-    /**
-     * Template content is invalid
-     */
-    422: unknown;
-    /**
-     * Upstream catalog unavailable
-     */
-    502: unknown;
-};
-
-export type GetServiceTemplateResponses = {
-    /**
-     * Service template detail and compatibility analysis
-     */
-    200: ServiceTemplateDetailResponse;
-};
-
-export type GetServiceTemplateResponse = GetServiceTemplateResponses[keyof GetServiceTemplateResponses];
-
-export type PreflightServiceTemplateData = {
-    body: PreflightServiceTemplateRequest;
-    path: {
-        /**
-         * Coolify template slug
-         */
-        slug: string;
-    };
-    query?: never;
-    url: '/service-templates/{slug}/preflight';
-};
-
-export type PreflightServiceTemplateErrors = {
-    /**
-     * Invalid project name
-     */
-    400: unknown;
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Template not found
-     */
-    404: unknown;
-    /**
-     * Catalog install plan changed; reload required
-     */
-    409: unknown;
-    /**
-     * Template content is invalid
-     */
-    422: unknown;
-    /**
-     * Upstream catalog unavailable
-     */
-    502: unknown;
-    /**
-     * Docker preflight unavailable or at capacity
-     */
-    503: unknown;
-};
-
-export type PreflightServiceTemplateResponses = {
-    /**
-     * Template preflight result
-     */
-    200: PreflightServiceTemplateResponse;
-};
-
-export type PreflightServiceTemplateResponse2 = PreflightServiceTemplateResponses[keyof PreflightServiceTemplateResponses];
 
 export type GetProjectSessionReplaysData = {
     body?: never;

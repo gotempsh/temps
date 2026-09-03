@@ -6105,16 +6105,6 @@
             "description": "Editable Docker Compose YAML owned by Temps.",
             "type": "string"
           },
-          "origin": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ComposeTemplateOrigin"
-              }
-            ]
-          },
           "revision": {
             "description": "Immutable source-bundle ID. Deployments snapshot this revision.",
             "format": "int32",
@@ -6181,45 +6171,6 @@
           "name",
           "looks_like_database",
           "ports"
-        ],
-        "type": "object"
-      },
-      "ComposeTemplateOrigin": {
-        "description": "Informational catalog origin captured from the install request.\n\nThe server preserves it after creation, but it is not a cryptographic\nattestation: API clients can supply project configuration directly.",
-        "properties": {
-          "installPlanDigest": {
-            "description": "Digest of the complete normalized install plan reviewed during\npreflight. Used to attest anonymous catalog telemetry at creation time.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "provider": {
-            "type": "string"
-          },
-          "slug": {
-            "type": "string"
-          },
-          "sourceRevision": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sourceUrl": {
-            "type": "string"
-          },
-          "templateLastUpdatedAt": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "provider",
-          "slug",
-          "sourceUrl"
         ],
         "type": "object"
       },
@@ -7927,7 +7878,7 @@
             "type": "array"
           },
           "target_all_services": {
-            "description": "When `true` (default), the schedule backs up every external service\non the host — including databases created in the future. When\n`false`, the schedule backs up only the services explicitly attached\nvia `POST /backups/schedules/{id}/services`. Omit to use the default.",
+            "description": "When `true` (default), the schedule backs up every external service\non the host — including databases created in the future. When\n`false`, the schedule backs up only the services supplied in\n`service_ids` (or later attached through the schedule-services API).\nOmit to use the default.",
             "type": [
               "boolean",
               "null"
@@ -13287,17 +13238,6 @@
               "type": "string"
             },
             "type": "array"
-          },
-          "templateOrigin": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ComposeTemplateOrigin",
-                "description": "Catalog origin captured when a service template creates the project.\nIts digest and the first saved Compose source are revalidated for\nanonymous telemetry provenance, but this is not a general-purpose audit\nattestation."
-              }
-            ]
           }
         },
         "type": "object"
@@ -15011,6 +14951,55 @@
         ],
         "type": "object"
       },
+      "EnvVarTemplate": {
+        "description": "Environment variable template definition",
+        "properties": {
+          "default": {
+            "description": "Default value if not provided by user",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_generator": {
+            "description": "Frontend-side generator for the default value. Recognised values:\n`app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),\n`random_hex_32` (32-byte hex). Unknown values are ignored client-side.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Description of what this variable is used for",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "example": {
+            "description": "Example value for documentation",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Name of the environment variable",
+            "type": "string"
+          },
+          "required": {
+            "description": "Whether this variable is required",
+            "type": "boolean"
+          },
+          "secret": {
+            "description": "Explicit sensitivity classification for credentials whose names do not\nmatch the conservative built-in heuristic.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "EnvVarTemplateResponse": {
         "description": "Environment variable template response",
         "properties": {
@@ -15049,11 +15038,16 @@
           "required": {
             "description": "Whether this variable is required",
             "type": "boolean"
+          },
+          "secret": {
+            "description": "Whether values must use the protected secret reveal path.",
+            "type": "boolean"
           }
         },
         "required": [
           "name",
-          "required"
+          "required",
+          "secret"
         ],
         "type": "object"
       },
@@ -19407,6 +19401,30 @@
         ],
         "type": "object"
       },
+      "GitRef": {
+        "description": "Git repository reference (supports any git provider: GitHub, GitLab, Bitbucket, etc.)",
+        "properties": {
+          "path": {
+            "description": "Path within the repository (for monorepos)\nAlso accepts \"subfolder\" as an alias in YAML/JSON",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ref": {
+            "description": "Git reference (branch, tag, or commit)",
+            "type": "string"
+          },
+          "url": {
+            "description": "Git repository URL (e.g., \"https://github.com/owner/repo.git\" or \"https://gitlab.com/owner/repo.git\")",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
       "GitRefResponse": {
         "description": "Git repository reference response",
         "properties": {
@@ -20484,7 +20502,7 @@
         "description": "Editable runtime settings for a single-container image template.\n\nMulti-container service templates will use a separate container collection;\nkeeping this shape explicitly singular prevents silently applying one image\nor command to an unrelated sidecar.",
         "properties": {
           "command": {
-            "description": "`None` explicitly means \"use the image's default command\". Keep the\nserialized `null` when a runtime snapshot exists so clients can\ndistinguish that choice from a legacy project with no snapshot.",
+            "description": "`None` explicitly means \"use the image's default command\". Keep the\nserialized `null` when a runtime snapshot exists so clients can\ndistinguish that choice from an omitted runtime setting.",
             "items": {
               "type": "string"
             },
@@ -22714,126 +22732,6 @@
         "required": [
           "items",
           "total"
-        ],
-        "type": "object"
-      },
-      "ListServiceTemplatesQuery": {
-        "properties": {
-          "category": {
-            "description": "Exact case-insensitive category filter.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "page": {
-            "description": "One-based page number. Defaults to 1.",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "per_page": {
-            "description": "Results per page. Defaults to 24 and is capped at 100.",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "search": {
-            "description": "Case-insensitive search across name, description, category, and tags.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tag": {
-            "description": "Exact normalized discovery-tag filter.",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "ListServiceTemplatesResponse": {
-        "properties": {
-          "catalog_fetched_at": {
-            "type": "string"
-          },
-          "catalog_total": {
-            "description": "Total entries in the upstream catalog before filters are applied.",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "categories": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "compatibility": {
-            "$ref": "#/components/schemas/ServiceTemplateCompatibilitySummaryResponse"
-          },
-          "page": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "per_page": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "popular_tags": {
-            "description": "Most common normalized tags across the complete catalog.",
-            "items": {
-              "$ref": "#/components/schemas/ServiceTemplateDiscoveryTagResponse"
-            },
-            "type": "array"
-          },
-          "source_repository_url": {
-            "type": "string"
-          },
-          "source_revision": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "source_url": {
-            "type": "string"
-          },
-          "templates": {
-            "items": {
-              "$ref": "#/components/schemas/ServiceTemplateSummaryResponse"
-            },
-            "type": "array"
-          },
-          "total": {
-            "description": "Total entries matching the current search and category filters.",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "total_pages": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "templates",
-          "categories",
-          "popular_tags",
-          "catalog_total",
-          "total",
-          "page",
-          "per_page",
-          "total_pages",
-          "catalog_fetched_at",
-          "source_url",
-          "source_repository_url",
-          "compatibility"
         ],
         "type": "object"
       },
@@ -29451,89 +29349,6 @@
         ],
         "type": "object"
       },
-      "PreflightServiceTemplateRequest": {
-        "properties": {
-          "approved_capability_services": {
-            "description": "Services for which the user explicitly approved limited startup capabilities.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "expected_install_plan_digest": {
-            "description": "Digest returned by the detail endpoint; prevents validating a newer install plan.",
-            "type": "string"
-          },
-          "project_name": {
-            "description": "Project name used to plan the exact slug and canonical route hostnames.",
-            "type": "string"
-          },
-          "variables": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "description": "Final environment values the project would persist. Values are never returned.",
-            "propertyNames": {
-              "type": "string"
-            },
-            "type": "object"
-          }
-        },
-        "required": [
-          "project_name",
-          "expected_install_plan_digest"
-        ],
-        "type": "object"
-      },
-      "PreflightServiceTemplateResponse": {
-        "properties": {
-          "architecture": {
-            "type": "string"
-          },
-          "compose_validated": {
-            "type": "boolean"
-          },
-          "errors": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "planned_project_slug": {
-            "description": "Optimistically allocated slug that must be claimed with `expected_slug`.",
-            "type": "string"
-          },
-          "public_variables": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "description": "Canonical URL/FQDN variables calculated from the allocated slug and hostname strategy.",
-            "propertyNames": {
-              "type": "string"
-            },
-            "type": "object"
-          },
-          "ready": {
-            "type": "boolean"
-          },
-          "warnings": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "ready",
-          "compose_validated",
-          "architecture",
-          "errors",
-          "warnings",
-          "planned_project_slug",
-          "public_variables"
-        ],
-        "type": "object"
-      },
       "PresetConfigSchema": {
         "description": "Union type for preset configurations\nUse the appropriate configuration type based on your preset",
         "oneOf": [
@@ -30424,6 +30239,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "project_type": {
+            "description": "Product lifecycle classification. `service` projects are tied to a\npersisted, versioned template release; this is independent from the\ndeployment transport in `source_type`.",
+            "type": "string"
+          },
           "repo_name": {
             "type": [
               "string",
@@ -30431,6 +30250,20 @@
             ]
           },
           "repo_owner": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_template_image_url": {
+            "description": "Logo from the immutable service-template release applied to this\nproject. Clients should prefer it over a deployed site's favicon.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_template_version": {
+            "description": "Exact service-template version currently applied to the project.",
             "type": [
               "string",
               "null"
@@ -30465,6 +30298,7 @@
           "name",
           "directory",
           "main_branch",
+          "project_type",
           "created_at",
           "updated_at",
           "is_public_repo",
@@ -30625,6 +30459,166 @@
           "total_page_views",
           "bounce_rate",
           "engagement_rate"
+        ],
+        "type": "object"
+      },
+      "ProjectTemplate": {
+        "description": "A curated project template",
+        "properties": {
+          "command": {
+            "description": "Optional command passed to the container image. This is needed for\nproduction images whose default command is intentionally a development\nmode (for example Keycloak).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Short description",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env_vars": {
+            "description": "Environment variables template",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
+            },
+            "type": "array"
+          },
+          "exposed_port": {
+            "description": "Container port the prebuilt image listens on (used for routing when\ndeploying from `image`). Falls back to the image's EXPOSE / 3000 default.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "features": {
+            "description": "Feature highlights",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "git": {
+            "$ref": "#/components/schemas/GitRef",
+            "description": "Git repository reference (supports any git provider). Always present as\nthe source-of-truth / build fallback, even for image-based templates."
+          },
+          "health_check_path": {
+            "description": "HTTP health-check path probed after the container starts (image deploys\ncan't read `.temps.yaml`). Must start with '/'. Defaults to \"/\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Prebuilt Docker image reference (e.g. \"ghcr.io/org/app:latest\"). When set,\nthe one-click deploy pulls and runs this image directly (source_type\ndocker_image) instead of building from `git` — instant, no BuildKit. When\nabsent, the template builds from source.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image_url": {
+            "description": "URL to template image/icon",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_featured": {
+            "description": "Whether the template is featured/promoted",
+            "type": "boolean"
+          },
+          "is_public": {
+            "description": "Whether the template is publicly visible",
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TemplateKind",
+            "description": "Gallery this template belongs to. Older configurations default to a\nsource-code starter, preserving their existing behaviour."
+          },
+          "managed_service_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Environment aliases populated from a linked managed service. The outer\nkey is the Temps service type and each inner entry maps an application\nvariable to a variable supplied by that service.\n\nExample: `postgres.KC_DB_USERNAME: POSTGRES_USER`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "description": "Display name",
+            "type": "string"
+          },
+          "preset": {
+            "description": "Framework/preset to use (e.g., \"nextjs\", \"fastapi\", \"dockerfile\")",
+            "type": "string"
+          },
+          "preset_config": {
+            "description": "Preset-specific configuration"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Minimum/safe runtime resources for this application. These values are\nvalidated against operator-configured tenant ceilings before creation."
+              }
+            ]
+          },
+          "screenshot_url": {
+            "description": "URL to a full screenshot/banner preview of the deployed template (e.g.\n`/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the\ntemplate card; optional — templates without one show no banner.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "services": {
+            "description": "Required external services (e.g., [\"postgres\", \"redis\"])",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "slug": {
+            "description": "Unique identifier for the template (used in URLs)",
+            "type": "string"
+          },
+          "sort_order": {
+            "description": "Sort order for display (lower = first)",
+            "format": "int32",
+            "type": "integer"
+          },
+          "tags": {
+            "description": "Tags/categories for filtering",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "description": "Version of this template release. Service projects pin this value and\nthe complete resolved definition so catalog updates are always an\nexplicit, reviewable upgrade rather than a silent runtime mutation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "name",
+          "git",
+          "preset"
         ],
         "type": "object"
       },
@@ -37465,332 +37459,124 @@
         ],
         "type": "object"
       },
-      "ServiceTemplateBackingServiceResponse": {
-        "properties": {
-          "kind": {
-            "description": "Temps service family: `postgres`, `redis`, `mongodb`, or `s3`.",
-            "type": "string"
-          },
-          "mode": {
-            "description": "Bundled services remain in this Compose snapshot. Safe managed-service\nreplacement requires a template adapter that rewrites its connection contract.",
-            "type": "string"
-          },
-          "service": {
-            "description": "Compose service name that provides this dependency.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "service",
-          "kind",
-          "mode"
+      "ServiceTemplateChangeKind": {
+        "enum": [
+          "added",
+          "removed",
+          "changed"
         ],
-        "type": "object"
+        "type": "string"
       },
-      "ServiceTemplateCapabilityRequirementResponse": {
+      "ServiceTemplateInstance": {
+        "description": "Immutable template release attached to a service project.\n\nThe resolved definition is deliberately stored with the project. The live\ncatalog is only needed to discover a newer release; deployments, edits and\nrollbacks continue to work if the catalog later changes or disappears.",
         "properties": {
-          "capability": {
+          "schema_version": {
+            "description": "Catalog schema used to deserialize `template`.",
             "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "service": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "service",
-          "capability",
-          "reason"
-        ],
-        "type": "object"
-      },
-      "ServiceTemplateCompatibilitySummaryResponse": {
-        "properties": {
-          "blocked": {
-            "description": "All non-installable templates, including `host_access` entries.",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "elevated": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "host_access": {
-            "description": "Blocked templates that require administrator-level host authority.\nThis is a subset of `blocked`.",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "standard": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "standard",
-          "elevated",
-          "host_access",
-          "blocked"
-        ],
-        "type": "object"
-      },
-      "ServiceTemplateDetailResponse": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/ServiceTemplateSummaryResponse"
-          },
-          {
-            "properties": {
-              "capability_requirements": {
-                "items": {
-                  "$ref": "#/components/schemas/ServiceTemplateCapabilityRequirementResponse"
-                },
-                "type": "array"
-              },
-              "catalog_fetched_at": {
-                "type": "string"
-              },
-              "compose": {
-                "description": "Normalized Compose copied into the new project when installed.",
-                "type": "string"
-              },
-              "install_plan_digest": {
-                "description": "SHA-256 of the exact normalized Compose and deployment-critical route metadata.",
-                "type": "string"
-              },
-              "routes": {
-                "items": {
-                  "$ref": "#/components/schemas/ServiceTemplateRouteResponse"
-                },
-                "type": "array"
-              },
-              "source_repository_url": {
-                "type": "string"
-              },
-              "source_revision": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "source_url": {
-                "type": "string"
-              },
-              "transformations": {
-                "items": {
-                  "$ref": "#/components/schemas/ServiceTemplateTransformationResponse"
-                },
-                "type": "array"
-              },
-              "variables": {
-                "items": {
-                  "$ref": "#/components/schemas/ServiceTemplateVariableResponse"
-                },
-                "type": "array"
-              }
-            },
-            "required": [
-              "compose",
-              "routes",
-              "variables",
-              "transformations",
-              "capability_requirements",
-              "catalog_fetched_at",
-              "source_url",
-              "source_repository_url",
-              "install_plan_digest"
-            ],
-            "type": "object"
-          }
-        ]
-      },
-      "ServiceTemplateDiscoveryTagResponse": {
-        "properties": {
-          "count": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "count"
-        ],
-        "type": "object"
-      },
-      "ServiceTemplateRouteResponse": {
-        "properties": {
-          "health_check_path": {
-            "description": "HTTP path detected from this service's Compose healthcheck.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "port": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "service": {
-            "type": "string"
-          },
-          "variable_names": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "service",
-          "port",
-          "variable_names"
-        ],
-        "type": "object"
-      },
-      "ServiceTemplateSummaryResponse": {
-        "properties": {
-          "amd_only": {
-            "type": "boolean"
-          },
-          "arm_only": {
-            "type": "boolean"
-          },
-          "backing_services": {
-            "items": {
-              "$ref": "#/components/schemas/ServiceTemplateBackingServiceResponse"
-            },
-            "type": "array"
-          },
-          "category": {
-            "type": "string"
-          },
-          "compatibility_issues": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "compatibility_tier": {
-            "description": "`standard`, `elevated`, `host_access`, or `blocked`.",
-            "type": "string"
-          },
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "documentation_url": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "installable": {
-            "type": "boolean"
-          },
-          "logo_url": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "port": {
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "service_count": {
-            "minimum": 0,
-            "type": "integer"
           },
           "slug": {
+            "description": "Stable service family identifier.",
             "type": "string"
           },
-          "tags": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
+          "template": {
+            "$ref": "#/components/schemas/ProjectTemplate",
+            "description": "Exact resolved release from which this project was created/upgraded."
           },
-          "template_last_updated_at": {
-            "description": "Upstream timestamp as supplied by Coolify.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "warnings": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
+          "version": {
+            "description": "Applied template release.",
+            "type": "string"
           }
         },
         "required": [
+          "schema_version",
           "slug",
-          "name",
-          "category",
-          "tags",
-          "backing_services",
-          "service_count",
-          "installable",
-          "compatibility_tier",
-          "compatibility_issues",
-          "warnings",
-          "amd_only",
-          "arm_only"
+          "version",
+          "template"
         ],
         "type": "object"
       },
-      "ServiceTemplateTransformationResponse": {
+      "ServiceTemplateInstanceResponse": {
         "properties": {
-          "code": {
-            "type": "string"
+          "applied": {
+            "$ref": "#/components/schemas/ServiceTemplateInstance"
           },
-          "description": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "code",
-          "description"
-        ],
-        "type": "object"
-      },
-      "ServiceTemplateVariableResponse": {
-        "properties": {
-          "default_value": {
+          "catalog_drift": {
+            "description": "The catalog definition changed without a version bump. Applying it is\nintentionally blocked because mutable releases make upgrades and\nrollbacks non-reproducible.",
+            "type": "boolean"
+          },
+          "catalog_error": {
+            "description": "User-safe explanation when the active catalog could not provide this\nservice family. The applied snapshot remains authoritative and editable.",
             "type": [
               "string",
               "null"
             ]
           },
-          "is_secret": {
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTemplateUpgradeChange"
+            },
+            "type": "array"
+          },
+          "latest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceTemplateInstance",
+                "description": "Latest release for the same service family. Absent when the catalog no\nlonger carries the template; the applied snapshot is still usable."
+              }
+            ]
+          },
+          "missing_services": {
+            "description": "Managed service families that must be linked before this release can be\napplied. Existing links are never removed automatically.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "required_configuration": {
+            "description": "Required target inputs that are not currently configured and cannot be\nfilled from a template default or generator.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
+            },
+            "type": "array"
+          },
+          "upgrade_available": {
             "type": "boolean"
+          }
+        },
+        "required": [
+          "project_id",
+          "applied",
+          "upgrade_available",
+          "catalog_drift",
+          "changes",
+          "required_configuration",
+          "missing_services"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateUpgradeChange": {
+        "description": "One reviewable change between the project's applied service release and\nthe current catalog release. Values contain public template metadata only;\nproject environment values and secrets never enter this response.",
+        "properties": {
+          "current": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field": {
+            "type": "string"
           },
           "kind": {
-            "description": "Generator/input type used by the installer.",
-            "type": "string"
+            "$ref": "#/components/schemas/ServiceTemplateChangeKind"
           },
-          "name": {
-            "type": "string"
-          },
-          "required": {
-            "type": "boolean"
-          },
-          "route_service": {
+          "target": {
             "type": [
               "string",
               "null"
@@ -37798,10 +37584,8 @@
           }
         },
         "required": [
-          "name",
-          "kind",
-          "required",
-          "is_secret"
+          "field",
+          "kind"
         ],
         "type": "object"
       },
@@ -42012,11 +41796,16 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "version": {
+            "description": "Immutable release identifier for service templates.",
+            "type": "string"
           }
         },
         "required": [
           "slug",
           "name",
+          "version",
           "kind",
           "git",
           "preset",
@@ -46519,6 +46308,25 @@
         },
         "required": [
           "image"
+        ],
+        "type": "object"
+      },
+      "UpgradeServiceTemplateRequest": {
+        "properties": {
+          "environment_variables": {
+            "description": "Values for inputs introduced by the target release. Existing project\nvalues are preserved and cannot be overwritten through this endpoint.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarInput"
+            },
+            "type": "array"
+          },
+          "target_version": {
+            "description": "Optimistic target selected from the preview. The server rejects a stale\ntarget if the catalog changes between preview and apply.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_version"
         ],
         "type": "object"
       },
@@ -93018,10 +92826,121 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/service-template": {
+      "get": {
+        "operationId": "get_project_service_template",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceTemplateInstanceResponse"
+                }
+              }
+            },
+            "description": "Applied service release and upgrade preview"
+          },
+          "400": {
+            "description": "Project is not a service"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Atomically replace a service-template project's image runtime and resource\nprofile. This endpoint is deliberately separate from generic project\nsettings because these fields form one deployable configuration.",
         "tags": [
           "Projects"
-        ]
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/service-template/upgrade": {
+      "post": {
+        "operationId": "upgrade_project_service_template",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeServiceTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Service template upgraded"
+          },
+          "400": {
+            "description": "Invalid or stale upgrade"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project or template not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/settings": {
@@ -98289,216 +98208,6 @@
           "Revenue"
         ],
         "x-maturity": "experimental"
-      }
-    },
-    "/service-templates/": {
-      "get": {
-        "operationId": "list_service_templates",
-        "parameters": [
-          {
-            "description": "Search name, description, category, and tags",
-            "in": "query",
-            "name": "search",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Filter by category",
-            "in": "query",
-            "name": "category",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Filter by exact normalized discovery tag",
-            "in": "query",
-            "name": "tag",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "One-based page number",
-            "in": "query",
-            "name": "page",
-            "required": false,
-            "schema": {
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Results per page, maximum 100",
-            "in": "query",
-            "name": "per_page",
-            "required": false,
-            "schema": {
-              "minimum": 0,
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ListServiceTemplatesResponse"
-                }
-              }
-            },
-            "description": "Paginated service template catalog"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "502": {
-            "description": "Upstream catalog unavailable"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "summary": "Browse Coolify's one-click Docker Compose catalog.",
-        "tags": [
-          "Service Templates"
-        ],
-        "x-maturity": "beta"
-      }
-    },
-    "/service-templates/{slug}": {
-      "get": {
-        "operationId": "get_service_template",
-        "parameters": [
-          {
-            "description": "Coolify template slug",
-            "in": "path",
-            "name": "slug",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ServiceTemplateDetailResponse"
-                }
-              }
-            },
-            "description": "Service template detail and compatibility analysis"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Template not found"
-          },
-          "422": {
-            "description": "Template content is invalid"
-          },
-          "502": {
-            "description": "Upstream catalog unavailable"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "summary": "Inspect a normalized service template before installing it.",
-        "tags": [
-          "Service Templates"
-        ],
-        "x-maturity": "beta"
-      }
-    },
-    "/service-templates/{slug}/preflight": {
-      "post": {
-        "operationId": "preflight_service_template",
-        "parameters": [
-          {
-            "description": "Coolify template slug",
-            "in": "path",
-            "name": "slug",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PreflightServiceTemplateRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PreflightServiceTemplateResponse"
-                }
-              }
-            },
-            "description": "Template preflight result"
-          },
-          "400": {
-            "description": "Invalid project name"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Template not found"
-          },
-          "409": {
-            "description": "Catalog install plan changed; reload required"
-          },
-          "422": {
-            "description": "Template content is invalid"
-          },
-          "502": {
-            "description": "Upstream catalog unavailable"
-          },
-          "503": {
-            "description": "Docker preflight unavailable or at capacity"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "summary": "Validate a fully configured template without creating a project or containers.",
-        "tags": [
-          "Service Templates"
-        ],
-        "x-maturity": "beta"
       }
     },
     "/session-replays": {
@@ -105405,10 +105114,6 @@
     {
       "description": "Custom domain management for projects",
       "name": "Custom Domains"
-    },
-    {
-      "description": "Runtime-synced Docker Compose service catalog",
-      "name": "Service Templates"
     },
     {
       "description": "Error tracking data fetching endpoints",

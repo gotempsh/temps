@@ -72,19 +72,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function pinnedImageReference(image: string): boolean {
   const digestSeparator = image.lastIndexOf("@");
-  if (digestSeparator >= 0) {
-    return /^sha256:[0-9a-f]{64}$/i.test(image.slice(digestSeparator + 1));
-  }
-
-  const lastSlash = image.lastIndexOf("/");
-  const tagSeparator = image.lastIndexOf(":");
-  if (tagSeparator <= lastSlash || tagSeparator === image.length - 1) {
-    return false;
-  }
-  return image.slice(tagSeparator + 1).toLowerCase() !== "latest";
+  return (
+    digestSeparator > 0 &&
+    /^sha256:[0-9a-f]{64}$/i.test(image.slice(digestSeparator + 1))
+  );
 }
 
 function isSecretEnvironmentVariable(variable: Record<string, unknown>): boolean {
+  if (variable.secret === true) return true;
   const generator = variable.default_generator;
   if (typeof generator === "string" && generator.includes("secret")) {
     return true;
@@ -223,7 +218,7 @@ export function validateNativeTemplateConfig(
         typeof value.image !== "string" ||
         !pinnedImageReference(value.image)
       ) {
-        errors.push(`${prefix}.image must be a version-pinned image reference`);
+        errors.push(`${prefix}.image must use an immutable sha256 digest`);
       }
       if (value.resources !== undefined) {
         if (!isRecord(value.resources)) {

@@ -110,6 +110,8 @@ pub struct EnvVarTemplateResponse {
     pub description: Option<String>,
     /// Whether this variable is required
     pub required: bool,
+    /// Whether values must use the protected secret reveal path.
+    pub secret: bool,
     /// Frontend-side generator hint for the default value
     /// (e.g. `app_url`, `random_secret`, `random_hex_32`)
     pub default_generator: Option<String>,
@@ -152,12 +154,14 @@ impl From<ProjectTemplate> for TemplateResponse {
 
 impl From<EnvVarTemplate> for EnvVarTemplateResponse {
     fn from(env_var: EnvVarTemplate) -> Self {
+        let secret = env_var.is_secret();
         Self {
             name: env_var.name,
             example: env_var.example,
-            default: env_var.default,
+            default: if secret { None } else { env_var.default },
             description: env_var.description,
             required: env_var.required,
+            secret,
             default_generator: env_var.default_generator,
         }
     }
@@ -472,6 +476,7 @@ mod tests {
                 default: None,
                 description: Some("A test variable".to_string()),
                 required: true,
+                secret: false,
                 default_generator: None,
             }],
             is_public: true,
@@ -510,19 +515,18 @@ mod tests {
             default: Some("postgres://localhost/default".to_string()),
             description: Some("Database connection URL".to_string()),
             required: true,
+            secret: false,
             default_generator: None,
         };
 
         let response = EnvVarTemplateResponse::from(env_var);
 
         assert_eq!(response.name, "DATABASE_URL");
+        assert!(response.secret);
+        assert_eq!(response.default, None);
         assert_eq!(
             response.example,
             Some("postgres://localhost/db".to_string())
-        );
-        assert_eq!(
-            response.default,
-            Some("postgres://localhost/default".to_string())
         );
         assert_eq!(
             response.description,

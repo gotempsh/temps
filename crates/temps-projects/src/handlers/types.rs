@@ -766,6 +766,9 @@ pub struct ServiceTemplateInstanceResponse {
     /// Latest release for the same service family. Absent when the catalog no
     /// longer carries the template; the applied snapshot is still usable.
     pub latest: Option<ServiceTemplateInstance>,
+    /// User-safe explanation when the active catalog could not provide this
+    /// service family. The applied snapshot remains authoritative and editable.
+    pub catalog_error: Option<String>,
     pub upgrade_available: bool,
     /// The catalog definition changed without a version bump. Applying it is
     /// intentionally blocked because mutable releases make upgrades and

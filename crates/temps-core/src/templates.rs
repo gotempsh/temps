@@ -31,6 +31,10 @@ pub struct EnvVarTemplate {
     /// Whether this variable is required
     #[serde(default)]
     pub required: bool,
+    /// Explicit sensitivity classification for credentials whose names do not
+    /// match the conservative built-in heuristic.
+    #[serde(default)]
+    pub secret: bool,
     /// Frontend-side generator for the default value. Recognised values:
     /// `app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),
     /// `random_hex_32` (32-byte hex). Unknown values are ignored client-side.
@@ -46,6 +50,9 @@ impl EnvVarTemplate {
     /// configuration is still encrypted at rest, but remains readable in the
     /// project environment-variable UI.
     pub fn is_secret(&self) -> bool {
+        if self.secret {
+            return true;
+        }
         if self
             .default_generator
             .as_deref()
@@ -263,6 +270,12 @@ pub enum ServiceTemplateInstanceError {
         #[source]
         source: semver::Error,
     },
+    #[error("service template {slug}@{version} has an invalid resolved definition: {reason}")]
+    InvalidDefinition {
+        slug: String,
+        version: String,
+        reason: String,
+    },
 }
 
 impl ServiceTemplateInstance {
@@ -290,13 +303,26 @@ impl ServiceTemplateInstance {
         if self.slug != self.template.slug || self.version != self.template.version {
             return Err(ServiceTemplateInstanceError::IdentityMismatch);
         }
-        self.release_version().map(|_| ()).map_err(|source| {
-            ServiceTemplateInstanceError::InvalidVersion {
+        self.release_version()
+            .map_err(|source| ServiceTemplateInstanceError::InvalidVersion {
                 slug: self.slug.clone(),
                 version: self.version.clone(),
                 source,
-            }
-        })
+            })?;
+
+        let mut errors = TemplateService::validate_template(&self.template);
+        if self.template.kind != TemplateKind::Service {
+            errors.push("Resolved definition must have kind 'service'".to_string());
+        }
+        if !errors.is_empty() {
+            return Err(ServiceTemplateInstanceError::InvalidDefinition {
+                slug: self.slug.clone(),
+                version: self.version.clone(),
+                reason: errors.join("; "),
+            });
+        }
+
+        Ok(())
     }
 
     /// Whether this release is a strictly newer release of the same service.
@@ -394,21 +420,11 @@ pub const VALID_SERVICES: &[&str] = &[
 ];
 
 fn is_pinned_image_reference(image: &str) -> bool {
-    if let Some((_, digest)) = image.rsplit_once('@') {
-        return digest
+    image.rsplit_once('@').is_some_and(|(_, digest)| {
+        digest
             .strip_prefix("sha256:")
-            .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()));
-    }
-
-    let last_slash = image.rfind('/');
-    let Some(tag_separator) = image.rfind(':') else {
-        return false;
-    };
-    if last_slash.is_some_and(|slash| tag_separator <= slash) {
-        return false;
-    }
-    let tag = &image[tag_separator + 1..];
-    !tag.is_empty() && !tag.eq_ignore_ascii_case("latest")
+            .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()))
+    })
 }
 
 /// Presets accepted by project creation. Kept here so invalid bundled YAML is
@@ -585,6 +601,16 @@ impl TemplateService {
                 config.version, SERVICE_TEMPLATE_SCHEMA_VERSION
             )));
         }
+        let contains_service_templates = config
+            .templates
+            .iter()
+            .any(|template| template.kind == TemplateKind::Service);
+        if contains_service_templates && config.version != SERVICE_TEMPLATE_SCHEMA_VERSION {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Service templates require catalog schema '{}'; received '{}'",
+                SERVICE_TEMPLATE_SCHEMA_VERSION, config.version
+            )));
+        }
         let validation_errors = Self::validate_config(&config);
         if !validation_errors.is_empty() {
             return Err(TemplateConfigError::ValidationErrors(validation_errors));
@@ -649,8 +675,7 @@ impl TemplateService {
                 .is_some_and(|image| !is_pinned_image_reference(image))
             {
                 errors.push(
-                    "Service templates must use a version-pinned image tag or sha256 digest"
-                        .to_string(),
+                    "Service templates must use an immutable sha256 image digest".to_string(),
                 );
             }
             if template
@@ -801,6 +826,18 @@ impl TemplateService {
 
         info!("Loading additional templates from {:?}", path);
         let additional_config = TemplatesConfig::from_file(path)?;
+        let contains_service_templates = additional_config
+            .templates
+            .iter()
+            .any(|template| template.kind == TemplateKind::Service);
+        if contains_service_templates
+            && additional_config.version != SERVICE_TEMPLATE_SCHEMA_VERSION
+        {
+            return Err(TemplateConfigError::ParseError(format!(
+                "Additional service templates require catalog schema '{}'; received '{}'",
+                SERVICE_TEMPLATE_SCHEMA_VERSION, additional_config.version
+            )));
+        }
 
         // Validate additional templates
         let validation_errors = Self::validate_config(&additional_config);
@@ -1143,7 +1180,7 @@ templates:
         );
         assert_eq!(
             template.image.as_deref(),
-            Some("quay.io/keycloak/keycloak:26.7.2")
+            Some("quay.io/keycloak/keycloak@sha256:9d1f1b2b7261ff53c66cb1092dfcdc34a5fb77e81f9e6a6e75b8b6a795de8067")
         );
         assert_eq!(template.command, Some(vec!["start".to_string()]));
         assert_eq!(
@@ -1184,7 +1221,7 @@ templates:
         );
         assert_eq!(
             template.image.as_deref(),
-            Some("ghcr.io/browserless/chromium:v2.56.0")
+            Some("ghcr.io/browserless/chromium@sha256:6f3149efabf5e04a44385974448c85264398db416bc63f884564316d0fcadc3e")
         );
         assert_eq!(template.exposed_port, Some(3000));
         assert_eq!(template.health_check_path.as_deref(), Some("/docs"));
@@ -1206,6 +1243,22 @@ templates:
         assert!(external.required);
         assert_eq!(external.default_generator.as_deref(), Some("app_url"));
         assert!(TemplateService::validate_template(&template).is_empty());
+    }
+
+    #[test]
+    fn service_template_rejects_a_mutable_version_tag() {
+        let mut template = bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be part of the reviewed catalog");
+        template.image = Some("quay.io/keycloak/keycloak:26.7.2".to_string());
+
+        let errors = TemplateService::validate_template(&template);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "Service templates must use an immutable sha256 image digest"),
+            "unexpected validation errors: {errors:?}"
+        );
     }
 
     #[test]
@@ -1344,6 +1397,54 @@ templates:
         assert_eq!(service.list_templates().await.len(), 2);
     }
 
+    #[tokio::test]
+    async fn external_version_one_service_catalogs_are_rejected() {
+        use std::io::Write;
+
+        let template = bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be part of the reviewed catalog");
+        let yaml = TemplatesConfig {
+            version: "1".to_string(),
+            templates: vec![template],
+        }
+        .to_yaml()
+        .expect("serialize incompatible service catalog");
+        let mut file = tempfile::NamedTempFile::new().expect("temporary template catalog");
+        file.write_all(yaml.as_bytes())
+            .expect("write incompatible service catalog");
+        let service = TemplateService::new(Some(file.path().to_path_buf()));
+
+        let error = service
+            .load()
+            .await
+            .expect_err("schema-one service definitions must not load");
+        assert!(matches!(error, TemplateConfigError::ParseError(_)));
+    }
+
+    #[tokio::test]
+    async fn additional_service_catalogs_cannot_be_relabelled_as_schema_two() {
+        use std::io::Write;
+
+        let template = bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be part of the reviewed catalog");
+        let yaml = TemplatesConfig {
+            version: "1".to_string(),
+            templates: vec![template],
+        }
+        .to_yaml()
+        .expect("serialize incompatible service catalog");
+        let mut file = tempfile::NamedTempFile::new().expect("temporary template catalog");
+        file.write_all(yaml.as_bytes())
+            .expect("write incompatible service catalog");
+        let service = TemplateService::new(None);
+
+        let error = service
+            .load_additional(file.path())
+            .await
+            .expect_err("schema-one service definitions must not be persisted as schema two");
+        assert!(matches!(error, TemplateConfigError::ParseError(_)));
+    }
+
     #[test]
     fn test_bundled_templates_parse_and_validate() {
         // The bundled templates.yaml is embedded at compile time and loaded on
@@ -1449,6 +1550,19 @@ templates:
     }
 
     #[test]
+    fn service_template_instance_rejects_an_invalid_resolved_definition() {
+        let mut template = bundled_template_by_slug("browserless")
+            .expect("Browserless should be part of the reviewed catalog");
+        template.image = Some("ghcr.io/browserless/chromium:v2.56.0".to_string());
+        let instance = ServiceTemplateInstance::new(SERVICE_TEMPLATE_SCHEMA_VERSION, template);
+
+        assert!(matches!(
+            instance.validate(),
+            Err(ServiceTemplateInstanceError::InvalidDefinition { .. })
+        ));
+    }
+
+    #[test]
     fn service_template_release_comparison_requires_same_family_and_newer_version() {
         let applied = ServiceTemplateInstance::new(
             SERVICE_TEMPLATE_SCHEMA_VERSION,
@@ -1491,7 +1605,9 @@ templates:
         template.version = "1.0.0".to_string();
         template.image = Some("example.test/keycloak:latest".to_string());
         let errors = TemplateService::validate_template(&template);
-        assert!(errors.iter().any(|error| error.contains("version-pinned")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("immutable sha256 image digest")));
     }
 
     #[test]

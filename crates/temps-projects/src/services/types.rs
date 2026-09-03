@@ -23,6 +23,10 @@ pub struct EnvVarWithEnvironments {
     pub project_id: i32,
     pub key: String,
     pub value: String,
+    /// Internal presence bit used by upgrade validation. Secret list values
+    /// are masked, so callers must never infer this from the serialized value.
+    #[serde(skip)]
+    pub has_value: bool,
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
     pub environments: Vec<EnvVarEnvironment>,

@@ -72,7 +72,7 @@ pub const FEATURE_MATURITY: &[FeatureMaturity] = &[
     feature(
         "service-template-catalog",
         Maturity::Beta,
-        "Community Compose compatibility is still being qualified; host-integrated templates remain unavailable until they can be isolated safely.",
+        "Native curated service templates currently support one application container with Temps-managed service bindings; multi-container template workloads are not available yet.",
     ),
     feature(
         "web-analytics",
@@ -240,7 +240,7 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/revenue") || path.contains("/revenue/") {
         return Some("revenue-tracking");
     }
-    if path.starts_with("/service-templates") {
+    if path.contains("/service-template") || path.contains("/service-runtime") {
         return Some("service-template-catalog");
     }
     if path.starts_with("/otel/genai") {
@@ -409,7 +409,11 @@ mod tests {
             Some("error-tracking")
         );
         assert_eq!(
-            feature_key_for_api_path("/service-templates/{slug}/preflight"),
+            feature_key_for_api_path("/projects/{project_id}/service-template/upgrade"),
+            Some("service-template-catalog")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/service-runtime"),
             Some("service-template-catalog")
         );
         assert_eq!(feature_key_for_api_path("/projects"), None);

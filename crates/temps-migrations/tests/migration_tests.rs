@@ -210,7 +210,14 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
          VALUES \
          ('Keycloak', '', '', '.', 'main', 'dockerfile', now(), now(), 'keycloak-test', 'keycloak'), \
          ('Static', '', '', '.', 'main', 'static', now(), now(), 'static-test', NULL), \
+         ('Vite', '', '', '.', 'main', 'vite', now(), now(), 'vite-test', NULL), \
+         ('Nixpacks static', '', '', '.', 'main', 'nixpacks', now(), now(), 'nixpacks-static-test', NULL), \
          ('Server', '', '', '.', 'main', 'nodejs', now(), now(), 'server-test', NULL)",
+    )
+    .await?;
+    db.execute_unprepared(
+        "UPDATE projects SET preset_config = '{\"preset\":\"nixpacks\",\"providers\":[\"static\"]}'::jsonb \
+         WHERE slug = 'nixpacks-static-test'",
     )
     .await?;
 
@@ -223,7 +230,7 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
         .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT slug, project_type FROM projects \
-             WHERE slug IN ('keycloak-test', 'static-test', 'server-test') ORDER BY slug"
+            WHERE slug IN ('keycloak-test', 'nixpacks-static-test', 'static-test', 'server-test', 'vite-test') ORDER BY slug"
                 .to_string(),
         ))
         .await?;
@@ -240,8 +247,10 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
         project_types,
         vec![
             ("keycloak-test".to_string(), "server".to_string()),
+            ("nixpacks-static-test".to_string(), "static".to_string()),
             ("server-test".to_string(), "server".to_string()),
             ("static-test".to_string(), "static".to_string()),
+            ("vite-test".to_string(), "static".to_string()),
         ]
     );
 

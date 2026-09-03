@@ -133,16 +133,36 @@ fn text_option(value: Option<impl ToString>) -> Option<String> {
 fn production_environment_variable_names(
     variables: &[crate::services::types::EnvVarWithEnvironments],
 ) -> BTreeSet<String> {
-    variables
-        .iter()
-        .filter(|variable| {
-            variable.environments.is_empty()
-                || variable
-                    .environments
-                    .iter()
-                    .any(|environment| environment.name.eq_ignore_ascii_case("production"))
-        })
-        .map(|variable| variable.key.clone())
+    // A production-scoped value overrides a global value with the same key,
+    // including when it is intentionally empty. Only fall back to the global
+    // row when there is no production-specific row.
+    let mut configured = BTreeMap::<String, (bool, bool)>::new();
+    for variable in variables {
+        let production_scoped = variable
+            .environments
+            .iter()
+            .any(|environment| environment.name.eq_ignore_ascii_case("production"));
+        let global = variable.environments.is_empty();
+        if !production_scoped && !global {
+            continue;
+        }
+
+        let entry = configured
+            .entry(variable.key.clone())
+            .or_insert((false, false));
+        if production_scoped {
+            if !entry.0 {
+                *entry = (true, false);
+            }
+            entry.1 |= variable.has_value;
+        } else if !entry.0 {
+            entry.1 |= variable.has_value;
+        }
+    }
+
+    configured
+        .into_iter()
+        .filter_map(|(key, (_, has_value))| has_value.then_some(key))
         .collect()
 }
 
@@ -2022,11 +2042,30 @@ pub async fn get_project_service_template(
         .get_linked_service_types(project_id)
         .await
         .map_err(Problem::from)?;
-    let latest = state
+    let (latest, catalog_error) = match state
         .template_service
         .get_service_template_instance(&applied.slug)
         .await
-        .ok();
+    {
+        Ok(latest) => (Some(latest), None),
+        Err(temps_core::templates::TemplateConfigError::NotFound(_)) => (
+            None,
+            Some(
+                "This service family is no longer present in the active template catalog."
+                    .to_string(),
+            ),
+        ),
+        Err(error) => {
+            warn!(project_id, template_slug = %applied.slug, %error, "Could not read the active service template catalog");
+            (
+                None,
+                Some(
+                    "The active service template catalog could not be read. Try again or ask an administrator to check the catalog configuration."
+                        .to_string(),
+                ),
+            )
+        }
+    };
     let catalog_drift = latest.as_ref().is_some_and(|latest| {
         latest.version == applied.version && latest.template != applied.template
     });
@@ -2058,6 +2097,7 @@ pub async fn get_project_service_template(
         project_id,
         applied,
         latest,
+        catalog_error,
         upgrade_available,
         catalog_drift,
         changes,
@@ -2113,6 +2153,10 @@ pub async fn upgrade_project_service_template(
                 .detail(error.to_string())
                 .build()
         })?;
+    let previous_template_version = applied.version.clone();
+    let previous_template_image = applied.template.image.clone();
+    let target_template_version = target.version.clone();
+    let target_template_image = target.template.image.clone();
     if target.version != request.target_version {
         return Err(temps_core::error_builder::bad_request()
             .title("Template Upgrade Changed")
@@ -2214,9 +2258,22 @@ pub async fn upgrade_project_service_template(
         project_id: updated_project.id,
         project_name: updated_project.name.clone(),
         project_slug: updated_project.slug.clone(),
-        updated_fields: [("service_template".to_string(), "upgraded".to_string())]
-            .into_iter()
-            .collect(),
+        updated_fields: [
+            (
+                "service_template_version".to_string(),
+                format!("{previous_template_version} -> {target_template_version}"),
+            ),
+            (
+                "service_template_image".to_string(),
+                format!(
+                    "{} -> {}",
+                    previous_template_image.as_deref().unwrap_or("not set"),
+                    target_template_image.as_deref().unwrap_or("not set")
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect(),
     };
     if let Err(error) = state.audit_service.create_audit_log(&audit_event).await {
         error!(project_id, %error, "Failed to create service upgrade audit log");
@@ -2252,6 +2309,33 @@ pub async fn update_service_template_runtime(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    let current_project = state
+        .project_service
+        .get_project(project_id)
+        .await
+        .map_err(Problem::from)?;
+    let previous_runtime = current_project
+        .preset_config
+        .as_ref()
+        .and_then(|value| {
+            serde_json::from_value::<temps_entities::preset::PresetConfig>(value.clone()).ok()
+        })
+        .and_then(|config| match config {
+            temps_entities::preset::PresetConfig::Dockerfile(config) => config.image_runtime,
+            _ => None,
+        });
+    let previous_image = previous_runtime
+        .as_ref()
+        .map(|runtime| runtime.image_ref.as_str())
+        .unwrap_or("not set")
+        .to_string();
+    let previous_command_count = previous_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.command.as_ref())
+        .map_or(0, Vec::len);
+    let requested_image = runtime.image_ref.clone();
+    let requested_command_count = runtime.command.len();
+
     let updated_project = state
         .project_service
         .update_service_template_runtime(
@@ -2270,17 +2354,22 @@ pub async fn update_service_template_runtime(
         user_agent: metadata.user_agent,
     };
     let updated_fields = [
-        "image_ref",
-        "command",
-        "health_check_path",
-        "cpu_request",
-        "cpu_limit",
-        "memory_request",
-        "memory_limit",
-        "exposed_port",
+        (
+            "image_ref".to_string(),
+            format!("{previous_image} -> {requested_image}"),
+        ),
+        (
+            "command_argument_count".to_string(),
+            format!("{previous_command_count} -> {requested_command_count}"),
+        ),
+        ("health_check_path".to_string(), "updated".to_string()),
+        ("cpu_request".to_string(), "updated".to_string()),
+        ("cpu_limit".to_string(), "updated".to_string()),
+        ("memory_request".to_string(), "updated".to_string()),
+        ("memory_limit".to_string(), "updated".to_string()),
+        ("exposed_port".to_string(), "updated".to_string()),
     ]
     .into_iter()
-    .map(|field| (field.to_string(), "updated".to_string()))
     .collect();
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,
@@ -3733,10 +3822,11 @@ mod tests {
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
         drop_preset_candidate_from, image_template_preset_config,
         missing_required_template_configuration, parse_owner_repo_from_git_url,
-        project_created_from_template_telemetry_event, require_git_settings_permissions,
-        require_template_creation_permissions, resolve_image_template_runtime,
-        service_template_changes, validate_template_service_selection, DropPresetCandidate,
-        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        production_environment_variable_names, project_created_from_template_telemetry_event,
+        require_git_settings_permissions, require_template_creation_permissions,
+        resolve_image_template_runtime, service_template_changes,
+        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
+        TemplateRuntimeOverrideError, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -3937,8 +4027,9 @@ mod tests {
         let runtime = resolve_image_template_runtime(&template, &image_template_request())
             .expect("curated defaults should be valid")
             .expect("Keycloak should resolve to image mode");
+        let expected_image = template.image.as_deref().expect("Keycloak image");
 
-        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:26.7.2");
+        assert_eq!(runtime.image_ref, expected_image);
         assert_eq!(runtime.command, Some(vec!["start".to_string()]));
         assert_eq!(runtime.cpu_request, Some(500_000));
         assert_eq!(runtime.cpu_limit, Some(1_000_000));
@@ -3949,10 +4040,7 @@ mod tests {
 
         let stored = image_template_preset_config(&template, &runtime)
             .expect("resolved runtime should be persistable");
-        assert_eq!(
-            stored["imageRuntime"]["imageRef"],
-            "quay.io/keycloak/keycloak:26.7.2"
-        );
+        assert_eq!(stored["imageRuntime"]["imageRef"], expected_image);
         assert_eq!(
             stored["imageRuntime"]["command"],
             serde_json::json!(["start"])
@@ -4374,6 +4462,7 @@ mod tests {
                 default: None,
                 description: Some("New integration credential".to_string()),
                 required: true,
+                secret: true,
                 default_generator: None,
             });
         let configured = BTreeSet::from(["TOKEN".to_string()]);
@@ -4404,6 +4493,43 @@ mod tests {
                 && variable.is_secret
         }));
         assert!(resolved.iter().any(|variable| variable.key == "EXTERNAL"));
+    }
+
+    #[test]
+    fn template_upgrade_treats_empty_production_override_as_unconfigured() {
+        let now = Utc::now();
+        let variables = vec![
+            crate::services::types::EnvVarWithEnvironments {
+                id: 1,
+                project_id: 7,
+                key: "NEW_API_KEY".to_string(),
+                value: "global-fallback".to_string(),
+                has_value: true,
+                created_at: now,
+                updated_at: now,
+                environments: Vec::new(),
+            },
+            crate::services::types::EnvVarWithEnvironments {
+                id: 2,
+                project_id: 7,
+                key: "NEW_API_KEY".to_string(),
+                value: "***".to_string(),
+                has_value: false,
+                created_at: now,
+                updated_at: now,
+                environments: vec![crate::services::types::EnvVarEnvironment {
+                    id: 20,
+                    name: "production".to_string(),
+                }],
+            },
+        ];
+
+        let configured = production_environment_variable_names(&variables);
+
+        assert!(!configured.contains("NEW_API_KEY"));
+        let serialized = serde_json::to_value(&variables[1]).expect("serialize env var response");
+        assert!(serialized.get("has_value").is_none());
+        assert_eq!(serialized["value"], "***");
     }
 
     #[test]

@@ -25,12 +25,15 @@ export function isLikelySecretProjectEnvironmentVariable(key: string): boolean {
 export function templateEnvironmentVariableDefaultsToSecret({
   key,
   defaultGenerator,
+  explicitSecret,
 }: {
   templateKind: string | undefined
   key: string
   defaultGenerator: string | null | undefined
+  explicitSecret?: boolean
 }): boolean {
   return (
+    explicitSecret === true ||
     isLikelySecretProjectEnvironmentVariable(key) ||
     defaultGenerator?.includes('secret') === true
   )

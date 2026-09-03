@@ -32,13 +32,19 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Preserve the pre-existing static/server classification. Service
-        // projects are new in this migration and are created explicitly by the
-        // application with an immutable template snapshot.
+        // Preserve the pre-existing static/server classification. Framework
+        // presets that produce static output do not use the literal `static`
+        // discriminator, and Nixpacks is static only when its sole selected
+        // provider is `static`. Service projects are new in this migration and
+        // are created explicitly by the application with an immutable template
+        // snapshot.
         manager
             .get_connection()
             .execute_unprepared(
-                "UPDATE projects SET project_type = 'static' WHERE preset = 'static'",
+                "UPDATE projects SET project_type = 'static' \
+                 WHERE preset IN ('static', 'vite', 'react', 'docusaurus', 'rsbuild') \
+                    OR (preset = 'nixpacks' AND \
+                        preset_config -> 'providers' = '[\"static\"]'::jsonb)",
             )
             .await?;
         manager

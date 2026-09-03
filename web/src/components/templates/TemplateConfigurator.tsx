@@ -364,6 +364,7 @@ export function TemplateConfigurator({
             templateKind: template.kind,
             key: env.name,
             defaultGenerator: env.default_generator,
+            explicitSecret: env.secret,
           }),
         }
       }),

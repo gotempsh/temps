@@ -72,7 +72,6 @@ export function ServiceTemplateRuntimeCard({
   })
   const updateRuntime = useMutation({
     ...updateServiceTemplateRuntimeMutation(),
-    meta: { errorTitle: 'Failed to update service runtime' },
   })
   const form = useForm<TemplateRuntimeDefaults>({
     resolver: zodResolver(templateRuntimeDefaultsSchema),
@@ -465,7 +464,6 @@ function ServiceTemplateUpgradeCard({
 }) {
   const upgrade = useMutation({
     ...upgradeProjectServiceTemplateMutation(),
-    meta: { errorTitle: 'Failed to update service template' },
   })
   const [configuration, setConfiguration] = useState<Record<string, string>>({})
   const latest = instance.latest
@@ -489,7 +487,13 @@ function ServiceTemplateUpgradeCard({
     )
   }, [requiredConfiguration])
 
-  if (!latest || (!instance.upgrade_available && !instance.catalog_drift)) {
+  if (!latest) {
+    return instance.catalog_error ? (
+      <ServiceTemplateCatalogUnavailable message={instance.catalog_error} />
+    ) : null
+  }
+
+  if (!instance.upgrade_available && !instance.catalog_drift) {
     return null
   }
 
@@ -662,6 +666,26 @@ function ServiceTemplateUpgradeCard({
   )
 }
 
+export function ServiceTemplateCatalogUnavailable({
+  message,
+}: {
+  message: string
+}) {
+  return (
+    <Card className="border-amber-500/30">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <AlertTriangle className="size-4 text-amber-500" />
+          Template updates unavailable
+        </CardTitle>
+        <CardDescription>
+          {message} Your saved runtime remains deployable and editable below.
+        </CardDescription>
+      </CardHeader>
+    </Card>
+  )
+}
+
 function isSecretTemplateVariable(
   variable: EnvVarTemplate,
   templateKind: string | undefined
@@ -670,6 +694,7 @@ function isSecretTemplateVariable(
     templateKind,
     key: variable.name,
     defaultGenerator: variable.default_generator,
+    explicitSecret: variable.secret,
   })
 }
 
