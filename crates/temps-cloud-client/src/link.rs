@@ -303,6 +303,18 @@ pub struct CloudLink {
     allow_loopback_development: bool,
     telemetry_enabled: AtomicBool,
     backups_enabled: AtomicBool,
+    /// Whether a Cloud-managed backup destination (`s3_sources.managed_by_cloud`)
+    /// currently exists on this instance. Kept in sync by the owner of that row
+    /// (`temps-cloud`'s `CloudService`), which is the only writer of it.
+    ///
+    /// This is *not* a consent switch — [`CloudLink::backups_enabled`] is. It
+    /// records a physical fact: backups written by this instance are landing in
+    /// a bucket Cloud owns, using a credential Cloud vended. Once that is true,
+    /// registering those objects with Cloud is mandatory bookkeeping rather than
+    /// an export, because the alternative is objects sitting in Cloud storage
+    /// that no Cloud record points at — invisible in the dashboard, unusable for
+    /// restore, and impossible for the operator to notice.
+    managed_backup_destination: AtomicBool,
     notifications_enabled: AtomicBool,
     encryption: Option<Arc<temps_core::EncryptionService>>,
     /// ADR-041 §7c. Set once at startup by whoever owns the write mode.
@@ -407,6 +419,7 @@ impl CloudLink {
             allow_loopback_development,
             telemetry_enabled: AtomicBool::new(false),
             backups_enabled: AtomicBool::new(false),
+            managed_backup_destination: AtomicBool::new(false),
             notifications_enabled: AtomicBool::new(false),
             encryption,
             telemetry_fallback: RwLock::new(None),
@@ -642,6 +655,35 @@ impl CloudLink {
         self.backups_enabled.load(Ordering::Acquire)
     }
 
+    /// Record whether a Cloud-managed backup destination exists locally.
+    ///
+    /// Called by `CloudService` every time it provisions, rotates, or removes
+    /// the `s3_sources.managed_by_cloud` row, and once at startup from the row's
+    /// actual presence. See the field's documentation for why this is separate
+    /// from the operator's export consent.
+    pub fn set_managed_backup_destination(&self, present: bool) {
+        self.managed_backup_destination
+            .store(present, Ordering::Release);
+    }
+
+    pub fn managed_backup_destination(&self) -> bool {
+        self.managed_backup_destination.load(Ordering::Acquire)
+    }
+
+    /// Whether this instance may register backup snapshots with Cloud.
+    ///
+    /// True when the operator turned Cloud backup export on, **or** when a
+    /// Cloud-managed destination exists — in the second case the bytes are
+    /// already inside Cloud-owned storage (Cloud vended the write credential
+    /// and, on an instance with no other S3 source, made that bucket the
+    /// default), so declaring them is the only thing that keeps them
+    /// discoverable and restorable. Gating declaration on the consent switch
+    /// alone does not stop a single byte reaching Cloud; it only guarantees the
+    /// objects arrive with no record attached to them.
+    pub fn backup_registration_permitted(&self) -> bool {
+        self.backups_enabled() || self.managed_backup_destination()
+    }
+
     pub fn telemetry_enabled(&self) -> bool {
         self.telemetry_enabled.load(Ordering::Acquire)
     }
@@ -807,6 +849,28 @@ impl CloudLink {
     /// with an offer; generation tagging prevents a raced batch crossing links.
     pub fn is_linked(&self) -> bool {
         self.linked.load(Ordering::Acquire)
+    }
+
+    /// Build identifier reported in [`Hello`](temps_cloud_protocol::Hello) and
+    /// `EnrollRequest`, so every peer of this link agrees on what "this
+    /// instance" means for support and skew diagnostics.
+    pub(crate) fn agent_version(&self) -> &str {
+        &self.agent_version
+    }
+
+    /// Estimated bytes currently held in the mirror spool, i.e. telemetry
+    /// this instance would ship if the backend accepted it right now.
+    ///
+    /// Reported on the heartbeat channel as `pending_spool_bytes` so a growing
+    /// value is visible from Cloud's side as "this instance is buffering
+    /// because we are failing it" — the same signal [`Self::health`] already
+    /// derives locally, just carried over the wire.
+    pub fn spooled_bytes(&self) -> u64 {
+        self.drain_incoming();
+        self.spool
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .buffered_bytes() as u64
     }
 
     /// Point this instance at a backend without linking it yet.
@@ -1212,7 +1276,7 @@ impl CloudLink {
     }
 
     fn linked_backup_credential(&self) -> Result<(String, String, Uuid), CloudError> {
-        if !self.backups_enabled.load(Ordering::Acquire) {
+        if !self.backup_registration_permitted() {
             return Err(CloudError::FeatureDisabled { feature: "backups" });
         }
         if let Some(error) = self.unreadable_cloud_error() {

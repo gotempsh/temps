@@ -7,6 +7,7 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+use super::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
 use super::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use super::deployment_config::DeploymentConfig;
@@ -182,9 +183,26 @@ pub struct Model {
     ///
     /// This is the operator's *declared intent*. The effective destination can
     /// temporarily differ (quota exhaustion, disconnect, queue overflow); that
-    /// history lives in `project_telemetry_write_intervals`, never here.
+    /// history lives in `project_telemetry_write_intervals` (signal_group =
+    /// 'spans'), never here.
     #[sea_orm(default_value = "local")]
     pub cloud_telemetry_write_mode: CloudTelemetryWriteMode,
+    /// ADR-043 §1: whether this project's analytics events, metrics and proxy
+    /// logs are stored on this instance at all, or written straight to Temps
+    /// Cloud through the shared durable outbox.
+    ///
+    /// `local` (the default for every existing and new project) is exactly
+    /// today's behaviour — analytics events, OTel metrics, service metrics and
+    /// proxy logs go to their local stores (Postgres / TimescaleDB). `cloud`
+    /// is a per-project opt-in subject to the same gate as
+    /// `cloud_telemetry_write_mode`: `queryable` fidelity, active Cloud link,
+    /// and Cloud telemetry switch on.
+    ///
+    /// This is the operator's *declared intent* for the non-span signal group.
+    /// The effective destination history lives in
+    /// `project_telemetry_write_intervals` (signal_group = 'analytics').
+    #[sea_orm(default_value = "local")]
+    pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

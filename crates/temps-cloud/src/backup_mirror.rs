@@ -47,21 +47,33 @@ const MAX_REPOSITORY_KEY_BYTES: usize = 16 * 1024 * 1024;
 /// object is malformed for this protocol and is rejected before allocation.
 const MAX_JSON_OBJECT_BYTES: usize = 1024 * 1024;
 const MIRROR_STATE_VERSION: u32 = 1;
+/// Both queries below are scoped to `s3_sources.managed_by_cloud`. A backup
+/// already written to an operator-configured, non-managed S3 source (their
+/// own bucket, their own credentials) is offsite by the operator's own
+/// choice; mirroring it into Temps Cloud storage too would silently double
+/// the upload/storage cost and, if the managed backend is degraded, retry
+/// forever against a destination the operator never asked this backup to
+/// use. Only backups written through the Cloud-provisioned source
+/// (`managed_by_cloud = true`) are mirrored.
 const DUE_BACKUPS_SQL: &str = r#"
 SELECT b.*
 FROM cloud_backup_mirror_states AS mirror
 JOIN backups AS b ON b.id = mirror.backup_id
+JOIN s3_sources AS s ON s.id = b.s3_source_id
 WHERE mirror.tenant_id = $1
   AND mirror.outcome <> 'complete'
   AND mirror.retry_after <= $3
   AND b.state = 'completed'
+  AND s.managed_by_cloud
 ORDER BY mirror.retry_after ASC, mirror.backup_id ASC
 LIMIT $2
 "#;
 const DISCOVER_BACKUPS_SQL: &str = r#"
 SELECT b.*
 FROM backups AS b
+JOIN s3_sources AS s ON s.id = b.s3_source_id
 WHERE b.state = 'completed'
+  AND s.managed_by_cloud
   AND (COALESCE(b.finished_at, b.started_at), b.id) > ($1, $2)
   AND NOT EXISTS (
     SELECT 1
@@ -88,10 +100,18 @@ enum SweepOutcome {
 
 fn next_sweep_interval(current: Duration, outcome: SweepOutcome) -> Duration {
     match outcome {
-        SweepOutcome::NotLinked => MAX_SWEEP_INTERVAL,
         SweepOutcome::Idle | SweepOutcome::Progress => BASE_SWEEP_INTERVAL,
-        SweepOutcome::Retry if current.is_zero() => BASE_SWEEP_INTERVAL,
-        SweepOutcome::Retry => (current * 2).min(MAX_SWEEP_INTERVAL),
+        // `NotLinked` backs off the same way an outage does instead of jumping
+        // straight to the ceiling. The mirror starts with the server, and being
+        // unlinked is the normal state for the first seconds of every boot and
+        // for the whole of the enrollment flow — an operator who links the
+        // instance a minute after it started must not then wait fifteen minutes
+        // for their first backup to appear in Cloud, with nothing logged in
+        // between to say why. The `NotLinked` path does no network or database
+        // work at all (three atomic loads), so ticking sooner costs nothing, and
+        // an instance that is never linked still settles at the same ceiling.
+        SweepOutcome::NotLinked | SweepOutcome::Retry if current.is_zero() => BASE_SWEEP_INTERVAL,
+        SweepOutcome::NotLinked | SweepOutcome::Retry => (current * 2).min(MAX_SWEEP_INTERVAL),
     }
 }
 
@@ -118,6 +138,14 @@ pub async fn run(
                 }
             }
             _ = tokio::time::sleep(retry_in) => {
+                // Every tick is logged, including the ones that decide there is
+                // nothing to do. A sweep that short-circuits silently is
+                // indistinguishable from a task that stopped ticking, and
+                // telling those two apart from the outside costs hours.
+                tracing::debug!(
+                    slept_secs = retry_in.as_secs(),
+                    "Cloud backup mirror sweep tick starting"
+                );
                 let outcome = match sweep(&link, &db, &encryption).await {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -126,6 +154,11 @@ pub async fn run(
                     }
                 };
                 retry_in = next_sweep_interval(retry_in, outcome);
+                tracing::debug!(
+                    outcome = ?outcome,
+                    next_tick_secs = retry_in.as_secs(),
+                    "Cloud backup mirror sweep tick finished"
+                );
                 if outcome == SweepOutcome::Retry {
                     warn!(
                         retry_in_secs = retry_in.as_secs(),
@@ -143,12 +176,34 @@ async fn sweep(
     encryption: &Arc<EncryptionService>,
 ) -> Result<SweepOutcome, sea_orm::DbErr> {
     if !link.is_linked() {
+        tracing::debug!(
+            reason = "this instance is not linked to Cloud",
+            "Cloud backup mirror sweep has nothing to do"
+        );
         return Ok(SweepOutcome::NotLinked);
     }
-    if !link.backups_enabled() {
+    // Deliberately not `backups_enabled()` on its own. Enrollment provisions
+    // the Cloud-managed `s3_sources` row without asking that switch, a
+    // background loop keeps its credential fresh, and on an instance with no
+    // other S3 source that row becomes the *default* backup destination — so
+    // backup bytes reach Cloud's bucket whether or not export consent is on.
+    // Gating declaration on the switch alone therefore blocks no data transfer
+    // at all; it only strands those objects in Cloud storage with no Cloud
+    // record pointing at them, invisible in the dashboard and unusable for
+    // restore. `backup_registration_permitted()` also lets the mirror stay idle
+    // (and cheap) on the common case: linked, export off, nothing managed.
+    if !link.backup_registration_permitted() {
+        tracing::debug!(
+            reason = "Cloud backup export is off and this instance has no Cloud-managed backup destination",
+            "Cloud backup mirror sweep has nothing to do"
+        );
         return Ok(SweepOutcome::NotLinked);
     }
     let (Some(tenant_id), Some(instance_id)) = (link.tenant_id(), link.instance_id()) else {
+        tracing::debug!(
+            reason = "the Cloud link has no tenant or instance identity yet",
+            "Cloud backup mirror sweep has nothing to do"
+        );
         return Ok(SweepOutcome::NotLinked);
     };
     let selection = select_due_backups(db, tenant_id, SWEEP_LIMIT).await?;
@@ -166,6 +221,20 @@ async fn sweep(
             advance_discovery_cursor(db, tenant_id, watermark).await?;
         }
         return Ok(SweepOutcome::Idle);
+    }
+
+    if !link.backups_enabled() {
+        // Say this out loud rather than mirroring quietly: the operator's
+        // settings page shows Cloud backup export as off while their backups
+        // are being written to, and now recorded in, Temps Cloud storage. They
+        // cannot act on a state nobody reports.
+        warn!(
+            candidate_count = candidates.len(),
+            "Cloud backup export is switched off, but this instance has a Cloud-managed backup \
+             destination and completed backups already written to it. Registering them with Cloud \
+             so they stay listed and restorable — turn the export switch on in Cloud settings to \
+             make this intentional, or disconnect from Cloud to stop using the managed destination."
+        );
     }
 
     let mut resources = SweepResources::load(db, encryption, &candidates).await?;
@@ -861,8 +930,7 @@ async fn mirror_walg_backup(
         .filter(|object| {
             object.key == sentinel_key
                 || object.key.starts_with(&base_prefix)
-                || object.key.strip_prefix(&wal_prefix).is_some_and(|name| {
-                    let segment = name.get(..24).unwrap_or(name);
+                || wal_segment_of(&object.key, &wal_prefix).is_some_and(|segment| {
                     segment >= first_wal.as_str() && segment <= last_wal.as_str()
                 })
         })
@@ -872,6 +940,33 @@ async fn mirror_walg_backup(
         return Err(StageError::Retry(format!(
             "WAL-G snapshot {backup_name} has no repository objects"
         )));
+    }
+    // `backups.state = 'completed'` only means `wal-g backup-push` exited 0,
+    // which confirms the base tar files and the sentinel. WAL archiving is a
+    // separate, asynchronous process — PostgreSQL's `archive_command` ships
+    // segments on its own schedule — so at the moment this sweep runs, the
+    // segment covering the backup's own finish LSN may not have reached the
+    // repository yet. Declaring the manifest anyway would mirror a base backup
+    // that cannot replay far enough to reach a consistent recovery point, then
+    // mark it mirrored: a backup that only fails when someone tries to restore
+    // it. Refuse until the range the sentinel names is actually there. The
+    // reason is recorded on the mirror state, so an operator sees "waiting for
+    // WAL archiving" rather than nothing, and it clears itself on a later
+    // sweep the moment the segment lands.
+    let archived = selected
+        .iter()
+        .filter_map(|object| wal_segment_of(&object.key, &wal_prefix))
+        .collect::<std::collections::BTreeSet<_>>();
+    for (segment, bound) in [(&first_wal, "start"), (&last_wal, "finish")] {
+        if !archived.contains(segment.as_str()) {
+            return Err(StageError::Retry(format!(
+                "WAL-G snapshot {backup_name} is not ready to mirror: WAL segment {segment}, \
+                 which covers its {bound} LSN, has not been archived to {wal_prefix} yet. \
+                 Mirroring it now would store a base backup that cannot replay to a consistent \
+                 point. Retrying; if this persists, check that PostgreSQL's archive_command is \
+                 succeeding for this service."
+            )));
+        }
     }
 
     let mut declarations = Vec::with_capacity(selected.len());
@@ -931,6 +1026,21 @@ async fn mirror_walg_backup(
         finish_lsn,
         objects: declarations.clone(),
     };
+    // The declared manifest is what Cloud binds the snapshot to, and a retry
+    // that computes a different one is rejected. Log the identity and the shape
+    // of every attempt so a mismatch between attempts is visible here rather
+    // than only inferable from Cloud's rejection message.
+    tracing::debug!(
+        local_backup_id = %backup.backup_id,
+        cloud_backup_id = %cloud_backup_id,
+        backup_name = %request.backup_name,
+        timeline = request.timeline,
+        object_count = declarations.len(),
+        total_bytes = declarations.iter().map(|object| object.bytes).sum::<u64>(),
+        // Count and size cannot distinguish two different manifests; this can.
+        manifest_digest = %manifest_digest(&declarations),
+        "Cloud backup mirror declaring WAL-G snapshot"
+    );
     let snapshot = link
         .declare_walg_snapshot(&request)
         .await
@@ -1114,6 +1224,51 @@ fn sentinel_u32(value: &serde_json::Value, keys: &[&str]) -> Option<u32> {
 
 /// Convert an LSN into the sortable 24-character WAL segment filename used by
 /// Temps-managed PostgreSQL images (default 16 MiB WAL segment size).
+/// The 24-character WAL segment name a `wal_005/` object carries, or `None`
+/// when the object is not a segment.
+///
+/// The compression suffix is deliberately dropped: WAL-G names segments
+/// `<timeline><logid><segment>` followed by whatever it compressed with
+/// (`.lz4`, `.br`, `.zst`), and the same segment can legitimately reappear
+/// under a different suffix. Requiring 24 hexadecimal characters is what keeps
+/// the repository's other bookkeeping out of a range comparison it has no
+/// business being in — a `.history` file is 8 characters and would otherwise be
+/// compared as a whole key against segment names.
+fn wal_segment_of<'a>(key: &'a str, wal_prefix: &str) -> Option<&'a str> {
+    let segment = key.strip_prefix(wal_prefix)?.get(..24)?;
+    segment
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit())
+        .then_some(segment)
+}
+
+/// A stable fingerprint of the exact manifest being declared.
+///
+/// Cloud binds a `backup_id` to its manifest, so the question during any
+/// mirroring incident is "did two attempts send the same objects?". Object
+/// count and total size cannot answer it — two different manifests can share
+/// both — and logging every key would flood the log for a large repository.
+/// This digest answers it in one field: equal digests mean byte-identical
+/// manifests.
+fn manifest_digest(declarations: &[WalGObjectDeclaration]) -> String {
+    let mut ordered = declarations.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by(|left, right| left.relative_key.cmp(&right.relative_key));
+    let mut hasher = Sha256::new();
+    for object in ordered {
+        hasher.update(object.relative_key.as_bytes());
+        hasher.update([0]);
+        hasher.update(object.bytes.to_le_bytes());
+        hasher.update(object.checksum_sha256.as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn wal_segment_name(lsn: &str, timeline: u32) -> Result<String, StageError> {
     const SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
     const SEGMENTS_PER_LOG: u64 = 0x1_0000_0000 / SEGMENT_BYTES;
@@ -1500,9 +1655,16 @@ async fn load_postgres_identity(
                 )))
             }
         };
-        let major = parse_postgres_major(service.version.as_deref()).ok_or_else(|| {
+        // `external_services.version` is optional and is left empty by the
+        // provisioning paths that pin a version through the image tag instead
+        // (`gotempsh/postgres-walg:18-...`). Reading the column raw made every
+        // such service permanently unmirrorable, even though the native-snapshot
+        // path in this same file has always derived the version from the image.
+        // Use the one resolver for both.
+        let version = service_engine_version(resources.encryption, &service);
+        let major = parse_postgres_major(Some(&version)).ok_or_else(|| {
             StageError::Unsupported(format!(
-                "service {} has no PostgreSQL major version",
+                "service {} reports PostgreSQL version {version}, which is not a supported major version",
                 service.name
             ))
         })?;
@@ -1803,11 +1965,12 @@ fn deferred_legacy_state(metadata: &str, tenant_id: Uuid) -> Option<LegacyMirror
 mod tests {
     use super::{
         append_source_object, contains_backup_identity, deferred_legacy_state,
-        ensure_json_object_size, image_tag_version, merge_mirror_state, next_sweep_interval,
-        parse_postgres_major, s3_key, select_due_backups, sentinel_lsn, supports_native_mirror,
-        timeline_from_backup_name, upload_native_object, wal_segment_name, walg_root_key,
-        SourceObject, StageError, SweepOutcome, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL,
-        DUE_BACKUPS_SQL, MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
+        ensure_json_object_size, image_tag_version, manifest_digest, merge_mirror_state,
+        next_sweep_interval, parse_postgres_major, run, s3_key, select_due_backups, sentinel_lsn,
+        supports_native_mirror, sweep, timeline_from_backup_name, upload_native_object,
+        wal_segment_name, wal_segment_of, walg_root_key, SourceObject, StageError, SweepOutcome,
+        BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL, DUE_BACKUPS_SQL, MAX_SWEEP_INTERVAL,
+        MIRROR_STATE_VERSION,
     };
     use std::{
         collections::HashMap,
@@ -1892,6 +2055,7 @@ mod tests {
             schema.create_table_from_entity(temps_entities::backups::Entity),
             schema.create_table_from_entity(temps_entities::cloud_backup_mirror_states::Entity),
             schema.create_table_from_entity(temps_entities::cloud_backup_mirror_cursors::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
         ] {
             db.execute(backend.build(&statement))
                 .await
@@ -1901,6 +2065,27 @@ mod tests {
             .await
             .expect("SQLite fixture disables unrelated backup foreign keys");
         let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("sqlite-source".to_owned()),
+            bucket_name: Set("sqlite-mirror".to_owned()),
+            region: Set("test-1".to_owned()),
+            endpoint: Set(None),
+            bucket_path: Set(String::new()),
+            access_key_id: Set("encrypted-test-key".to_owned()),
+            secret_key: Set("encrypted-test-secret".to_owned()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(false),
+            // Only Cloud-managed sources are mirror candidates.
+            managed_by_cloud: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("SQLite S3 source inserts");
         temps_entities::backups::ActiveModel {
             id: Set(1),
             name: Set("sqlite-backup".to_owned()),
@@ -2008,6 +2193,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_never_selects_backups_from_an_operator_owned_s3_source() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_states::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_cursors::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite mirror table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated backup foreign keys");
+        let now = chrono::Utc::now();
+
+        let make_source =
+            |id: i32, managed_by_cloud: bool| temps_entities::s3_sources::ActiveModel {
+                id: Set(id),
+                name: Set(format!("source-{id}")),
+                bucket_name: Set(format!("bucket-{id}")),
+                region: Set("test-1".to_owned()),
+                endpoint: Set(None),
+                bucket_path: Set(String::new()),
+                access_key_id: Set("encrypted".to_owned()),
+                secret_key: Set("encrypted".to_owned()),
+                session_token: Set(None),
+                credentials_expire_at: Set(None),
+                force_path_style: Set(Some(true)),
+                is_default: Set(false),
+                managed_by_cloud: Set(managed_by_cloud),
+                created_at: Set(now),
+                updated_at: Set(now),
+            };
+        // Source 1: the operator's own bucket, their own credentials -- never
+        // a mirror candidate. Source 2: provisioned by the Cloud link.
+        make_source(1, false)
+            .insert(&db)
+            .await
+            .expect("operator-owned source inserts");
+        make_source(2, true)
+            .insert(&db)
+            .await
+            .expect("Cloud-managed source inserts");
+
+        let make_backup = |id: i32, s3_source_id: i32| temps_entities::backups::ActiveModel {
+            id: Set(id),
+            name: Set(format!("backup-{id}")),
+            backup_id: Set(Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            backup_type: Set("full".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now + chrono::Duration::seconds(i64::from(id)))),
+            size_bytes: Set(Some(1)),
+            file_count: Set(Some(1)),
+            s3_source_id: Set(s3_source_id),
+            s3_location: Set(format!("s3://bucket-{s3_source_id}/backup-{id}")),
+            error_message: Set(None),
+            metadata: Set("{}".to_owned()),
+            checksum: Set(None),
+            compression_type: Set("none".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        };
+        // Backup 1 went to the operator's own bucket; backup 2 went to the
+        // Cloud-managed one. Only backup 2 may ever become a mirror candidate.
+        make_backup(1, 1)
+            .insert(&db)
+            .await
+            .expect("operator-bucket backup inserts");
+        make_backup(2, 2)
+            .insert(&db)
+            .await
+            .expect("Cloud-managed-bucket backup inserts");
+
+        let selection = select_due_backups(&db, Uuid::nil(), 50)
+            .await
+            .expect("SQLite discovery query runs");
+        assert_eq!(
+            selection.backups.len(),
+            1,
+            "only the backup on the Cloud-managed source may be discovered: {:?}",
+            selection.backups
+        );
+        assert_eq!(selection.backups[0].id, 2);
+    }
+
+    #[tokio::test]
     async fn indexed_state_selects_only_bounded_due_work_after_thousands_of_rows() {
         let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
@@ -2046,6 +2327,10 @@ mod tests {
             secret_key: Set("encrypted-test-secret".to_owned()),
             force_path_style: Set(Some(true)),
             is_default: Set(false),
+            // Only Cloud-managed sources are mirror candidates; this test
+            // exercises the mirror discovery/due queries themselves, so its
+            // fixture backups must actually qualify.
+            managed_by_cloud: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
@@ -2429,6 +2714,249 @@ mod tests {
     }
 
     #[test]
+    fn an_unlinked_instance_rechecks_soon_instead_of_sleeping_out_the_ceiling() {
+        // The mirror starts with the server, so its first tick almost always
+        // lands before enrollment finishes. Jumping straight to the ceiling
+        // there meant an operator who linked their instance a minute after boot
+        // saw nothing happen — and nothing logged — for a quarter of an hour.
+        let first = next_sweep_interval(Duration::ZERO, SweepOutcome::NotLinked);
+        assert_eq!(first, BASE_SWEEP_INTERVAL);
+        assert_eq!(
+            next_sweep_interval(first, SweepOutcome::NotLinked),
+            BASE_SWEEP_INTERVAL * 2
+        );
+
+        // An instance that is never linked still settles at the outage ceiling
+        // rather than polling forever at the healthy cadence.
+        let mut interval = first;
+        for _ in 0..20 {
+            interval = next_sweep_interval(interval, SweepOutcome::NotLinked);
+        }
+        assert_eq!(interval, MAX_SWEEP_INTERVAL);
+    }
+
+    /// A linked [`CloudLink`] built without a single network round-trip, by
+    /// writing the state file `CloudLink::load` reads on startup. Enrolling
+    /// against an HTTP stub would drag real socket I/O into tests that need a
+    /// deterministic clock.
+    ///
+    /// `base_url` is a closed loopback port on purpose: nothing in these tests
+    /// may reach Cloud, and anything that tries fails immediately instead of
+    /// waiting out a connect timeout.
+    fn linked_link_fixture(temp: &tempfile::TempDir) -> Arc<CloudLink> {
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("cloud-link state dir");
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": Uuid::new_v4(),
+                "base_url": "http://127.0.0.1:1",
+                "allow_loopback_development": true,
+                "token": "test-instance-token",
+                "tenant_id": Uuid::new_v4(),
+                "account_email": "backup-owner@example.invalid",
+            })
+            .to_string(),
+        )
+        .expect("write Cloud link state");
+        Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ))
+    }
+
+    /// One completed backup sitting in a Cloud-managed bucket — the shape an
+    /// instance is left in after enrollment provisions `managed_by_cloud` and a
+    /// scheduled backup runs against it.
+    ///
+    /// `s3_location` is deliberately not a WAL-G repository, so `mirror_backup`
+    /// reaches a terminal decision without any S3 or Cloud call. The assertion
+    /// under test is that the backup was *processed at all*, not how it ended.
+    async fn managed_backup_fixture_db() -> sea_orm::DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_states::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_cursors::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+            schema.create_table_from_entity(temps_entities::external_service_backups::Entity),
+            schema.create_table_from_entity(temps_entities::external_services::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite mirror table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated backup foreign keys");
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("Temps Cloud managed backups".to_owned()),
+            bucket_name: Set("managed-bucket".to_owned()),
+            region: Set("test-1".to_owned()),
+            endpoint: Set(None),
+            bucket_path: Set(String::new()),
+            access_key_id: Set("encrypted".to_owned()),
+            secret_key: Set("encrypted".to_owned()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(false)),
+            // Enrollment makes the managed source the default on an instance
+            // that has no other one, which is how backup bytes end up in
+            // Cloud's bucket without the operator choosing a destination.
+            is_default: Set(true),
+            managed_by_cloud: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("Cloud-managed S3 source inserts");
+        temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("managed-backup".to_owned()),
+            backup_id: Set(Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            backup_type: Set("full".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1)),
+            file_count: Set(Some(1)),
+            s3_source_id: Set(1),
+            s3_location: Set("s3://managed-bucket/backups/manual".to_owned()),
+            error_message: Set(None),
+            metadata: Set("{}".to_owned()),
+            checksum: Set(None),
+            compression_type: Set("none".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("completed managed backup inserts");
+        db
+    }
+
+    async fn mirror_states(
+        db: &sea_orm::DatabaseConnection,
+    ) -> Vec<temps_entities::cloud_backup_mirror_states::Model> {
+        temps_entities::cloud_backup_mirror_states::Entity::find()
+            .order_by_asc(temps_entities::cloud_backup_mirror_states::Column::BackupId)
+            .all(db)
+            .await
+            .expect("mirror states read")
+    }
+
+    #[tokio::test]
+    async fn managed_backups_are_registered_even_when_cloud_export_consent_is_off() {
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        // Exactly the state a real enrollment leaves behind: Cloud provisioned
+        // the managed destination and the backup engine started writing to it,
+        // while `settings.cloud.backups_enabled` was never switched on.
+        link.set_feature_switches(CloudFeatureSwitches::default())
+            .expect("consent switches default to off");
+        assert!(!link.backups_enabled());
+        let tenant_id = link.tenant_id().expect("fixture link carries a tenant");
+
+        let db = Arc::new(managed_backup_fixture_db().await);
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "mirror-gate-test",
+        ));
+
+        // Control: nothing of this instance's is in Cloud storage, and export
+        // consent is off, so there is genuinely nothing to register.
+        link.set_managed_backup_destination(false);
+        assert_eq!(
+            sweep(&link, &db, &encryption)
+                .await
+                .expect("sweep runs against the fixture"),
+            SweepOutcome::NotLinked
+        );
+        assert!(mirror_states(&db).await.is_empty());
+
+        // The reported bug: a Cloud-managed destination exists, so completed
+        // backups have already been written into a bucket Cloud owns. Skipping
+        // them here does not keep one byte out of Cloud — it only leaves those
+        // objects with no Cloud record, invisible and unrestorable.
+        link.set_managed_backup_destination(true);
+        let outcome = sweep(&link, &db, &encryption)
+            .await
+            .expect("sweep runs against the fixture");
+        assert_ne!(
+            outcome,
+            SweepOutcome::NotLinked,
+            "a backup already written to Cloud-managed storage must be processed, not skipped"
+        );
+        let states = mirror_states(&db).await;
+        assert_eq!(states.len(), 1, "the managed backup was never processed");
+        assert_eq!(states[0].backup_id, 1);
+        assert_eq!(states[0].tenant_id, tenant_id);
+    }
+
+    /// The spawned loop — not `sweep` in isolation — must actually reach the
+    /// database and register a managed backup, then stop when asked.
+    ///
+    /// This runs on the real clock. A virtual clock cannot be used here: tokio
+    /// auto-advances paused time whenever the runtime is idle, which includes
+    /// every moment a query is out at the SQLite worker thread, so the pool's
+    /// own acquire timeout fast-forwards and trips while the connection is
+    /// legitimately in use. The cadence half of the loop's behaviour — that an
+    /// unlinked tick must not push the next one out to the outage ceiling — is
+    /// therefore asserted separately and deterministically in
+    /// `an_unlinked_instance_rechecks_soon_instead_of_sleeping_out_the_ceiling`.
+    /// The two together cover what a `sweep`-only unit test cannot: that the
+    /// loop runs the work, and that it comes back soon enough to matter.
+    #[tokio::test]
+    async fn the_mirror_loop_registers_managed_backups_and_stops_on_request() {
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        // The state a real enrollment leaves behind: a Cloud-managed backup
+        // destination in use, with export consent never switched on.
+        link.set_feature_switches(CloudFeatureSwitches::default())
+            .expect("consent switches default to off");
+        link.set_managed_backup_destination(true);
+        let db = Arc::new(managed_backup_fixture_db().await);
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "mirror-loop-test",
+        ));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        // `run` starts with a zero-length first sleep, so its first sweep is
+        // immediate and needs no clock manipulation to observe.
+        let loop_handle =
+            tokio::spawn(run(link.clone(), db.clone(), encryption.clone(), cancel_rx));
+
+        let registered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let states = mirror_states(&db).await;
+                if !states.is_empty() {
+                    return states;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the spawned mirror loop must run its first sweep, not sit idle");
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].backup_id, 1);
+
+        cancel_tx.send(true).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(5), loop_handle)
+            .await
+            .expect("mirror loop stops promptly on cancellation, not at the next tick")
+            .expect("mirror loop does not panic");
+    }
+
+    #[test]
     fn parses_supported_postgres_version_shapes() {
         assert_eq!(parse_postgres_major(Some("17.6")), Some(17));
         assert_eq!(parse_postgres_major(Some("pg16")), Some(16));
@@ -2447,6 +2975,69 @@ mod tests {
         );
         assert_eq!(image_tag_version("rustfs/rustfs@sha256:abc"), None);
         assert_eq!(image_tag_version("mariadb"), None);
+    }
+
+    #[test]
+    fn a_postgres_service_pinned_only_by_image_tag_still_resolves_a_major_version() {
+        // `external_services.version` is optional and the PostgreSQL provider
+        // leaves it empty, pinning the version through the image tag instead.
+        // Reading the column raw made every such service permanently
+        // unmirrorable with "has no PostgreSQL major version", which is the
+        // second thing that kept real backups out of Cloud.
+        let encryption = temps_core::EncryptionService::new_from_password("engine-version-test");
+        let config = encryption
+            .encrypt_string(
+                &serde_json::json!({"docker_image": "gotempsh/postgres-walg:18-bookworm"})
+                    .to_string(),
+            )
+            .expect("service config encrypts");
+        let now = chrono::Utc::now();
+        let mut service = temps_entities::external_services::Model {
+            id: 1,
+            name: "managed-postgres".to_owned(),
+            service_type: "postgres".to_owned(),
+            version: None,
+            status: "running".to_owned(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: Some(config),
+            node_id: None,
+            topology: "standalone".to_owned(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+        };
+
+        assert_eq!(
+            parse_postgres_major(Some(&super::service_engine_version(&encryption, &service))),
+            Some(18),
+            "a version pinned only by the image tag must still be usable"
+        );
+
+        // An explicit column value still wins over the image tag.
+        service.version = Some("17.6".to_owned());
+        assert_eq!(
+            parse_postgres_major(Some(&super::service_engine_version(&encryption, &service))),
+            Some(17)
+        );
+
+        // A service with neither is reported as unsupported rather than
+        // silently mirrored against a guessed engine version.
+        service.version = None;
+        service.config = None;
+        assert_eq!(
+            parse_postgres_major(Some(&super::service_engine_version(&encryption, &service))),
+            None
+        );
     }
 
     #[test]
@@ -2504,6 +3095,77 @@ mod tests {
             Some("000000020000000100000000")
         );
         assert!(wal_segment_name("not-an-lsn", 1).is_err());
+    }
+
+    #[test]
+    fn only_real_wal_segments_are_range_compared() {
+        let prefix = "repo/wal_005/";
+        // Every compression WAL-G may have used names the same segment.
+        for suffix in [".lz4", ".br", ".zst", ""] {
+            assert_eq!(
+                wal_segment_of(&format!("{prefix}000000010000000000000007{suffix}"), prefix),
+                Some("000000010000000000000007"),
+                "the compression suffix must not change the segment identity"
+            );
+        }
+        // Timeline history and partial/short bookkeeping objects are not
+        // segments and must never be compared against segment bounds.
+        assert_eq!(
+            wal_segment_of(&format!("{prefix}00000002.history"), prefix),
+            None
+        );
+        assert_eq!(wal_segment_of(&format!("{prefix}short"), prefix), None);
+        assert_eq!(
+            wal_segment_of(&format!("{prefix}00000001000000000000000g.lz4"), prefix),
+            None,
+            "a non-hexadecimal name is not a segment"
+        );
+        // Objects outside the WAL prefix are never segments.
+        assert_eq!(
+            wal_segment_of("repo/basebackups_005/base_7/metadata.json", prefix),
+            None
+        );
+    }
+
+    /// Two attempts that send the same objects must produce the same digest,
+    /// and any change to any field must change it — that is the whole point of
+    /// logging it, since object count and total size can both stay equal while
+    /// the manifest changes.
+    #[test]
+    fn the_logged_manifest_digest_identifies_the_exact_manifest() {
+        use temps_cloud_protocol::{WalGObjectDeclaration, WalGObjectKind};
+        let object = |key: &str, bytes: u64, checksum: &str| WalGObjectDeclaration {
+            relative_key: key.to_owned(),
+            kind: WalGObjectKind::Wal,
+            bytes,
+            checksum_sha256: checksum.to_owned(),
+        };
+        let checksum = "a".repeat(64);
+        let manifest = vec![
+            object("wal_005/000000010000000000000006.lz4", 16, &checksum),
+            object("wal_005/000000010000000000000007.lz4", 32, &checksum),
+        ];
+        let digest = manifest_digest(&manifest);
+
+        // Listing order must not matter: the manifest is the set of objects.
+        let mut reordered = manifest.clone();
+        reordered.reverse();
+        assert_eq!(manifest_digest(&reordered), digest);
+
+        // A size moved between two objects keeps both the count and the total
+        // identical. Only the digest catches it.
+        let mut rebalanced = manifest.clone();
+        rebalanced[0].bytes = 32;
+        rebalanced[1].bytes = 16;
+        assert_ne!(manifest_digest(&rebalanced), digest);
+
+        let mut rekeyed = manifest.clone();
+        rekeyed[1].relative_key = "wal_005/000000010000000000000008.lz4".to_owned();
+        assert_ne!(manifest_digest(&rekeyed), digest);
+
+        let mut rechecksummed = manifest;
+        rechecksummed[1].checksum_sha256 = "b".repeat(64);
+        assert_ne!(manifest_digest(&rechecksummed), digest);
     }
 
     #[test]

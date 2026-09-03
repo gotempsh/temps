@@ -312,6 +312,44 @@ impl AuditOperation for CloudTelemetryWriteModeChangedAudit {
     }
 }
 
+// ── Cloud analytics write-mode audit events (ADR-043 §1) ─────────────
+
+/// Audit event for changing where a project's non-span telemetry (metrics
+/// under Phase C1) is written. Independent of
+/// [`CloudTelemetryWriteModeChangedAudit`] — the two switches are orthogonal,
+/// so each records its own trail rather than sharing one event shape that
+/// would leave a reader guessing which switch actually moved.
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudAnalyticsWriteModeChangedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous_analytics_write_mode: String,
+    pub analytics_write_mode: String,
+}
+
+impl AuditOperation for CloudAnalyticsWriteModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_CLOUD_ANALYTICS_WRITE_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
 // ── Bulk Cloud telemetry activation audit events (ADR-042 §9) ───────
 
 /// Audit event for queueing a bulk Cloud-telemetry activation job.

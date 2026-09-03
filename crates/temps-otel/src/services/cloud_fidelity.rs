@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use temps_core::DBDateTime;
+use temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
 use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use temps_entities::projects;
@@ -114,6 +115,13 @@ pub struct CloudTelemetryPolicy {
     /// window has passed — whereas failing to `Local` merely writes spans to a
     /// store that already exists.
     pub write_mode: CloudTelemetryWriteMode,
+    /// ADR-043 §1: whether this project's non-span telemetry (metrics first,
+    /// under Phase C1) is written to local storage at all. Independent of
+    /// `write_mode` -- a project may be Cloud-primary for spans and local for
+    /// analytics, or vice versa, during an incremental cutover. Same
+    /// fail-safe direction as `write_mode`: an unresolved project is
+    /// `CloudAnalyticsWriteMode::Local`.
+    pub analytics_write_mode: CloudAnalyticsWriteMode,
 }
 
 impl Default for CloudTelemetryPolicy {
@@ -130,6 +138,7 @@ impl CloudTelemetryPolicy {
             fidelity: CloudTelemetryFidelity::Metered,
             attribute_allowlist: Arc::new(BTreeSet::new()),
             write_mode: CloudTelemetryWriteMode::Local,
+            analytics_write_mode: CloudAnalyticsWriteMode::Local,
         }
     }
 
@@ -142,6 +151,7 @@ impl CloudTelemetryPolicy {
             fidelity: CloudTelemetryFidelity::Queryable,
             attribute_allowlist: Arc::new(allowlist.into_iter().collect()),
             write_mode: CloudTelemetryWriteMode::Local,
+            analytics_write_mode: CloudAnalyticsWriteMode::Local,
         }
     }
 
@@ -156,6 +166,14 @@ impl CloudTelemetryPolicy {
         self
     }
 
+    /// The same policy with Cloud-primary analytics writes (ADR-043 §1) —
+    /// independent of [`Self::cloud_primary`], which only sets the span
+    /// switch.
+    pub fn analytics_cloud_primary(mut self) -> Self {
+        self.analytics_write_mode = CloudAnalyticsWriteMode::Cloud;
+        self
+    }
+
     /// Whether spans for this project skip local storage entirely.
     ///
     /// Defence in depth against the one state that must be unreachable: even if
@@ -167,6 +185,13 @@ impl CloudTelemetryPolicy {
     /// storage* is the only safe direction here.
     pub fn is_cloud_primary(&self) -> bool {
         self.write_mode.is_cloud_primary() && self.fidelity.is_queryable()
+    }
+
+    /// Whether this project's non-span telemetry (metrics under Phase C1)
+    /// skips local storage entirely. Same defence-in-depth reasoning as
+    /// [`Self::is_cloud_primary`], applied to the analytics switch.
+    pub fn is_analytics_cloud_primary(&self) -> bool {
+        self.analytics_write_mode.is_cloud_primary() && self.fidelity.is_queryable()
     }
 
     /// Whether `key` may be mirrored.
@@ -188,6 +213,7 @@ impl CloudTelemetryPolicy {
                     .collect(),
             ),
             write_mode: row.cloud_telemetry_write_mode,
+            analytics_write_mode: row.cloud_analytics_write_mode,
         }
     }
 }
@@ -200,6 +226,7 @@ struct ProjectPolicyRow {
     cloud_telemetry_fidelity: CloudTelemetryFidelity,
     cloud_telemetry_attribute_allowlist: Vec<String>,
     cloud_telemetry_write_mode: CloudTelemetryWriteMode,
+    cloud_analytics_write_mode: CloudAnalyticsWriteMode,
     /// Read, but only acted on by [`CloudPolicyCache::resolve_project`]: a
     /// soft-deleted project is "gone" to an operator naming it on a command
     /// line, while the ingest path has no reason to care — spans still arriving
@@ -341,6 +368,7 @@ impl CloudPolicyCache {
             .column(projects::Column::CloudTelemetryFidelity)
             .column(projects::Column::CloudTelemetryAttributeAllowlist)
             .column(projects::Column::CloudTelemetryWriteMode)
+            .column(projects::Column::CloudAnalyticsWriteMode)
             .column(projects::Column::DeletedAt)
             .filter(projects::Column::Id.is_in(project_ids.iter().copied()))
             .into_model::<ProjectPolicyRow>()
@@ -435,6 +463,10 @@ mod tests {
         row.insert(
             "cloud_telemetry_write_mode".to_string(),
             Value::String(Some(Box::new(write_mode.to_string()))),
+        );
+        row.insert(
+            "cloud_analytics_write_mode".to_string(),
+            Value::String(Some(Box::new(CloudAnalyticsWriteMode::Local.to_string()))),
         );
         row.insert("deleted_at".to_string(), Value::ChronoDateTimeUtc(None));
         row

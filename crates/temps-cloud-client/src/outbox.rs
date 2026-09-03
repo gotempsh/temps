@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The durable, byte-bounded queue behind Cloud-primary span writes
-//! (ADR-041 §3).
+//! Durable, byte-bounded queues behind Cloud-primary telemetry writes
+//! (ADR-041 §3, ADR-043 §2).
 //!
 //! # Why this exists next to [`crate::spool::Spool`] rather than replacing it
 //!
@@ -15,10 +15,11 @@
 //! and nothing is lost because the real copy is already on disk. It stays
 //! exactly as it is.
 //!
-//! This type serves projects whose spans are **not** written locally at all.
-//! Every premise above inverts:
+//! [`SpanOutbox`] and the generic [`TelemetryOutbox`] in this module serve
+//! projects whose signals are **not** written locally at all. Every premise
+//! above inverts:
 //!
-//! | Property | `Spool` (mirror) | `SpanOutbox` (primary) |
+//! | Property | `Spool` (mirror) | `SpanOutbox`/[`TelemetryOutbox`] (primary) |
 //! |---|---|---|
 //! | Survives restart | no | yes — rows in Postgres |
 //! | Overflow policy | drop **oldest** | reject **newest** at the boundary |
@@ -30,6 +31,22 @@
 //! ships some spans of a trace and discards others, rendering a broken tree
 //! that reads as an instrumentation bug rather than an outage. Rejecting at the
 //! boundary produces one clean, dated hole instead.
+//!
+//! # One generic accessor over `(entity_type, target_table, row_bytes)`
+//!
+//! The shared `cloud_telemetry_outbox` table carries an `entity_type`
+//! discriminant (ADR-043 §2). Spans keep their own accessor, [`SpanOutbox`],
+//! because their payload is JSON stored in the original `payload TEXT`
+//! column and their delivery transport (`POST /v1/telemetry`) predates this
+//! ADR. Every entity type added after spans — metrics first — goes through
+//! [`TelemetryOutbox`], one concrete type parameterized by `entity_type` at
+//! construction and operating on `(target_table, payload_row)` rather than a
+//! domain-specific struct (ADR-043 §2b). Claim, deliver, dead-letter,
+//! byte-cap and gap-window logic is byte-identical regardless of which domain
+//! produced the row, so there is exactly one implementation of it — not one
+//! per entity type. The partial index on `(entity_type, enqueued_at, id)
+//! WHERE state = 'pending'` makes each entity type's claim scan independent
+//! of every other's, whichever accessor is doing the claiming.
 //!
 //! # Why Postgres and not a file queue
 //!
@@ -58,6 +75,7 @@ use sea_orm::{
     TransactionTrait,
 };
 use temps_cloud_protocol::SpanRecord;
+use temps_entities::cloud_telemetry_outbox::CloudTelemetryOutboxEntityType;
 use temps_entities::project_telemetry_write_intervals::TelemetryWriteIntervalReason;
 
 /// Rows claimed per shipping attempt.
@@ -360,7 +378,7 @@ impl SpanOutbox {
                     COALESCE(SUM(payload_bytes), 0)::bigint AS bytes, \
                     EXTRACT(EPOCH FROM (NOW() - MIN(enqueued_at)))::double precision \
                         AS oldest_age_secs \
-             FROM cloud_span_outbox WHERE state = 'pending'",
+             FROM cloud_telemetry_outbox WHERE entity_type = 'span' AND state = 'pending'",
             vec![],
         ))
         .one(self.db.as_ref())
@@ -369,7 +387,8 @@ impl SpanOutbox {
 
         let dead = RowCount::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT COUNT(*)::bigint AS n FROM cloud_span_outbox WHERE state = 'dead_letter'",
+            "SELECT COUNT(*)::bigint AS n FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND state = 'dead_letter'",
             vec![],
         ))
         .one(self.db.as_ref())
@@ -396,8 +415,8 @@ impl SpanOutbox {
     pub async fn pending_rows_for_project(&self, project_id: i32) -> Result<i64, SpanOutboxError> {
         let row = RowCount::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT COUNT(*)::bigint AS n FROM cloud_span_outbox \
-             WHERE project_id = $1 AND state = 'pending'",
+            "SELECT COUNT(*)::bigint AS n FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND project_id = $1 AND state = 'pending'",
             vec![project_id.into()],
         ))
         .one(self.db.as_ref())
@@ -422,8 +441,8 @@ impl SpanOutbox {
         }
         let rows = ProjectId::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT DISTINCT project_id FROM cloud_span_outbox \
-             WHERE state = 'pending' ORDER BY project_id",
+            "SELECT DISTINCT project_id FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND state = 'pending' ORDER BY project_id",
             vec![],
         ))
         .all(self.db.as_ref())
@@ -446,10 +465,11 @@ impl SpanOutbox {
             DatabaseBackend::Postgres,
             "SELECT COUNT(*)::bigint AS rows, \
                     MAX(settled_at) AS last_settled_at, \
-                    ( SELECT last_error FROM cloud_span_outbox \
-                      WHERE project_id = $1 AND state = 'dead_letter' \
+                    ( SELECT last_error FROM cloud_telemetry_outbox \
+                      WHERE entity_type = 'span' AND project_id = $1 AND state = 'dead_letter' \
                       ORDER BY settled_at DESC NULLS LAST, id DESC LIMIT 1 ) AS last_error \
-             FROM cloud_span_outbox WHERE project_id = $1 AND state = 'dead_letter'",
+             FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND project_id = $1 AND state = 'dead_letter'",
             vec![project_id.into()],
         ))
         .one(self.db.as_ref())
@@ -498,7 +518,7 @@ impl SpanOutbox {
         let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "DELETE FROM cloud_span_outbox WHERE project_id = $1",
+                "DELETE FROM cloud_telemetry_outbox WHERE entity_type = 'span' AND project_id = $1",
                 vec![project_id.into()],
             ))
             .await
@@ -518,8 +538,9 @@ impl SpanOutbox {
             .db
             .execute(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "DELETE FROM cloud_span_outbox o \
-                 WHERE NOT EXISTS ( \
+                "DELETE FROM cloud_telemetry_outbox o \
+                 WHERE o.entity_type = 'span' \
+                   AND NOT EXISTS ( \
                      SELECT 1 FROM projects p \
                      WHERE p.id = o.project_id AND p.deleted_at IS NULL \
                  )"
@@ -612,9 +633,9 @@ impl SpanOutbox {
             .map(|(_, bytes)| sea_orm::Value::from(*bytes))
             .collect();
 
-        let sql = "INSERT INTO cloud_span_outbox \
-                       (project_id, payload, payload_bytes, enqueued_at, attempts, state) \
-                   SELECT $1, payload, payload_bytes, NOW(), 0, 'pending' \
+        let sql = "INSERT INTO cloud_telemetry_outbox \
+                       (project_id, entity_type, payload, payload_bytes, enqueued_at, attempts, state) \
+                   SELECT $1, 'span', payload, payload_bytes, NOW(), 0, 'pending' \
                    FROM UNNEST($2::text[], $3::int[]) AS t(payload, payload_bytes)";
 
         self.db
@@ -670,11 +691,11 @@ impl SpanOutbox {
     /// Skipped rows are not stranded — [`Self::purge_orphaned`] removes them on
     /// the worker's idle sweep, so they cannot silently consume the byte cap.
     pub async fn claim(&self, batch_size: u32) -> Result<Vec<ClaimedSpan>, SpanOutboxError> {
-        let sql = "UPDATE cloud_span_outbox \
+        let sql = "UPDATE cloud_telemetry_outbox \
                    SET attempts = attempts + 1 \
                    WHERE id IN ( \
-                       SELECT o.id FROM cloud_span_outbox o \
-                       WHERE o.state = 'pending' AND o.attempts < $1 \
+                       SELECT o.id FROM cloud_telemetry_outbox o \
+                       WHERE o.entity_type = 'span' AND o.state = 'pending' AND o.attempts < $1 \
                          AND EXISTS ( \
                              SELECT 1 FROM projects p \
                              WHERE p.id = o.project_id AND p.deleted_at IS NULL \
@@ -763,9 +784,9 @@ impl SpanOutbox {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE cloud_span_outbox \
+                "UPDATE cloud_telemetry_outbox \
                  SET attempts = GREATEST(attempts - 1, 0) \
-                 WHERE id = ANY($1) AND state = 'pending'",
+                 WHERE id = ANY($1) AND entity_type = 'span' AND state = 'pending'",
                 vec![ids.to_vec().into()],
             ))
             .await
@@ -790,7 +811,8 @@ impl SpanOutbox {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE cloud_span_outbox SET last_error = $2 WHERE id = ANY($1)",
+                "UPDATE cloud_telemetry_outbox \
+                 SET last_error = $2 WHERE id = ANY($1) AND entity_type = 'span'",
                 vec![ids.to_vec().into(), truncate_error(reason).into()],
             ))
             .await
@@ -806,9 +828,9 @@ impl SpanOutbox {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE cloud_span_outbox \
+                "UPDATE cloud_telemetry_outbox \
                  SET state = 'dead_letter', settled_at = NOW() \
-                 WHERE id = ANY($1) AND state = 'pending' AND attempts >= $2",
+                 WHERE id = ANY($1) AND entity_type = 'span' AND state = 'pending' AND attempts >= $2",
                 vec![ids.to_vec().into(), OUTBOX_MAX_ATTEMPTS.into()],
             ))
             .await
@@ -829,10 +851,10 @@ impl SpanOutbox {
         if ids.is_empty() {
             return Ok(());
         }
-        let sql = "UPDATE cloud_span_outbox \
+        let sql = "UPDATE cloud_telemetry_outbox \
                    SET state = $2, settled_at = NOW(), \
                        last_error = COALESCE($3, last_error) \
-                   WHERE id = ANY($1) AND state = 'pending' \
+                   WHERE id = ANY($1) AND entity_type = 'span' AND state = 'pending' \
                    RETURNING payload_bytes";
 
         #[derive(FromQueryResult)]
@@ -881,8 +903,9 @@ impl SpanOutbox {
         // `RETURNING` in `claim`.
         let rows = ClaimedRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, project_id, payload, payload_bytes, enqueued_at FROM cloud_span_outbox \
-             WHERE state = 'pending' AND project_id = ANY($1) \
+            "SELECT id, project_id, payload, payload_bytes, enqueued_at \
+             FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND state = 'pending' AND project_id = ANY($1) \
              ORDER BY enqueued_at, id LIMIT $2",
             vec![project_ids.to_vec().into(), (limit as i64).into()],
         ))
@@ -924,8 +947,9 @@ impl SpanOutbox {
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "DELETE FROM cloud_span_outbox \
-                 WHERE state IN ('delivered', 'spilled_to_local') \
+                "DELETE FROM cloud_telemetry_outbox \
+                 WHERE entity_type = 'span' \
+                   AND state IN ('delivered', 'spilled_to_local') \
                    AND settled_at IS NOT NULL \
                    AND settled_at < NOW() - ($1 * INTERVAL '1 second')",
                 vec![secs.into()],
@@ -952,9 +976,10 @@ impl SpanOutbox {
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE cloud_span_outbox \
+                "UPDATE cloud_telemetry_outbox \
                  SET payload = NULL, payload_bytes = 0 \
-                 WHERE state = 'dead_letter' \
+                 WHERE entity_type = 'span' \
+                   AND state = 'dead_letter' \
                    AND payload IS NOT NULL \
                    AND settled_at IS NOT NULL \
                    AND settled_at < NOW() - ($1 * INTERVAL '1 second')",
@@ -1050,10 +1075,630 @@ impl SpanOutbox {
     }
 }
 
+// ── TelemetryOutbox: the generic accessor for every non-span entity ────────
+
+/// One claimed generic-entity row, ready to ship.
+///
+/// `row_bytes` is opaque to this module: whatever the owning domain's
+/// `#[derive(clickhouse::Row)]` struct serialized for its local insert,
+/// unchanged. `target_table` is the only thing that says where it goes.
+#[derive(Debug, Clone)]
+pub struct ClaimedTelemetryRow {
+    pub id: i64,
+    pub project_id: i32,
+    pub target_table: String,
+    pub row_bytes: Vec<u8>,
+    pub bytes: i64,
+}
+
+/// Everything that can go wrong talking to the generic telemetry outbox.
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryOutboxError {
+    #[error("Failed to enqueue {row_count} {entity_type} row(s) for project {project_id} into the Temps Cloud telemetry outbox: {source}")]
+    Enqueue {
+        entity_type: CloudTelemetryOutboxEntityType,
+        project_id: i32,
+        row_count: usize,
+        #[source]
+        source: DbErr,
+    },
+
+    #[error("Failed to claim a {entity_type} batch from the Temps Cloud telemetry outbox (batch_size {batch_size}): {source}")]
+    Claim {
+        entity_type: CloudTelemetryOutboxEntityType,
+        batch_size: u32,
+        #[source]
+        source: DbErr,
+    },
+
+    #[error(
+        "Failed to mark {row_count} Temps Cloud {entity_type} outbox row(s) as {state}: {source}"
+    )]
+    Settle {
+        entity_type: CloudTelemetryOutboxEntityType,
+        row_count: usize,
+        state: &'static str,
+        #[source]
+        source: DbErr,
+    },
+
+    #[error("Failed to read Temps Cloud {entity_type} outbox statistics: {source}")]
+    Stats {
+        entity_type: CloudTelemetryOutboxEntityType,
+        #[source]
+        source: DbErr,
+    },
+
+    #[error(
+        "Failed to purge the Temps Cloud {entity_type} outbox for project {project_id}: {source}"
+    )]
+    Purge {
+        entity_type: CloudTelemetryOutboxEntityType,
+        project_id: i32,
+        #[source]
+        source: DbErr,
+    },
+}
+
+/// The generic accessor over `(entity_type, target_table, row_bytes)`
+/// (ADR-043 §2b).
+///
+/// One instance per entity type — constructed with the `entity_type` it
+/// serves, exactly as [`SpanOutbox`] is one instance for `entity_type =
+/// 'span'`. Every method carries that entity type into its queries as a bind
+/// parameter, so two instances (say, one for `metric` and a future one for
+/// `analytics_event`) never contend on each other's partial-index claim scan.
+///
+/// This is *not* generic over a payload type. By the time a row reaches this
+/// accessor, the owning domain has already projected and serialized it — the
+/// accessor moves opaque bytes plus a destination table name, nothing more.
+/// See the module docs and ADR-043 §2b/Alternatives Considered → Option D for
+/// why that boundary is where it is.
+pub struct TelemetryOutbox {
+    db: Arc<DatabaseConnection>,
+    entity_type: CloudTelemetryOutboxEntityType,
+    /// Operator-set ceiling in bytes for this entity type specifically
+    /// (ADR-043 §2d: the byte cap is enforced per entity type, not globally,
+    /// so a high-volume type cannot crowd out span writes sharing the same
+    /// table).
+    max_bytes: AtomicU64,
+    pending_bytes: AtomicI64,
+    dropped_rows: AtomicU64,
+    dropped_bytes: AtomicU64,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ClaimedGenericRow {
+    id: i64,
+    project_id: i32,
+    target_table: Option<String>,
+    payload_row: Option<Vec<u8>>,
+    payload_bytes: i32,
+    enqueued_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl TelemetryOutbox {
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        entity_type: CloudTelemetryOutboxEntityType,
+        max_bytes: u64,
+    ) -> Self {
+        Self {
+            db,
+            entity_type,
+            max_bytes: AtomicU64::new(max_bytes),
+            pending_bytes: AtomicI64::new(0),
+            dropped_rows: AtomicU64::new(0),
+            dropped_bytes: AtomicU64::new(0),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub fn entity_type(&self) -> CloudTelemetryOutboxEntityType {
+        self.entity_type
+    }
+
+    pub fn set_max_bytes(&self, max_bytes: u64) {
+        self.max_bytes.store(max_bytes, Ordering::Release);
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn wake_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.wake.clone()
+    }
+
+    pub fn pending_bytes(&self) -> i64 {
+        self.pending_bytes.load(Ordering::Acquire).max(0)
+    }
+
+    pub fn dropped_rows(&self) -> u64 {
+        self.dropped_rows.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_bytes(&self) -> u64 {
+        self.dropped_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn is_at_capacity(&self) -> bool {
+        self.pending_bytes() >= self.max_bytes() as i64
+    }
+
+    /// Re-read the true pending byte total from Postgres. Called at startup
+    /// and once per worker cycle, same as [`SpanOutbox::resync`].
+    pub async fn resync(&self) -> Result<OutboxStats, TelemetryOutboxError> {
+        let stats = self.stats().await?;
+        self.pending_bytes
+            .store(stats.pending_bytes, Ordering::Release);
+        Ok(stats)
+    }
+
+    /// Queue depth, size, dead letters and oldest-unshipped age for this
+    /// entity type.
+    pub async fn stats(&self) -> Result<OutboxStats, TelemetryOutboxError> {
+        let entity_type = self.entity_type.as_sql_str();
+        let totals = PendingTotals::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS rows, \
+                    COALESCE(SUM(payload_bytes), 0)::bigint AS bytes, \
+                    EXTRACT(EPOCH FROM (NOW() - MIN(enqueued_at)))::double precision \
+                        AS oldest_age_secs \
+             FROM cloud_telemetry_outbox WHERE entity_type = $1 AND state = 'pending'",
+            vec![entity_type.into()],
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|source| TelemetryOutboxError::Stats {
+            entity_type: self.entity_type,
+            source,
+        })?;
+
+        let dead = RowCount::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS n FROM cloud_telemetry_outbox \
+             WHERE entity_type = $1 AND state = 'dead_letter'",
+            vec![entity_type.into()],
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|source| TelemetryOutboxError::Stats {
+            entity_type: self.entity_type,
+            source,
+        })?;
+
+        let totals = totals.unwrap_or(PendingTotals {
+            rows: 0,
+            bytes: 0,
+            oldest_age_secs: None,
+        });
+
+        Ok(OutboxStats {
+            pending_rows: totals.rows,
+            pending_bytes: totals.bytes,
+            dead_letter_rows: dead.map_or(0, |row| row.n),
+            oldest_pending_age_secs: totals.oldest_age_secs.map(|secs| secs.max(0.0) as i64),
+        })
+    }
+
+    /// Accept rows for `project_id`, up to this entity type's byte cap.
+    ///
+    /// `target_table` names the Cloud ClickHouse table every row in this call
+    /// is destined for. Mixed-table batches are the caller's choice to make
+    /// (or not) — one call always writes one `target_table` value, matching
+    /// the drain worker's own grouping by `(entity_type, target_table)`.
+    pub async fn enqueue(
+        &self,
+        project_id: i32,
+        target_table: &str,
+        rows: &[Vec<u8>],
+    ) -> Result<EnqueueOutcome, TelemetryOutboxError> {
+        if rows.is_empty() {
+            return Ok(EnqueueOutcome::default());
+        }
+
+        let sized: Vec<(Vec<u8>, i32)> = rows
+            .iter()
+            .map(|row| (row.clone(), row.len().min(i32::MAX as usize) as i32))
+            .collect();
+
+        let budget =
+            (self.max_bytes() as i64).saturating_sub(self.pending_bytes.load(Ordering::Acquire));
+        let (accepted, refused, refused_bytes) = split_at_cap(sized, budget);
+
+        let accepted_count = accepted.len();
+        if accepted_count > 0 {
+            let accepted_bytes: i64 = accepted.iter().map(|(_, bytes)| i64::from(*bytes)).sum();
+            self.insert_rows(project_id, target_table, &accepted)
+                .await?;
+            self.pending_bytes
+                .fetch_add(accepted_bytes, Ordering::AcqRel);
+            self.wake.notify_waiters();
+        }
+
+        if refused > 0 {
+            self.dropped_rows
+                .fetch_add(refused as u64, Ordering::Relaxed);
+            self.dropped_bytes
+                .fetch_add(refused_bytes, Ordering::Relaxed);
+        }
+
+        Ok(EnqueueOutcome {
+            accepted: accepted_count,
+            refused,
+            refused_bytes,
+        })
+    }
+
+    async fn insert_rows(
+        &self,
+        project_id: i32,
+        target_table: &str,
+        rows: &[(Vec<u8>, i32)],
+    ) -> Result<(), TelemetryOutboxError> {
+        let payloads: Vec<sea_orm::Value> = rows
+            .iter()
+            .map(|(payload, _)| sea_orm::Value::from(payload.clone()))
+            .collect();
+        let sizes: Vec<sea_orm::Value> = rows
+            .iter()
+            .map(|(_, bytes)| sea_orm::Value::from(*bytes))
+            .collect();
+
+        let sql = "INSERT INTO cloud_telemetry_outbox \
+                       (project_id, entity_type, target_table, payload_row, payload_bytes, \
+                        enqueued_at, attempts, state) \
+                   SELECT $1, $2, $3, payload_row, payload_bytes, NOW(), 0, 'pending' \
+                   FROM UNNEST($4::bytea[], $5::int[]) AS t(payload_row, payload_bytes)";
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![
+                    project_id.into(),
+                    self.entity_type.as_sql_str().into(),
+                    target_table.into(),
+                    sea_orm::Value::Array(
+                        sea_orm::sea_query::ArrayType::Bytes,
+                        Some(Box::new(payloads)),
+                    ),
+                    sea_orm::Value::Array(
+                        sea_orm::sea_query::ArrayType::Int,
+                        Some(Box::new(sizes)),
+                    ),
+                ],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Enqueue {
+                entity_type: self.entity_type,
+                project_id,
+                row_count: rows.len(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Claim up to `batch_size` pending rows for this entity type,
+    /// incrementing their attempt count. Same `FOR UPDATE SKIP LOCKED` /
+    /// FIFO-restore shape as [`SpanOutbox::claim`] — see there for why.
+    pub async fn claim(
+        &self,
+        batch_size: u32,
+    ) -> Result<Vec<ClaimedTelemetryRow>, TelemetryOutboxError> {
+        let entity_type = self.entity_type.as_sql_str();
+        let sql = "UPDATE cloud_telemetry_outbox \
+                   SET attempts = attempts + 1 \
+                   WHERE id IN ( \
+                       SELECT o.id FROM cloud_telemetry_outbox o \
+                       WHERE o.entity_type = $1 AND o.state = 'pending' AND o.attempts < $2 \
+                         AND EXISTS ( \
+                             SELECT 1 FROM projects p \
+                             WHERE p.id = o.project_id AND p.deleted_at IS NULL \
+                         ) \
+                       ORDER BY o.enqueued_at, o.id \
+                       LIMIT $3 \
+                       FOR UPDATE SKIP LOCKED \
+                   ) \
+                   RETURNING id, project_id, target_table, payload_row, payload_bytes, enqueued_at";
+
+        let mut rows = ClaimedGenericRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                entity_type.into(),
+                OUTBOX_MAX_ATTEMPTS.into(),
+                (batch_size as i64).into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(|source| TelemetryOutboxError::Claim {
+            entity_type: self.entity_type,
+            batch_size,
+            source,
+        })?;
+
+        rows.sort_by(|a, b| a.enqueued_at.cmp(&b.enqueued_at).then(a.id.cmp(&b.id)));
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        let mut undecodable: Vec<i64> = Vec::new();
+        for row in rows {
+            let bytes = i64::from(row.payload_bytes);
+            match (row.target_table, row.payload_row) {
+                (Some(target_table), Some(row_bytes)) => claimed.push(ClaimedTelemetryRow {
+                    id: row.id,
+                    project_id: row.project_id,
+                    target_table,
+                    row_bytes,
+                    bytes,
+                }),
+                _ => {
+                    tracing::error!(
+                        outbox_id = row.id,
+                        project_id = row.project_id,
+                        entity_type = %self.entity_type,
+                        "Temps Cloud telemetry outbox row is missing its target table or row \
+                         payload; dead-lettering it rather than blocking the queue behind it"
+                    );
+                    undecodable.push(row.id);
+                }
+            }
+        }
+
+        if !undecodable.is_empty() {
+            self.dead_letter(
+                &undecodable,
+                "outbox row was missing its target table or payload",
+            )
+            .await?;
+        }
+
+        Ok(claimed)
+    }
+
+    pub async fn mark_delivered(&self, ids: &[i64]) -> Result<(), TelemetryOutboxError> {
+        self.settle(ids, "delivered", None).await
+    }
+
+    pub async fn dead_letter(&self, ids: &[i64], reason: &str) -> Result<(), TelemetryOutboxError> {
+        self.settle(ids, "dead_letter", Some(reason)).await
+    }
+
+    pub async fn mark_spilled(&self, ids: &[i64]) -> Result<(), TelemetryOutboxError> {
+        self.settle(ids, "spilled_to_local", None).await
+    }
+
+    pub async fn release_claim(&self, ids: &[i64]) -> Result<(), TelemetryOutboxError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE cloud_telemetry_outbox \
+                 SET attempts = GREATEST(attempts - 1, 0) \
+                 WHERE id = ANY($1) AND entity_type = $2 AND state = 'pending'",
+                vec![ids.to_vec().into(), self.entity_type.as_sql_str().into()],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Settle {
+                entity_type: self.entity_type,
+                row_count: ids.len(),
+                state: "pending",
+                source,
+            })?;
+        Ok(())
+    }
+
+    pub async fn record_attempt_failure(
+        &self,
+        ids: &[i64],
+        reason: &str,
+    ) -> Result<(), TelemetryOutboxError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let entity_type = self.entity_type.as_sql_str();
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE cloud_telemetry_outbox \
+                 SET last_error = $2 WHERE id = ANY($1) AND entity_type = $3",
+                vec![
+                    ids.to_vec().into(),
+                    truncate_error(reason).into(),
+                    entity_type.into(),
+                ],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Settle {
+                entity_type: self.entity_type,
+                row_count: ids.len(),
+                state: "pending",
+                source,
+            })?;
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE cloud_telemetry_outbox \
+                 SET state = 'dead_letter', settled_at = NOW() \
+                 WHERE id = ANY($1) AND entity_type = $3 AND state = 'pending' AND attempts >= $2",
+                vec![
+                    ids.to_vec().into(),
+                    OUTBOX_MAX_ATTEMPTS.into(),
+                    entity_type.into(),
+                ],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Settle {
+                entity_type: self.entity_type,
+                row_count: ids.len(),
+                state: "dead_letter",
+                source,
+            })?;
+        Ok(())
+    }
+
+    async fn settle(
+        &self,
+        ids: &[i64],
+        state: &'static str,
+        reason: Option<&str>,
+    ) -> Result<(), TelemetryOutboxError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let sql = "UPDATE cloud_telemetry_outbox \
+                   SET state = $2, settled_at = NOW(), \
+                       last_error = COALESCE($3, last_error) \
+                   WHERE id = ANY($1) AND entity_type = $4 AND state = 'pending' \
+                   RETURNING payload_bytes";
+
+        #[derive(FromQueryResult)]
+        struct SettledBytes {
+            payload_bytes: i32,
+        }
+
+        let settled = SettledBytes::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                ids.to_vec().into(),
+                state.to_string().into(),
+                reason.map(truncate_error).into(),
+                self.entity_type.as_sql_str().into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(|source| TelemetryOutboxError::Settle {
+            entity_type: self.entity_type,
+            row_count: ids.len(),
+            state,
+            source,
+        })?;
+
+        let freed: i64 = settled.iter().map(|row| i64::from(row.payload_bytes)).sum();
+        if freed > 0 {
+            self.pending_bytes.fetch_sub(freed, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    /// Delete settled rows older than [`OUTBOX_SETTLED_RETENTION`], for this
+    /// entity type.
+    pub async fn sweep_settled(&self) -> Result<u64, TelemetryOutboxError> {
+        let secs = OUTBOX_SETTLED_RETENTION.as_secs() as i64;
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM cloud_telemetry_outbox \
+                 WHERE entity_type = $2 \
+                   AND state IN ('delivered', 'spilled_to_local') \
+                   AND settled_at IS NOT NULL \
+                   AND settled_at < NOW() - ($1 * INTERVAL '1 second')",
+                vec![secs.into(), self.entity_type.as_sql_str().into()],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Stats {
+                entity_type: self.entity_type,
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
+    /// Drop the row payload of dead letters older than
+    /// [`DEAD_LETTER_PAYLOAD_RETENTION`], keeping everything else — same
+    /// reasoning as [`SpanOutbox::redact_expired_dead_letters`].
+    pub async fn redact_expired_dead_letters(&self) -> Result<u64, TelemetryOutboxError> {
+        let secs = DEAD_LETTER_PAYLOAD_RETENTION.as_secs() as i64;
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE cloud_telemetry_outbox \
+                 SET payload_row = NULL, payload_bytes = 0 \
+                 WHERE entity_type = $2 \
+                   AND state = 'dead_letter' \
+                   AND payload_row IS NOT NULL \
+                   AND settled_at IS NOT NULL \
+                   AND settled_at < NOW() - ($1 * INTERVAL '1 second')",
+                vec![secs.into(), self.entity_type.as_sql_str().into()],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Stats {
+                entity_type: self.entity_type,
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
+    /// Remove rows of this entity type whose project no longer exists.
+    pub async fn purge_orphaned(&self) -> Result<u64, TelemetryOutboxError> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM cloud_telemetry_outbox o \
+                 WHERE o.entity_type = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM projects p \
+                     WHERE p.id = o.project_id AND p.deleted_at IS NULL \
+                 )",
+                vec![self.entity_type.as_sql_str().into()],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Purge {
+                entity_type: self.entity_type,
+                project_id: 0,
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
+    /// Remove every row this project owns for this entity type, in every
+    /// state. Same reasoning as [`SpanOutbox::purge_project`].
+    pub async fn purge_project(&self, project_id: i32) -> Result<u64, TelemetryOutboxError> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM cloud_telemetry_outbox WHERE entity_type = $2 AND project_id = $1",
+                vec![project_id.into(), self.entity_type.as_sql_str().into()],
+            ))
+            .await
+            .map_err(|source| TelemetryOutboxError::Purge {
+                entity_type: self.entity_type,
+                project_id,
+                source,
+            })?;
+        if result.rows_affected() > 0 {
+            if let Err(error) = self.resync().await {
+                tracing::debug!(
+                    project_id,
+                    entity_type = %self.entity_type,
+                    %error,
+                    "Purged a deleted project's telemetry outbox rows but could not re-read the \
+                     queue size; the worker's next idle cycle will correct it"
+                );
+            }
+        }
+        Ok(result.rows_affected())
+    }
+}
+
 /// Split a batch at the byte budget: what fits, and what is refused.
 ///
 /// The load-bearing policy of ADR-041 §3d, extracted so it is testable without
-/// a database.
+/// a database. Generic over the payload type so both [`SpanOutbox`] (JSON
+/// `String` payloads) and [`TelemetryOutbox`] (binary `Vec<u8>` row payloads)
+/// share this one implementation rather than each re-deriving the same
+/// byte-cap policy.
 ///
 /// **Once the cap is hit, everything after it is refused** — including a small
 /// span that would individually still fit behind a refused large one. Letting
@@ -1061,8 +1706,8 @@ impl SpanOutbox {
 /// reject-newest policy exists to avoid: some spans of a trace present, others
 /// missing, rendering as a broken tree that reads like an instrumentation bug
 /// rather than an outage. A contiguous refusal is one honest hole.
-fn split_at_cap(payloads: Vec<(String, i32)>, mut budget: i64) -> (Vec<(String, i32)>, usize, u64) {
-    let mut accepted: Vec<(String, i32)> = Vec::with_capacity(payloads.len());
+fn split_at_cap<P>(payloads: Vec<(P, i32)>, mut budget: i64) -> (Vec<(P, i32)>, usize, u64) {
+    let mut accepted: Vec<(P, i32)> = Vec::with_capacity(payloads.len());
     let mut refused = 0usize;
     let mut refused_bytes = 0u64;
 
@@ -1266,7 +1911,7 @@ mod tests {
 
     #[test]
     fn an_empty_batch_produces_no_refusal() {
-        let (accepted, refused, refused_bytes) = split_at_cap(Vec::new(), 100);
+        let (accepted, refused, refused_bytes) = split_at_cap(Vec::<(String, i32)>::new(), 100);
         assert!(accepted.is_empty());
         assert_eq!(refused, 0);
         assert_eq!(refused_bytes, 0);
@@ -1325,5 +1970,144 @@ mod tests {
         // An empty queue reports zero rows and no reason, never a fabricated one.
         assert_eq!(DeadLetterSummary::default().rows, 0);
         assert!(DeadLetterSummary::default().last_error.is_none());
+    }
+
+    // ── TelemetryOutbox: the generic accessor ─────────────────────────────
+
+    fn telemetry_outbox(max_bytes: u64) -> TelemetryOutbox {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        TelemetryOutbox::new(
+            Arc::new(db),
+            CloudTelemetryOutboxEntityType::Metric,
+            max_bytes,
+        )
+    }
+
+    #[test]
+    fn a_telemetry_outbox_remembers_the_entity_type_it_was_built_for() {
+        let outbox = telemetry_outbox(1024);
+        assert_eq!(outbox.entity_type(), CloudTelemetryOutboxEntityType::Metric);
+    }
+
+    #[test]
+    fn the_telemetry_outbox_cap_can_be_raised_without_a_restart() {
+        let outbox = telemetry_outbox(1024);
+        assert_eq!(outbox.max_bytes(), 1024);
+        outbox.set_max_bytes(4096);
+        assert_eq!(outbox.max_bytes(), 4096);
+    }
+
+    #[test]
+    fn lowering_the_telemetry_outbox_cap_below_the_backlog_does_not_discard_anything() {
+        let outbox = telemetry_outbox(1_000_000);
+        outbox.pending_bytes.store(900_000, Ordering::Release);
+        outbox.set_max_bytes(1_000);
+        assert_eq!(outbox.pending_bytes(), 900_000);
+        assert!(outbox.is_at_capacity());
+        assert_eq!(outbox.dropped_rows(), 0);
+    }
+
+    #[test]
+    fn split_at_cap_works_identically_over_binary_row_payloads() {
+        // The whole point of extracting `split_at_cap` generically: the same
+        // byte-cap policy that governs JSON span payloads governs binary
+        // ClickHouse row payloads, with no second implementation.
+        let rows: Vec<(Vec<u8>, i32)> = vec![
+            (vec![0u8; 10], 10),
+            (vec![0u8; 10], 10),
+            (vec![0u8; 10], 10),
+        ];
+        let (accepted, refused, refused_bytes) = split_at_cap(rows, 15);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(refused, 2);
+        assert_eq!(refused_bytes, 20);
+    }
+
+    /// One row in `BTreeMap<&str, Value>` shape, matching the columns
+    /// `ClaimedGenericRow`/`SettledBytes` decode by name — the pattern already
+    /// used by `OtelAuthService`'s `MockDatabase` tests.
+    fn claimed_generic_row_mock(
+        id: i64,
+        project_id: i32,
+        target_table: &str,
+        row_bytes: Vec<u8>,
+    ) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
+        let bytes_len = row_bytes.len() as i32;
+        let mut row: std::collections::BTreeMap<&str, sea_orm::Value> =
+            std::collections::BTreeMap::new();
+        row.insert("id", id.into());
+        row.insert("project_id", project_id.into());
+        row.insert("target_table", Some(target_table.to_string()).into());
+        row.insert("payload_row", Some(row_bytes).into());
+        row.insert("payload_bytes", bytes_len.into());
+        row.insert("enqueued_at", chrono::Utc::now().into());
+        row
+    }
+
+    #[tokio::test]
+    async fn claim_then_mark_delivered_is_the_generic_accessors_happy_path() {
+        // Two round trips: `claim` (an UPDATE ... RETURNING, read back through
+        // `find_by_statement`) and `mark_delivered` -> `settle` (another
+        // `find_by_statement` returning the freed `payload_bytes`). Both are
+        // plain `Value` rows, so this exercises the exact decode path
+        // `ClaimedGenericRow`/`SettledBytes` use without a live Postgres.
+        let mut settled_bytes_row: std::collections::BTreeMap<&str, sea_orm::Value> =
+            std::collections::BTreeMap::new();
+        settled_bytes_row.insert("payload_bytes", 7_i32.into());
+
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![claimed_generic_row_mock(
+                    1,
+                    9,
+                    "otel_metrics",
+                    vec![1, 2, 3, 4, 5, 6, 7],
+                )]])
+                .append_query_results(vec![vec![settled_bytes_row]])
+                .into_connection(),
+        );
+        let outbox = TelemetryOutbox::new(db, CloudTelemetryOutboxEntityType::Metric, 1_000_000);
+
+        let claimed = outbox.claim(500).await.expect("claim must succeed");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, 1);
+        assert_eq!(claimed[0].project_id, 9);
+        assert_eq!(claimed[0].target_table, "otel_metrics");
+        assert_eq!(claimed[0].row_bytes, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(claimed[0].bytes, 7);
+
+        let ids: Vec<i64> = claimed.iter().map(|row| row.id).collect();
+        outbox
+            .mark_delivered(&ids)
+            .await
+            .expect("mark_delivered must succeed");
+    }
+
+    #[tokio::test]
+    async fn a_row_missing_its_target_table_is_dead_lettered_rather_than_claimed() {
+        // A row that somehow lost its destination (a bug upstream, a manual
+        // edit) must not be handed to a caller that will try to insert it
+        // nowhere. Dead-lettering it keeps the claim loop moving instead of
+        // returning a row the drain worker cannot act on.
+        let mut missing_target_row = claimed_generic_row_mock(2, 9, "otel_metrics", vec![1]);
+        missing_target_row.insert("target_table", Option::<String>::None.into());
+
+        let mut dead_letter_settled_row: std::collections::BTreeMap<&str, sea_orm::Value> =
+            std::collections::BTreeMap::new();
+        dead_letter_settled_row.insert("payload_bytes", 1_i32.into());
+
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![missing_target_row]])
+                .append_query_results(vec![vec![dead_letter_settled_row]])
+                .into_connection(),
+        );
+        let outbox = TelemetryOutbox::new(db, CloudTelemetryOutboxEntityType::Metric, 1_000_000);
+
+        let claimed = outbox.claim(500).await.expect("claim must succeed");
+        assert!(
+            claimed.is_empty(),
+            "a row with no target table must not be handed to the caller"
+        );
     }
 }

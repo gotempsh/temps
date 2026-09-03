@@ -755,6 +755,30 @@ impl TempsPlugin for OtelPlugin {
                 ))
             });
 
+            // ── ADR-043 §3 Phase C1: the durable Cloud-primary metric outbox ──
+            //
+            // Same construction shape as `span_outbox` above, over the generic
+            // accessor rather than a per-entity type. The byte cap reuses the
+            // span cap setting for now — ADR-043 §2d's proposal of a dedicated
+            // `max_pending_bytes_metric` operator setting (distinct from the
+            // span cap, so a high-volume metric backlog cannot crowd out span
+            // writes sharing the same table) has not shipped yet; this is a
+            // known interim gap, not a design decision.
+            let metric_outbox = match cloud_link.as_ref() {
+                Some(_) => {
+                    let cap = match context.get_service::<temps_config::ConfigService>() {
+                        Some(config) => read_outbox_cap(&config).await,
+                        None => temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+                    };
+                    Some(Arc::new(temps_cloud_client::TelemetryOutbox::new(
+                        db.clone(),
+                        temps_entities::cloud_telemetry_outbox::CloudTelemetryOutboxEntityType::Metric,
+                        cap,
+                    )))
+                }
+                None => None,
+            };
+
             // ADR-041 §1: the write-mode gate and the interval ledger. Always
             // constructed, even with no Cloud link — the write-mode control
             // renders in every project's settings and must onboard rather than
@@ -787,11 +811,21 @@ impl TempsPlugin for OtelPlugin {
                          cross-project traces, the AI chat's trace tools and the Observe page all \
                          inherit it"
                     );
-                    Arc::new(crate::storage::CloudRoutedOtelStorage::new(
-                        storage,
-                        Arc::new(crate::storage::CloudTelemetrySpanSource::new(link)),
-                        telemetry_write_modes.clone(),
-                    ))
+                    Arc::new(
+                        crate::storage::CloudRoutedOtelStorage::new(
+                            storage,
+                            Arc::new(crate::storage::CloudTelemetrySpanSource::new(link.clone())),
+                            telemetry_write_modes.clone(),
+                        )
+                        // ADR-043 §3 Phase C1: metric reads route on the
+                        // independent `cloud_analytics_write_mode` ledger.
+                        // Installed unconditionally alongside the span source
+                        // — an instance with no metrics ever Cloud-primary
+                        // simply never resolves anything but `Local` for it.
+                        .with_cloud_metrics(Arc::new(
+                            crate::storage::CloudTelemetryMetricSource::new(link),
+                        )),
+                    )
                 }
                 // No Cloud integration on this instance: nothing to route to,
                 // and wrapping would add a ledger lookup to every span read for
@@ -838,6 +872,9 @@ impl TempsPlugin for OtelPlugin {
                 .with_write_mode_service(telemetry_write_modes.clone());
                 if let Some(outbox) = span_outbox.clone() {
                     service = service.with_span_outbox(outbox);
+                }
+                if let Some(outbox) = metric_outbox.clone() {
+                    service = service.with_metric_outbox(outbox);
                 }
                 service
             });
@@ -1142,6 +1179,29 @@ impl TempsPlugin for OtelPlugin {
                         cancel_rx,
                     )
                     .await;
+                });
+            }
+
+            // ── ADR-043 §2b/§4: the Cloud-primary metric outbox worker ─────
+            //
+            // Sibling of the span outbox worker above, not a replacement —
+            // spans and metrics have independent write-mode switches
+            // (`cloud_telemetry_write_mode` vs `cloud_analytics_write_mode`)
+            // and independent outbox rows (`entity_type = 'metric'`), so they
+            // drain on independent loops. The concrete insert logic lives in
+            // `temps-otel` (see `storage::cloud_metrics`) rather than
+            // `temps_cloud_client::outbox_worker` because shipping a metric
+            // batch needs the concrete `CloudMetricRow` type that
+            // `temps-cloud-client` cannot depend on without creating a
+            // circular crate dependency.
+            if let (Some(outbox), Some(link)) = (metric_outbox.clone(), cloud_link.clone()) {
+                let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+                let worker_link = link.clone();
+                let worker_outbox = outbox.clone();
+                tokio::spawn(async move {
+                    let _cancel = cancel;
+                    crate::storage::run_metric_outbox_worker(worker_link, worker_outbox, cancel_rx)
+                        .await;
                 });
             }
 

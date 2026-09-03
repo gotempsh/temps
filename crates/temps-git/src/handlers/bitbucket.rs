@@ -434,6 +434,8 @@ mod tests {
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
             cloud_telemetry_write_mode:
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+            cloud_analytics_write_mode:
+                temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             enable_preview_environments: false,
             preview_envs_on_demand: false,

@@ -35,6 +35,7 @@ use crate::OtelAppState;
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
+use temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
 use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use temps_entities::project_telemetry_write_intervals::TelemetryWriteIntervalReason;
@@ -207,6 +208,10 @@ pub struct ProjectCloudTelemetryResponse {
     /// Why they differ. Absent when intent and reality agree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_reason: Option<TelemetryWriteIntervalReason>,
+    /// ADR-043 §1: the independent analytics write mode (metrics under Phase
+    /// C1). Orthogonal to `write_mode` — a project may be Cloud-primary for
+    /// spans and local for analytics, or vice versa.
+    pub analytics_write_mode: CloudAnalyticsWriteMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_reason_message: Option<String>,
     /// Whether `write_mode = cloud` could be set right now.
@@ -306,6 +311,11 @@ pub struct UpdateProjectCloudTelemetryRequest {
     pub attribute_allowlist: Option<Vec<String>>,
     #[serde(default)]
     pub write_mode: Option<CloudTelemetryWriteMode>,
+    /// ADR-043 §1: the independent switch for non-span telemetry (metrics
+    /// under Phase C1). Orthogonal to `write_mode` — a project may be
+    /// Cloud-primary for spans and local for analytics, or vice versa.
+    #[serde(default)]
+    pub analytics_write_mode: Option<CloudAnalyticsWriteMode>,
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────────
@@ -392,6 +402,13 @@ pub async fn update_project_cloud_telemetry(
             .await?;
     }
 
+    if let Some(analytics_write_mode) = request.analytics_write_mode {
+        state
+            .telemetry_write_modes
+            .set_analytics_write_mode(project_id, analytics_write_mode, link_snapshot(&state))
+            .await?;
+    }
+
     let after = state.telemetry_write_modes.settings(project_id).await?;
 
     let audit = crate::handlers::audit::CloudTelemetryWriteModeChangedAudit {
@@ -408,6 +425,22 @@ pub async fn update_project_cloud_telemetry(
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
+    }
+
+    if before.analytics_write_mode != after.analytics_write_mode {
+        let analytics_audit = crate::handlers::audit::CloudAnalyticsWriteModeChangedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id,
+            previous_analytics_write_mode: before.analytics_write_mode.to_string(),
+            analytics_write_mode: after.analytics_write_mode.to_string(),
+        };
+        if let Err(e) = state.audit_service.create_audit_log(&analytics_audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
     }
 
     let response = build_project_response(&state, project_id).await?;
@@ -723,6 +756,7 @@ async fn build_project_response(
         effective_reason_message: settings
             .effective_reason
             .map(|reason| reason.message().to_string()),
+        analytics_write_mode: settings.analytics_write_mode,
         cloud_write_mode_available: available,
         reason,
         setup_path,
@@ -751,6 +785,7 @@ mod tests {
             attribute_allowlist: Vec::new(),
             effective_mode: write_mode,
             effective_reason: None,
+            analytics_write_mode: CloudAnalyticsWriteMode::Local,
         }
     }
 

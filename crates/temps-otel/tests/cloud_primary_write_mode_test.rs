@@ -499,7 +499,8 @@ impl Harness {
 
     async fn outbox_rows(&self, project_id: i32) -> i64 {
         self.scalar::<i64>(
-            "SELECT COUNT(*)::bigint AS v FROM cloud_span_outbox WHERE project_id = $1",
+            "SELECT COUNT(*)::bigint AS v FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND project_id = $1",
             vec![project_id.into()],
         )
         .await
@@ -510,8 +511,8 @@ impl Harness {
     /// whether anything can still leave this instance.
     async fn pending_outbox_rows(&self, project_id: i32) -> i64 {
         self.scalar::<i64>(
-            "SELECT COUNT(*)::bigint AS v FROM cloud_span_outbox \
-             WHERE project_id = $1 AND state = 'pending'",
+            "SELECT COUNT(*)::bigint AS v FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND project_id = $1 AND state = 'pending'",
             vec![project_id.into()],
         )
         .await

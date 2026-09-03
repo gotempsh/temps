@@ -174,7 +174,15 @@ export function TriggerBackupDialog({
               <FormField
                 control={form.control}
                 name="s3_source_id"
-                render={({ field }) => (
+                render={({ field }) => {
+                  const selectedSource = s3Sources?.find(
+                    (s) => s.id === field.value
+                  )
+                  const selectedIsDefault =
+                    selectedSource &&
+                    (selectedSource as { is_default?: boolean })
+                      .is_default === true
+                  return (
                   <FormItem>
                     <FormLabel>Storage Destination</FormLabel>
                     <Select
@@ -183,7 +191,32 @@ export function TriggerBackupDialog({
                     >
                       <FormControl>
                         <SelectTrigger>
-                          <SelectValue placeholder="Select an S3 source" />
+                          {/* Explicit children override Radix's default
+                              behavior of mirroring the selected SelectItem's
+                              full two-line (name + bucket-path) content into
+                              the trigger, which has no width/height budget
+                              for it and wraps ugly. Show a compact
+                              single-line summary here instead; the bucket
+                              path is still visible in the open dropdown and
+                              in the FormDescription below. */}
+                          <SelectValue placeholder="Select an S3 source">
+                            {selectedSource && (
+                              <span className="flex min-w-0 items-center gap-1.5">
+                                <span className="truncate">
+                                  {selectedSource.name}
+                                </span>
+                                {selectedIsDefault ? (
+                                  <span
+                                    title="Default source"
+                                    className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                  >
+                                    <Star className="h-3 w-3 fill-current" />
+                                    Default
+                                  </span>
+                                ) : null}
+                              </span>
+                            )}
+                          </SelectValue>
                         </SelectTrigger>
                       </FormControl>
                       <SelectContent>
@@ -236,7 +269,8 @@ export function TriggerBackupDialog({
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
-                )}
+                  )
+                }}
               />
 
               <FormField

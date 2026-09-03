@@ -9,13 +9,20 @@
 //! implementing this trait.
 
 pub mod clickhouse;
+/// Reads mirrored metrics back out of Temps Cloud through its read proxy
+/// (ADR-043 §3 Phase C1).
+pub mod cloud_metrics;
 /// ADR-040 §2 / ADR-041 §8: routes span reads for Cloud-primary projects.
+/// Extended in ADR-043 §3 to also route metric reads.
 pub mod cloud_routed;
 /// Reads mirrored spans back out of Temps Cloud through its read proxy.
 pub mod cloud_spans;
 pub mod timescaledb;
 
-pub use cloud_routed::{CloudRoutedOtelStorage, CloudSpanSource};
+pub use cloud_metrics::{
+    project_cloud_metric_row, run_metric_outbox_worker, CloudMetricRow, CloudTelemetryMetricSource,
+};
+pub use cloud_routed::{CloudMetricSource, CloudRoutedOtelStorage, CloudSpanSource};
 pub use cloud_spans::CloudTelemetrySpanSource;
 
 use async_trait::async_trait;

@@ -24,6 +24,11 @@
 #![forbid(unsafe_code)]
 
 pub mod flusher;
+/// The liveness signal on the dedicated management channel -- see the module
+/// docs for why this is separate from telemetry shipment and backup mirroring.
+pub mod heartbeat;
+/// ADR-043 §5a: the write-side sibling of [`query`]'s Cloud read proxy.
+pub mod insert;
 pub mod link;
 pub mod outbox;
 pub mod outbox_worker;
@@ -37,8 +42,9 @@ pub use link::{
     OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
 };
 pub use outbox::{
-    ClaimedSpan, DeadLetterSummary, EnqueueOutcome, OutboxStats, SpanOutbox, SpanOutboxError,
-    DEAD_LETTER_PAYLOAD_RETENTION, OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS,
+    ClaimedSpan, ClaimedTelemetryRow, DeadLetterSummary, EnqueueOutcome, OutboxStats, SpanOutbox,
+    SpanOutboxError, TelemetryOutbox, TelemetryOutboxError, DEAD_LETTER_PAYLOAD_RETENTION,
+    OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS,
 };
 pub use outbox_worker::{DrainObserver, DrainOutcome, OutboxCapSource};
 pub use state::EnrollmentState;

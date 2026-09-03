@@ -35,6 +35,55 @@ use utoipa::ToSchema;
 
 use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 
+/// Which group of telemetry signals this interval record covers (ADR-043 §3).
+///
+/// `signal_group` is the discriminant that lets the shared
+/// `project_telemetry_write_intervals` table serve both write-mode switches
+/// independently. The routing decorator for each domain queries its own signal
+/// group and gets an independent interval history.
+///
+/// `spans` covers the original `cloud_telemetry_write_mode` switch (ADR-041).
+/// `analytics` covers the new `cloud_analytics_write_mode` switch (ADR-043 §1)
+/// for `otel_metrics`, `service_metrics`, `analytics_events`,
+/// `analytics_sessions`, and `proxy_logs` collectively.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    DeriveActiveEnum,
+    EnumIter,
+    Default,
+)]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetrySignalGroup {
+    /// OTel spans, governed by `projects.cloud_telemetry_write_mode`.
+    /// The only group that existed before ADR-043; pre-migration rows default
+    /// to this value.
+    #[default]
+    #[sea_orm(string_value = "spans")]
+    Spans,
+    /// Analytics events, sessions, OTel metrics, service metrics and proxy
+    /// logs, governed by `projects.cloud_analytics_write_mode` (ADR-043 §1).
+    #[sea_orm(string_value = "analytics")]
+    Analytics,
+}
+
+impl std::fmt::Display for TelemetrySignalGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TelemetrySignalGroup::Spans => write!(f, "spans"),
+            TelemetrySignalGroup::Analytics => write!(f, "analytics"),
+        }
+    }
+}
+
 /// Why an interval opened.
 #[derive(
     Debug,
@@ -140,11 +189,21 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub project_id: i32,
-    /// Where spans went during this interval.
+    /// Which group of signals this interval record covers (ADR-043 §3).
+    ///
+    /// `spans` for the original span write-mode ledger; `analytics` for the
+    /// new group covering metrics, analytics events and proxy logs. Defaults
+    /// to `spans` so all pre-ADR-043 rows decode correctly without a data
+    /// migration.
+    #[sea_orm(default_value = "spans")]
+    pub signal_group: TelemetrySignalGroup,
+    /// Where the signals in `signal_group` went during this interval.
     pub mode: CloudTelemetryWriteMode,
     pub effective_from: DBDateTime,
-    /// `NULL` while this is the open interval. Exactly one row per project may
-    /// have `effective_to IS NULL`, enforced by a partial unique index.
+    /// `NULL` while this is the open interval. Exactly one row per
+    /// `(project_id, signal_group)` pair may have `effective_to IS NULL`,
+    /// enforced by the partial unique index
+    /// `idx_write_intervals_one_open_per_project_signal`.
     pub effective_to: Option<DBDateTime>,
     pub reason: TelemetryWriteIntervalReason,
 }
@@ -206,6 +265,18 @@ mod tests {
                 reason.message()
             );
         }
+    }
+
+    #[test]
+    fn signal_group_default_is_spans() {
+        // Pre-ADR-043 rows must decode as 'spans' when the column is absent.
+        assert_eq!(TelemetrySignalGroup::default(), TelemetrySignalGroup::Spans);
+    }
+
+    #[test]
+    fn signal_group_display_matches_stored_column_values() {
+        assert_eq!(TelemetrySignalGroup::Spans.to_string(), "spans");
+        assert_eq!(TelemetrySignalGroup::Analytics.to_string(), "analytics");
     }
 
     #[test]

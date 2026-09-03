@@ -43,6 +43,13 @@ tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+# The heartbeat sender's transport (`src/heartbeat.rs`): a long-lived
+# WebSocket to the managed backend's `/v1/management` endpoint. Same version
+# and TLS feature set already pinned at the workspace level and used the same
+# way by `temps-deployments`' remote-terminal proxy, so this resolves one
+# tokio-tungstenite across the workspace rather than a second one.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["serde"] }

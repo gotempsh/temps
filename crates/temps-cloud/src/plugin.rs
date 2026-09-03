@@ -92,6 +92,7 @@ impl TempsPlugin for CloudPlugin {
                     context.require_service::<temps_core::EncryptionService>(),
                 );
                 service.start_backup_credential_rotation();
+                service.start_heartbeat_sender();
             }
             Ok(())
         })

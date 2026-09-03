@@ -16,7 +16,7 @@ use temps_core::retry::RetryConfig;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, warn};
 
-use crate::error::OtelError;
+use crate::error::{OtelError, StorageErrorKind};
 use crate::ingest::auth::{IngestAuth, OtelAuthService, ProjectAuth};
 use crate::ingest::quota_cache::{QuotaCache, QUOTA_CACHE_TTL};
 use crate::ingest::rate_limit::RateLimiter;
@@ -65,6 +65,14 @@ pub struct OtelService {
     /// requires one, so an unwired outbox degrades to today's local-first
     /// behaviour rather than to dropping spans.
     span_outbox: Option<Arc<temps_cloud_client::SpanOutbox>>,
+    /// ADR-043 §3 Phase C1: the durable queue Cloud-primary metric points are
+    /// written to instead of local storage. `entity_type = 'metric'`,
+    /// `target_table = "otel_metrics"` — see [`crate::storage::clickhouse`]'s
+    /// `ChMetricRow`, the same struct the local write path already builds.
+    ///
+    /// `None` means no project can be analytics-Cloud-primary on this
+    /// instance, mirroring [`Self::span_outbox`]'s degrade-to-local contract.
+    metric_outbox: Option<Arc<temps_cloud_client::TelemetryOutbox>>,
     /// ADR-041 §7b: consulted per batch so a quota event resumes local writes
     /// immediately rather than up to one policy TTL later.
     write_mode_service: Option<Arc<crate::services::TelemetryWriteModeService>>,
@@ -317,6 +325,7 @@ impl OtelService {
             cloud_link: None,
             cloud_policy_cache: None,
             span_outbox: None,
+            metric_outbox: None,
             write_mode_service: None,
             stats: PipelineStatsAtomic::default(),
         }
@@ -358,6 +367,19 @@ impl OtelService {
     pub fn with_span_outbox(mut self, outbox: Arc<temps_cloud_client::SpanOutbox>) -> Self {
         self.span_outbox = Some(outbox);
         self
+    }
+
+    /// Attach the durable outbox that backs Cloud-primary metric writes
+    /// (ADR-043 §3 Phase C1). Same degrade-to-local contract as
+    /// [`Self::with_span_outbox`].
+    pub fn with_metric_outbox(mut self, outbox: Arc<temps_cloud_client::TelemetryOutbox>) -> Self {
+        self.metric_outbox = Some(outbox);
+        self
+    }
+
+    /// The metric outbox, when one is wired. Exposed for the status surfaces.
+    pub fn metric_outbox(&self) -> Option<&Arc<temps_cloud_client::TelemetryOutbox>> {
+        self.metric_outbox.as_ref()
     }
 
     /// Attach the write-mode service, whose suspension flag the ingest path
@@ -513,11 +535,156 @@ impl OtelService {
     }
 
     /// Ingest metric data points.
+    ///
+    /// # ADR-043 §3 Phase C1: the batch is partitioned by analytics write mode
+    ///
+    /// Mirrors [`Self::ingest_spans`]'s ADR-041 §2 partition, one signal group
+    /// over: points whose project has `cloud_analytics_write_mode = local` (or
+    /// no `metric_outbox`/Cloud link wired at all) go to
+    /// `store_metrics` exactly as before; points whose project is
+    /// analytics-Cloud-primary are enqueued to the durable telemetry outbox
+    /// instead — **no local write happens for those**. A batch mixing both is
+    /// normal. Ingestion never blocks on Cloud: the enqueue is a local durable
+    /// Postgres write, and shipping happens on a background worker.
     pub async fn ingest_metrics(&self, points: Vec<MetricPoint>) -> Result<u64, OtelError> {
         let count = points.len() as u64;
         self.stats
             .metrics_received
             .fetch_add(count, Ordering::Relaxed);
+
+        if points.is_empty() {
+            return Ok(0);
+        }
+
+        // ── Deployment shape A: no Cloud link, or no metric outbox wired ──
+        let Some(link) = self.cloud_link.as_ref() else {
+            return self.store_metrics_locally(points).await;
+        };
+        if !link.is_linked() || !link.telemetry_enabled() || self.metric_outbox.is_none() {
+            return self.store_metrics_locally(points).await;
+        }
+
+        let cloud_writes_available = self
+            .write_mode_service
+            .as_ref()
+            .is_none_or(|service| !service.suspension().is_suspended());
+
+        let Some(cache) = self.cloud_policy_cache.as_ref() else {
+            return self.store_metrics_locally(points).await;
+        };
+        let policies = cache
+            .policies_for(points.iter().map(|point| point.project_id))
+            .await;
+        let metered = CloudTelemetryPolicy::metered();
+
+        let mut local_points: Vec<MetricPoint> = Vec::with_capacity(points.len());
+        let mut cloud_by_project: std::collections::HashMap<i32, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        let mut cloud_project_point_counts: std::collections::HashMap<i32, u64> =
+            std::collections::HashMap::new();
+
+        for point in points {
+            let policy = policies.get(&point.project_id).unwrap_or(&metered);
+            let cloud_primary = cloud_writes_available && policy.is_analytics_cloud_primary();
+            if !cloud_primary {
+                local_points.push(point);
+                continue;
+            }
+            match crate::storage::project_cloud_metric_row(link, &point) {
+                Some(row) => match serde_json::to_vec(&row) {
+                    Ok(bytes) => {
+                        cloud_by_project
+                            .entry(point.project_id)
+                            .or_default()
+                            .push(bytes);
+                        *cloud_project_point_counts
+                            .entry(point.project_id)
+                            .or_default() += 1;
+                    }
+                    Err(error) => {
+                        warn!(
+                            project_id = point.project_id,
+                            %error,
+                            "Could not serialize a Cloud-primary metric point for the telemetry \
+                             outbox; storing it locally instead"
+                        );
+                        local_points.push(point);
+                    }
+                },
+                // No scalar value (histogram-shaped) or the link could not
+                // scope it — store locally rather than drop. There is never a
+                // state in which the instance stores a point nowhere.
+                None => local_points.push(point),
+            }
+        }
+
+        let mut queued = 0u64;
+        if !cloud_by_project.is_empty() {
+            let Some(outbox) = self.metric_outbox.as_ref() else {
+                // Unreachable: `self.metric_outbox.is_none()` already returned
+                // above. Kept as a branch rather than an `expect` for the same
+                // reason `ingest_spans` does — losing metrics to a panic on
+                // the ingest path is the worst possible way to be wrong here.
+                return self.store_metrics_locally(local_points).await;
+            };
+            for (project_id, rows) in &cloud_by_project {
+                match outbox.enqueue(*project_id, "otel_metrics", rows).await {
+                    Ok(outcome) => {
+                        queued += outcome.accepted as u64;
+                        if outcome.refused_any() {
+                            self.stats
+                                .metrics_dropped
+                                .fetch_add(outcome.refused as u64, Ordering::Relaxed);
+                            warn!(
+                                project_id,
+                                refused = outcome.refused,
+                                refused_bytes = outcome.refused_bytes,
+                                "Metric telemetry outbox is at its byte cap; these points were \
+                                 not captured"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let point_count = cloud_project_point_counts
+                            .get(project_id)
+                            .copied()
+                            .unwrap_or(0);
+                        self.stats
+                            .metrics_dropped
+                            .fetch_add(point_count, Ordering::Relaxed);
+                        self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            project_id,
+                            points = rows.len(),
+                            %error,
+                            "Failed to enqueue Cloud-primary metrics; answering the exporter with \
+                             an error so its retry can still save them"
+                        );
+                        return Err(OtelError::Storage {
+                            message: error.to_string(),
+                            kind: StorageErrorKind::ClickHouseOther,
+                        });
+                    }
+                }
+            }
+        }
+
+        if local_points.is_empty() {
+            self.stats
+                .metrics_stored
+                .fetch_add(queued, Ordering::Relaxed);
+            return Ok(queued);
+        }
+
+        let stored = self.store_metrics_locally(local_points).await?;
+        Ok(stored + queued)
+    }
+
+    /// The pre-ADR-043 write path, unchanged: store locally with a bounded
+    /// retry. Extracted so deployment shape A executes exactly the same
+    /// statements in exactly the same order as before.
+    async fn store_metrics_locally(&self, points: Vec<MetricPoint>) -> Result<u64, OtelError> {
+        let count = points.len() as u64;
 
         // Retry the write on transient storage failures before counting the
         // batch as dropped — see `store_with_retry`. The batch is cloned per

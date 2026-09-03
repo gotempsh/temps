@@ -44,10 +44,11 @@ use sea_orm::{
     Statement, TransactionTrait,
 };
 use temps_core::DBDateTime;
+use temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
 use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use temps_entities::project_telemetry_write_intervals::{
-    self as write_intervals, TelemetryWriteIntervalReason,
+    self as write_intervals, TelemetrySignalGroup, TelemetryWriteIntervalReason,
 };
 use temps_entities::{projects, telemetry_gap_windows};
 
@@ -211,6 +212,10 @@ pub struct ProjectTelemetryWriteSettings {
     pub effective_mode: CloudTelemetryWriteMode,
     /// Why, when it differs. `None` when intent and reality agree.
     pub effective_reason: Option<TelemetryWriteIntervalReason>,
+    /// ADR-043 §1: the independent analytics (metrics under Phase C1) write
+    /// mode. Orthogonal to `write_mode`; carried on the same lookup for the
+    /// same reason `write_mode` is.
+    pub analytics_write_mode: CloudAnalyticsWriteMode,
 }
 
 /// Which store answers a query for a given window (ADR-041 §8).
@@ -317,6 +322,7 @@ struct ProjectModeRow {
     id: i32,
     cloud_telemetry_fidelity: CloudTelemetryFidelity,
     cloud_telemetry_write_mode: CloudTelemetryWriteMode,
+    cloud_analytics_write_mode: CloudAnalyticsWriteMode,
     cloud_telemetry_attribute_allowlist: Vec<String>,
 }
 
@@ -464,6 +470,7 @@ impl TelemetryWriteModeService {
             attribute_allowlist: row.cloud_telemetry_attribute_allowlist,
             effective_mode,
             effective_reason,
+            analytics_write_mode: row.cloud_analytics_write_mode,
         })
     }
 
@@ -522,13 +529,13 @@ impl TelemetryWriteModeService {
 
             // Leaving Cloud-primary has to reach what is already queued, not
             // only what has not been captured yet. The rows in
-            // `cloud_span_outbox` are serialized `Queryable` projections of real
-            // spans; without this they keep shipping to Cloud after the operator
-            // has moved the project back to local storage, and — because the
-            // fidelity gate only blocks a downgrade while the mode is still
-            // `cloud` — a two-step withdrawal (`write_mode = local`, then
-            // `fidelity = metered`) would export up to a full queue of real span
-            // data *after* consent was withdrawn.
+            // `cloud_telemetry_outbox` (entity_type = 'span') are serialized
+            // `Queryable` projections of real spans; without this they keep
+            // shipping to Cloud after the operator has moved the project back to
+            // local storage, and — because the fidelity gate only blocks a
+            // downgrade while the mode is still `cloud` — a two-step withdrawal
+            // (`write_mode = local`, then `fidelity = metered`) would export up
+            // to a full queue of real span data *after* consent was withdrawn.
             //
             // Deliberately after the flip, not before: once the mode is `local`
             // the ingest path stops enqueueing for this project, so the drain
@@ -539,6 +546,59 @@ impl TelemetryWriteModeService {
         }
 
         self.settings(project_id).await
+    }
+
+    /// Set a project's analytics write mode (ADR-043 §1), enforcing the same
+    /// gate as `set_write_mode`.
+    ///
+    /// Setting `local` is always allowed — an operator must always be able to
+    /// bring a project's analytics back to storage they control.
+    pub async fn set_analytics_write_mode(
+        &self,
+        project_id: i32,
+        requested: CloudAnalyticsWriteMode,
+        link: CloudLinkSnapshot,
+    ) -> Result<CloudAnalyticsWriteMode, TelemetryWriteModeError> {
+        let row = self.project_row(project_id).await?;
+
+        if requested.is_cloud_primary() {
+            if !row.cloud_telemetry_fidelity.is_queryable() {
+                return Err(TelemetryWriteModeError::FidelityTooLow {
+                    project_id,
+                    fidelity: row.cloud_telemetry_fidelity,
+                });
+            }
+            if !link.linked {
+                return Err(TelemetryWriteModeError::NotLinked {
+                    project_id,
+                    setup_path: CLOUD_SETUP_PATH,
+                });
+            }
+            if link.credential_rejected {
+                return Err(TelemetryWriteModeError::CredentialRejected {
+                    project_id,
+                    setup_path: CLOUD_SETUP_PATH,
+                });
+            }
+            if !link.telemetry_enabled {
+                return Err(TelemetryWriteModeError::TelemetryExportDisabled {
+                    project_id,
+                    setup_path: CLOUD_SETUP_PATH,
+                });
+            }
+        }
+
+        if row.cloud_analytics_write_mode != requested {
+            self.persist_analytics_mode_and_interval(
+                project_id,
+                requested,
+                TelemetryWriteIntervalReason::Operator,
+            )
+            .await?;
+            self.invalidate(project_id);
+        }
+
+        Ok(requested)
     }
 
     /// Write this project's queued Cloud-bound spans back to local storage.
@@ -573,8 +633,8 @@ impl TelemetryWriteModeService {
     pub async fn queued_span_count(&self, project_id: i32) -> Result<i64, TelemetryWriteModeError> {
         let row = ModeCount::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT COUNT(*)::bigint AS n FROM cloud_span_outbox \
-             WHERE project_id = $1 AND state = 'pending'",
+            "SELECT COUNT(*)::bigint AS n FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND project_id = $1 AND state = 'pending'",
             vec![project_id.into()],
         ))
         .one(self.db.as_ref())
@@ -874,17 +934,44 @@ impl TelemetryWriteModeService {
     /// represent — the read decorator uses `DateTime::MIN_UTC` to mean "whatever
     /// you have" — is treated as unbounded on that side rather than bound
     /// verbatim, which the database would reject.
+    /// Every span-group interval that overlaps `from..to` (ADR-041 §8).
+    ///
+    /// Filters to `signal_group = 'spans'` so span and analytics ledgers remain
+    /// independent — the routing decorator for each domain calls its own method.
     pub async fn intervals_covering(
         &self,
         project_id: i32,
         from: DBDateTime,
         to: DBDateTime,
     ) -> Result<Vec<write_intervals::Model>, TelemetryWriteModeError> {
+        self.intervals_covering_for_group(project_id, from, to, TelemetrySignalGroup::Spans)
+            .await
+    }
+
+    /// Every analytics-group interval that overlaps `from..to` (ADR-043 §3).
+    pub async fn analytics_intervals_covering(
+        &self,
+        project_id: i32,
+        from: DBDateTime,
+        to: DBDateTime,
+    ) -> Result<Vec<write_intervals::Model>, TelemetryWriteModeError> {
+        self.intervals_covering_for_group(project_id, from, to, TelemetrySignalGroup::Analytics)
+            .await
+    }
+
+    async fn intervals_covering_for_group(
+        &self,
+        project_id: i32,
+        from: DBDateTime,
+        to: DBDateTime,
+        group: TelemetrySignalGroup,
+    ) -> Result<Vec<write_intervals::Model>, TelemetryWriteModeError> {
         write_intervals::Model::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id, project_id, mode, effective_from, effective_to, reason \
+            "SELECT id, project_id, signal_group, mode, effective_from, effective_to, reason \
              FROM project_telemetry_write_intervals \
              WHERE project_id = $1 \
+               AND signal_group = $4 \
                AND effective_from <= COALESCE($3, 'infinity'::timestamptz) \
                AND COALESCE(effective_to, 'infinity'::timestamptz) \
                    >= COALESCE($2, '-infinity'::timestamptz) \
@@ -893,6 +980,7 @@ impl TelemetryWriteModeService {
                 project_id.into(),
                 bindable_instant(from).into(),
                 bindable_instant(to).into(),
+                group.to_string().into(),
             ],
         ))
         .all(self.db.as_ref())
@@ -900,7 +988,7 @@ impl TelemetryWriteModeService {
         .map_err(|source| TelemetryWriteModeError::Read { project_id, source })
     }
 
-    /// Which store answers a query for `from..to`, clamping a straddle.
+    /// Which store answers a span query for `from..to`, clamping a straddle.
     ///
     /// Never merges. ADR-040 §3's reasons stand unchanged: the source badge can
     /// only name one source, and paginating across two stores is not coherently
@@ -913,6 +1001,21 @@ impl TelemetryWriteModeService {
         to: DBDateTime,
     ) -> Result<WindowResolution, TelemetryWriteModeError> {
         let intervals = self.intervals_covering(project_id, from, to).await?;
+        Ok(resolve_window(&intervals, from, to))
+    }
+
+    /// Which store answers an analytics (metric/event) query for `from..to`.
+    ///
+    /// Uses the `analytics` signal group's independent ledger (ADR-043 §3).
+    pub async fn resolve_analytics_read_window(
+        &self,
+        project_id: i32,
+        from: DBDateTime,
+        to: DBDateTime,
+    ) -> Result<WindowResolution, TelemetryWriteModeError> {
+        let intervals = self
+            .analytics_intervals_covering(project_id, from, to)
+            .await?;
         Ok(resolve_window(&intervals, from, to))
     }
 
@@ -1056,6 +1159,7 @@ impl TelemetryWriteModeService {
             .column(projects::Column::Id)
             .column(projects::Column::CloudTelemetryFidelity)
             .column(projects::Column::CloudTelemetryWriteMode)
+            .column(projects::Column::CloudAnalyticsWriteMode)
             .column(projects::Column::CloudTelemetryAttributeAllowlist)
             .filter(projects::Column::Id.eq(project_id))
             // Soft-deleted projects are "gone" to an operator naming one, and
@@ -1096,6 +1200,41 @@ impl TelemetryWriteModeService {
             .map_err(|source| TelemetryWriteModeError::Write { project_id, source })
     }
 
+    async fn persist_analytics_mode_and_interval(
+        &self,
+        project_id: i32,
+        mode: CloudAnalyticsWriteMode,
+        reason: TelemetryWriteIntervalReason,
+    ) -> Result<(), TelemetryWriteModeError> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|source| TelemetryWriteModeError::Write { project_id, source })?;
+
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE projects SET cloud_analytics_write_mode = $2 WHERE id = $1",
+            vec![project_id.into(), mode.to_string().into()],
+        ))
+        .await
+        .map_err(|source| TelemetryWriteModeError::Write { project_id, source })?;
+
+        // Map CloudAnalyticsWriteMode → CloudTelemetryWriteMode for the shared
+        // interval ledger. The ledger table uses CloudTelemetryWriteMode for
+        // both signal groups because the binary local/cloud split is the same.
+        let ledger_mode = if mode.is_cloud_primary() {
+            CloudTelemetryWriteMode::Cloud
+        } else {
+            CloudTelemetryWriteMode::Local
+        };
+        close_and_open_analytics_intervals(&txn, &[project_id], ledger_mode, reason).await?;
+
+        txn.commit()
+            .await
+            .map_err(|source| TelemetryWriteModeError::Write { project_id, source })
+    }
+
     fn invalidate(&self, project_id: i32) {
         if let Some(cache) = &self.policy_cache {
             cache.invalidate(project_id);
@@ -1103,8 +1242,8 @@ impl TelemetryWriteModeService {
     }
 }
 
-/// Close each project's open interval and open a new one, inside the caller's
-/// transaction.
+/// Close each project's open span-group interval and open a new one, inside
+/// the caller's transaction.
 ///
 /// Skips projects whose open interval already has the requested mode, so a
 /// repeated call is a no-op rather than a zero-length interval — the ledger is
@@ -1116,38 +1255,75 @@ async fn close_and_open_intervals<C: ConnectionTrait>(
     mode: CloudTelemetryWriteMode,
     reason: TelemetryWriteIntervalReason,
 ) -> Result<(), TelemetryWriteModeError> {
+    close_and_open_intervals_for_group(txn, project_ids, mode, reason, TelemetrySignalGroup::Spans)
+        .await
+}
+
+/// Close each project's open analytics-group interval and open a new one.
+async fn close_and_open_analytics_intervals<C: ConnectionTrait>(
+    txn: &C,
+    project_ids: &[i32],
+    mode: CloudTelemetryWriteMode,
+    reason: TelemetryWriteIntervalReason,
+) -> Result<(), TelemetryWriteModeError> {
+    close_and_open_intervals_for_group(
+        txn,
+        project_ids,
+        mode,
+        reason,
+        TelemetrySignalGroup::Analytics,
+    )
+    .await
+}
+
+async fn close_and_open_intervals_for_group<C: ConnectionTrait>(
+    txn: &C,
+    project_ids: &[i32],
+    mode: CloudTelemetryWriteMode,
+    reason: TelemetryWriteIntervalReason,
+    group: TelemetrySignalGroup,
+) -> Result<(), TelemetryWriteModeError> {
     if project_ids.is_empty() {
         return Ok(());
     }
 
-    // Close every open interval that disagrees with the requested mode.
+    // Close every open interval for this signal_group that disagrees with the
+    // requested mode. The signal_group filter is required: without it, closing
+    // a span interval would also close an open analytics interval for the same
+    // project, and vice versa.
     txn.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "UPDATE project_telemetry_write_intervals \
          SET effective_to = NOW() \
-         WHERE project_id = ANY($1) AND effective_to IS NULL AND mode <> $2",
-        vec![project_ids.to_vec().into(), mode.to_string().into()],
+         WHERE project_id = ANY($1) AND signal_group = $3 \
+           AND effective_to IS NULL AND mode <> $2",
+        vec![
+            project_ids.to_vec().into(),
+            mode.to_string().into(),
+            group.to_string().into(),
+        ],
     ))
     .await
     .map_err(|source| TelemetryWriteModeError::Ledger { source })?;
 
-    // Open one for every project that now has none. The partial unique index on
-    // `(project_id) WHERE effective_to IS NULL` is what makes this safe under a
-    // concurrent writer: the second one fails rather than producing two open
-    // intervals the read path would have to choose between.
+    // Open one for every project that now has none for this signal_group. The
+    // partial unique index on `(project_id, signal_group) WHERE effective_to IS
+    // NULL` is what makes this safe under a concurrent writer.
     txn.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         "INSERT INTO project_telemetry_write_intervals \
-             (project_id, mode, effective_from, effective_to, reason) \
-         SELECT id, $2, NOW(), NULL, $3 FROM UNNEST($1::int[]) AS t(id) \
+             (project_id, signal_group, mode, effective_from, effective_to, reason) \
+         SELECT id, $4, $2, NOW(), NULL, $3 FROM UNNEST($1::int[]) AS t(id) \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM project_telemetry_write_intervals open \
-             WHERE open.project_id = t.id AND open.effective_to IS NULL \
+             WHERE open.project_id = t.id AND open.signal_group = $4 \
+               AND open.effective_to IS NULL \
          )",
         vec![
             project_ids.to_vec().into(),
             mode.to_string().into(),
             reason.to_string().into(),
+            group.to_string().into(),
         ],
     ))
     .await
@@ -1255,6 +1431,7 @@ mod tests {
         write_intervals::Model {
             id,
             project_id: 7,
+            signal_group: TelemetrySignalGroup::Spans,
             mode,
             effective_from: now - ChronoDuration::minutes(from_mins_ago),
             effective_to: to_mins_ago.map(|mins| now - ChronoDuration::minutes(mins)),

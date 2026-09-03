@@ -30,15 +30,21 @@
 //!
 //! # What is routed, and what is not
 //!
-//! Only **span reads** are routed. Metrics, logs, insights, health summaries,
-//! quota, retention and the ingest-error report all delegate straight through:
-//! Cloud holds a projection of spans and only spans, so routing anything else
-//! would be a silent feature removal.
+//! **Span reads** route on `cloud_telemetry_write_mode` (the `spans` signal
+//! group). **Metric reads** (ADR-043 §3 Phase C1) route independently, on
+//! `cloud_analytics_write_mode` (the `analytics` signal group), and only when
+//! a [`CloudMetricSource`] has been installed via
+//! [`CloudRoutedOtelStorage::with_cloud_metrics`] — an instance whose Cloud
+//! link predates Phase C1 simply never routes metrics, exactly as if the
+//! switch had never been raised. Logs, insights, health summaries, quota,
+//! retention and the ingest-error report all delegate straight through: Cloud
+//! holds no projection of them, so routing would be a silent feature removal.
 //!
-//! **Writes are never routed.** `store_spans` always goes to the local store.
-//! The ingest path decides which spans are written locally at all (ADR-041 §2),
-//! and the ones that reach here are either `Local`-mode spans or the
-//! disconnect/quota spill — both of which belong on disk here.
+//! **Writes are never routed.** `store_spans`/`store_metrics` always go to the
+//! local store. The ingest path decides whether a signal is written locally at
+//! all (ADR-041 §2, ADR-043 §3), and the ones that reach here are either
+//! `Local`-mode signals or the disconnect/quota spill — both of which belong
+//! on disk here.
 //!
 //! # No silent fallback
 //!
@@ -80,10 +86,61 @@ pub trait CloudSpanSource: Send + Sync {
     async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64>;
 }
 
-/// Wraps a local `OtelStorage`, routing span reads for Cloud-primary projects.
+/// The Cloud-side half of the metric read path (ADR-043 §3 Phase C1).
+///
+/// Split from [`CloudSpanSource`] rather than folded into it: metrics route
+/// on the `analytics` signal group (`cloud_analytics_write_mode`), spans on
+/// the `spans` group (`cloud_telemetry_write_mode`) — two independent
+/// ledgers, so two independent Cloud-side contracts, even though both are
+/// implemented by the same `clickhouse::Client`-reuse pattern.
+#[async_trait]
+pub trait CloudMetricSource: Send + Sync {
+    async fn query_metrics(&self, query: MetricQuery) -> StorageResult<Vec<MetricBucket>>;
+    async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>>;
+    async fn list_metric_label_keys(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>>;
+    async fn list_metric_label_values(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        label_key: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>>;
+    async fn get_metric_baseline(
+        &self,
+        project_id: i32,
+        service_name: &str,
+        metric_name: &str,
+        environment: Option<&str>,
+        lookback_days: i32,
+    ) -> StorageResult<Vec<BaselinePoint>>;
+    async fn get_recent_minute_aggregates(
+        &self,
+        project_id: i32,
+        service_name: &str,
+        metric_name: &str,
+        environment: Option<&str>,
+        minutes: i32,
+    ) -> StorageResult<Vec<MinuteAggregate>>;
+}
+
+/// Wraps a local `OtelStorage`, routing span and metric reads for
+/// Cloud-primary projects.
 pub struct CloudRoutedOtelStorage {
     local: Arc<dyn OtelStorage>,
     cloud: Arc<dyn CloudSpanSource>,
+    /// `None` when no Cloud metric source is wired — e.g. an instance whose
+    /// Cloud link predates Phase C1, or a test double that only cares about
+    /// span routing. Every metric method falls back to local in that case,
+    /// exactly as it would if `cloud_analytics_write_mode` had never been
+    /// raised to `cloud`.
+    cloud_metrics: Option<Arc<dyn CloudMetricSource>>,
     write_modes: Arc<TelemetryWriteModeService>,
 }
 
@@ -96,8 +153,15 @@ impl CloudRoutedOtelStorage {
         Self {
             local,
             cloud,
+            cloud_metrics: None,
             write_modes,
         }
+    }
+
+    /// Install the Cloud-side metric read source (ADR-043 §3 Phase C1).
+    pub fn with_cloud_metrics(mut self, cloud_metrics: Arc<dyn CloudMetricSource>) -> Self {
+        self.cloud_metrics = Some(cloud_metrics);
+        self
     }
 
     /// The undecorated local store.
@@ -160,6 +224,49 @@ impl CloudRoutedOtelStorage {
         }
         query
     }
+
+    /// Resolve a window against the project's **analytics** ledger
+    /// (`signal_group = 'analytics'`) — the independent switch metrics route
+    /// on (ADR-043 §3). Same fail-safe-to-local direction as [`Self::resolve`].
+    async fn resolve_analytics(
+        &self,
+        project_id: i32,
+        start: Option<chrono::DateTime<chrono::Utc>>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> WindowResolution {
+        let from = start.unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        let to = end.unwrap_or_else(chrono::Utc::now);
+
+        match self
+            .write_modes
+            .resolve_analytics_read_window(project_id, from, to)
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                tracing::warn!(
+                    project_id,
+                    %error,
+                    "Could not resolve the analytics write-mode ledger; serving this window from \
+                     local storage"
+                );
+                WindowResolution {
+                    source: CloudTelemetryWriteMode::Local,
+                    window_clamped_at: None,
+                    from,
+                    to,
+                }
+            }
+        }
+    }
+
+    /// Apply an analytics resolution's clamp to a metric query.
+    fn clamped_metrics(mut query: MetricQuery, resolution: &WindowResolution) -> MetricQuery {
+        if resolution.window_clamped_at.is_some() {
+            query.start_time = Some(resolution.from);
+        }
+        query
+    }
 }
 
 #[async_trait]
@@ -197,14 +304,34 @@ impl OtelStorage for CloudRoutedOtelStorage {
         self.local.recent_ingest_errors(limit).await
     }
 
-    // ── Non-span reads: never routed, Cloud has no counterpart ───────────
+    // ── Metric reads: routed per the analytics ledger (ADR-043 §3) ───────
 
     async fn query_metrics(&self, query: MetricQuery) -> StorageResult<Vec<MetricBucket>> {
-        self.local.query_metrics(query).await
+        let Some(cloud_metrics) = self.cloud_metrics.as_ref() else {
+            return self.local.query_metrics(query).await;
+        };
+        let resolution = self
+            .resolve_analytics(query.project_id, query.start_time, query.end_time)
+            .await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => self.local.query_metrics(query).await,
+            CloudTelemetryWriteMode::Cloud => {
+                cloud_metrics
+                    .query_metrics(Self::clamped_metrics(query, &resolution))
+                    .await
+            }
+        }
     }
 
     async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>> {
-        self.local.list_metric_names(project_id).await
+        let Some(cloud_metrics) = self.cloud_metrics.as_ref() else {
+            return self.local.list_metric_names(project_id).await;
+        };
+        let resolution = self.resolve_analytics(project_id, None, None).await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => self.local.list_metric_names(project_id).await,
+            CloudTelemetryWriteMode::Cloud => cloud_metrics.list_metric_names(project_id).await,
+        }
     }
 
     async fn list_metric_label_keys(
@@ -214,9 +341,27 @@ impl OtelStorage for CloudRoutedOtelStorage {
         start_time: chrono::DateTime<chrono::Utc>,
         end_time: chrono::DateTime<chrono::Utc>,
     ) -> StorageResult<Vec<String>> {
-        self.local
-            .list_metric_label_keys(project_id, metric_name, start_time, end_time)
-            .await
+        let Some(cloud_metrics) = self.cloud_metrics.as_ref() else {
+            return self
+                .local
+                .list_metric_label_keys(project_id, metric_name, start_time, end_time)
+                .await;
+        };
+        let resolution = self
+            .resolve_analytics(project_id, Some(start_time), Some(end_time))
+            .await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .list_metric_label_keys(project_id, metric_name, start_time, end_time)
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => {
+                cloud_metrics
+                    .list_metric_label_keys(project_id, metric_name, resolution.from, resolution.to)
+                    .await
+            }
+        }
     }
 
     async fn list_metric_label_values(
@@ -227,9 +372,39 @@ impl OtelStorage for CloudRoutedOtelStorage {
         start_time: chrono::DateTime<chrono::Utc>,
         end_time: chrono::DateTime<chrono::Utc>,
     ) -> StorageResult<Vec<String>> {
-        self.local
-            .list_metric_label_values(project_id, metric_name, label_key, start_time, end_time)
-            .await
+        let Some(cloud_metrics) = self.cloud_metrics.as_ref() else {
+            return self
+                .local
+                .list_metric_label_values(project_id, metric_name, label_key, start_time, end_time)
+                .await;
+        };
+        let resolution = self
+            .resolve_analytics(project_id, Some(start_time), Some(end_time))
+            .await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .list_metric_label_values(
+                        project_id,
+                        metric_name,
+                        label_key,
+                        start_time,
+                        end_time,
+                    )
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => {
+                cloud_metrics
+                    .list_metric_label_values(
+                        project_id,
+                        metric_name,
+                        label_key,
+                        resolution.from,
+                        resolution.to,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>> {
@@ -423,15 +598,46 @@ impl OtelStorage for CloudRoutedOtelStorage {
         environment: Option<&str>,
         lookback_days: i32,
     ) -> StorageResult<Vec<BaselinePoint>> {
-        self.local
-            .get_metric_baseline(
-                project_id,
-                service_name,
-                metric_name,
-                environment,
-                lookback_days,
-            )
-            .await
+        let Some(cloud_metrics) = self.cloud_metrics.as_ref() else {
+            return self
+                .local
+                .get_metric_baseline(
+                    project_id,
+                    service_name,
+                    metric_name,
+                    environment,
+                    lookback_days,
+                )
+                .await;
+        };
+        // Baselines look back `lookback_days`, always ending now — there is no
+        // caller-supplied window to clamp, so resolve against the open
+        // interval, same as `get_trace`'s reasoning for spans.
+        let resolution = self.resolve_analytics(project_id, None, None).await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .get_metric_baseline(
+                        project_id,
+                        service_name,
+                        metric_name,
+                        environment,
+                        lookback_days,
+                    )
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => {
+                cloud_metrics
+                    .get_metric_baseline(
+                        project_id,
+                        service_name,
+                        metric_name,
+                        environment,
+                        lookback_days,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn get_recent_minute_aggregates(
@@ -442,15 +648,43 @@ impl OtelStorage for CloudRoutedOtelStorage {
         environment: Option<&str>,
         minutes: i32,
     ) -> StorageResult<Vec<MinuteAggregate>> {
-        self.local
-            .get_recent_minute_aggregates(
-                project_id,
-                service_name,
-                metric_name,
-                environment,
-                minutes,
-            )
-            .await
+        let Some(cloud_metrics) = self.cloud_metrics.as_ref() else {
+            return self
+                .local
+                .get_recent_minute_aggregates(
+                    project_id,
+                    service_name,
+                    metric_name,
+                    environment,
+                    minutes,
+                )
+                .await;
+        };
+        let resolution = self.resolve_analytics(project_id, None, None).await;
+        match resolution.source {
+            CloudTelemetryWriteMode::Local => {
+                self.local
+                    .get_recent_minute_aggregates(
+                        project_id,
+                        service_name,
+                        metric_name,
+                        environment,
+                        minutes,
+                    )
+                    .await
+            }
+            CloudTelemetryWriteMode::Cloud => {
+                cloud_metrics
+                    .get_recent_minute_aggregates(
+                        project_id,
+                        service_name,
+                        metric_name,
+                        environment,
+                        minutes,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn get_recent_deploys(
@@ -628,5 +862,231 @@ mod tests {
         assert_eq!(cloud.query_spans.load(Ordering::SeqCst), 1);
         assert_eq!(cloud.get_trace.load(Ordering::SeqCst), 1);
         assert_eq!(cloud.has_traces.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Metric routing (ADR-043 §3) ───────────────────────────────────────
+
+    #[test]
+    fn a_clamped_analytics_resolution_narrows_the_metric_query_start() {
+        let clamp_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let query = MetricQuery {
+            project_id: 7,
+            start_time: Some(chrono::Utc::now() - chrono::Duration::hours(6)),
+            end_time: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        let resolution = WindowResolution {
+            source: CloudTelemetryWriteMode::Cloud,
+            window_clamped_at: Some(clamp_at),
+            from: clamp_at,
+            to: chrono::Utc::now(),
+        };
+
+        let clamped = CloudRoutedOtelStorage::clamped_metrics(query, &resolution);
+        assert_eq!(clamped.start_time, Some(clamp_at));
+    }
+
+    /// Records whether — and with what window — Cloud was actually asked.
+    #[derive(Default)]
+    struct CountingCloudMetricSource {
+        query_metrics_calls: AtomicUsize,
+        last_start_time: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    }
+
+    #[async_trait]
+    impl CloudMetricSource for CountingCloudMetricSource {
+        async fn query_metrics(&self, query: MetricQuery) -> StorageResult<Vec<MetricBucket>> {
+            self.query_metrics_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_start_time.lock().expect("mutex") = query.start_time;
+            Ok(vec![MetricBucket::scalar(
+                chrono::Utc::now(),
+                1.0,
+                1.0,
+                1.0,
+                1,
+            )])
+        }
+        async fn list_metric_names(&self, _project_id: i32) -> StorageResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn list_metric_label_keys(
+            &self,
+            _project_id: i32,
+            _metric_name: &str,
+            _start_time: chrono::DateTime<chrono::Utc>,
+            _end_time: chrono::DateTime<chrono::Utc>,
+        ) -> StorageResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn list_metric_label_values(
+            &self,
+            _project_id: i32,
+            _metric_name: &str,
+            _label_key: &str,
+            _start_time: chrono::DateTime<chrono::Utc>,
+            _end_time: chrono::DateTime<chrono::Utc>,
+        ) -> StorageResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_metric_baseline(
+            &self,
+            _project_id: i32,
+            _service_name: &str,
+            _metric_name: &str,
+            _environment: Option<&str>,
+            _lookback_days: i32,
+        ) -> StorageResult<Vec<BaselinePoint>> {
+            Ok(Vec::new())
+        }
+        async fn get_recent_minute_aggregates(
+            &self,
+            _project_id: i32,
+            _service_name: &str,
+            _metric_name: &str,
+            _environment: Option<&str>,
+            _minutes: i32,
+        ) -> StorageResult<Vec<MinuteAggregate>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// One mocked `project_telemetry_write_intervals` row, shaped exactly like
+    /// `intervals_covering_for_group`'s `SELECT` decodes it.
+    fn interval_row(
+        id: i64,
+        mode: &str,
+        from_mins_ago: i64,
+        to_mins_ago: Option<i64>,
+    ) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
+        let now = chrono::Utc::now();
+        let mut row: std::collections::BTreeMap<&str, sea_orm::Value> =
+            std::collections::BTreeMap::new();
+        row.insert("id", id.into());
+        row.insert("project_id", 7_i32.into());
+        row.insert("signal_group", "analytics".to_string().into());
+        row.insert("mode", mode.to_string().into());
+        row.insert(
+            "effective_from",
+            (now - chrono::Duration::minutes(from_mins_ago)).into(),
+        );
+        row.insert(
+            "effective_to",
+            to_mins_ago
+                .map(|mins| now - chrono::Duration::minutes(mins))
+                .into(),
+        );
+        row.insert("reason", "operator".to_string().into());
+        row
+    }
+
+    /// The full path: `CloudRoutedOtelStorage::query_metrics` reads the
+    /// **analytics** ledger (not the span one), finds a straddle, clamps to
+    /// the newest interval, and only then calls Cloud — proving both that
+    /// metrics route independently of spans and that the straddle-clamp
+    /// contract (ADR-040 §3, extended to metrics by ADR-043 §3) is wired end
+    /// to end, not just unit-tested in isolation as a pure function.
+    #[tokio::test]
+    async fn metric_reads_straddling_an_analytics_cutover_are_clamped_to_the_newest_interval() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    interval_row(1, "local", 240, Some(120)),
+                    interval_row(2, "cloud", 120, None),
+                ]])
+                .into_connection(),
+        );
+        let write_modes = std::sync::Arc::new(
+            crate::services::telemetry_write_mode::TelemetryWriteModeService::new(db),
+        );
+
+        let local = std::sync::Arc::new(crate::test_support::MockOtelStorage::new());
+        let cloud_span = std::sync::Arc::new(CountingCloudSource::default());
+        let cloud_metrics = std::sync::Arc::new(CountingCloudMetricSource::default());
+
+        let routed = CloudRoutedOtelStorage::new(
+            local as Arc<dyn OtelStorage>,
+            cloud_span as Arc<dyn CloudSpanSource>,
+            write_modes,
+        )
+        .with_cloud_metrics(cloud_metrics.clone() as Arc<dyn CloudMetricSource>);
+
+        let query = MetricQuery {
+            project_id: 7,
+            start_time: Some(chrono::Utc::now() - chrono::Duration::minutes(200)),
+            end_time: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        let result = routed
+            .query_metrics(query)
+            .await
+            .expect("routed query succeeds");
+
+        assert_eq!(
+            cloud_metrics.query_metrics_calls.load(Ordering::SeqCst),
+            1,
+            "a window that straddles into the cloud interval must reach the Cloud source"
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "the Cloud stub's answer must be the one returned"
+        );
+        let sent_start = cloud_metrics
+            .last_start_time
+            .lock()
+            .expect("mutex")
+            .expect("Cloud was called with a start time");
+        // The clamp must have narrowed the request to the newest interval's
+        // start (120 minutes ago), not the originally requested 200 minutes.
+        assert!(
+            (sent_start - (chrono::Utc::now() - chrono::Duration::minutes(120)))
+                .num_seconds()
+                .abs()
+                < 5,
+            "the query sent to Cloud must be clamped to the newest interval's start: {sent_start}"
+        );
+    }
+
+    /// The mirror image: a project with no `cloud_analytics_write_mode`
+    /// history at all must never reach Cloud, and must not even construct a
+    /// `CloudMetricSource` call when none is wired.
+    #[tokio::test]
+    async fn a_project_with_no_analytics_ledger_stays_local_and_never_calls_cloud() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new(),
+                ])
+                .into_connection(),
+        );
+        let write_modes = std::sync::Arc::new(
+            crate::services::telemetry_write_mode::TelemetryWriteModeService::new(db),
+        );
+
+        let local = std::sync::Arc::new(crate::test_support::MockOtelStorage::new());
+        let cloud_span = std::sync::Arc::new(CountingCloudSource::default());
+        let cloud_metrics = std::sync::Arc::new(CountingCloudMetricSource::default());
+
+        let routed = CloudRoutedOtelStorage::new(
+            local as Arc<dyn OtelStorage>,
+            cloud_span as Arc<dyn CloudSpanSource>,
+            write_modes,
+        )
+        .with_cloud_metrics(cloud_metrics.clone() as Arc<dyn CloudMetricSource>);
+
+        let query = MetricQuery {
+            project_id: 9,
+            ..Default::default()
+        };
+        assert!(routed.query_metrics(query).await.is_ok());
+        assert_eq!(
+            cloud_metrics.query_metrics_calls.load(Ordering::SeqCst),
+            0,
+            "a project with no analytics ledger has always been local; it must not call Cloud"
+        );
     }
 }

@@ -215,7 +215,8 @@ impl Harness {
         }
         Counted::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT COUNT(*)::bigint AS n FROM cloud_span_outbox WHERE state = $1",
+            "SELECT COUNT(*)::bigint AS n FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND state = $1",
             vec![state.into()],
         ))
         .one(self.db.as_ref())

@@ -152,6 +152,7 @@ pub struct CloudService {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     allow_loopback_development: bool,
     configuration_issue: RwLock<Option<String>>,
     managed_backup_setup: RwLock<Option<ManagedBackupSetup>>,
@@ -176,6 +177,7 @@ impl CloudService {
             task: Mutex::new(None),
             backup_task: Mutex::new(None),
             backup_credential_rotation_task: Mutex::new(None),
+            heartbeat_task: Mutex::new(None),
             allow_loopback_development,
             configuration_issue: RwLock::new(None),
             managed_backup_setup: RwLock::new(None),
@@ -269,6 +271,30 @@ impl CloudService {
         }
     }
 
+    /// Launch the heartbeat sender: a dedicated liveness signal on the
+    /// management channel, independent of whatever telemetry or backups this
+    /// instance does or does not have to ship. Like the backup mirror, it is
+    /// safe to spawn unconditionally at startup -- it self-gates on
+    /// [`temps_cloud_client::CloudLink::is_linked`] every cycle, so it starts
+    /// working the moment the instance links and goes quiet (cheaply) the
+    /// moment it disconnects, with no separate start/stop wiring needed.
+    pub fn start_heartbeat_sender(&self) {
+        let mut task = self
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_none() {
+            tracing::info!("Cloud service launching heartbeat sender task");
+            let link = self.link.clone();
+            let cancel = self.cancel.subscribe();
+            *task = Some(tokio::spawn(async move {
+                temps_cloud_client::heartbeat::run(link, cancel).await;
+            }));
+        } else {
+            tracing::debug!("Cloud heartbeat sender task is already registered");
+        }
+    }
+
     pub fn link(&self) -> Arc<CloudLink> {
         self.link.clone()
     }
@@ -288,7 +314,29 @@ impl CloudService {
         self.link.feature_switches()
     }
 
+    /// Tell the link whether a Cloud-managed backup destination exists locally.
+    ///
+    /// The backup mirror keys off this rather than off the export consent
+    /// switch: once `s3_sources.managed_by_cloud` exists, completed backups are
+    /// physically written into a Cloud-owned bucket, and only the mirror can
+    /// give Cloud a record of them. Refreshed from the row itself, which is the
+    /// single source of truth, rather than inferred from settings.
+    async fn refresh_managed_backup_destination(&self) {
+        match self.has_managed_backup_source().await {
+            Ok(present) => self.link.set_managed_backup_destination(present),
+            Err(error) => tracing::error!(
+                %error,
+                "could not determine whether a Cloud-managed backup destination exists; \
+                 leaving backup mirroring gated on the export consent switch"
+            ),
+        }
+    }
+
     pub async fn initialize(&self) -> Result<(), CloudServiceError> {
+        // Before any early return below: a degraded Cloud configuration must
+        // not make the instance forget that its backups are already landing in
+        // a Cloud-managed bucket.
+        self.refresh_managed_backup_destination().await;
         let settings = match self.config.get_settings().await {
             Ok(settings) => settings,
             Err(error) => {
@@ -570,7 +618,13 @@ impl CloudService {
                 return ManagedBackupOutcome::Unavailable(reason);
             }
         };
-        match self.upsert_managed_backup_source(credentials).await {
+        let upserted = self.upsert_managed_backup_source(credentials).await;
+        if upserted.is_ok() {
+            // The destination now exists, so every completed backup written to
+            // it must be declared to Cloud from here on.
+            self.link.set_managed_backup_destination(true);
+        }
+        match upserted {
             Ok(UpsertOutcome::SameBucket) => ManagedBackupOutcome::Provisioned,
             Ok(UpsertOutcome::BucketChanged {
                 previous_bucket_name,
@@ -721,6 +775,9 @@ impl CloudService {
         temps_entities::s3_sources::Entity::delete_by_id(source.id)
             .exec(self.db.as_ref())
             .await?;
+        // Nothing of this instance's is in Cloud storage any more, so the
+        // mirror goes back to being gated purely on operator consent.
+        self.link.set_managed_backup_destination(false);
         Ok(true)
     }
 
@@ -764,6 +821,14 @@ impl CloudService {
                 SHUTDOWN_TASK_TIMEOUT,
             )
             .await;
+        }
+        let heartbeat_task = self
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = heartbeat_task {
+            await_task_shutdown(task, "Cloud heartbeat sender", SHUTDOWN_TASK_TIMEOUT).await;
         }
     }
 }

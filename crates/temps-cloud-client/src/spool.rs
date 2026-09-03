@@ -62,6 +62,13 @@ impl Spool {
         self.buffer.is_empty()
     }
 
+    /// Estimated bytes currently held. Used to report local buffering depth
+    /// (e.g. the heartbeat channel's `pending_spool_bytes`) without walking
+    /// the buffer on every call.
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+
     /// Remove every buffered span after the operator revokes telemetry export.
     /// This is intentionally distinct from capacity drops: consent revocation
     /// must not leave exportable customer data resident for a later re-enable.
