@@ -2817,6 +2817,7 @@ mod tests {
             service: "web".to_string(),
             port: 80,
             published: None,
+            health_check_path: None,
         };
 
         let addr = build_public_compose_backend_addr(
