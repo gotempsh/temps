@@ -7777,6 +7777,14 @@
           "schedule_expression": {
             "type": "string"
           },
+          "service_ids": {
+            "description": "External services to target when `target_all_services` is `false`.\nThe schedule and these memberships are created atomically, so an\nenabled schedule can never be observed without its requested targets.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "tags": {
             "items": {
               "type": "string"
@@ -43337,6 +43345,17 @@
             "description": "New cron expression. When changed, `next_run` is recomputed.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "service_ids": {
+            "description": "Replace the explicit external-service selection atomically with the\nschedule update. Only meaningful when `target_all_services` resolves\nto `false`; an empty list explicitly clears the selection.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },

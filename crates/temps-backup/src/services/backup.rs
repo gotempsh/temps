@@ -5686,6 +5686,40 @@ SELECT cp.id
         Ok(service_ids)
     }
 
+    /// Normalize and validate an explicit schedule target list before it is
+    /// written. Returning the de-duplicated IDs keeps create, update, and the
+    /// standalone attach endpoint on the same validation contract.
+    async fn validated_schedule_service_ids(
+        &self,
+        s3_source_id: i32,
+        service_ids: &[i32],
+    ) -> Result<Vec<i32>, BackupError> {
+        let mut unique_ids = service_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+
+        if unique_ids.is_empty() {
+            return Ok(unique_ids);
+        }
+
+        let backing_service_ids = self.source_backing_service_ids(s3_source_id).await?;
+        reject_source_backing_targets(&backing_service_ids, unique_ids.iter().copied())?;
+
+        let found_count = temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::Id.is_in(unique_ids.clone()))
+            .count(self.db.as_ref())
+            .await?;
+        if found_count as usize != unique_ids.len() {
+            return Err(BackupError::Validation(format!(
+                "One or more service ids do not exist (requested {}, found {})",
+                unique_ids.len(),
+                found_count
+            )));
+        }
+
+        Ok(unique_ids)
+    }
+
     /// Delete an S3 source
     pub async fn delete_s3_source(&self, id: i32) -> Result<bool, BackupError> {
         // First check if source exists and is not in use
@@ -5747,6 +5781,21 @@ SELECT cp.id
 
         validate_retention_period(request.retention_period)?;
 
+        let target_all = request.target_all_services.unwrap_or(true);
+        let include_control_plane = request.include_control_plane.unwrap_or(true);
+        if target_all && !request.service_ids.is_empty() {
+            return Err(BackupError::Validation(
+                "service_ids cannot be set when target_all_services=true".to_string(),
+            ));
+        }
+        if !target_all && !include_control_plane && request.service_ids.is_empty() {
+            return Err(BackupError::Validation(
+                "A schedule must include the control plane, at least one specific database, \
+                 or all databases."
+                    .to_string(),
+            ));
+        }
+
         // Resolve S3 source: explicit id OR fall back to the default source.
         let s3_source_id = self.resolve_s3_source_id(request.s3_source_id).await?;
 
@@ -5767,7 +5816,14 @@ SELECT cp.id
             .map_err(|e| BackupError::Schedule(e.to_string()))?;
         let next_run = cron_schedule.upcoming(Utc).next();
 
-        // Insert with SeaORM
+        let service_ids = self
+            .validated_schedule_service_ids(s3_source_id, &request.service_ids)
+            .await?;
+
+        // Insert the schedule and its explicit memberships in one transaction.
+        // A scheduler tick can therefore never observe an enabled specific-
+        // target schedule before its databases have been attached.
+        let txn = self.db.begin().await?;
         let now = chrono::Utc::now();
         let tags_json = serde_json::to_string(&request.tags)?;
         let new_schedule = temps_entities::backup_schedules::ActiveModel {
@@ -5787,30 +5843,25 @@ SELECT cp.id
             // Default is true ("back up every database, including future
             // ones") so a freshly-created schedule does the obvious thing
             // without the operator having to pick services up front.
-            target_all_services: Set(request.target_all_services.unwrap_or(true)),
-            include_control_plane: Set(request.include_control_plane.unwrap_or(true)),
+            target_all_services: Set(target_all),
+            include_control_plane: Set(include_control_plane),
             ..Default::default()
         };
 
-        // Validate the resulting schedule has at least one thing to back
-        // up. We do this *after* defaulting so callers who omit the flags
-        // get the safe "back up everything" behaviour instead of a 400.
-        let target_all = request.target_all_services.unwrap_or(true);
-        let include_cp = request.include_control_plane.unwrap_or(true);
-        if !target_all && !include_cp {
-            // Without target_all_services the operator must also attach at
-            // least one service. They can't do that until the schedule
-            // exists, so the only way to get here legitimately is via an
-            // update — block it on create.
-            return Err(BackupError::Validation(
-                "A schedule must include the control plane, target all databases, \
-                 or both. Set include_control_plane=true or target_all_services=true \
-                 (or omit the flags to use the defaults)."
-                    .to_string(),
-            ));
+        let schedule_model = new_schedule.insert(&txn).await?;
+        if !service_ids.is_empty() {
+            let memberships = service_ids.into_iter().map(|service_id| {
+                temps_entities::backup_schedule_services::ActiveModel {
+                    schedule_id: Set(schedule_model.id),
+                    service_id: Set(service_id),
+                    created_at: Set(now),
+                }
+            });
+            temps_entities::backup_schedule_services::Entity::insert_many(memberships)
+                .exec(&txn)
+                .await?;
         }
-
-        let schedule_model = new_schedule.insert(self.db.as_ref()).await?;
+        txn.commit().await?;
         info!("Created new backup schedule: {}", schedule_model.name);
         self.fire_lifecycle_reconcile(schedule_model.s3_source_id);
         Ok(schedule_model)
@@ -6076,7 +6127,7 @@ SELECT cp.id
         schedule_id: i32,
         service_ids: &[i32],
     ) -> Result<u64, BackupError> {
-        use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+        use sea_orm::ConnectionTrait;
 
         // Validate schedule exists (raises NotFound otherwise) and resolve the
         // destination identity before accepting explicit targets.
@@ -6086,29 +6137,9 @@ SELECT cp.id
             return Ok(0);
         }
 
-        // De-duplicate the input so we don't ask the DB to insert dup rows
-        // (ON CONFLICT handles it, but logging stays clean).
-        let mut unique_ids: Vec<i32> = service_ids.to_vec();
-        unique_ids.sort_unstable();
-        unique_ids.dedup();
-
-        let backing_service_ids = self
-            .source_backing_service_ids(schedule.s3_source_id)
+        let unique_ids = self
+            .validated_schedule_service_ids(schedule.s3_source_id, service_ids)
             .await?;
-        reject_source_backing_targets(&backing_service_ids, unique_ids.iter().copied())?;
-
-        // Validate every requested service id exists.
-        let found_count = temps_entities::external_services::Entity::find()
-            .filter(temps_entities::external_services::Column::Id.is_in(unique_ids.clone()))
-            .count(self.db.as_ref())
-            .await?;
-        if (found_count as usize) != unique_ids.len() {
-            return Err(BackupError::Validation(format!(
-                "One or more service ids do not exist (requested {}, found {})",
-                unique_ids.len(),
-                found_count
-            )));
-        }
 
         // Build a single multi-row INSERT with ON CONFLICT DO NOTHING for
         // idempotency. Sea-ORM `insert_many` does not expose ON CONFLICT in
@@ -6251,17 +6282,11 @@ SELECT cp.id
             ),
             tags: vec![],
             max_runtime_secs: None,
-            // Target exactly this service (attached below), not every DB.
-            //
-            // `create_backup_schedule` refuses to create a schedule that has
-            // nothing to back up (target_all=false AND include_control_plane=
-            // false) because no services can be attached until the schedule
-            // row exists. So we create it with the control plane temporarily
-            // included, attach the service, then flip include_control_plane
-            // off via `update_backup_schedule` — which permits the otherwise-
-            // empty combination precisely because a service is now attached.
+            // Target exactly this service, not every DB or the control plane.
+            // Schedule creation commits this membership atomically.
             target_all_services: Some(false),
-            include_control_plane: Some(true),
+            include_control_plane: Some(false),
+            service_ids: vec![service.id],
         };
 
         let schedule = self.create_backup_schedule(request).await?;
@@ -6269,30 +6294,6 @@ SELECT cp.id
             schedule.clone().into();
         generated_schedule.generated_kind = Set(Some("mariadb_base_backup".to_string()));
         generated_schedule.update(self.db.as_ref()).await?;
-
-        // Attach exactly this service so the schedule's fan-out targets it.
-        self.attach_services_to_schedule(schedule.id, &[service.id])
-            .await?;
-
-        // Now that the service is attached, narrow the schedule down to exactly
-        // that service: drop the control-plane backup so the schedule only
-        // produces base backups for this MariaDB service.
-        let schedule = self
-            .update_backup_schedule(
-                schedule.id,
-                UpdateBackupScheduleRequest {
-                    name: None,
-                    description: None,
-                    schedule_expression: None,
-                    retention_period: None,
-                    max_runtime_secs: None,
-                    enabled: None,
-                    tags: None,
-                    target_all_services: None,
-                    include_control_plane: Some(false),
-                },
-            )
-            .await?;
 
         // Flip the one-shot latch so we never provision this service again.
         let mut active: temps_entities::external_services::ActiveModel = service.clone().into();
@@ -9191,6 +9192,8 @@ ORDER BY a.opened_at DESC
 
         // 1. Load the existing schedule (returns NotFound if absent).
         let existing = self.get_backup_schedule(id).await?;
+        let requested_target_all = request.target_all_services;
+        let requested_service_ids = request.service_ids.clone();
 
         // 2. Validate fields before touching the ActiveModel.
         if let Some(ref name) = request.name {
@@ -9280,45 +9283,79 @@ ORDER BY a.opened_at DESC
         let final_include_cp = request
             .include_control_plane
             .unwrap_or(existing.include_control_plane);
-        if !final_target_all && !final_include_cp {
-            use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
-            let attached_count = temps_entities::backup_schedule_services::Entity::find()
+        if final_target_all
+            && requested_service_ids
+                .as_ref()
+                .is_some_and(|service_ids| !service_ids.is_empty())
+        {
+            return Err(BackupError::Validation(
+                "service_ids cannot be set when target_all_services=true".to_string(),
+            ));
+        }
+
+        let validated_service_ids = match requested_service_ids.as_deref() {
+            Some(service_ids) => Some(
+                self.validated_schedule_service_ids(existing.s3_source_id, service_ids)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        let txn = self.db.begin().await?;
+        let final_service_count = if final_target_all {
+            0
+        } else if let Some(service_ids) = validated_service_ids.as_ref() {
+            service_ids.len() as u64
+        } else {
+            temps_entities::backup_schedule_services::Entity::find()
                 .filter(temps_entities::backup_schedule_services::Column::ScheduleId.eq(id))
-                .count(self.db.as_ref())
-                .await
-                .map_err(BackupError::Database)?;
-            if attached_count == 0 {
-                return Err(BackupError::Validation(
-                    "Schedule would have nothing to back up: \
-                     include_control_plane=false, target_all_services=false, \
-                     and no services attached. Attach at least one service \
-                     or re-enable one of the broader flags."
-                        .to_string(),
-                ));
-            }
+                .count(&txn)
+                .await?
+        };
+        if !final_target_all && !final_include_cp && final_service_count == 0 {
+            return Err(BackupError::Validation(
+                "Schedule would have nothing to back up: select at least one specific database, \
+                 enable the control plane, or target all databases."
+                    .to_string(),
+            ));
         }
 
         active.updated_at = Set(Utc::now());
 
-        let updated = active.update(self.db.as_ref()).await?;
+        let updated = active.update(&txn).await?;
 
-        // When the caller flipped target_all_services to true, clear any
-        // stale explicit-membership rows. The user's choice ("clear it")
-        // means "all means all" — no hidden saved list to surface later if
-        // they flip back to specific.
-        if matches!(request.target_all_services, Some(true)) {
-            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        // Apply the target-mode and explicit selection in the same transaction
+        // as the schedule fields. This prevents both no-target scheduler races
+        // and partial UI saves when switching from all to specific databases.
+        if matches!(requested_target_all, Some(true)) || validated_service_ids.is_some() {
             let deleted = temps_entities::backup_schedule_services::Entity::delete_many()
                 .filter(temps_entities::backup_schedule_services::Column::ScheduleId.eq(id))
-                .exec(self.db.as_ref())
-                .await
-                .map_err(BackupError::Database)?;
+                .exec(&txn)
+                .await?;
             info!(
                 schedule_id = id,
                 rows_deleted = deleted.rows_affected,
-                "Cleared explicit service memberships after flipping target_all_services=true",
+                "Cleared explicit service memberships before applying schedule targets",
             );
         }
+        if !final_target_all {
+            if let Some(service_ids) = validated_service_ids {
+                if !service_ids.is_empty() {
+                    let now = Utc::now();
+                    let memberships = service_ids.into_iter().map(|service_id| {
+                        temps_entities::backup_schedule_services::ActiveModel {
+                            schedule_id: Set(id),
+                            service_id: Set(service_id),
+                            created_at: Set(now),
+                        }
+                    });
+                    temps_entities::backup_schedule_services::Entity::insert_many(memberships)
+                        .exec(&txn)
+                        .await?;
+                }
+            }
+        }
+        txn.commit().await?;
 
         info!(
             schedule_id = id,
@@ -10976,6 +11013,7 @@ mod tests {
             max_runtime_secs: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: vec![],
         };
 
         let schedule = backup_service
@@ -11947,6 +11985,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(1, request).await;
@@ -12001,6 +12040,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(1, request).await;
@@ -12052,6 +12092,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(1, request).await;
@@ -12096,6 +12137,7 @@ mod tests {
             tags: None,
             target_all_services: None,
             include_control_plane: None,
+            service_ids: None,
         };
 
         let result = svc.update_backup_schedule(999, request).await;
@@ -12818,6 +12860,96 @@ mod tests {
     // does not accept generically. The integration test exercises the same
     // code path against a real Postgres.
 
+    /// Regression for the schedule-creation UI: a weekly schedule targeting
+    /// specific databases must be creatable without a control-plane backup.
+    /// The schedule row and membership are committed together.
+    #[tokio::test]
+    async fn integration_create_weekly_specific_schedule_without_control_plane() {
+        if bollard::Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping test");
+            return;
+        }
+        use chrono::{Datelike, Weekday};
+        use sea_orm::ActiveValue::Set;
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) => {
+                println!("TestDatabase unavailable, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+
+        let s3_source = temps_entities::s3_sources::ActiveModel {
+            name: Set("schedule-target-source".to_string()),
+            bucket_name: Set("schedule-target-bucket".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            region: Set("us-east-1".to_string()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert S3 source");
+
+        let database = temps_entities::external_services::ActiveModel {
+            name: Set("selected-database".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert selected database");
+
+        let service = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db.clone()),
+            create_mock_alarm_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+
+        let schedule = service
+            .create_backup_schedule(CreateBackupScheduleRequest {
+                name: "Weekly selected database".to_string(),
+                backup_type: "full".to_string(),
+                retention_period: 7,
+                s3_source_id: Some(s3_source.id),
+                schedule_expression: "0 0 0 * * SUN".to_string(),
+                enabled: true,
+                description: None,
+                tags: vec![],
+                max_runtime_secs: None,
+                target_all_services: Some(false),
+                include_control_plane: Some(false),
+                service_ids: vec![database.id],
+            })
+            .await
+            .expect("weekly specific schedule should be created");
+
+        assert!(!schedule.target_all_services);
+        assert!(!schedule.include_control_plane);
+        assert_eq!(
+            schedule.next_run.map(|run| run.weekday()),
+            Some(Weekday::Sun)
+        );
+
+        let memberships = temps_entities::backup_schedule_services::Entity::find()
+            .filter(temps_entities::backup_schedule_services::Column::ScheduleId.eq(schedule.id))
+            .all(db.as_ref())
+            .await
+            .expect("list schedule memberships");
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].service_id, database.id);
+    }
+
     #[tokio::test]
     async fn detach_service_returns_false_when_no_row() {
         let db = Arc::new(
@@ -13211,6 +13343,7 @@ mod tests {
                 tags: None,
                 target_all_services: Some(true),
                 include_control_plane: None,
+                service_ids: None,
             },
         )
         .await
@@ -13240,6 +13373,7 @@ mod tests {
                 tags: None,
                 target_all_services: Some(false),
                 include_control_plane: None,
+                service_ids: None,
             },
         )
         .await
@@ -13253,6 +13387,38 @@ mod tests {
             after_specific.is_empty(),
             "flipping back to specific must not magically restore membership"
         );
+
+        // The edit form can switch from all databases to one explicit
+        // database while disabling the control-plane target in one PATCH.
+        // This used to fail because the service validated the intermediate
+        // target state before the UI could attach the selected database.
+        let selected = svc
+            .update_backup_schedule(
+                schedule.id,
+                crate::handlers::backup_handler::UpdateBackupScheduleRequest {
+                    name: None,
+                    description: None,
+                    schedule_expression: None,
+                    retention_period: None,
+                    max_runtime_secs: None,
+                    enabled: None,
+                    tags: None,
+                    target_all_services: Some(false),
+                    include_control_plane: Some(false),
+                    service_ids: Some(vec![svc_a.id]),
+                },
+            )
+            .await
+            .expect("atomic specific-target update succeeds");
+        assert!(!selected.target_all_services);
+        assert!(!selected.include_control_plane);
+
+        let selected_services = svc
+            .list_services_for_schedule(schedule.id)
+            .await
+            .expect("list after atomic specific-target update");
+        assert_eq!(selected_services.len(), 1);
+        assert_eq!(selected_services[0].id, svc_a.id);
     }
 
     /// Unit test (no DB needed): create_backup_schedule rejects a request
@@ -13307,6 +13473,7 @@ mod tests {
             max_runtime_secs: None,
             target_all_services: Some(false),
             include_control_plane: Some(false),
+            service_ids: vec![],
         };
 
         let err = svc
@@ -13656,6 +13823,7 @@ mod tests {
                     tags: None,
                     target_all_services: None,
                     include_control_plane: Some(false),
+                    service_ids: None,
                 },
             )
             .await

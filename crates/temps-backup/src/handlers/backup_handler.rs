@@ -280,8 +280,9 @@ pub struct CreateBackupScheduleRequest {
     pub max_runtime_secs: Option<i64>,
     /// When `true` (default), the schedule backs up every external service
     /// on the host — including databases created in the future. When
-    /// `false`, the schedule backs up only the services explicitly attached
-    /// via `POST /backups/schedules/{id}/services`. Omit to use the default.
+    /// `false`, the schedule backs up only the services supplied in
+    /// `service_ids` (or later attached through the schedule-services API).
+    /// Omit to use the default.
     #[serde(default)]
     pub target_all_services: Option<bool>,
     /// When `true` (default), every run also produces a `control_plane`
@@ -290,6 +291,11 @@ pub struct CreateBackupScheduleRequest {
     /// keep the run history focused on those services.
     #[serde(default)]
     pub include_control_plane: Option<bool>,
+    /// External services to target when `target_all_services` is `false`.
+    /// The schedule and these memberships are created atomically, so an
+    /// enabled schedule can never be observed without its requested targets.
+    #[serde(default)]
+    pub service_ids: Vec<i32>,
 }
 
 /// Deserializer for `Option<Option<i64>>` that maps:
@@ -348,6 +354,10 @@ pub struct UpdateBackupScheduleRequest {
     pub target_all_services: Option<bool>,
     /// Toggle whether the control-plane backup is produced on every run.
     pub include_control_plane: Option<bool>,
+    /// Replace the explicit external-service selection atomically with the
+    /// schedule update. Only meaningful when `target_all_services` resolves
+    /// to `false`; an empty list explicitly clears the selection.
+    pub service_ids: Option<Vec<i32>>,
 }
 
 /// Returns the names of fields that are present (i.e., `Some`) in the patch
@@ -380,6 +390,9 @@ fn changed_fields_for_audit(request: &UpdateBackupScheduleRequest) -> Vec<String
     }
     if request.include_control_plane.is_some() {
         fields.push("include_control_plane".to_string());
+    }
+    if request.service_ids.is_some() {
+        fields.push("service_ids".to_string());
     }
     fields
 }
@@ -2913,7 +2926,18 @@ async fn update_backup_schedule(
     Json(request): Json<UpdateBackupScheduleRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
-    require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "update").await?;
+    if let Some(service_ids) = request.service_ids.as_deref() {
+        require_schedule_attach_access(
+            &app_state,
+            &auth,
+            id,
+            service_ids,
+            Permission::BackupsWrite,
+        )
+        .await?;
+    } else {
+        require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "update").await?;
+    }
     if matches!(request.target_all_services, Some(true))
         || matches!(request.include_control_plane, Some(true))
     {

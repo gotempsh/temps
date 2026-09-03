@@ -3850,6 +3850,12 @@ export type CreateBackupScheduleRequest = {
      */
     s3_source_id?: number | null;
     schedule_expression: string;
+    /**
+     * External services to target when `target_all_services` is `false`.
+     * The schedule and these memberships are created atomically, so an
+     * enabled schedule can never be observed without its requested targets.
+     */
+    service_ids?: Array<number>;
     tags: Array<string>;
     /**
      * When `true` (default), the schedule backs up every external service
@@ -19990,6 +19996,12 @@ export type UpdateBackupScheduleRequest = {
      * New cron expression. When changed, `next_run` is recomputed.
      */
     schedule_expression?: string | null;
+    /**
+     * Replace the explicit external-service selection atomically with the
+     * schedule update. Only meaningful when `target_all_services` resolves
+     * to `false`; an empty list explicitly clears the selection.
+     */
+    service_ids?: Array<number> | null;
     /**
      * Replace the full tag list. Skipped when `None`.
      */
