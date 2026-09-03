@@ -54,7 +54,7 @@ use rsbuild::Rsbuild;
 pub use rust_preset::RustPreset;
 pub use temps_entities::preset::Preset as PresetType;
 use temps_entities::preset::{
-    DockerfileVariant, NixpacksConfig, PresetConfig as StoredPresetConfig,
+    DockerfileVariant, ImageRuntimeConfig, NixpacksConfig, PresetConfig as StoredPresetConfig,
 };
 pub use vite::Vite;
 
@@ -402,6 +402,69 @@ pub fn validate_preset_config(
 
     if let StoredPresetConfig::Nixpacks(config) = config {
         NixpacksPreset::validate_config(config)?;
+    }
+
+    if let StoredPresetConfig::Dockerfile(config) = config {
+        if let Some(runtime) = config.image_runtime.as_ref() {
+            validate_image_runtime_config(runtime)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate the durable runtime snapshot used by prebuilt-image templates.
+///
+/// These checks live at the preset persistence boundary so settings cannot be
+/// saved successfully with values that every later deployment would reject.
+pub fn validate_image_runtime_config(
+    runtime: &ImageRuntimeConfig,
+) -> Result<(), PresetResolutionError> {
+    let invalid = |reason: &str| PresetResolutionError::InvalidConfig {
+        slug: PresetType::Dockerfile.as_str().to_string(),
+        reason: reason.to_string(),
+    };
+
+    if runtime.image_ref.is_empty() || runtime.image_ref.len() > 512 {
+        return Err(invalid(
+            "image reference must contain between 1 and 512 bytes",
+        ));
+    }
+    if runtime
+        .image_ref
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(invalid(
+            "image reference cannot contain whitespace or control characters",
+        ));
+    }
+
+    if let Some(command) = runtime.command.as_ref() {
+        if command.len() > 64 {
+            return Err(invalid("container command supports at most 64 arguments"));
+        }
+        if command.iter().any(|part| {
+            part.is_empty() || part.len() > 1_024 || part.chars().any(char::is_control)
+        }) {
+            return Err(invalid(
+                "container command arguments must be non-empty, at most 1024 bytes, and contain no control characters",
+            ));
+        }
+    }
+
+    if let Some(path) = runtime.health_check_path.as_deref() {
+        if path.is_empty()
+            || path.len() > 2_048
+            || !path.starts_with('/')
+            || path.contains('@')
+            || path.contains("://")
+            || path.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "health-check path must be a safe relative HTTP path starting with '/'",
+            ));
+        }
     }
 
     Ok(())
@@ -1052,6 +1115,38 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
 mod uploaded_source_detection_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    fn image_runtime() -> ImageRuntimeConfig {
+        ImageRuntimeConfig {
+            image_ref: "quay.io/keycloak/keycloak:26.7.2".to_string(),
+            command: Some(vec!["start".to_string()]),
+            health_check_path: Some("/realms/master".to_string()),
+        }
+    }
+
+    #[test]
+    fn image_runtime_validation_accepts_safe_runtime() {
+        assert!(validate_image_runtime_config(&image_runtime()).is_ok());
+    }
+
+    #[test]
+    fn image_runtime_validation_rejects_values_that_deploy_cannot_run() {
+        let mut runtime = image_runtime();
+        runtime.command = Some(vec!["part".to_string(); 65]);
+        assert!(validate_image_runtime_config(&runtime).is_err());
+
+        let mut runtime = image_runtime();
+        runtime.command = Some(vec!["bad\nargument".to_string()]);
+        assert!(validate_image_runtime_config(&runtime).is_err());
+
+        let mut runtime = image_runtime();
+        runtime.health_check_path = Some("https://attacker.example".to_string());
+        assert!(validate_image_runtime_config(&runtime).is_err());
+
+        let mut runtime = image_runtime();
+        runtime.image_ref = "registry.example/image:tag with-space".to_string();
+        assert!(validate_image_runtime_config(&runtime).is_err());
+    }
 
     #[test]
     fn detects_next_without_a_next_config_file() {

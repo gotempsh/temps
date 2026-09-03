@@ -8,7 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use temps_entities::preset::{
-    ComposePublicPort, ComposeTemplateOrigin, DockerfileVariant, NixpacksProvider,
+    ComposePublicPort, ComposeTemplateOrigin, DockerfileVariant, ImageRuntimeConfig,
+    NixpacksProvider,
 };
 
 #[cfg(feature = "openapi")]
@@ -36,6 +37,10 @@ pub struct DockerfilePresetConfig {
     #[cfg_attr(feature = "openapi", schema(example = "./api"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_context: Option<String>,
+
+    /// Durable runtime selected for a curated single-container image template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_runtime: Option<ImageRuntimeConfig>,
 }
 
 /// Configuration for Docker Compose deployments.
@@ -159,6 +164,7 @@ mod tests {
             variant: None,
             dockerfile_path: Some("docker/Dockerfile".to_string()),
             build_context: Some("./api".to_string()),
+            image_runtime: None,
         };
 
         let json = serde_json::to_value(&config).unwrap();
@@ -222,6 +228,7 @@ mod tests {
             variant: None,
             dockerfile_path: Some("Dockerfile.prod".to_string()),
             build_context: None,
+            image_runtime: None,
         });
 
         let json = serde_json::to_value(&dockerfile_config).unwrap();

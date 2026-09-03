@@ -46,6 +46,8 @@ pub struct Project {
     pub directory: String,
     pub main_branch: String,
     pub preset: Option<String>,
+    /// Bundled template provenance persisted on the project row.
+    pub template_slug: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     pub preset_config: Option<serde_json::Value>,
     pub created_at: UtcDateTime,

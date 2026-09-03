@@ -327,8 +327,14 @@ pub struct ProjectResponse {
     pub directory: String,
     pub main_branch: String,
     pub preset: Option<String>,
+    /// Bundled template slug that created this project. Clients use this to
+    /// present template-specific runtime configuration instead of generic
+    /// source-build controls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_slug: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<PresetConfigSchema>)]
     pub preset_config: Option<serde_json::Value>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -424,6 +430,7 @@ impl ProjectResponse {
             directory: project.directory,
             main_branch: project.main_branch,
             preset: project.preset,
+            template_slug: project.template_slug,
             preset_config: project.preset_config,
             created_at: project.created_at.timestamp_millis(),
             updated_at: project.updated_at.timestamp_millis(),
@@ -701,6 +708,24 @@ pub struct UpdateDeploymentConfigRequest {
     /// issue #646.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_connections: Option<i32>,
+}
+
+/// Complete replacement for the editable runtime of a single-container
+/// service-template project. Runtime and resource fields are written to the
+/// same project row in one transaction.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServiceTemplateRuntimeRequest {
+    pub image_ref: String,
+    /// Empty means use the image's own default command.
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub health_check_path: String,
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+    pub exposed_port: Option<i32>,
 }
 
 /// Deserialize a PATCH integer field while preserving the distinction between

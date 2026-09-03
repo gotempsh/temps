@@ -1,25 +1,49 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
-import { selectRuntimeLogContainer } from './runtime-logs.js'
+import { describe, expect, test } from "bun:test";
+import {
+  parseDeploymentId,
+  selectRuntimeLogContainer,
+} from "./runtime-logs.js";
 
 const containers = [
-  { container_id: 'abc123456789', container_name: 'checkout-production' },
-  { container_id: 'def987654321', container_name: 'worker-production' },
-]
+  { container_id: "abc123456789", container_name: "checkout-production" },
+  { container_id: "def987654321", container_name: "worker-production" },
+];
 
-describe('selectRuntimeLogContainer', () => {
-  test('defaults to the first live container', () => {
-    expect(selectRuntimeLogContainer(containers)).toEqual(containers[0])
-  })
+describe("selectRuntimeLogContainer", () => {
+  test("defaults to the first live container", () => {
+    expect(selectRuntimeLogContainer(containers)).toEqual(containers[0]);
+  });
 
-  test('accepts partial IDs and names', () => {
-    expect(selectRuntimeLogContainer(containers, 'def987')).toEqual(containers[1])
-    expect(selectRuntimeLogContainer(containers, 'checkout')).toEqual(containers[0])
-  })
+  test("accepts partial IDs and names", () => {
+    expect(selectRuntimeLogContainer(containers, "def987")).toEqual(
+      containers[1],
+    );
+    expect(selectRuntimeLogContainer(containers, "checkout")).toEqual(
+      containers[0],
+    );
+  });
 
-  test('does not silently select a different container', () => {
-    expect(selectRuntimeLogContainer(containers, 'missing')).toBeUndefined()
-  })
-})
+  test("does not silently select a different container", () => {
+    expect(selectRuntimeLogContainer(containers, "missing")).toBeUndefined();
+  });
+});
+
+describe("parseDeploymentId", () => {
+  test("accepts a complete positive integer", () => {
+    expect(parseDeploymentId("25")).toBe(25);
+  });
+
+  test.each(["", "0", "-1", "25garbage", "1.5", " 25"])(
+    "rejects malformed deployment ID %p",
+    (value) => {
+      expect(parseDeploymentId(value)).toBeUndefined();
+    },
+  );
+
+  test("rejects integers that are not safe in JavaScript", () => {
+    expect(parseDeploymentId("9007199254740992")).toBeUndefined();
+  });
+});

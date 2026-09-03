@@ -109,7 +109,7 @@ describe('templateEnvironmentVariableDefaultsToSecret', () => {
     ['DATABASE_URL', undefined],
     ['API_TOKEN', undefined],
   ])(
-    'keeps native service variable %s regular by default',
+    'protects native service credential %s by default',
     (key, defaultGenerator) => {
       expect(
         templateEnvironmentVariableDefaultsToSecret({
@@ -117,7 +117,7 @@ describe('templateEnvironmentVariableDefaultsToSecret', () => {
           key,
           defaultGenerator,
         })
-      ).toBe(false)
+      ).toBe(true)
     }
   )
 

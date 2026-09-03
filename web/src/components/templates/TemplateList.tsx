@@ -13,7 +13,15 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { Search, Star, Loader2, LayoutGrid, List } from 'lucide-react'
+import {
+  AlertCircle,
+  Search,
+  Star,
+  Loader2,
+  LayoutGrid,
+  List,
+  RefreshCw,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface TemplateListProps {
@@ -37,7 +45,12 @@ export function TemplateList({
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid')
 
   // Fetch templates
-  const { data: templatesData, isLoading: isLoadingTemplates } = useQuery({
+  const {
+    data: templatesData,
+    isLoading: isLoadingTemplates,
+    isError: isTemplatesError,
+    refetch: refetchTemplates,
+  } = useQuery({
     ...listProjectTemplatesOptions({
       query: {
         featured: showFeaturedOnly ? true : undefined,
@@ -51,17 +64,18 @@ export function TemplateList({
   const { data: tagsData } = useQuery({
     ...listProjectTemplateTagsOptions(),
   })
+  const templates = templatesData?.templates
 
   // Filter and sort templates
   const filteredTemplates = useMemo(() => {
-    if (!templatesData?.templates) return []
+    if (!templates) return []
 
-    let templates = [...templatesData.templates]
+    let matchingTemplates = [...templates]
 
     // Filter by search query
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase()
-      templates = templates.filter(
+      matchingTemplates = matchingTemplates.filter(
         (t) =>
           t.name.toLowerCase().includes(query) ||
           t.description?.toLowerCase().includes(query) ||
@@ -72,20 +86,38 @@ export function TemplateList({
 
     // Sort: featured first, then alphabetically
     if (showFeaturedFirst) {
-      templates.sort((a, b) => {
+      matchingTemplates.sort((a, b) => {
         if (a.is_featured && !b.is_featured) return -1
         if (!a.is_featured && b.is_featured) return 1
         return a.name.localeCompare(b.name)
       })
     }
 
-    return templates
-  }, [templatesData?.templates, searchQuery, showFeaturedFirst])
+    return matchingTemplates
+  }, [templates, searchQuery, showFeaturedFirst])
 
   if (isLoadingTemplates) {
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
+
+  if (isTemplatesError) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-6 py-12 text-center">
+        <AlertCircle className="size-6 text-amber-600 dark:text-amber-400" />
+        <div>
+          <p className="font-medium">Could not load the template catalog</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Check the server connection and try again.
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => refetchTemplates()}>
+          <RefreshCw className="mr-1.5 size-3.5" />
+          Retry
+        </Button>
       </div>
     )
   }

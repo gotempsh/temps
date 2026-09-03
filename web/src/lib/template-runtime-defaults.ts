@@ -16,6 +16,24 @@ type TemplateRuntimeSource = {
   health_check_path?: string | null
 }
 
+type ServiceTemplateProjectSource = {
+  preset_config?: unknown
+  deployment_config?: {
+    cpuRequest?: number | null
+    cpuLimit?: number | null
+    memoryRequest?: number | null
+    memoryLimit?: number | null
+    exposedPort?: number | null
+  } | null
+}
+
+type StoredImageRuntime = {
+  exists: boolean
+  imageRef?: unknown
+  command?: unknown
+  healthCheckPath?: unknown
+}
+
 const optionalNumber = (
   label: string,
   options: { min: number; allowZero?: boolean }
@@ -51,7 +69,30 @@ export const templateRuntimeDefaultsSchema = z
           !hasControlCharacters(value),
         'Image reference cannot contain whitespace or control characters'
       ),
-    command: z.string(),
+    command: z.string().superRefine((value, context) => {
+      const argumentsList = value
+        .split('\n')
+        .map((argument) => argument.trim())
+        .filter(Boolean)
+      if (argumentsList.length > 64) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Container command supports at most 64 arguments',
+        })
+      }
+      if (
+        argumentsList.some(
+          (argument) =>
+            argument.length > 1_024 || hasControlCharacters(argument)
+        )
+      ) {
+        context.addIssue({
+          code: 'custom',
+          message:
+            'Each command argument must be at most 1024 bytes and contain no control characters',
+        })
+      }
+    }),
     cpuRequest: optionalNumber('CPU request', { min: 0.01 }),
     cpuLimit: optionalNumber('CPU limit', { min: 0.01, allowZero: true }),
     memoryRequest: optionalNumber('Memory request', { min: 1 }),
@@ -152,6 +193,96 @@ export function templateRuntimeDefaults(
     memoryLimit: formatInteger(template.resources?.memory_limit),
     exposedPort: formatInteger(template.exposed_port),
     healthCheckPath: template.health_check_path ?? '/',
+  }
+}
+
+function storedImageRuntime(
+  project: ServiceTemplateProjectSource
+): StoredImageRuntime {
+  if (!project.preset_config || typeof project.preset_config !== 'object') {
+    return { exists: false }
+  }
+  const value = (project.preset_config as Record<string, unknown>).imageRuntime
+  return value && typeof value === 'object'
+    ? { ...(value as Omit<StoredImageRuntime, 'exists'>), exists: true }
+    : { exists: false }
+}
+
+/**
+ * Resolve the durable project settings first and use the current catalog only
+ * as a migration fallback for projects created before image runtime settings
+ * were persisted.
+ */
+export function serviceTemplateRuntimeDefaults(
+  project: ServiceTemplateProjectSource,
+  template: TemplateRuntimeSource
+): TemplateRuntimeDefaults {
+  const defaults = templateRuntimeDefaults(template)
+  const stored = storedImageRuntime(project)
+  const deployment = project.deployment_config
+
+  return {
+    image:
+      typeof stored.imageRef === 'string' ? stored.imageRef : defaults.image,
+    command: stored.exists
+      ? Array.isArray(stored.command)
+        ? stored.command
+            .filter((value): value is string => typeof value === 'string')
+            .join('\n')
+        : ''
+      : defaults.command,
+    healthCheckPath:
+      typeof stored.healthCheckPath === 'string'
+        ? stored.healthCheckPath
+        : defaults.healthCheckPath,
+    cpuRequest: formatCores(deployment?.cpuRequest),
+    cpuLimit: formatCores(deployment?.cpuLimit),
+    memoryRequest: formatInteger(deployment?.memoryRequest),
+    memoryLimit: formatInteger(deployment?.memoryLimit),
+    exposedPort: formatInteger(deployment?.exposedPort),
+  }
+}
+
+export function serviceTemplateDeployOverrides(
+  project: ServiceTemplateProjectSource
+): {
+  image_ref?: string
+  command?: string[]
+  health_check_path?: string
+} {
+  const stored = storedImageRuntime(project)
+  return {
+    ...(typeof stored.imageRef === 'string' && stored.imageRef.trim()
+      ? { image_ref: stored.imageRef.trim() }
+      : {}),
+    ...(Array.isArray(stored.command) &&
+    stored.command.length > 0 &&
+    stored.command.every((part) => typeof part === 'string')
+      ? { command: stored.command as string[] }
+      : {}),
+    ...(typeof stored.healthCheckPath === 'string' && stored.healthCheckPath
+      ? { health_check_path: stored.healthCheckPath }
+      : {}),
+  }
+}
+
+/**
+ * Recreate a historical image deployment exactly. A missing/null command is
+ * serialized as an empty argv override so the server uses the image default
+ * instead of inheriting the project's current saved template command.
+ */
+export function historicalImageRuntime(
+  metadata?: {
+    command?: string[] | null
+    healthCheckPath?: string | null
+  } | null
+): {
+  command: string[]
+  health_check_path: string
+} {
+  return {
+    command: Array.isArray(metadata?.command) ? metadata.command : [],
+    health_check_path: metadata?.healthCheckPath ?? '/',
   }
 }
 

@@ -50,6 +50,7 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { deployComposeSource } from '@/lib/compose-source-api'
 import { composeRevisionForRedeploy } from '@/lib/project-deploy-action'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
+import { historicalImageRuntime } from '@/lib/template-runtime-defaults'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
@@ -1032,6 +1033,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     composeRevision?: number
   }) => {
     if (project.source_type === 'docker_image') {
+      const deploymentRuntime = historicalImageRuntime(deployment?.metadata)
       const ref =
         editedImageRef?.trim() || deployment?.metadata?.externalImageRef
       if (!ref) {
@@ -1040,7 +1042,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       }
       await redeployImage.mutateAsync({
         path: { project_id: project.id, environment_id: environmentId },
-        body: { image_ref: ref },
+        body: {
+          ...deploymentRuntime,
+          image_ref: ref,
+        },
       })
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
       return

@@ -19,6 +19,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_auth::{
@@ -33,7 +34,7 @@ use super::types::{
     ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse,
     SetAlternateSourcesRequest, TriggerPipelinePayload, TriggerPipelineResponse,
     UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
-    UpdateProjectSettingsRequest,
+    UpdateProjectSettingsRequest, UpdateServiceTemplateRuntimeRequest,
 };
 use crate::services::service_templates::{prepare_template, COOLIFY_CATALOG_URL};
 use crate::services::types::CreateProjectEnvVar;
@@ -109,6 +110,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/deployment-config",
             patch(update_project_deployment_config),
+        )
+        .route(
+            "/projects/{project_id}/service-runtime",
+            patch(update_service_template_runtime),
         )
         .route(
             "/projects/{project_id}/gitlab/reinstall-webhook",
@@ -262,6 +267,7 @@ async fn authorize_storage_service_scopes(
         update_git_settings,
         update_automatic_deploy,
         update_project_deployment_config,
+        update_service_template_runtime,
         reinstall_gitlab_webhook,
         trigger_project_pipeline,
         get_project_statistics,
@@ -1823,6 +1829,80 @@ pub async fn update_project_deployment_config(
     Ok(Json(ProjectResponse::map_from_project(updated_project)))
 }
 
+/// Atomically replace a service-template project's image runtime and resource
+/// profile. This endpoint is deliberately separate from generic project
+/// settings because these fields form one deployable configuration.
+#[utoipa::path(
+    patch,
+    path = "/projects/{project_id}/service-runtime",
+    tag = "Projects",
+    request_body = UpdateServiceTemplateRuntimeRequest,
+    responses(
+        (status = 200, description = "Service runtime updated successfully", body = ProjectResponse),
+        (status = 400, description = "Invalid service runtime"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(("project_id" = i32, Path, description = "Project ID")),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_service_template_runtime(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(runtime): Json<UpdateServiceTemplateRuntimeRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let updated_project = state
+        .project_service
+        .update_service_template_runtime(
+            project_id,
+            runtime,
+            temps_core::CeilingEnforcement::from_has_settings_write(
+                auth.has_permission(&temps_auth::Permission::SettingsWrite),
+            ),
+        )
+        .await
+        .map_err(Problem::from)?;
+
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.to_string()),
+        user_agent: metadata.user_agent,
+    };
+    let updated_fields = [
+        "image_ref",
+        "command",
+        "health_check_path",
+        "cpu_request",
+        "cpu_limit",
+        "memory_request",
+        "memory_limit",
+        "exposed_port",
+    ]
+    .into_iter()
+    .map(|field| (field.to_string(), "updated".to_string()))
+    .collect();
+    let audit_event = super::audit::DeploymentConfigUpdatedAudit {
+        context: audit_context,
+        project_id: updated_project.id,
+        project_name: updated_project.name.clone(),
+        project_slug: updated_project.slug.clone(),
+        updated_fields,
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit_event).await {
+        error!(?error, "Failed to create service runtime audit log");
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated_project)))
+}
+
 /// Trigger pipeline for a specific project
 #[utoipa::path(
     post,
@@ -2312,6 +2392,35 @@ struct EffectiveImageTemplateRuntime {
     health_check_path: Option<String>,
 }
 
+fn image_template_preset_config(
+    template: &temps_core::templates::ProjectTemplate,
+    runtime: &EffectiveImageTemplateRuntime,
+) -> Result<serde_json::Value, TemplateRuntimeOverrideError> {
+    let mut config = match template.preset_config.as_ref() {
+        Some(value) => temps_entities::preset::PresetConfig::parse_for_preset(
+            &temps_entities::preset::Preset::Dockerfile,
+            value,
+        )
+        .map_err(|reason| TemplateRuntimeOverrideError::InvalidImage { reason })?,
+        None => temps_entities::preset::PresetConfig::default_for_preset(
+            temps_entities::preset::Preset::Dockerfile,
+        ),
+    };
+    let temps_entities::preset::PresetConfig::Dockerfile(config) = &mut config else {
+        return Err(TemplateRuntimeOverrideError::InvalidImage {
+            reason: "image templates must use the dockerfile runtime preset".to_string(),
+        });
+    };
+    config.image_runtime = Some(temps_entities::preset::ImageRuntimeConfig {
+        image_ref: runtime.image_ref.clone(),
+        command: runtime.command.clone(),
+        health_check_path: runtime.health_check_path.clone(),
+    });
+    serde_json::to_value(config).map_err(|error| TemplateRuntimeOverrideError::InvalidImage {
+        reason: format!("could not store the selected runtime: {error}"),
+    })
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 enum TemplateRuntimeOverrideError {
     #[error("Runtime overrides are available only for templates that deploy a prebuilt image")]
@@ -2480,6 +2589,219 @@ fn validate_template_service_selection(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum TemplateEnvironmentError {
+    #[error("Environment variable '{name}' is defined more than once")]
+    Duplicate { name: String },
+    #[error("Required environment variable '{name}' has no value")]
+    MissingRequired { name: String },
+    #[error("Environment variable '{name}' uses unsupported generator '{generator}'")]
+    UnsupportedGenerator { name: String, generator: String },
+    #[error("Could not securely generate environment variable '{name}': {reason}")]
+    SecureGeneration { name: String, reason: String },
+}
+
+fn require_template_creation_permissions(auth: &AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, ProjectsCreate);
+    permission_guard!(auth, DeploymentsCreate);
+    Ok(())
+}
+
+fn template_environment_variable_is_secret(
+    variable: &temps_core::templates::EnvVarTemplate,
+) -> bool {
+    if variable
+        .default_generator
+        .as_deref()
+        .is_some_and(|generator| generator.contains("secret"))
+    {
+        return true;
+    }
+
+    let key = variable.name.to_ascii_uppercase();
+    let secret_segment = key.split('_').any(|segment| {
+        matches!(
+            segment,
+            "SECRET" | "PASSWORD" | "PASSWD" | "TOKEN" | "PRIVATEKEY"
+        )
+    });
+    secret_segment
+        || key.ends_with("_API_KEY")
+        || key.ends_with("_PRIVATE_KEY")
+        || key.ends_with("_ACCESS_KEY")
+        || key.ends_with("_DATABASE_URL")
+        || key.ends_with("_POSTGRES_URL")
+        || key.ends_with("_MYSQL_URL")
+        || key.ends_with("_MONGODB_URL")
+        || key.ends_with("_MONGODB_URI")
+        || key.ends_with("_REDIS_URL")
+        || key.ends_with("_AMQP_URL")
+        || key.ends_with("_CONNECTION_STRING")
+        || key.ends_with("_DSN")
+        || key.ends_with("_WEBHOOK_URL")
+        || matches!(
+            key.as_str(),
+            "DATABASE_URL"
+                | "POSTGRES_URL"
+                | "MYSQL_URL"
+                | "MONGODB_URL"
+                | "MONGODB_URI"
+                | "REDIS_URL"
+                | "AMQP_URL"
+                | "CONNECTION_STRING"
+                | "DSN"
+                | "WEBHOOK_URL"
+        )
+}
+
+fn secure_template_value(
+    variable_name: &str,
+    generator: &str,
+) -> Result<String, TemplateEnvironmentError> {
+    let mut bytes = [0_u8; 32];
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes).map_err(|error| {
+        TemplateEnvironmentError::SecureGeneration {
+            name: variable_name.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+
+    match generator {
+        "random_secret" => Ok(URL_SAFE_NO_PAD.encode(bytes)),
+        "random_hex_32" => Ok(hex::encode(bytes)),
+        _ => Err(TemplateEnvironmentError::UnsupportedGenerator {
+            name: variable_name.to_string(),
+            generator: generator.to_string(),
+        }),
+    }
+}
+
+fn canonicalize_template_environment_variables(
+    template: &temps_core::templates::ProjectTemplate,
+    requested: &[super::templates::EnvVarInput],
+    generated_app_url: Option<&str>,
+) -> Result<Vec<CreateProjectEnvVar>, TemplateEnvironmentError> {
+    let mut requested_by_name = BTreeMap::new();
+    for variable in requested {
+        if requested_by_name
+            .insert(
+                variable.name.clone(),
+                (variable.value.clone(), variable.is_secret),
+            )
+            .is_some()
+        {
+            return Err(TemplateEnvironmentError::Duplicate {
+                name: variable.name.clone(),
+            });
+        }
+    }
+
+    let mut resolved = Vec::with_capacity(template.env_vars.len() + requested_by_name.len());
+    for variable in &template.env_vars {
+        let requested_value = requested_by_name.remove(&variable.name);
+        let explicitly_supplied = requested_value.is_some();
+        let requested_secret = requested_value
+            .as_ref()
+            .is_some_and(|(_, is_secret)| *is_secret);
+        let mut value = requested_value.map(|(value, _)| value);
+
+        if value.as_deref().is_none_or(str::is_empty) {
+            value = variable.default.clone();
+        }
+        if value.as_deref().is_none_or(str::is_empty) {
+            value = match variable.default_generator.as_deref() {
+                Some("app_url") => generated_app_url.map(str::to_string),
+                Some(generator @ ("random_secret" | "random_hex_32")) => {
+                    Some(secure_template_value(&variable.name, generator)?)
+                }
+                Some(generator) => {
+                    return Err(TemplateEnvironmentError::UnsupportedGenerator {
+                        name: variable.name.clone(),
+                        generator: generator.to_string(),
+                    });
+                }
+                None => None,
+            };
+        }
+
+        if variable.required && value.as_deref().is_none_or(str::is_empty) {
+            return Err(TemplateEnvironmentError::MissingRequired {
+                name: variable.name.clone(),
+            });
+        }
+        if let Some(value) = value {
+            if !value.is_empty() || explicitly_supplied {
+                resolved.push(CreateProjectEnvVar {
+                    key: variable.name.clone(),
+                    value,
+                    is_secret: requested_secret
+                        || template_environment_variable_is_secret(variable),
+                });
+            }
+        }
+    }
+
+    resolved.extend(
+        requested_by_name
+            .into_iter()
+            .map(|(key, (value, is_secret))| CreateProjectEnvVar {
+                key,
+                value,
+                is_secret,
+            }),
+    );
+    Ok(resolved)
+}
+
+fn template_needs_generated_app_url(
+    template: &temps_core::templates::ProjectTemplate,
+    requested: &[super::templates::EnvVarInput],
+) -> bool {
+    template.env_vars.iter().any(|variable| {
+        variable.default_generator.as_deref() == Some("app_url")
+            && requested
+                .iter()
+                .find(|requested| requested.name == variable.name)
+                .is_none_or(|requested| requested.value.is_empty())
+            && variable.default.as_deref().is_none_or(str::is_empty)
+    })
+}
+
+async fn canonical_template_app_url(
+    state: &AppState,
+    project_slug: &str,
+) -> Result<String, Problem> {
+    let settings = state.config_service.get_settings().await.map_err(|error| {
+        error!(%error, "Failed to load hostname settings for native template");
+        temps_core::error_builder::internal_server_error()
+            .title("Template URL Generation Failed")
+            .detail("Could not load the platform hostname settings")
+            .build()
+    })?;
+    let preview_domain = if settings.preview_domain.trim().is_empty() {
+        "localho.st"
+    } else {
+        settings.preview_domain.trim()
+    };
+    let strategy = state
+        .public_hostname_resolver
+        .strategy_for(preview_domain)
+        .await;
+    let (scheme, port) = settings
+        .external_url
+        .as_deref()
+        .and_then(|value| url::Url::parse(value).ok())
+        .map(|url| (url.scheme().to_string(), url.port()))
+        .unwrap_or_else(|| ("http".to_string(), Some(state.config_service.proxy_port())));
+    let hostname =
+        strategy.environment_hostname(preview_domain, &format!("{project_slug}-production"));
+    let port_suffix = port
+        .filter(|port| !((scheme == "http" && *port == 80) || (scheme == "https" && *port == 443)))
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    Ok(format!("{scheme}://{hostname}{port_suffix}"))
+}
+
 /// Create a new project from a template
 ///
 /// Creates a new repository from a template and sets up the project with the
@@ -2506,7 +2828,7 @@ pub async fn create_project_from_template(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<super::templates::CreateProjectFromTemplateRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsCreate);
+    require_template_creation_permissions(&auth)?;
     let storage_service_claim_ids = if !request.storage_service_ids.is_empty() {
         permission_guard!(auth, ExternalServicesWrite);
         require_storage_services_access(state.as_ref(), &auth, &request.storage_service_ids).await?
@@ -2531,6 +2853,11 @@ pub async fn create_project_from_template(
             .detail(error.to_string())
             .build()
     })?;
+    let planned_project_slug = state
+        .project_service
+        .plan_project_slug(&request.project_name)
+        .await
+        .map_err(Problem::from)?;
 
     // The browser normally enforces this selection, but the API must fail
     // before creating a project when a required managed dependency is absent
@@ -2584,22 +2911,34 @@ pub async fn create_project_from_template(
             .build());
     }
 
-    // 2. Build the environment variables from the request (shared by both modes).
-    let env_vars: Option<Vec<CreateProjectEnvVar>> = if request.environment_variables.is_empty() {
-        None
-    } else {
-        Some(
-            request
-                .environment_variables
-                .iter()
-                .map(|ev| CreateProjectEnvVar {
-                    key: ev.name.clone(),
-                    value: ev.value.clone(),
-                    is_secret: ev.is_secret,
-                })
-                .collect(),
-        )
-    };
+    // 2. Resolve template defaults and generators on the server. The client is
+    //    an editor, not the authority for required values or secret handling.
+    let generated_app_url =
+        if template_needs_generated_app_url(&template, &request.environment_variables) {
+            Some(canonical_template_app_url(state.as_ref(), &planned_project_slug).await?)
+        } else {
+            None
+        };
+    let env_vars = canonicalize_template_environment_variables(
+        &template,
+        &request.environment_variables,
+        generated_app_url.as_deref(),
+    )
+    .map_err(|error| {
+        if matches!(&error, TemplateEnvironmentError::SecureGeneration { .. }) {
+            error!(%error, "Secure template environment generation failed");
+            temps_core::error_builder::internal_server_error()
+                .title("Template Secret Generation Failed")
+                .detail("Could not securely generate the required template credentials")
+                .build()
+        } else {
+            temps_core::error_builder::bad_request()
+                .title("Invalid Template Environment")
+                .detail(error.to_string())
+                .build()
+        }
+    })?;
+    let env_vars = (!env_vars.is_empty()).then_some(env_vars);
 
     // 3. Resolve the deploy mode, producing the project-create request, a
     //    source URL for the response, a non-identifying `deploy_mode` label for
@@ -2623,16 +2962,22 @@ pub async fn create_project_from_template(
             "Deploying template {} from prebuilt image {} (image mode)",
             request.template_slug, runtime.image_ref
         );
+        let preset_config = image_template_preset_config(&template, &runtime).map_err(|error| {
+            temps_core::error_builder::bad_request()
+                .title("Invalid Template Runtime Configuration")
+                .detail(error.to_string())
+                .build()
+        })?;
         let req = crate::services::types::CreateProjectRequest {
             name: request.project_name.clone(),
-            expected_slug: None,
+            expected_slug: Some(planned_project_slug.clone()),
             // No Git source — the image is pulled from its registry.
             repo_name: None,
             repo_owner: None,
             directory: ".".to_string(),
             main_branch: template.git.r#ref.clone(),
             preset: template.preset.clone(),
-            preset_config: template.preset_config.clone(),
+            preset_config: Some(preset_config),
             environment_variables: env_vars,
             automatic_deploy: false,
             storage_service_ids: request.storage_service_ids.clone(),
@@ -2705,7 +3050,7 @@ pub async fn create_project_from_template(
                 // flattened into the fork root by create_repository_and_push_template.
                 let req = crate::services::types::CreateProjectRequest {
                     name: request.project_name.clone(),
-                    expected_slug: None,
+                    expected_slug: Some(planned_project_slug.clone()),
                     repo_name: Some(new_repo.name.clone()),
                     repo_owner: Some(new_repo.owner.clone()),
                     directory: ".".to_string(),
@@ -2756,7 +3101,7 @@ pub async fn create_project_from_template(
 
                 let req = crate::services::types::CreateProjectRequest {
                     name: request.project_name.clone(),
-                    expected_slug: None,
+                    expected_slug: Some(planned_project_slug.clone()),
                     repo_name: Some(repo_name),
                     repo_owner: Some(repo_owner),
                     directory,
@@ -2887,11 +3232,13 @@ pub async fn create_project_from_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_storage_service_scopes, compose_path_for_candidate, drop_preset_candidate_from,
+        authorize_storage_service_scopes, canonicalize_template_environment_variables,
+        compose_path_for_candidate, drop_preset_candidate_from, image_template_preset_config,
         parse_owner_repo_from_git_url, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, resolve_image_template_runtime,
-        service_template_origin_attestation, validate_template_service_selection,
-        DropPresetCandidate, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        require_git_settings_permissions, require_template_creation_permissions,
+        resolve_image_template_runtime, service_template_origin_attestation,
+        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
+        TemplateRuntimeOverrideError, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -2944,6 +3291,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn template_creation_requires_project_and_deployment_permissions() {
+        let projects_only = custom_api_key(vec![Permission::ProjectsCreate]);
+        assert!(require_template_creation_permissions(&projects_only).is_err());
+
+        let authorized = custom_api_key(vec![
+            Permission::ProjectsCreate,
+            Permission::DeploymentsCreate,
+        ]);
+        assert!(require_template_creation_permissions(&authorized).is_ok());
+    }
+
+    #[test]
+    fn browserless_environment_is_complete_and_protects_its_token_server_side() {
+        let template = temps_core::templates::bundled_template_by_slug("browserless")
+            .expect("Browserless should be bundled");
+        let resolved = canonicalize_template_environment_variables(
+            &template,
+            &[],
+            Some("https://browserless-production.example.test"),
+        )
+        .expect("bundled Browserless variables should resolve");
+
+        let token = resolved
+            .iter()
+            .find(|variable| variable.key == "TOKEN")
+            .expect("TOKEN should be generated");
+        assert!(token.is_secret);
+        assert!(token.value.len() >= 42);
+        assert_eq!(
+            resolved
+                .iter()
+                .find(|variable| variable.key == "EXTERNAL")
+                .map(|variable| variable.value.as_str()),
+            Some("https://browserless-production.example.test")
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .find(|variable| variable.key == "CONCURRENT")
+                .map(|variable| variable.value.as_str()),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn client_cannot_downgrade_a_template_password_to_regular_storage() {
+        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be bundled");
+        let requested = [super::super::templates::EnvVarInput {
+            name: "KC_BOOTSTRAP_ADMIN_PASSWORD".to_string(),
+            value: "operator-supplied".to_string(),
+            is_secret: false,
+        }];
+        let resolved = canonicalize_template_environment_variables(&template, &requested, None)
+            .expect("Keycloak defaults should resolve");
+
+        let password = resolved
+            .iter()
+            .find(|variable| variable.key == "KC_BOOTSTRAP_ADMIN_PASSWORD")
+            .expect("admin password should exist");
+        assert_eq!(password.value, "operator-supplied");
+        assert!(password.is_secret);
+    }
+
+    #[test]
+    fn template_environment_rejects_duplicates_and_missing_required_values() {
+        let template = temps_core::templates::bundled_template_by_slug("browserless")
+            .expect("Browserless should be bundled");
+        let duplicate = super::super::templates::EnvVarInput {
+            name: "TOKEN".to_string(),
+            value: "one".to_string(),
+            is_secret: true,
+        };
+        assert!(matches!(
+            canonicalize_template_environment_variables(
+                &template,
+                &[duplicate.clone(), duplicate],
+                Some("https://browserless.example.test")
+            ),
+            Err(TemplateEnvironmentError::Duplicate { .. })
+        ));
+        assert!(matches!(
+            canonicalize_template_environment_variables(&template, &[], None),
+            Err(TemplateEnvironmentError::MissingRequired { name }) if name == "EXTERNAL"
+        ));
+    }
+
     fn image_template_request() -> super::super::templates::CreateProjectFromTemplateRequest {
         super::super::templates::CreateProjectFromTemplateRequest {
             template_slug: "keycloak".to_string(),
@@ -2983,6 +3418,18 @@ mod tests {
         assert_eq!(runtime.memory_limit, Some(1_536));
         assert_eq!(runtime.exposed_port, Some(8080));
         assert_eq!(runtime.health_check_path.as_deref(), Some("/realms/master"));
+
+        let stored = image_template_preset_config(&template, &runtime)
+            .expect("resolved runtime should be persistable");
+        assert_eq!(
+            stored["imageRuntime"]["imageRef"],
+            "quay.io/keycloak/keycloak:26.7.2"
+        );
+        assert_eq!(
+            stored["imageRuntime"]["command"],
+            serde_json::json!(["start"])
+        );
+        assert_eq!(stored["imageRuntime"]["healthCheckPath"], "/realms/master");
     }
 
     #[test]

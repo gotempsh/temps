@@ -18,14 +18,11 @@ export function isLikelySecretProjectEnvironmentVariable(key: string): boolean {
 }
 
 /**
- * Native service templates create regular environment variables by default.
- * Every environment-variable value is already encrypted at rest; `isSecret`
- * adds stricter list/reveal behavior and should therefore remain an explicit
- * operator choice for curated services. Starter templates keep the heuristic
- * for backwards-compatible defaults.
+ * Credential-like values and generated secrets use the stricter, audited
+ * reveal flow for every template kind. The server enforces the same rule, so
+ * a modified client cannot downgrade a template credential to a regular value.
  */
 export function templateEnvironmentVariableDefaultsToSecret({
-  templateKind,
   key,
   defaultGenerator,
 }: {
@@ -33,8 +30,6 @@ export function templateEnvironmentVariableDefaultsToSecret({
   key: string
   defaultGenerator: string | null | undefined
 }): boolean {
-  if (templateKind === 'service') return false
-
   return (
     isLikelySecretProjectEnvironmentVariable(key) ||
     defaultGenerator?.includes('secret') === true

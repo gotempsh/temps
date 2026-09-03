@@ -10646,6 +10646,16 @@
             "description": "Claim an image already present in the platform host's Docker daemon.\nTemps retags it into a generated project-owned namespace and records\nits immutable image ID. Never set this for a registry image.",
             "type": "boolean"
           },
+          "command": {
+            "description": "Optional container command override. Each entry is passed directly as\none argv element; no shell parsing or interpolation is performed.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "external_image_id": {
             "description": "External image ID (if already registered). If provided without image_ref,\nthe image reference will be fetched from the registered external image.",
             "format": "int32",
@@ -13390,6 +13400,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "imageRuntime": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageRuntimeConfig",
+                "description": "Durable runtime selected for a curated single-container image template."
+              }
             ]
           },
           "variant": {
@@ -20457,6 +20478,34 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "ImageRuntimeConfig": {
+        "description": "Editable runtime settings for a single-container image template.\n\nMulti-container service templates will use a separate container collection;\nkeeping this shape explicitly singular prevents silently applying one image\nor command to an unrelated sidecar.",
+        "properties": {
+          "command": {
+            "description": "`None` explicitly means \"use the image's default command\". Keep the\nserialized `null` when a runtime snapshot exists so clients can\ndistinguish that choice from a legacy project with no snapshot.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "healthCheckPath": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "imageRef": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "imageRef"
+        ],
         "type": "object"
       },
       "ImportCredentials": {
@@ -30351,7 +30400,15 @@
             ]
           },
           "preset_config": {
-            "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PresetConfigSchema",
+                "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+              }
+            ]
           },
           "preview_envs_idle_timeout_seconds": {
             "description": "Idle timeout (seconds) for on-demand preview environments.",
@@ -30385,6 +30442,13 @@
           "source_type": {
             "$ref": "#/components/schemas/SourceType",
             "description": "Source type for deployments (git, docker_image, or static_files)"
+          },
+          "template_slug": {
+            "description": "Bundled template slug that created this project. Clients use this to\npresent template-specific runtime configuration instead of generic\nsource-build controls.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
             "format": "int64",
@@ -46070,6 +46134,64 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateServiceTemplateRuntimeRequest": {
+        "description": "Complete replacement for the editable runtime of a single-container\nservice-template project. Runtime and resource fields are written to the\nsame project row in one transaction.",
+        "properties": {
+          "command": {
+            "description": "Empty means use the image's own default command.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cpuLimit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpuRequest": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exposedPort": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "healthCheckPath": {
+            "type": "string"
+          },
+          "imageRef": {
+            "type": "string"
+          },
+          "memoryLimit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memoryRequest": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "imageRef",
+          "healthCheckPath"
+        ],
         "type": "object"
       },
       "UpdateSessionDurationRequest": {
@@ -92836,6 +92958,69 @@
         "summary": "Update a project secret. Value rotation requires a redeploy to take effect —\nrunning containers keep their currently-mounted values until the next\ndeployment.",
         "tags": [
           "Secrets"
+        ]
+      }
+    },
+    "/projects/{project_id}/service-runtime": {
+      "patch": {
+        "operationId": "update_service_template_runtime",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceTemplateRuntimeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Service runtime updated successfully"
+          },
+          "400": {
+            "description": "Invalid service runtime"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Atomically replace a service-template project's image runtime and resource\nprofile. This endpoint is deliberately separate from generic project\nsettings because these fields form one deployable configuration.",
+        "tags": [
+          "Projects"
         ]
       }
     },

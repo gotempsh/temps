@@ -866,6 +866,31 @@ pub struct DockerfileConfig {
     /// Docker build target stage
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+
+    /// Runtime configuration for a curated service template that deploys a
+    /// prebuilt image. This is intentionally stored with the project rather
+    /// than inferred from the latest deployment so a version change is durable
+    /// and applies to every subsequent environment deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_runtime: Option<ImageRuntimeConfig>,
+}
+
+/// Editable runtime settings for a single-container image template.
+///
+/// Multi-container service templates will use a separate container collection;
+/// keeping this shape explicitly singular prevents silently applying one image
+/// or command to an unrelated sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRuntimeConfig {
+    pub image_ref: String,
+    /// `None` explicitly means "use the image's default command". Keep the
+    /// serialized `null` when a runtime snapshot exists so clients can
+    /// distinguish that choice from a legacy project with no snapshot.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check_path: Option<String>,
 }
 
 /// Catalog origin captured from the install request.
@@ -1375,6 +1400,28 @@ mod tests {
         };
         let json = serde_json::to_value(custom).unwrap();
         assert_eq!(json["variant"], "custom");
+    }
+
+    #[test]
+    fn dockerfile_config_round_trips_image_template_runtime() {
+        let config = DockerfileConfig {
+            image_runtime: Some(ImageRuntimeConfig {
+                image_ref: "registry.example.test/keycloak:27.0.0".to_string(),
+                command: Some(vec!["start".to_string(), "--optimized".to_string()]),
+                health_check_path: Some("/realms/master".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json["imageRuntime"]["imageRef"],
+            "registry.example.test/keycloak:27.0.0"
+        );
+        assert_eq!(
+            serde_json::from_value::<DockerfileConfig>(json).unwrap(),
+            config
+        );
     }
 
     #[test]

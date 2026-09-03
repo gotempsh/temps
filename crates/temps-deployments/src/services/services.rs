@@ -2173,9 +2173,19 @@ impl DeploymentService {
 
         let rollback_asset_origin =
             deployment_asset_origin(self.db.as_ref(), &target_deployment).await?;
+        let rollback_health_check_path = target_deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.health_check_path.clone());
+        let rollback_command = target_deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.command.clone());
         let rollback_metadata = DeploymentMetadata {
             is_rollback: true,
             rolled_back_from_id: Some(deployment_id),
+            health_check_path: rollback_health_check_path.clone(),
+            command: rollback_command.clone(),
             ..Default::default()
         };
 
@@ -2412,6 +2422,8 @@ impl DeploymentService {
                 })
                 .service_name(rollback_slug.clone())
                 .health_check_path(None)
+                .health_check_path_override(rollback_health_check_path)
+                .command(rollback_command)
                 .replicas(
                     environment
                         .deployment_config
@@ -2844,6 +2856,14 @@ impl DeploymentService {
             // Reuse build info from source
             builder: source.metadata.as_ref().and_then(|m| m.builder.clone()),
             image_size_bytes: source.metadata.as_ref().and_then(|m| m.image_size_bytes),
+            health_check_path: source
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.health_check_path.clone()),
+            command: source
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.command.clone()),
             ..Default::default()
         };
 
@@ -3080,6 +3100,18 @@ impl DeploymentService {
                 })
                 .service_name(promote_slug.clone())
                 .health_check_path(None)
+                .health_check_path_override(
+                    promoted_deployment
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.health_check_path.clone()),
+                )
+                .command(
+                    promoted_deployment
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.command.clone()),
+                )
                 .replicas(
                     target_env
                         .deployment_config
@@ -5581,6 +5613,10 @@ mod tests {
         // We need to provide the database URL that the test database is using
         let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
         let proxy_address = spawn_test_readiness_proxy();
+        let readiness_host_port = proxy_address
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .expect("read test readiness proxy port");
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
                 proxy_address,
@@ -5684,12 +5720,12 @@ mod tests {
 
         // Create mock deployer with all required methods
         let mut deployer = MockContainerDeployer::new();
-        deployer.expect_deploy_container().returning(|_| {
+        deployer.expect_deploy_container().returning(move |_| {
             Ok(temps_deployer::DeployResult {
                 container_id: "test-container".to_string(),
                 container_name: "test-container".to_string(),
                 container_port: 3000,
-                host_port: 3000,
+                host_port: readiness_host_port,
                 status: temps_deployer::ContainerStatus::Running,
             })
         });
@@ -6277,6 +6313,15 @@ mod tests {
 
         // Setup test data
         let (_project, mut environment, target_deployment) = setup_test_data(&db).await?;
+        let expected_command = vec!["start".to_string(), "--optimized".to_string()];
+        let expected_health_check_path = "/realms/master".to_string();
+        let mut active_target: deployments::ActiveModel = target_deployment.into();
+        active_target.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            command: Some(expected_command.clone()),
+            health_check_path: Some(expected_health_check_path.clone()),
+            ..Default::default()
+        }));
+        let target_deployment = active_target.update(db.as_ref()).await?;
         setup_test_environment_variables(&db, target_deployment.project_id, environment.id).await?;
 
         // Create container for target deployment (required for rollback)
@@ -6350,6 +6395,11 @@ mod tests {
         let metadata = rollback_dep.metadata.unwrap();
         assert!(metadata.is_rollback);
         assert_eq!(metadata.rolled_back_from_id, Some(target_deployment.id));
+        assert_eq!(metadata.command, Some(expected_command));
+        assert_eq!(
+            metadata.health_check_path.as_deref(),
+            Some(expected_health_check_path.as_str())
+        );
 
         // Verify environment was updated to point to the NEW rollback deployment
         let updated_environment = environments::Entity::find_by_id(environment.id)
@@ -6357,6 +6407,62 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(updated_environment.current_deployment_id, Some(result.id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_promote_deployment_preserves_image_runtime(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (project, _source_environment, source) = setup_test_data(&db).await?;
+        let expected_command = vec!["start".to_string(), "--optimized".to_string()];
+        let expected_health_check_path = "/realms/master".to_string();
+        let mut active_source: deployments::ActiveModel = source.into();
+        active_source.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            command: Some(expected_command.clone()),
+            health_check_path: Some(expected_health_check_path.clone()),
+            ..Default::default()
+        }));
+        let source = active_source.update(db.as_ref()).await?;
+
+        let now = Utc::now();
+        let target_environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Promotion Target".to_string()),
+            slug: Set("promotion-target".to_string()),
+            host: Set("promotion-target.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            current_deployment_id: Set(None),
+            subdomain: Set("promotion-target.example.com".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
+
+        let promoted = deployment_service
+            .promote_deployment(project.id, source.id, target_environment.id)
+            .await?;
+
+        let promoted_model = deployments::Entity::find_by_id(promoted.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("promoted deployment was not persisted")?;
+        let metadata = promoted_model
+            .metadata
+            .ok_or("promoted deployment metadata was not persisted")?;
+        assert_eq!(metadata.command, Some(expected_command));
+        assert_eq!(
+            metadata.health_check_path.as_deref(),
+            Some(expected_health_check_path.as_str())
+        );
 
         Ok(())
     }

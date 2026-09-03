@@ -7,9 +7,9 @@ use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{error, info, warn};
 
 use sea_orm::{
-    prelude::Uuid, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
-    Statement, TransactionTrait,
+    prelude::Uuid, sea_query::LockType, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    RelationTrait, Set, Statement, TransactionTrait,
 };
 use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
@@ -25,7 +25,7 @@ use super::types::{
     UpdateProjectSettingsParams,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
-use crate::handlers::UpdateDeploymentConfigRequest;
+use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
 // Placeholder functions - these should be implemented properly or imported from other services
 
 /// A project row plus the provider type of the Git connection it is linked to.
@@ -257,6 +257,13 @@ fn merge_preset_config(
         ) => {
             if omits_dockerfile_variant {
                 parsed_cfg.variant = existing_cfg.variant;
+            }
+            if config_value
+                .as_object()
+                .map(|map| !map.contains_key("imageRuntime"))
+                .unwrap_or(true)
+            {
+                parsed_cfg.image_runtime = existing_cfg.image_runtime.clone();
             }
             PresetConfig::Dockerfile(parsed_cfg)
         }
@@ -3528,6 +3535,101 @@ impl ProjectService {
         Ok(self.map_written_project(updated_project).await)
     }
 
+    /// Replace the editable runtime snapshot for a single-container image
+    /// template and its project-level resources atomically.
+    ///
+    /// Both JSON columns live on `projects`, so one row update is enough. A
+    /// rejected image, command, health path, resource profile, or tenant
+    /// ceiling leaves every previous value intact.
+    pub async fn update_service_template_runtime(
+        &self,
+        project_id: i32,
+        runtime: UpdateServiceTemplateRuntimeRequest,
+        ceiling_enforcement: temps_core::CeilingEnforcement,
+    ) -> Result<Project, ProjectError> {
+        let txn = self.db.begin().await?;
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound(format!("Project with id {} not found", project_id))
+            })?;
+
+        if project.source_type != temps_entities::source_type::SourceType::DockerImage
+            || project.template_slug.is_none()
+        {
+            return Err(ProjectError::InvalidInput(
+                "Service runtime settings are available only for projects created from a prebuilt-image template"
+                    .to_string(),
+            ));
+        }
+        if project.preset != temps_entities::preset::Preset::Dockerfile {
+            return Err(ProjectError::InvalidInput(
+                "Single-container service templates must use the Dockerfile runtime preset"
+                    .to_string(),
+            ));
+        }
+
+        let mut preset_config = project.preset_config.clone().unwrap_or_else(|| {
+            temps_entities::preset::PresetConfig::default_for_preset(
+                temps_entities::preset::Preset::Dockerfile,
+            )
+        });
+        let temps_entities::preset::PresetConfig::Dockerfile(config) = &mut preset_config else {
+            return Err(ProjectError::InvalidInput(
+                "Project preset configuration does not match the Dockerfile runtime".to_string(),
+            ));
+        };
+        config.image_runtime = Some(temps_entities::preset::ImageRuntimeConfig {
+            image_ref: runtime.image_ref,
+            command: (!runtime.command.is_empty()).then_some(runtime.command),
+            health_check_path: Some(runtime.health_check_path),
+        });
+        temps_presets::validate_preset_config(project.preset, &preset_config).map_err(|error| {
+            ProjectError::InvalidInput(format!("Invalid service runtime: {error}"))
+        })?;
+
+        let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
+        deployment_config.cpu_request = runtime.cpu_request;
+        deployment_config.cpu_limit = runtime.cpu_limit;
+        deployment_config.memory_request = runtime.memory_request;
+        deployment_config.memory_limit = runtime.memory_limit;
+        deployment_config.exposed_port = runtime.exposed_port;
+        deployment_config.validate().map_err(|error| {
+            ProjectError::InvalidInput(format!("Invalid deployment config: {error}"))
+        })?;
+
+        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|error| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id}: {error}"
+                ))
+            })?;
+            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        }
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.preset_config = Set(Some(preset_config));
+        active_project.deployment_config = Set(Some(deployment_config));
+        let updated_project = active_project.update(&txn).await?;
+        txn.commit().await?;
+
+        let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
+            project_id: updated_project.id,
+            project_name: updated_project.name.clone(),
+        });
+        if let Err(error) = self.queue_service.send(project_updated_job).await {
+            warn!(
+                "Failed to emit ProjectUpdated job for project {}: {}",
+                updated_project.id, error
+            );
+        }
+
+        Ok(self.map_written_project(updated_project).await)
+    }
+
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed.
     /// Slug is truncated to 40 chars max to keep DNS labels within the 63-char limit
     /// when combined with environment slug and service name prefix.
@@ -3731,6 +3833,7 @@ impl ProjectService {
             directory: db_project.directory,
             main_branch: db_project.main_branch,
             preset: Some(preset_str),
+            template_slug: db_project.template_slug,
             preset_config: preset_config_json,
             created_at: db_project.created_at,
             updated_at: db_project.updated_at,
@@ -4450,6 +4553,40 @@ mod tests {
                 assert_eq!(cfg.unsandboxed_services, ["webserver"]);
             }
             other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_dockerfile_patch_preserves_service_image_runtime() {
+        use temps_entities::preset::{DockerfileConfig, ImageRuntimeConfig, PresetConfig};
+
+        let runtime = ImageRuntimeConfig {
+            image_ref: "registry.example.test/app:1".to_string(),
+            command: Some(vec!["serve".to_string()]),
+            health_check_path: Some("/ready".to_string()),
+        };
+        let existing = PresetConfig::Dockerfile(DockerfileConfig {
+            image_runtime: Some(runtime.clone()),
+            ..Default::default()
+        });
+        let parsed = PresetConfig::Dockerfile(DockerfileConfig {
+            target: Some("runner".to_string()),
+            ..Default::default()
+        });
+
+        let merged = merge_preset_config(
+            Some(&existing),
+            parsed,
+            &serde_json::json!({ "target": "runner" }),
+            true,
+        );
+
+        match merged {
+            PresetConfig::Dockerfile(config) => {
+                assert_eq!(config.target.as_deref(), Some("runner"));
+                assert_eq!(config.image_runtime, Some(runtime));
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
         }
     }
 
@@ -5524,6 +5661,122 @@ mod tests {
             Ok(d) => d.ping().await.is_ok(),
             Err(_) => false,
         }
+    }
+
+    #[tokio::test]
+    async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let old_runtime = temps_entities::preset::ImageRuntimeConfig {
+            image_ref: "quay.io/keycloak/keycloak:26.7.2".to_string(),
+            command: Some(vec!["start".to_string()]),
+            health_check_path: Some("/realms/master".to_string()),
+        };
+        let project = projects::ActiveModel {
+            name: Set("Template runtime".to_string()),
+            slug: Set("template-runtime".to_string()),
+            repo_name: Set(String::new()),
+            repo_owner: Set(String::new()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Dockerfile),
+            preset_config: Set(Some(temps_entities::preset::PresetConfig::Dockerfile(
+                temps_entities::preset::DockerfileConfig {
+                    image_runtime: Some(old_runtime.clone()),
+                    ..Default::default()
+                },
+            ))),
+            deployment_config: Set(Some(temps_entities::deployment_config::DeploymentConfig {
+                cpu_request: Some(500_000),
+                memory_request: Some(512),
+                exposed_port: Some(8080),
+                ..Default::default()
+            })),
+            source_type: Set(temps_entities::source_type::SourceType::DockerImage),
+            template_slug: Set(Some("keycloak".to_string())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_service_template_runtime(
+                project.id,
+                UpdateServiceTemplateRuntimeRequest {
+                    image_ref: "quay.io/keycloak/keycloak:27.0.0".to_string(),
+                    command: Vec::new(),
+                    health_check_path: "/ready".to_string(),
+                    cpu_request: None,
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    exposed_port: None,
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap();
+
+        let updated = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(temps_entities::preset::PresetConfig::Dockerfile(config)) =
+            updated.preset_config.as_ref()
+        else {
+            panic!("expected Dockerfile config");
+        };
+        let runtime = config.image_runtime.as_ref().unwrap();
+        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:27.0.0");
+        assert_eq!(runtime.command, None);
+        assert_eq!(runtime.health_check_path.as_deref(), Some("/ready"));
+        let deployment_config = updated.deployment_config.as_ref().unwrap();
+        assert_eq!(deployment_config.cpu_request, None);
+        assert_eq!(deployment_config.memory_request, None);
+        assert_eq!(deployment_config.exposed_port, None);
+
+        let invalid = project_service
+            .update_service_template_runtime(
+                project.id,
+                UpdateServiceTemplateRuntimeRequest {
+                    image_ref: "quay.io/keycloak/keycloak:99.0.0".to_string(),
+                    command: vec!["start".to_string()],
+                    health_check_path: "https://attacker.example".to_string(),
+                    cpu_request: Some(750_000),
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    exposed_port: Some(9090),
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await;
+        assert!(matches!(invalid, Err(ProjectError::InvalidInput(_))));
+
+        let unchanged = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(temps_entities::preset::PresetConfig::Dockerfile(config)) =
+            unchanged.preset_config.as_ref()
+        else {
+            panic!("expected Dockerfile config");
+        };
+        assert_eq!(
+            config.image_runtime.as_ref().unwrap().image_ref,
+            "quay.io/keycloak/keycloak:27.0.0"
+        );
+        assert_eq!(unchanged.deployment_config.unwrap().exposed_port, None);
     }
 
     fn create_request(name: &str) -> CreateProjectRequest {

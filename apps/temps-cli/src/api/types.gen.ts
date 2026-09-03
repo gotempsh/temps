@@ -5205,6 +5205,11 @@ export type DeployFromImageRequest = {
      */
     claim_local?: boolean;
     /**
+     * Optional container command override. Each entry is passed directly as
+     * one argv element; no shell parsing or interpolation is performed.
+     */
+    command?: Array<string> | null;
+    /**
      * External image ID (if already registered). If provided without image_ref,
      * the image reference will be fetched from the registered external image.
      */
@@ -6491,6 +6496,7 @@ export type DockerfilePresetConfig = {
      * If not specified, defaults to "Dockerfile" in the build context
      */
     dockerfilePath?: string | null;
+    imageRuntime?: null | ImageRuntimeConfig;
     variant?: null | DockerfileVariant;
 };
 
@@ -9560,6 +9566,24 @@ export type ImageRetentionSettings = {
      * Disabling it keeps every built image forever (the pre-0.1 behaviour).
      */
     enabled?: boolean;
+};
+
+/**
+ * Editable runtime settings for a single-container image template.
+ *
+ * Multi-container service templates will use a separate container collection;
+ * keeping this shape explicitly singular prevents silently applying one image
+ * or command to an unrelated sidecar.
+ */
+export type ImageRuntimeConfig = {
+    /**
+     * `None` explicitly means "use the image's default command". Keep the
+     * serialized `null` when a runtime snapshot exists so clients can
+     * distinguish that choice from a legacy project with no snapshot.
+     */
+    command?: Array<string> | null;
+    healthCheckPath?: string | null;
+    imageRef: string;
 };
 
 /**
@@ -14099,10 +14123,7 @@ export type ProjectResponse = {
     main_branch: string;
     name: string;
     preset?: string | null;
-    /**
-     * Preset-specific configuration (Dockerfile path, build context, etc.)
-     */
-    preset_config?: unknown;
+    preset_config?: null | PresetConfigSchema;
     /**
      * Idle timeout (seconds) for on-demand preview environments.
      */
@@ -14123,6 +14144,12 @@ export type ProjectResponse = {
      * Source type for deployments (git, docker_image, or static_files)
      */
     source_type: SourceType;
+    /**
+     * Bundled template slug that created this project. Clients use this to
+     * present template-specific runtime configuration instead of generic
+     * source-build controls.
+     */
+    template_slug?: string | null;
     updated_at: number;
     /**
      * Opt-in Trivy vulnerability scanning of this project's deployed Docker
@@ -21256,6 +21283,25 @@ export type UpdateSecretBody = {
 export type UpdateSelfRequest = {
     email?: string | null;
     name?: string | null;
+};
+
+/**
+ * Complete replacement for the editable runtime of a single-container
+ * service-template project. Runtime and resource fields are written to the
+ * same project row in one transaction.
+ */
+export type UpdateServiceTemplateRuntimeRequest = {
+    /**
+     * Empty means use the image's own default command.
+     */
+    command?: Array<string>;
+    cpuLimit?: number | null;
+    cpuRequest?: number | null;
+    exposedPort?: number | null;
+    healthCheckPath: string;
+    imageRef: string;
+    memoryLimit?: number | null;
+    memoryRequest?: number | null;
 };
 
 export type UpdateSessionDurationRequest = {
@@ -50007,6 +50053,50 @@ export type UpdateProjectSecretResponses = {
 };
 
 export type UpdateProjectSecretResponse = UpdateProjectSecretResponses[keyof UpdateProjectSecretResponses];
+
+export type UpdateServiceTemplateRuntimeData = {
+    body: UpdateServiceTemplateRuntimeRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-runtime';
+};
+
+export type UpdateServiceTemplateRuntimeErrors = {
+    /**
+     * Invalid service runtime
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateServiceTemplateRuntimeResponses = {
+    /**
+     * Service runtime updated successfully
+     */
+    200: ProjectResponse;
+};
+
+export type UpdateServiceTemplateRuntimeResponse = UpdateServiceTemplateRuntimeResponses[keyof UpdateServiceTemplateRuntimeResponses];
 
 export type UpdateProjectSettingsData = {
     body: UpdateProjectSettingsRequest;
