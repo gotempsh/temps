@@ -48,7 +48,9 @@ use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
     LifecycleRuleFilter, Tag,
 };
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, QueryTrait,
+};
 use tracing::{debug, info, warn};
 
 use temps_core::EncryptionService;
@@ -139,6 +141,38 @@ impl S3LifecycleService {
 
         let rules = build_lifecycle_rules(&retentions);
         apply_lifecycle(&client, &source.bucket_name, rules, s3_source_id).await
+    }
+
+    /// S3 sources actually in scope for Temps-managed lifecycle rules:
+    /// those with at least one enabled backup schedule, plus any bucket
+    /// Temps Cloud provisioned itself (`managed_by_cloud`).
+    ///
+    /// Deliberately excludes sources with no enabled schedule and
+    /// `managed_by_cloud = false` — buckets the operator configured with
+    /// their own credentials but never attached to a backup schedule
+    /// (e.g. an unrelated production bucket). `reconcile_bucket` has never
+    /// had anything to apply for those, so calling
+    /// `PutBucketLifecycleConfiguration` / `DeleteBucketLifecycle` against
+    /// them is a paid API call against infrastructure Temps doesn't
+    /// manage, for no behavioral benefit.
+    pub async fn sources_in_scope(
+        &self,
+    ) -> Result<Vec<temps_entities::s3_sources::Model>, BackupError> {
+        let scheduled_source_ids = temps_entities::backup_schedules::Entity::find()
+            .filter(temps_entities::backup_schedules::Column::Enabled.eq(true))
+            .select_only()
+            .column(temps_entities::backup_schedules::Column::S3SourceId)
+            .into_query();
+
+        temps_entities::s3_sources::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+                    .add(temps_entities::s3_sources::Column::Id.in_subquery(scheduled_source_ids)),
+            )
+            .all(self.db.as_ref())
+            .await
+            .map_err(BackupError::Database)
     }
 }
 
@@ -560,5 +594,128 @@ mod tests {
         }
 
         assert_lifecycle_roundtrip(&client, bucket, &[14, 60]).await;
+    }
+
+    /// Regression: the hourly lifecycle sweep must not touch S3 sources
+    /// the operator configured with their own credentials but never
+    /// attached to a backup schedule — those API calls cost money against
+    /// infrastructure Temps doesn't manage. Seeds four sources against a
+    /// real Postgres: one with an enabled schedule (in scope), one with
+    /// only a disabled schedule (out of scope), one `managed_by_cloud`
+    /// with no schedule at all (in scope), and one plain unattached
+    /// source (out of scope) — then asserts `sources_in_scope` returns
+    /// exactly the two that should be reconciled.
+    #[tokio::test]
+    async fn sources_in_scope_excludes_unscheduled_operator_buckets() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+
+        let insert_source = |name: &str, managed_by_cloud: bool| {
+            let now = chrono::Utc::now();
+            temps_entities::s3_sources::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                name: Set(name.to_string()),
+                bucket_name: Set(format!("{name}-bucket")),
+                bucket_path: Set("/".to_string()),
+                access_key_id: Set(String::new()),
+                secret_key: Set(String::new()),
+                session_token: Set(None),
+                credentials_expire_at: Set(None),
+                region: Set("us-east-1".to_string()),
+                endpoint: Set(None),
+                force_path_style: Set(Some(true)),
+                is_default: Set(false),
+                managed_by_cloud: Set(managed_by_cloud),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+        };
+
+        let scheduled = insert_source("scheduled", false)
+            .insert(db.as_ref())
+            .await
+            .expect("insert scheduled source");
+        let disabled_only = insert_source("disabled-only", false)
+            .insert(db.as_ref())
+            .await
+            .expect("insert disabled-only source");
+        let cloud_managed = insert_source("cloud-managed", true)
+            .insert(db.as_ref())
+            .await
+            .expect("insert cloud-managed source");
+        let unattached = insert_source("unattached", false)
+            .insert(db.as_ref())
+            .await
+            .expect("insert unattached source");
+
+        let insert_schedule = |name: &str, s3_source_id: i32, enabled: bool| {
+            let now = chrono::Utc::now();
+            temps_entities::backup_schedules::ActiveModel {
+                id: sea_orm::ActiveValue::NotSet,
+                name: Set(name.to_string()),
+                backup_type: Set("full".to_string()),
+                retention_period: Set(7),
+                s3_source_id: Set(s3_source_id),
+                schedule_expression: Set("0 0 2 * * *".to_string()),
+                enabled: Set(enabled),
+                last_run: Set(None),
+                next_run: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                description: Set(None),
+                tags: Set("[]".to_string()),
+                max_runtime_secs: Set(None),
+                target_all_services: Set(false),
+                include_control_plane: Set(true),
+            }
+        };
+
+        insert_schedule("enabled-sched", scheduled.id, true)
+            .insert(db.as_ref())
+            .await
+            .expect("insert enabled schedule");
+        insert_schedule("disabled-sched", disabled_only.id, false)
+            .insert(db.as_ref())
+            .await
+            .expect("insert disabled schedule");
+        // `unattached` and `cloud_managed` intentionally have no schedule.
+
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "test_encryption_key_1234567890ab",
+        ));
+        let svc = S3LifecycleService::new(db.clone(), encryption);
+
+        let in_scope_ids: std::collections::HashSet<i32> = svc
+            .sources_in_scope()
+            .await
+            .expect("sources_in_scope should succeed")
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+
+        assert!(
+            in_scope_ids.contains(&scheduled.id),
+            "source with an enabled schedule must be in scope"
+        );
+        assert!(
+            in_scope_ids.contains(&cloud_managed.id),
+            "managed_by_cloud source must be in scope even with no schedule"
+        );
+        assert!(
+            !in_scope_ids.contains(&disabled_only.id),
+            "source with only a disabled schedule must NOT be in scope"
+        );
+        assert!(
+            !in_scope_ids.contains(&unattached.id),
+            "unattached operator bucket must NOT be in scope — reconciling it wastes a paid S3 API call"
+        );
     }
 }
