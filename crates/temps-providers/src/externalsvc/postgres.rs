@@ -2867,8 +2867,15 @@ fn postgres_recovery_target_setting(recovery_target: Option<&super::RecoveryTarg
     match recovery_target {
         None => "recovery_target = 'immediate'".to_string(),
         Some(super::RecoveryTarget::Time { time }) => format!(
+            // PostgreSQL's recovery_target_time GUC is parsed by a stricter
+            // datetime parser than SQL's ::timestamptz cast: it rejects the
+            // ISO 8601 'T' separator / 'Z' suffix (`invalid value for
+            // parameter "recovery_target_time"`), even though the same
+            // string casts fine in a query. Use the space-separated,
+            // explicit-offset form Postgres's own output uses, with
+            // microsecond precision preserved.
             "recovery_target_time = '{}'",
-            time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            time.format("%Y-%m-%d %H:%M:%S%.6f%:z")
         ),
         Some(super::RecoveryTarget::Xid { xid }) => {
             format!("recovery_target_xid = '{}'", xid.replace('\'', ""))
@@ -6500,7 +6507,7 @@ mod tests {
             postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
                 time: target,
             })),
-            "recovery_target_time = '2026-09-02T17:11:48.133085Z'"
+            "recovery_target_time = '2026-09-02 17:11:48.133085+00:00'"
         );
     }
 
@@ -6514,23 +6521,57 @@ mod tests {
             postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
                 time: target,
             })),
-            "recovery_target_time = '2026-09-02T17:11:48Z'"
+            "recovery_target_time = '2026-09-02 17:11:48.000000+00:00'"
         );
     }
 
     #[test]
     fn recovery_target_setting_preserves_microsecond_boundaries() {
-        for timestamp in ["2026-09-02T17:11:48.000001Z", "2026-09-02T17:11:48.999999Z"] {
-            let target = chrono::DateTime::parse_from_rfc3339(timestamp)
+        for (input, expected) in [
+            (
+                "2026-09-02T17:11:48.000001Z",
+                "2026-09-02 17:11:48.000001+00:00",
+            ),
+            (
+                "2026-09-02T17:11:48.999999Z",
+                "2026-09-02 17:11:48.999999+00:00",
+            ),
+        ] {
+            let target = chrono::DateTime::parse_from_rfc3339(input)
                 .expect("test timestamp must parse")
                 .with_timezone(&chrono::Utc);
             assert_eq!(
                 postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
                     time: target
                 })),
-                format!("recovery_target_time = '{timestamp}'")
+                format!("recovery_target_time = '{expected}'")
             );
         }
+    }
+
+    #[test]
+    fn recovery_target_setting_never_emits_iso8601_t_or_z() {
+        // Regression test: PostgreSQL's recovery_target_time GUC rejects the
+        // ISO 8601 'T' date/time separator and 'Z' UTC suffix with
+        // `FATAL: configuration file "postgresql.auto.conf" contains errors`
+        // / `invalid value for parameter "recovery_target_time"`, even
+        // though the identical string parses fine via `::timestamptz` in
+        // SQL. Confirmed against a real postgres:18-bookworm container.
+        let target = chrono::DateTime::parse_from_rfc3339("2026-09-02T17:11:48.133085Z")
+            .expect("test timestamp must parse")
+            .with_timezone(&chrono::Utc);
+        let setting =
+            postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                time: target,
+            }));
+        assert!(
+            !setting.contains('T'),
+            "must not use ISO 8601 'T' separator: {setting}"
+        );
+        assert!(
+            !setting.contains('Z'),
+            "must not use ISO 8601 'Z' UTC suffix: {setting}"
+        );
     }
 
     // -----------------------------------------------------------------
