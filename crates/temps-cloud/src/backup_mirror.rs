@@ -282,7 +282,20 @@ async fn sweep(
                     Some(&reason),
                 )
                 .await?;
-                retry_required = true;
+                // Deliberately does NOT set `retry_required`. `Unsupported`
+                // means this specific backup already has its own long
+                // `retry_after` window from `mirror_retry_delay`, so it is
+                // excluded from `DUE_BACKUPS_SQL` on its own — it needs no
+                // help from the outer loop. Treating it the same as
+                // `StageError::Retry` here doubled the backoff: one
+                // permanently-unsupported backup (e.g. an empty RustFS
+                // mirror, or an old WAL-G repository missing the
+                // `temps_backup_id` tag) would ratchet the *whole* sweep's
+                // cadence up to `MAX_SWEEP_INTERVAL` and hold it there
+                // indefinitely, delaying discovery of every other backup on
+                // the instance — including brand new, healthy ones — by up
+                // to 15 minutes each tick, with no way to recover short of
+                // clearing the offending backup.
             }
             Err(StageError::Retry(error)) => {
                 warn!(backup_id = %backup.backup_id, error = %error, "Cloud backup mirror unavailable; will retry without affecting the local backup");
@@ -856,8 +869,18 @@ async fn mirror_native_backup(
                 .cloned()
                 .collect::<Vec<_>>();
             if selected.is_empty() {
-                return Err(StageError::Retry(format!(
-                    "RustFS snapshot {root} has no objects"
+                // Not transient: `root` is this specific backup's frozen,
+                // backup_id-keyed destination prefix — the `mc mirror` run
+                // that wrote (or didn't write) to it already finished, and
+                // nothing will ever appear under this exact prefix later.
+                // A source that was empty when the backup ran produces a
+                // permanently empty manifest, not a manifest that will
+                // eventually show up. `StageError::Retry` here meant this
+                // condition — which can never resolve — retried forever at
+                // the sweep's maximum interval, never declaring anything to
+                // Cloud and never freeing the backup from the retry queue.
+                return Err(StageError::Unsupported(format!(
+                    "RustFS snapshot {root} has no objects; the source was empty when this backup ran, so it can never be mirrored to Cloud"
                 )));
             }
             (
@@ -3968,5 +3991,217 @@ mod tests {
         assert_eq!(state.upload_attempts.load(Ordering::SeqCst), 2);
         assert!(state.upload_committed.load(Ordering::SeqCst));
         assert_eq!(state.completion_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Empty `ListBucketResult` — the response a real S3-compatible provider
+    /// returns for a prefix with no objects under it, e.g. an `mc mirror` run
+    /// whose source bucket was empty at backup time.
+    async fn empty_list_objects_stub() -> impl axum::response::IntoResponse {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/xml")],
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>source-bucket</Name>
+    <Prefix></Prefix>
+    <KeyCount>0</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+</ListBucketResult>"#,
+        )
+    }
+
+    /// Regression covering both halves of the empty-manifest fix:
+    ///
+    /// 1. A native-mirror snapshot that lists zero objects (the source was
+    ///    empty when `mc mirror`/the engine ran) is classified `unsupported`,
+    ///    not `transient` — this condition is permanent for this specific,
+    ///    already-finished backup, so it must never be reported as something
+    ///    that might resolve on a later attempt.
+    /// 2. `sweep` must not fold that permanent classification into the
+    ///    sweep-wide retry signal. Before the fix, one such backup pushed
+    ///    every future sweep's cadence to `MAX_SWEEP_INTERVAL` forever (see
+    ///    `next_sweep_interval`'s `Retry` arm) — starving discovery of every
+    ///    *other*, healthy backup on the instance of prompt reporting to
+    ///    Cloud, not just this one. `sweep` returning anything other than
+    ///    `SweepOutcome::Retry` here is the regression assertion for that.
+    #[tokio::test]
+    async fn empty_native_mirror_snapshot_is_permanent_not_transient_and_does_not_stall_the_sweep()
+    {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping empty-manifest sweep test");
+                return;
+            }
+            Err(error) => panic!("bind empty-manifest stub: {error}"),
+        };
+        let address = listener.local_addr().expect("empty-manifest stub address");
+        let app = Router::new()
+            .route("/{bucket}", get(empty_list_objects_stub))
+            .route("/{bucket}/", get(empty_list_objects_stub));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve empty-manifest stub");
+        });
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        link.set_feature_switches(CloudFeatureSwitches::default())
+            .expect("consent switches default to off");
+        link.set_managed_backup_destination(true);
+        let tenant_id = link.tenant_id().expect("fixture link carries a tenant");
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_states::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_cursors::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+            schema.create_table_from_entity(temps_entities::external_service_backups::Entity),
+            schema.create_table_from_entity(temps_entities::external_services::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite fixture table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated foreign keys");
+
+        let encryption =
+            temps_core::EncryptionService::new_from_password("empty-manifest-sweep-test");
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("Temps Cloud managed backups".to_owned()),
+            bucket_name: Set("source-bucket".to_owned()),
+            region: Set("test-1".to_owned()),
+            endpoint: Set(Some(format!("http://{address}"))),
+            bucket_path: Set(String::new()),
+            access_key_id: Set(encryption
+                .encrypt_string("test-access-key")
+                .expect("encrypt fixture access key")),
+            secret_key: Set(encryption
+                .encrypt_string("test-secret-key")
+                .expect("encrypt fixture secret key")),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("S3 source inserts");
+        temps_entities::external_services::Model {
+            id: 1,
+            name: "empty-mirror".to_owned(),
+            service_type: "s3".to_owned(),
+            version: None,
+            status: "running".to_owned(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_owned(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service inserts");
+        let backup_uuid = Uuid::new_v4().to_string();
+        let location = format!("external_services/s3/empty-mirror/{backup_uuid}");
+        temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("s3 backup (empty-mirror)".to_owned()),
+            backup_id: Set(backup_uuid.clone()),
+            schedule_id: Set(None),
+            backup_type: Set("scheduled".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(0)),
+            file_count: Set(Some(0)),
+            s3_source_id: Set(1),
+            s3_location: Set(location.clone()),
+            error_message: Set(None),
+            metadata: Set("{}".to_owned()),
+            checksum: Set(None),
+            compression_type: Set("none".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("empty s3-mirror backup inserts");
+        temps_entities::external_service_backups::Model {
+            id: 1,
+            service_id: 1,
+            backup_id: 1,
+            backup_type: "scheduled".to_owned(),
+            state: "completed".to_owned(),
+            started_at: now,
+            finished_at: Some(now),
+            size_bytes: Some(0),
+            s3_location: location,
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "none".to_owned(),
+            created_by: 1,
+            expires_at: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service backup link inserts");
+
+        let db = Arc::new(db);
+        let encryption = Arc::new(encryption);
+        let outcome = sweep(&link, &db, &encryption)
+            .await
+            .expect("sweep runs against the empty-manifest fixture");
+        let states = mirror_states(&db).await;
+        assert_ne!(
+            outcome,
+            SweepOutcome::Retry,
+            "a permanently-empty native-mirror snapshot must not degrade the shared sweep \
+             cadence — every other backup on the instance would wait behind it"
+        );
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].tenant_id, tenant_id);
+        assert_eq!(states[0].classification, "unsupported");
+        assert!(
+            states[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("has no objects")),
+            "unexpected reason: {:?}",
+            states[0].reason
+        );
     }
 }
