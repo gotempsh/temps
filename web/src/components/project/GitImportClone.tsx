@@ -51,6 +51,10 @@ import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { parsePublicRepositoryUrl } from '@/lib/public-repository'
 import { getPublicRepository } from '@/api/client/sdk.gen'
+import {
+  templateBelongsToSource,
+  templateSource,
+} from '@/lib/template-source-selection'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
@@ -161,9 +165,8 @@ export function GitImportClone({
     if (mode !== 'navigation') return
     queueMicrotask(() => {
       if (
-        selectedSource !== 'templates' &&
-        selectedSource !== 'services' &&
-        selectedTemplate
+        selectedTemplate &&
+        !templateBelongsToSource(selectedTemplate, selectedSource)
       ) {
         setSelectedTemplate(null)
       }
@@ -516,16 +519,25 @@ export function GitImportClone({
     }
   }
 
+  const handleTemplateSourceSelection = (source: ProjectSource) => {
+    if (
+      selectedTemplate &&
+      !templateBelongsToSource(selectedTemplate, source)
+    ) {
+      setSelectedTemplate(null)
+    }
+    setSelectedSource(source)
+  }
+
   // Show TemplateConfigurator when a template is selected — inside the same
   // shell (header + pills) as the picker, so configuring never swaps the
   // page frame.
   if (selectedTemplate) {
-    const selectedTemplateSource =
-      selectedTemplate.kind === 'service' ? 'services' : 'templates'
+    const selectedTemplateSource = templateSource(selectedTemplate)
     return (
       <NewProjectShell
         activeSource={selectedTemplateSource}
-        onSelectSource={setSelectedSource}
+        onSelectSource={handleTemplateSourceSelection}
       >
         <div className="space-y-6">
           <div className="flex items-center gap-4">

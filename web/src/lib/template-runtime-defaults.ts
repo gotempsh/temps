@@ -257,6 +257,14 @@ export function serviceTemplateRuntimeDefaults(
   }
 }
 
+export function shouldSynchronizeServiceTemplateRuntimeForm(
+  isDirty: boolean,
+  appliedDefaultsKey: string | null,
+  nextDefaultsKey: string
+): boolean {
+  return !isDirty && appliedDefaultsKey !== nextDefaultsKey
+}
+
 export function serviceTemplateDeployOverrides(
   project: ServiceTemplateProjectSource
 ): {

@@ -295,7 +295,8 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
 }
 
 #[tokio::test]
-async fn test_managed_monitor_migration_backfill_uniqueness_down_and_reup() -> anyhow::Result<()> {
+async fn test_managed_monitor_migration_preserves_ownership_uniqueness_down_and_reup(
+) -> anyhow::Result<()> {
     if external_db_configured() {
         println!("Skipping managed-monitor migration test: external database configured");
         return Ok(());
@@ -374,7 +375,18 @@ async fn test_managed_monitor_migration_backfill_uniqueness_down_and_reup() -> a
     assert_eq!(rows[0].try_get::<String>("", "name")?, "Custom readiness");
     assert!(!rows[0].try_get::<bool>("", "is_managed")?);
     assert_eq!(rows[1].try_get::<String>("", "name")?, "production Monitor");
-    assert!(rows[1].try_get::<bool>("", "is_managed")?);
+    assert!(
+        !rows[1].try_get::<bool>("", "is_managed")?,
+        "an ordinary user-editable name is not durable ownership provenance"
+    );
+
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'Temps managed', 'web', 60, true, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-test-production'",
+    )
+    .await?;
 
     let duplicate = db
         .execute_unprepared(

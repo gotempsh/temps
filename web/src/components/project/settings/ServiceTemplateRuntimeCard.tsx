@@ -37,6 +37,7 @@ import { templateEnvironmentVariableDefaultsToSecret } from '@/lib/project-envir
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import {
   serviceTemplateRuntimeDefaults,
+  shouldSynchronizeServiceTemplateRuntimeForm,
   templateRuntimeDefaults,
   templateRuntimeDefaultsSchema,
   templateRuntimeOverrides,
@@ -54,7 +55,7 @@ import {
   RotateCcw,
   Save,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
@@ -90,14 +91,28 @@ export function ServiceTemplateRuntimeCard({
     },
   })
 
+  const appliedTemplate = instanceQuery.data?.applied.template
+  const runtimeDefaults = useMemo(
+    () => serviceTemplateRuntimeDefaults(project, appliedTemplate ?? {}),
+    [project, appliedTemplate]
+  )
+  const runtimeDefaultsKey = JSON.stringify(runtimeDefaults)
+  const appliedDefaultsKey = useRef<string | null>(null)
+  const isDirty = form.formState.isDirty
+
   useEffect(() => {
-    form.reset(
-      serviceTemplateRuntimeDefaults(
-        project,
-        instanceQuery.data?.applied.template ?? {}
+    if (
+      !shouldSynchronizeServiceTemplateRuntimeForm(
+        isDirty,
+        appliedDefaultsKey.current,
+        runtimeDefaultsKey
       )
-    )
-  }, [form, project, instanceQuery.data?.applied.template])
+    ) {
+      return
+    }
+    form.reset(runtimeDefaults)
+    appliedDefaultsKey.current = runtimeDefaultsKey
+  }, [form, isDirty, runtimeDefaults, runtimeDefaultsKey])
 
   const template = instanceQuery.data?.applied.template
   const appliedVersion = instanceQuery.data?.applied.version
@@ -131,6 +146,7 @@ export function ServiceTemplateRuntimeCard({
           },
         })
         await refetch()
+        form.reset(values)
       })(),
       {
         loading: 'Saving service runtime…',
