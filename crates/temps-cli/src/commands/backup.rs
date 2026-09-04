@@ -1789,6 +1789,7 @@ impl BackupCommand {
             is_default: false,
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

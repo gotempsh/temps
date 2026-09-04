@@ -1246,6 +1246,7 @@ mod tests {
             is_default: true,
             managed_by_cloud: true,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

@@ -232,6 +232,7 @@ mod m20260903_000002_add_signal_group_to_write_intervals;
 mod m20260903_000003_add_cloud_analytics_write_mode;
 mod m20260903_000004_add_target_table_and_payload_row_to_outbox;
 mod m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources;
+mod m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources;
 
 pub struct Migrator;
 
@@ -512,6 +513,9 @@ impl MigratorTrait for Migrator {
             ),
             Box::new(
                 m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources::Migration,
+            ),
+            Box::new(
+                m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources::Migration,
             ),
         ]
     }

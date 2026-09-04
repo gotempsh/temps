@@ -1145,14 +1145,23 @@ async fn describe_failed_response(response: reqwest::Response) -> String {
     }
 }
 
+/// The subset of an RFC 7807 Problem Details body this client reads. Cloud's
+/// error responses may carry `type`/`title`/`instance`/extension fields too,
+/// but `detail` is the only one `managed_detail` surfaces — declaring just
+/// it (rather than parsing into `serde_json::Value`) checks the response
+/// actually has the expected shape instead of silently accepting anything.
+#[derive(serde::Deserialize)]
+struct ManagedProblemDetail {
+    detail: Option<String>,
+}
+
 /// Extract the RFC 7807 `detail` from a managed response body, if it has one.
 async fn managed_detail(response: reqwest::Response) -> Option<String> {
     let detail = response
-        .json::<serde_json::Value>()
+        .json::<ManagedProblemDetail>()
         .await
         .ok()?
-        .get("detail")?
-        .as_str()?
+        .detail?
         .trim()
         .to_string();
     (!detail.is_empty()).then_some(detail)

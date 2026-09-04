@@ -49,8 +49,8 @@ use aws_sdk_s3::types::{
     LifecycleRuleFilter, Tag,
 };
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    QueryFilter, QuerySelect, QueryTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, QueryTrait,
 };
 use tracing::{debug, info, warn};
 
@@ -136,6 +136,13 @@ impl S3LifecycleService {
                 ),
             })?;
 
+        // Claim this attempt's generation *before* talking to S3, so any
+        // concurrent reconcile for the same source that starts later (an
+        // overlapping event-driven trigger, or the hourly sweep) is
+        // guaranteed to claim a higher one — see `record_reconcile_attempt`
+        // for why that ordering is what makes the retry marker race-safe.
+        let generation = self.begin_reconcile_attempt(s3_source_id).await?;
+
         let result = if retentions.is_empty() {
             clear_temps_rules(&client, &source.bucket_name, s3_source_id).await
         } else {
@@ -150,7 +157,7 @@ impl S3LifecycleService {
         // disabled). Cleared on the next success so a source that's
         // genuinely out of scope stops being swept once it converges.
         if let Err(e) = self
-            .record_reconcile_attempt(s3_source_id, result.is_err())
+            .record_reconcile_attempt(s3_source_id, generation, result.is_err())
             .await
         {
             warn!(
@@ -163,25 +170,66 @@ impl S3LifecycleService {
         result
     }
 
+    /// Atomically claim the next reconcile "generation" for `s3_source_id`
+    /// and return it. Pairs with `record_reconcile_attempt`, which only
+    /// applies its write while this is still the newest claimed generation.
+    async fn begin_reconcile_attempt(&self, s3_source_id: i32) -> Result<i32, BackupError> {
+        let row = self
+            .db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE s3_sources SET lifecycle_reconcile_generation = lifecycle_reconcile_generation + 1 \
+                 WHERE id = $1 RETURNING lifecycle_reconcile_generation",
+                [s3_source_id.into()],
+            ))
+            .await
+            .map_err(BackupError::Database)?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "s3_source".to_string(),
+                detail: format!("id {}", s3_source_id),
+            })?;
+        row.try_get("", "lifecycle_reconcile_generation")
+            .map_err(BackupError::Database)
+    }
+
     /// Persist whether the reconcile attempt for `s3_source_id` failed, so
     /// `sources_in_scope` can keep retrying it independent of schedule
     /// state. Best-effort: a failure here doesn't change `reconcile_bucket`'s
     /// return value, since the S3 call itself already succeeded or failed on
     /// its own terms — this is only bookkeeping for the next sweep.
+    ///
+    /// Guarded by `generation` (claimed via `begin_reconcile_attempt` before
+    /// the S3 call): the write only applies `WHERE
+    /// lifecycle_reconcile_generation = generation`, i.e. only if no other
+    /// attempt has *started* for this source since this one did. Two
+    /// reconciles for the same source can overlap — an event-driven
+    /// reconcile and the hourly sweep, or two schedule mutations in quick
+    /// succession — and finish in either order. Without this guard, an
+    /// older attempt that started first but finishes last could overwrite a
+    /// newer attempt's failure marker with its own (stale) success,
+    /// silently dropping the source from every future retry even though the
+    /// newer, more-informed attempt actually failed. The generation check
+    /// makes only the most-recently-*started* attempt's outcome authoritative;
+    /// a stale write is simply dropped (`exec` reports 0 rows affected,
+    /// which isn't an error — the newer attempt already recorded, or will
+    /// record, the outcome that matters).
     async fn record_reconcile_attempt(
         &self,
         s3_source_id: i32,
+        generation: i32,
         failed: bool,
     ) -> Result<(), BackupError> {
-        temps_entities::s3_sources::ActiveModel {
-            id: Set(s3_source_id),
-            lifecycle_reconcile_failed_at: Set(failed.then(chrono::Utc::now)),
-            ..Default::default()
-        }
-        .update(self.db.as_ref())
-        .await
-        .map(|_| ())
-        .map_err(BackupError::Database)
+        temps_entities::s3_sources::Entity::update_many()
+            .col_expr(
+                temps_entities::s3_sources::Column::LifecycleReconcileFailedAt,
+                sea_orm::sea_query::Expr::value(failed.then(chrono::Utc::now)),
+            )
+            .filter(temps_entities::s3_sources::Column::Id.eq(s3_source_id))
+            .filter(temps_entities::s3_sources::Column::LifecycleReconcileGeneration.eq(generation))
+            .exec(self.db.as_ref())
+            .await
+            .map(|_| ())
+            .map_err(BackupError::Database)
     }
 
     /// S3 sources actually in scope for Temps-managed lifecycle rules:
@@ -691,6 +739,7 @@ mod tests {
                 is_default: Set(false),
                 managed_by_cloud: Set(managed_by_cloud),
                 lifecycle_reconcile_failed_at: Set(None),
+                lifecycle_reconcile_generation: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -812,6 +861,7 @@ mod tests {
             is_default: Set(false),
             managed_by_cloud: Set(false),
             lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -846,6 +896,7 @@ mod tests {
         temps_entities::s3_sources::ActiveModel {
             id: Set(source.id),
             lifecycle_reconcile_failed_at: Set(Some(now)),
+            lifecycle_reconcile_generation: Set(0),
             ..Default::default()
         }
         .update(db.as_ref())
@@ -869,6 +920,96 @@ mod tests {
             in_scope_ids.contains(&source.id),
             "a source with a pending reconcile retry must stay in scope even with no enabled \
              schedule, so the hourly sweep keeps retrying until it converges"
+        );
+    }
+
+    /// Regression (Greptile P1 on the fix above): two reconciles for the
+    /// same source can overlap and finish out of start order — an
+    /// event-driven reconcile and the hourly sweep, or two schedule
+    /// mutations in quick succession. Without a generation guard, an older
+    /// attempt that starts first but finishes *last* could write its own
+    /// (stale) success over a newer attempt's failure, silently clearing
+    /// `lifecycle_reconcile_failed_at` and dropping the source out of every
+    /// future retry even though the more recent, more-informed attempt
+    /// actually failed. `record_reconcile_attempt` must refuse a write once
+    /// a newer attempt has already claimed the generation.
+    #[tokio::test]
+    async fn a_stale_reconcile_attempt_cannot_clobber_a_newer_attempts_failure() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+        let now = chrono::Utc::now();
+
+        let source = temps_entities::s3_sources::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            name: Set("overlapping-reconciles".to_string()),
+            bucket_name: Set("overlapping-reconciles-bucket".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            region: Set("us-east-1".to_string()),
+            endpoint: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(false),
+            managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert source");
+
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "test_encryption_key_1234567890ab",
+        ));
+        let svc = S3LifecycleService::new(db.clone(), encryption);
+
+        // Two attempts start, in order: an older one (e.g. an event-driven
+        // reconcile from an earlier schedule mutation), then a newer one
+        // (e.g. the immediate reconcile fired by disabling the last
+        // schedule).
+        let older_generation = svc
+            .begin_reconcile_attempt(source.id)
+            .await
+            .expect("begin older attempt");
+        let newer_generation = svc
+            .begin_reconcile_attempt(source.id)
+            .await
+            .expect("begin newer attempt");
+        assert!(newer_generation > older_generation);
+
+        // The newer attempt finishes first and fails.
+        svc.record_reconcile_attempt(source.id, newer_generation, true)
+            .await
+            .expect("record newer failure");
+
+        // The older attempt, despite having started first, finishes last
+        // and succeeds. Its write must be dropped rather than clearing the
+        // newer attempt's failure marker.
+        svc.record_reconcile_attempt(source.id, older_generation, false)
+            .await
+            .expect("record older success (must be a no-op)");
+
+        let refreshed = temps_entities::s3_sources::Entity::find_by_id(source.id)
+            .one(db.as_ref())
+            .await
+            .expect("refetch source")
+            .expect("source still exists");
+
+        assert!(
+            refreshed.lifecycle_reconcile_failed_at.is_some(),
+            "a stale (older) attempt's success must not clear a newer attempt's failure marker"
         );
     }
 }

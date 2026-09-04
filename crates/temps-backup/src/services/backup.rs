@@ -10003,6 +10003,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10070,6 +10071,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10124,6 +10126,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: true,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10171,6 +10174,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: true,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10313,6 +10317,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10583,6 +10588,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10716,6 +10722,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -12008,6 +12015,7 @@ mod tests {
             is_default: false,
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -13214,6 +13222,7 @@ mod tests {
             is_default: Set(true),
             managed_by_cloud: Set(false),
             lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13400,6 +13409,7 @@ mod tests {
             is_default: Set(true),
             managed_by_cloud: Set(false),
             lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13565,6 +13575,7 @@ mod tests {
                     is_default: true,
                     managed_by_cloud: false,
                     lifecycle_reconcile_failed_at: None,
+                    lifecycle_reconcile_generation: 0,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 }]])
@@ -13702,6 +13713,7 @@ mod tests {
             is_default: Set(true),
             managed_by_cloud: Set(false),
             lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13848,6 +13860,7 @@ mod tests {
             is_default: Set(true),
             managed_by_cloud: Set(false),
             lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
