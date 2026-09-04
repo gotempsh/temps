@@ -413,14 +413,18 @@ impl TempsPlugin for BackupPlugin {
             // App-side `enforce_retention` is still the primary cleanup
             // path; this only handles drift on the storage provider side.
             //
-            // Deliberately excludes sources with no enabled schedule and
-            // `managed_by_cloud = false`: those are buckets the operator
-            // configured with their own credentials but never attached to
-            // a Temps backup schedule (e.g. an unrelated production
-            // bucket), so `reconcile_bucket` has never had anything to
-            // apply for them and a `PutBucketLifecycleConfiguration` /
-            // `DeleteBucketLifecycle` call against them is pure waste —
-            // paid API operations on infrastructure Temps doesn't manage.
+            // Deliberately excludes sources with no enabled schedule,
+            // `managed_by_cloud = false`, and no pending retry: those are
+            // buckets the operator configured with their own credentials
+            // but never attached to a Temps backup schedule (e.g. an
+            // unrelated production bucket), so `reconcile_bucket` has never
+            // had anything to apply for them and a
+            // `PutBucketLifecycleConfiguration` / `DeleteBucketLifecycle`
+            // call against them is pure waste — paid API operations on
+            // infrastructure Temps doesn't manage. A source with a failed
+            // reconcile attempt stays in scope regardless of schedule state
+            // (see `S3LifecycleService::sources_in_scope`) so this sweep is
+            // also the retry path for a transient failure at disable time.
             let lifecycle_db = db.clone();
             let lifecycle_enc = encryption_service.clone();
             tokio::spawn(async move {

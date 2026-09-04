@@ -1230,7 +1230,11 @@ impl BackupService {
     ///
     /// The reconcile rebuilds the bucket's lifecycle rules from current
     /// schedule state, so even concurrent schedule changes converge to a
-    /// consistent rule set eventually.
+    /// consistent rule set eventually. A failure here isn't a dead end: it's
+    /// recorded on the source via `lifecycle_reconcile_failed_at` (see
+    /// `S3LifecycleService::reconcile_bucket`), which keeps the source in
+    /// the hourly sweep's scope — even with no enabled schedule left — until
+    /// a later attempt actually succeeds.
     fn fire_lifecycle_reconcile(&self, s3_source_id: i32) {
         let db = self.db.clone();
         let enc = self.encryption_service.clone();
@@ -9998,6 +10002,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10064,6 +10069,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10117,6 +10123,7 @@ mod tests {
             force_path_style: Some(false),
             is_default: false,
             managed_by_cloud: true,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10163,6 +10170,7 @@ mod tests {
             force_path_style: Some(false),
             is_default: false,
             managed_by_cloud: true,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10304,6 +10312,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10573,6 +10582,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10705,6 +10715,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -11996,6 +12007,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -13201,6 +13213,7 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13386,6 +13399,7 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13550,6 +13564,7 @@ mod tests {
                     force_path_style: Some(true),
                     is_default: true,
                     managed_by_cloud: false,
+                    lifecycle_reconcile_failed_at: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 }]])
@@ -13686,6 +13701,7 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13831,6 +13847,7 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

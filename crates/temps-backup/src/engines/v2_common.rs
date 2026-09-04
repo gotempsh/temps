@@ -925,6 +925,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: true,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: now,
             updated_at: now,
         }

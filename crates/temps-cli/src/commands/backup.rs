@@ -1788,6 +1788,7 @@ impl BackupCommand {
             force_path_style: Some(s3_credentials.force_path_style),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

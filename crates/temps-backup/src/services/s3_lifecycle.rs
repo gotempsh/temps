@@ -49,7 +49,8 @@ use aws_sdk_s3::types::{
     LifecycleRuleFilter, Tag,
 };
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, QueryTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
+    QueryFilter, QuerySelect, QueryTrait,
 };
 use tracing::{debug, info, warn};
 
@@ -135,26 +136,77 @@ impl S3LifecycleService {
                 ),
             })?;
 
-        if retentions.is_empty() {
-            return clear_temps_rules(&client, &source.bucket_name, s3_source_id).await;
+        let result = if retentions.is_empty() {
+            clear_temps_rules(&client, &source.bucket_name, s3_source_id).await
+        } else {
+            let rules = build_lifecycle_rules(&retentions);
+            apply_lifecycle(&client, &source.bucket_name, rules, s3_source_id).await
+        };
+
+        // Record the outcome so a transient failure keeps this source in
+        // `sources_in_scope` — and therefore in the hourly sweep's retry
+        // path — even if it has no enabled schedule at the moment (e.g. the
+        // schedule that triggered this reconcile was the one just
+        // disabled). Cleared on the next success so a source that's
+        // genuinely out of scope stops being swept once it converges.
+        if let Err(e) = self
+            .record_reconcile_attempt(s3_source_id, result.is_err())
+            .await
+        {
+            warn!(
+                s3_source_id,
+                error = %e,
+                "failed to persist S3 lifecycle reconcile retry state"
+            );
         }
 
-        let rules = build_lifecycle_rules(&retentions);
-        apply_lifecycle(&client, &source.bucket_name, rules, s3_source_id).await
+        result
+    }
+
+    /// Persist whether the reconcile attempt for `s3_source_id` failed, so
+    /// `sources_in_scope` can keep retrying it independent of schedule
+    /// state. Best-effort: a failure here doesn't change `reconcile_bucket`'s
+    /// return value, since the S3 call itself already succeeded or failed on
+    /// its own terms — this is only bookkeeping for the next sweep.
+    async fn record_reconcile_attempt(
+        &self,
+        s3_source_id: i32,
+        failed: bool,
+    ) -> Result<(), BackupError> {
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(s3_source_id),
+            lifecycle_reconcile_failed_at: Set(failed.then(chrono::Utc::now)),
+            ..Default::default()
+        }
+        .update(self.db.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(BackupError::Database)
     }
 
     /// S3 sources actually in scope for Temps-managed lifecycle rules:
-    /// those with at least one enabled backup schedule, plus any bucket
-    /// Temps Cloud provisioned itself (`managed_by_cloud`).
+    /// those with at least one enabled backup schedule, any bucket Temps
+    /// Cloud provisioned itself (`managed_by_cloud`), or any source with a
+    /// reconcile attempt still pending retry (`lifecycle_reconcile_failed_at`
+    /// set).
     ///
-    /// Deliberately excludes sources with no enabled schedule and
-    /// `managed_by_cloud = false` — buckets the operator configured with
-    /// their own credentials but never attached to a backup schedule
-    /// (e.g. an unrelated production bucket). `reconcile_bucket` has never
-    /// had anything to apply for those, so calling
-    /// `PutBucketLifecycleConfiguration` / `DeleteBucketLifecycle` against
-    /// them is a paid API call against infrastructure Temps doesn't
+    /// Deliberately excludes sources with no enabled schedule,
+    /// `managed_by_cloud = false`, and no pending retry — buckets the
+    /// operator configured with their own credentials but never attached to
+    /// a backup schedule (e.g. an unrelated production bucket).
+    /// `reconcile_bucket` has never had anything to apply for those, so
+    /// calling `PutBucketLifecycleConfiguration` / `DeleteBucketLifecycle`
+    /// against them is a paid API call against infrastructure Temps doesn't
     /// manage, for no behavioral benefit.
+    ///
+    /// The pending-retry clause exists because disabling a source's last
+    /// enabled schedule fires an immediate reconcile to clear its rules; if
+    /// that attempt hits a transient S3 error, the source would otherwise
+    /// drop out of scope in the same moment it needed a retry, stranding a
+    /// stale lifecycle rule in S3 with nothing left to clear it. Keeping it
+    /// in scope until reconcile actually succeeds (which clears the flag —
+    /// see `record_reconcile_attempt`) bounds staleness to the sweep
+    /// interval instead of leaving it indefinite.
     pub async fn sources_in_scope(
         &self,
     ) -> Result<Vec<temps_entities::s3_sources::Model>, BackupError> {
@@ -168,7 +220,11 @@ impl S3LifecycleService {
             .filter(
                 Condition::any()
                     .add(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
-                    .add(temps_entities::s3_sources::Column::Id.in_subquery(scheduled_source_ids)),
+                    .add(temps_entities::s3_sources::Column::Id.in_subquery(scheduled_source_ids))
+                    .add(
+                        temps_entities::s3_sources::Column::LifecycleReconcileFailedAt
+                            .is_not_null(),
+                    ),
             )
             .all(self.db.as_ref())
             .await
@@ -634,6 +690,7 @@ mod tests {
                 force_path_style: Set(Some(true)),
                 is_default: Set(false),
                 managed_by_cloud: Set(managed_by_cloud),
+                lifecycle_reconcile_failed_at: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -716,6 +773,102 @@ mod tests {
         assert!(
             !in_scope_ids.contains(&unattached.id),
             "unattached operator bucket must NOT be in scope — reconciling it wastes a paid S3 API call"
+        );
+    }
+
+    /// Regression: disabling a source's last enabled schedule fires an
+    /// immediate reconcile (`BackupService::fire_lifecycle_reconcile`). If
+    /// that attempt hits a transient S3 error, the source must not simply
+    /// fall out of scope — `lifecycle_reconcile_failed_at` (set by
+    /// `record_reconcile_attempt`) has to keep it in the hourly sweep until
+    /// a retry actually succeeds, or its stale lifecycle rule would persist
+    /// in S3 indefinitely with nothing left to clear it.
+    #[tokio::test]
+    async fn sources_in_scope_includes_source_with_a_pending_reconcile_retry() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+        let now = chrono::Utc::now();
+
+        let source = temps_entities::s3_sources::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            name: Set("disabled-with-pending-retry".to_string()),
+            bucket_name: Set("disabled-with-pending-retry-bucket".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            region: Set("us-east-1".to_string()),
+            endpoint: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(false),
+            managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert source");
+
+        temps_entities::backup_schedules::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            name: Set("disabled-sched".to_string()),
+            backup_type: Set("full".to_string()),
+            retention_period: Set(7),
+            s3_source_id: Set(source.id),
+            schedule_expression: Set("0 0 2 * * *".to_string()),
+            enabled: Set(false),
+            last_run: Set(None),
+            next_run: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            description: Set(None),
+            tags: Set("[]".to_string()),
+            max_runtime_secs: Set(None),
+            target_all_services: Set(false),
+            include_control_plane: Set(true),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert disabled schedule");
+
+        // Simulate the bookkeeping `record_reconcile_attempt` performs when
+        // the disable-time fire-and-forget reconcile errors.
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(source.id),
+            lifecycle_reconcile_failed_at: Set(Some(now)),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await
+        .expect("mark reconcile attempt as failed");
+
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "test_encryption_key_1234567890ab",
+        ));
+        let svc = S3LifecycleService::new(db.clone(), encryption);
+
+        let in_scope_ids: std::collections::HashSet<i32> = svc
+            .sources_in_scope()
+            .await
+            .expect("sources_in_scope should succeed")
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+
+        assert!(
+            in_scope_ids.contains(&source.id),
+            "a source with a pending reconcile retry must stay in scope even with no enabled \
+             schedule, so the hourly sweep keeps retrying until it converges"
         );
     }
 }

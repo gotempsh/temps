@@ -3782,6 +3782,7 @@ mod tests {
                     force_path_style: Set(Some(true)),
                     is_default: Set(true),
                     managed_by_cloud: Set(false),
+                    lifecycle_reconcile_failed_at: Set(None),
                     created_at: Set(now),
                     updated_at: Set(now),
                 }
