@@ -2156,6 +2156,8 @@ mod tests {
             is_default: Set(false),
             // Only Cloud-managed sources are mirror candidates.
             managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -2305,6 +2307,8 @@ mod tests {
                 force_path_style: Set(Some(true)),
                 is_default: Set(false),
                 managed_by_cloud: Set(managed_by_cloud),
+                lifecycle_reconcile_failed_at: Set(None),
+                lifecycle_reconcile_generation: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
             };
@@ -2714,6 +2718,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: now,
             updated_at: now,
         };
@@ -2887,6 +2893,8 @@ mod tests {
             // Cloud's bucket without the operator choosing a destination.
             is_default: Set(true),
             managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -3112,6 +3120,8 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
         }

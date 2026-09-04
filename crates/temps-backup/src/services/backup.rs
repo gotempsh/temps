@@ -1230,7 +1230,11 @@ impl BackupService {
     ///
     /// The reconcile rebuilds the bucket's lifecycle rules from current
     /// schedule state, so even concurrent schedule changes converge to a
-    /// consistent rule set eventually.
+    /// consistent rule set eventually. A failure here isn't a dead end: it's
+    /// recorded on the source via `lifecycle_reconcile_failed_at` (see
+    /// `S3LifecycleService::reconcile_bucket`), which keeps the source in
+    /// the hourly sweep's scope — even with no enabled schedule left — until
+    /// a later attempt actually succeeds.
     fn fire_lifecycle_reconcile(&self, s3_source_id: i32) {
         let db = self.db.clone();
         let enc = self.encryption_service.clone();
@@ -9281,11 +9285,17 @@ ORDER BY a.opened_at DESC
                 detail: "Backup schedule not found".to_string(),
             })?;
 
+        let s3_source_id = schedule_model.s3_source_id;
         let mut schedule_update: temps_entities::backup_schedules::ActiveModel =
             schedule_model.into_active_model();
         schedule_update.enabled = sea_orm::Set(false);
         schedule_update.updated_at = sea_orm::Set(Utc::now());
         schedule_update.update(self.db.as_ref()).await?;
+
+        // Disabling may have been this source's last enabled schedule —
+        // reconcile now so a stale S3-side lifecycle rule doesn't keep
+        // expiring objects after the schedule stops running.
+        self.fire_lifecycle_reconcile(s3_source_id);
 
         self.get_backup_schedule(id).await
     }
@@ -9350,6 +9360,12 @@ ORDER BY a.opened_at DESC
         schedule_update.next_run = sea_orm::Set(next_run);
 
         let updated_schedule = schedule_update.update(self.db.as_ref()).await?;
+
+        // Re-enabling puts this source back in scope for lifecycle
+        // reconciliation — push the rule immediately rather than waiting
+        // for the hourly sweep to notice.
+        self.fire_lifecycle_reconcile(updated_schedule.s3_source_id);
+
         Ok(updated_schedule)
     }
 }
@@ -9986,6 +10002,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10052,6 +10070,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10105,6 +10125,8 @@ mod tests {
             force_path_style: Some(false),
             is_default: false,
             managed_by_cloud: true,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10151,6 +10173,8 @@ mod tests {
             force_path_style: Some(false),
             is_default: false,
             managed_by_cloud: true,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10292,6 +10316,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10561,6 +10587,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10693,6 +10721,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -11185,6 +11215,230 @@ mod tests {
         println!("  - Decompressed size: {} bytes", decompressed.len());
         println!("  - Backup format: valid gzip-compressed pg_dump custom format (PGDMP)");
         println!("  - Objects in bucket before deletion: {}", object_count);
+    }
+
+    /// Regression: `disable_backup_schedule` and `enable_backup_schedule`
+    /// must trigger the same S3 lifecycle reconcile that
+    /// `create_backup_schedule`/`update_backup_schedule`/
+    /// `delete_backup_schedule` already do. Without it, disabling a
+    /// source's last enabled schedule leaves a stale
+    /// `PutBucketLifecycleConfiguration` rule on the bucket that keeps
+    /// expiring objects indefinitely — and, after the hourly sweep was
+    /// scoped down to only actively-scheduled sources, there is no other
+    /// path that would ever clear it.
+    #[tokio::test]
+    async fn disable_and_enable_schedule_reconcile_s3_lifecycle_rules() {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(error) => {
+                println!("Docker not available, skipping test: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping test: {}", error);
+            return;
+        }
+
+        use temps_database::test_utils::TestDatabase;
+        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+
+        let minio_container = GenericImage::new("minio/minio", "latest")
+            .with_env_var("MINIO_ROOT_USER", "minioadmin")
+            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
+            .start()
+            .await
+            .expect("Failed to start MinIO container");
+        let minio_port = minio_container
+            .get_host_port_ipv4(9000)
+            .await
+            .expect("Failed to get MinIO port");
+        let minio_endpoint = format!("http://localhost:{}", minio_port);
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "minioadmin",
+                "minioadmin",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(&minio_endpoint)
+            .force_path_style(true)
+            .http_client(crate::engines::v2_common::bundled_roots_http_client())
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        let bucket_name = "test-lifecycle-toggle";
+        s3_client
+            .create_bucket()
+            .bucket(bucket_name)
+            .send()
+            .await
+            .expect("Failed to create bucket");
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        let external_service_manager = create_mock_external_service_manager(test_db.db.clone());
+        let alarm_service = create_mock_alarm_service();
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            test_db.database_url.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            test_db.db.clone(),
+        ));
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let backup_service = BackupService::new(
+            test_db.db.clone(),
+            external_service_manager,
+            alarm_service,
+            config_service,
+            encryption_service,
+        );
+
+        let s3_source = backup_service
+            .create_s3_source(CreateS3SourceRequest {
+                name: "test-minio-toggle".to_string(),
+                bucket_name: bucket_name.to_string(),
+                bucket_path: "/backups".to_string(),
+                access_key_id: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(minio_endpoint.clone()),
+                force_path_style: Some(true),
+                is_default: None,
+            })
+            .await
+            .expect("Failed to create S3 source");
+
+        let schedule = backup_service
+            .create_backup_schedule(CreateBackupScheduleRequest {
+                name: "toggle-schedule".to_string(),
+                backup_type: "full".to_string(),
+                retention_period: 7,
+                s3_source_id: Some(s3_source.id),
+                schedule_expression: "0 0 2 * * *".to_string(),
+                enabled: true,
+                description: None,
+                tags: vec![],
+                max_runtime_secs: None,
+                target_all_services: None,
+                include_control_plane: None,
+            })
+            .await
+            .expect("Failed to create backup schedule");
+
+        // Poll until the schedule creation's own reconcile has pushed the
+        // retention-7d rule (proves the create-path reconcile ran, so the
+        // baseline before disabling is "rule present").
+        let rules_after_create = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_lifecycle_rule_count(&s3_client, bucket_name),
+        )
+        .await
+        .expect("lifecycle rule must appear after schedule creation");
+        assert_eq!(
+            rules_after_create, 1,
+            "expected exactly one rule (temps-retention-7d) after create"
+        );
+
+        backup_service
+            .disable_backup_schedule(schedule.id)
+            .await
+            .expect("Failed to disable backup schedule");
+
+        // The disable must clear the now-orphaned rule, not leave it
+        // dangling on the bucket.
+        let rules_after_disable = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_lifecycle_rule_count_becomes(&s3_client, bucket_name, 0),
+        )
+        .await
+        .expect("lifecycle rule must be cleared after disabling the schedule");
+        assert_eq!(
+            rules_after_disable, 0,
+            "disabling the sole schedule must clear the S3 lifecycle rule"
+        );
+
+        backup_service
+            .enable_backup_schedule(schedule.id)
+            .await
+            .expect("Failed to enable backup schedule");
+
+        // Re-enabling must push the rule back.
+        let rules_after_enable = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_lifecycle_rule_count_becomes(&s3_client, bucket_name, 1),
+        )
+        .await
+        .expect("lifecycle rule must reappear after re-enabling the schedule");
+        assert_eq!(
+            rules_after_enable, 1,
+            "re-enabling the schedule must restore the S3 lifecycle rule"
+        );
+    }
+
+    /// Number of lifecycle rules currently on the bucket, treating "no
+    /// lifecycle configuration at all" (`NoSuchLifecycleConfiguration`) as
+    /// zero rather than an error — that's the expected state before the
+    /// first reconcile, and after a reconcile clears the last rule.
+    async fn current_lifecycle_rule_count(client: &aws_sdk_s3::Client, bucket: &str) -> usize {
+        match client
+            .get_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.rules().len(),
+            Err(err) => {
+                let msg = format!("{err:?}");
+                if msg.contains("NoSuchLifecycleConfiguration") {
+                    0
+                } else {
+                    panic!("unexpected error reading bucket lifecycle config: {msg}");
+                }
+            }
+        }
+    }
+
+    /// Polls until the bucket has at least one lifecycle rule, returning
+    /// the count once non-zero.
+    async fn poll_lifecycle_rule_count(client: &aws_sdk_s3::Client, bucket: &str) -> usize {
+        loop {
+            let count = current_lifecycle_rule_count(client, bucket).await;
+            if count > 0 {
+                return count;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Polls until the bucket's lifecycle rule count equals `expected`.
+    async fn poll_lifecycle_rule_count_becomes(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        expected: usize,
+    ) -> usize {
+        loop {
+            let count = current_lifecycle_rule_count(client, bucket).await;
+            if count == expected {
+                return count;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
@@ -11760,6 +12014,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -12965,6 +13221,8 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13150,6 +13408,8 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13314,6 +13574,8 @@ mod tests {
                     force_path_style: Some(true),
                     is_default: true,
                     managed_by_cloud: false,
+                    lifecycle_reconcile_failed_at: None,
+                    lifecycle_reconcile_generation: 0,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 }]])
@@ -13450,6 +13712,8 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13595,6 +13859,8 @@ mod tests {
             force_path_style: Set(Some(true)),
             is_default: Set(true),
             managed_by_cloud: Set(false),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

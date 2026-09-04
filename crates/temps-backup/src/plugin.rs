@@ -404,27 +404,38 @@ impl TempsPlugin for BackupPlugin {
                 }
             });
 
-            // S3 lifecycle drift reconciler. Walks every S3 source hourly
-            // and re-pushes lifecycle rules so manual edits in the AWS
-            // console (or missed event-driven reconciles) eventually
-            // converge to the desired state. App-side `enforce_retention`
-            // is still the primary cleanup path; this only handles drift
-            // on the storage provider side.
+            // S3 lifecycle drift reconciler. Walks S3 sources that are
+            // actually in scope for Temps-managed lifecycle rules — those
+            // with at least one enabled backup schedule, plus Cloud's own
+            // managed bucket — hourly, and re-pushes lifecycle rules so
+            // manual edits in the AWS console (or missed event-driven
+            // reconciles) eventually converge to the desired state.
+            // App-side `enforce_retention` is still the primary cleanup
+            // path; this only handles drift on the storage provider side.
+            //
+            // Deliberately excludes sources with no enabled schedule,
+            // `managed_by_cloud = false`, and no pending retry: those are
+            // buckets the operator configured with their own credentials
+            // but never attached to a Temps backup schedule (e.g. an
+            // unrelated production bucket), so `reconcile_bucket` has never
+            // had anything to apply for them and a
+            // `PutBucketLifecycleConfiguration` / `DeleteBucketLifecycle`
+            // call against them is pure waste — paid API operations on
+            // infrastructure Temps doesn't manage. A source with a failed
+            // reconcile attempt stays in scope regardless of schedule state
+            // (see `S3LifecycleService::sources_in_scope`) so this sweep is
+            // also the retry path for a transient failure at disable time.
             let lifecycle_db = db.clone();
             let lifecycle_enc = encryption_service.clone();
             tokio::spawn(async move {
-                use sea_orm::EntityTrait;
                 // First tick is one interval out — give the rest of the
                 // server time to settle before hammering S3.
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
                 tick.tick().await;
-                let svc = S3LifecycleService::new(lifecycle_db.clone(), lifecycle_enc);
+                let svc = S3LifecycleService::new(lifecycle_db, lifecycle_enc);
                 loop {
                     tick.tick().await;
-                    let sources = match temps_entities::s3_sources::Entity::find()
-                        .all(lifecycle_db.as_ref())
-                        .await
-                    {
+                    let sources = match svc.sources_in_scope().await {
                         Ok(s) => s,
                         Err(e) => {
                             error!(
