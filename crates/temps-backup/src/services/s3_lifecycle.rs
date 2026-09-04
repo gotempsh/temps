@@ -87,6 +87,28 @@ pub enum ReconcileOutcome {
     Unsupported { reason: String },
 }
 
+/// Process-level locks keyed by `s3_source_id`, serializing
+/// `reconcile_bucket` calls for the same source. The lifecycle sweep and
+/// every event-driven trigger (`BackupService::fire_lifecycle_reconcile`)
+/// only ever run on the control-plane process, so an in-process lock is
+/// sufficient — no cross-process coordination is needed. This mirrors
+/// `ENVIRONMENT_LOCKS` in `temps-deployments/src/jobs/mark_deployment_complete.rs`,
+/// which rejected PostgreSQL advisory locks for the same reason: Sea-ORM's
+/// `DatabaseConnection` is pooled, so an advisory lock/unlock pair can hit
+/// different pooled connections and leave the lock permanently held.
+static SOURCE_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<i32, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn get_source_lock(s3_source_id: i32) -> Arc<tokio::sync::Mutex<()>> {
+    SOURCE_LOCKS
+        .lock()
+        .expect("source locks poisoned")
+        .entry(s3_source_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Reconciles S3 bucket lifecycle policies with the retention values
 /// configured on `backup_schedules`. Stateless — every call recomputes
 /// the desired state from the database.
@@ -106,10 +128,71 @@ impl S3LifecycleService {
     /// Reconcile lifecycle rules for one S3 source. Loads all enabled
     /// schedules pointing at this source, collects the distinct
     /// retention values, and pushes one rule per value to the bucket.
+    ///
+    /// Two reconciles for the same source can overlap — an event-driven
+    /// trigger and the hourly sweep, or two schedule mutations in quick
+    /// succession — and this call is not itself ordered relative to them.
+    /// Without serialization, an older attempt (reading stale schedule
+    /// state) could push its `PutBucketLifecycleConfiguration` /
+    /// `DeleteBucketLifecycle` call to S3 *after* a newer attempt's,
+    /// silently overwriting the correct state with stale rules even though
+    /// the generation guard on `record_reconcile_attempt` correctly
+    /// prevents the stale attempt's DB write from clobbering the newer
+    /// one's retry marker. Acquiring `get_source_lock` first makes the two
+    /// attempts run strictly one after the other, so the second always
+    /// recomputes from fresh schedule state and its S3 call is the one
+    /// that actually lands last.
     pub async fn reconcile_bucket(
         &self,
         s3_source_id: i32,
     ) -> Result<ReconcileOutcome, BackupError> {
+        let source_lock = get_source_lock(s3_source_id);
+        let _guard = source_lock.lock().await;
+
+        // Claim this attempt's generation first — before schedule lookup,
+        // S3 client construction, or the S3 call itself, i.e. before
+        // anything else in this function that can fail. `begin_reconcile_attempt`
+        // itself confirms the source exists (its `UPDATE ... RETURNING`
+        // reports `NotFound` if no row matched), so no separate existence
+        // check is needed here. Every failure past this point (a
+        // schedule-fetch DB error, a credential-decrypt error building the
+        // client, a rejected S3 call) is captured by `do_reconcile` and
+        // reported through `record_reconcile_attempt` under this same
+        // generation. Claiming it any later would let those earlier
+        // failure modes slip through with no retry marker ever recorded —
+        // the source would then silently vanish from `sources_in_scope`
+        // the moment its last schedule is disabled, with nothing left to
+        // retry it.
+        let generation = self.begin_reconcile_attempt(s3_source_id).await?;
+
+        let result = self.do_reconcile(s3_source_id).await;
+
+        // Record the outcome so a transient failure keeps this source in
+        // `sources_in_scope` — and therefore in the hourly sweep's retry
+        // path — even if it has no enabled schedule at the moment (e.g. the
+        // schedule that triggered this reconcile was the one just
+        // disabled). Cleared on the next success so a source that's
+        // genuinely out of scope stops being swept once it converges.
+        if let Err(e) = self
+            .record_reconcile_attempt(s3_source_id, generation, result.is_err())
+            .await
+        {
+            warn!(
+                s3_source_id,
+                error = %e,
+                "failed to persist S3 lifecycle reconcile retry state"
+            );
+        }
+
+        result
+    }
+
+    /// The actual reconcile work — schedule lookup through the S3 call.
+    /// Split out from `reconcile_bucket` so every error path here (schedule
+    /// fetch, S3 client construction, the S3 call itself) runs *after* a
+    /// generation has already been claimed, letting the caller record the
+    /// failure under that generation regardless of which step raised it.
+    async fn do_reconcile(&self, s3_source_id: i32) -> Result<ReconcileOutcome, BackupError> {
         let source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
             .one(self.db.as_ref())
             .await
@@ -136,38 +219,12 @@ impl S3LifecycleService {
                 ),
             })?;
 
-        // Claim this attempt's generation *before* talking to S3, so any
-        // concurrent reconcile for the same source that starts later (an
-        // overlapping event-driven trigger, or the hourly sweep) is
-        // guaranteed to claim a higher one — see `record_reconcile_attempt`
-        // for why that ordering is what makes the retry marker race-safe.
-        let generation = self.begin_reconcile_attempt(s3_source_id).await?;
-
-        let result = if retentions.is_empty() {
+        if retentions.is_empty() {
             clear_temps_rules(&client, &source.bucket_name, s3_source_id).await
         } else {
             let rules = build_lifecycle_rules(&retentions);
             apply_lifecycle(&client, &source.bucket_name, rules, s3_source_id).await
-        };
-
-        // Record the outcome so a transient failure keeps this source in
-        // `sources_in_scope` — and therefore in the hourly sweep's retry
-        // path — even if it has no enabled schedule at the moment (e.g. the
-        // schedule that triggered this reconcile was the one just
-        // disabled). Cleared on the next success so a source that's
-        // genuinely out of scope stops being swept once it converges.
-        if let Err(e) = self
-            .record_reconcile_attempt(s3_source_id, generation, result.is_err())
-            .await
-        {
-            warn!(
-                s3_source_id,
-                error = %e,
-                "failed to persist S3 lifecycle reconcile retry state"
-            );
         }
-
-        result
     }
 
     /// Atomically claim the next reconcile "generation" for `s3_source_id`
@@ -433,6 +490,64 @@ pub fn is_unsupported_error(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: without `get_source_lock`, two overlapping
+    /// `reconcile_bucket` calls for the same source can each push a
+    /// different desired lifecycle state to S3 independently, and whichever
+    /// HTTP call lands last on S3 wins regardless of which attempt started
+    /// with fresher schedule state — the generation guard on
+    /// `record_reconcile_attempt` only protects the DB bookkeeping, not the
+    /// actual S3 mutation order. This proves the lock actually serializes
+    /// same-source access: while the first guard is held, a second
+    /// acquisition attempt for the same id must block until it's released.
+    #[tokio::test]
+    async fn source_lock_serializes_calls_for_the_same_source() {
+        let order: Arc<tokio::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let first_lock = get_source_lock(90_001);
+        let first_guard = first_lock.lock().await;
+
+        let order_clone = order.clone();
+        let waiter = tokio::spawn(async move {
+            let second_lock = get_source_lock(90_001);
+            let _second_guard = second_lock.lock().await;
+            order_clone.lock().await.push("second acquired");
+        });
+
+        // Give the spawned task a chance to actually attempt (and block
+        // on) the same-source lock before we record that the first guard
+        // is still held.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        order.lock().await.push("first still holding");
+        drop(first_guard);
+
+        waiter.await.expect("waiter task completes");
+
+        assert_eq!(
+            *order.lock().await,
+            vec!["first still holding", "second acquired"],
+            "a second reconcile for the same source must block until the first releases the lock"
+        );
+    }
+
+    /// Complement to the test above: two different source ids must not
+    /// contend on the same lock, so the sweep isn't accidentally serialized
+    /// across unrelated sources.
+    #[tokio::test]
+    async fn source_lock_does_not_serialize_different_sources() {
+        let held_lock = get_source_lock(90_101);
+        let _held_guard = held_lock.lock().await;
+
+        let other_lock = get_source_lock(90_102);
+        let other_acquired =
+            tokio::time::timeout(std::time::Duration::from_millis(500), other_lock.lock()).await;
+
+        assert!(
+            other_acquired.is_ok(),
+            "a different source id's lock must be acquirable while an unrelated source's lock is held"
+        );
+    }
 
     fn schedule_with_retention(
         id: i32,
