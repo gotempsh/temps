@@ -295,7 +295,7 @@ fn apply_managed_service_bindings(
     let template_slug = template.slug.clone();
 
     for (service, bindings) in template.managed_service_bindings {
-        let normalized_service = service.to_ascii_lowercase();
+        let normalized_service = temps_core::templates::canonical_managed_service_type(&service);
         let service_candidates = linked_service_vars_by_type
             .get(&normalized_service)
             .ok_or_else(|| DeploymentEnvResolutionError::ManagedServiceTypeMissing {
@@ -531,7 +531,8 @@ impl DeploymentEnvResolver {
                     continue;
                 }
             };
-            let service_type = service.service_type.to_ascii_lowercase();
+            let service_type =
+                temps_core::templates::canonical_managed_service_type(&service.service_type);
             match self
                 .external_service_manager
                 .get_runtime_env_vars(project_service.service_id, project.id, environment.id)

@@ -1194,7 +1194,11 @@ impl DeployComposeJob {
                 let retained = if containers.is_empty() {
                     false
                 } else {
-                    match self.compose_executor.stop(&project_name).await {
+                    match self
+                        .compose_executor
+                        .stop_at(&project_name, repo_path.as_deref(), Some(compose_file_name))
+                        .await
+                    {
                         Err(stop_error) => {
                             tracing::error!(
                                 deployment_id = self.deployment_id,

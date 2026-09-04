@@ -53,7 +53,8 @@ impl MigrationTrait for Migration {
                 "ALTER TABLE projects \
                  ADD CONSTRAINT projects_service_template_identity \
                  CHECK (\
-                    (project_type = 'service' AND service_template IS NOT NULL) OR \
+                    (project_type = 'service' AND service_template IS NOT NULL AND \
+                        template_slug IS NOT NULL AND btrim(template_slug) <> '') OR \
                     (project_type IN ('server', 'static') AND service_template IS NULL)\
                  )",
             )

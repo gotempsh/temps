@@ -4479,6 +4479,14 @@ export type CreateProjectFromTemplateRequest = {
  */
 export type CreateProjectFromTemplateResponse = {
     /**
+     * Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.
+     */
+    deployment_error?: string | null;
+    /**
+     * Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.
+     */
+    deployment_queued?: boolean | null;
+    /**
      * Message with additional info
      */
     message: string;

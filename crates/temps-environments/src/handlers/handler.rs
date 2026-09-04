@@ -43,6 +43,10 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             EnvVarError::NotFound(msg) => {
                 temps_core::error_builder::not_found().detail(msg).build()
             }
+            EnvVarError::EnvironmentNotFound { .. } => temps_core::error_builder::not_found()
+                .title("Environment not found")
+                .detail(err.to_string())
+                .build(),
             EnvVarError::InvalidInput(msg) => {
                 temps_core::error_builder::bad_request().detail(msg).build()
             }

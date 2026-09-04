@@ -535,7 +535,14 @@ export function TemplateConfigurator({
     onSuccess: async (data) => {
       await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
       await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
-      toast.success(`Project "${data.project_name}" created successfully!`)
+      if (data.deployment_queued === false) {
+        toast.warning(
+          data.deployment_error ??
+            `Project "${data.project_name}" was created, but deployment must be retried.`
+        )
+      } else {
+        toast.success(`Project "${data.project_name}" created successfully!`)
+      }
       onSuccess?.()
       navigate(`/projects/${data.project_slug}?new=true`)
     },
@@ -717,7 +724,7 @@ export function TemplateConfigurator({
     })
   }, [configurableTemplateEnvVars, watchedEnvVars])
 
-  if (isLoadingConnections) {
+  if (isLoadingConnections && !isImageTemplate) {
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />

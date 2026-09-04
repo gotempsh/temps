@@ -59,6 +59,7 @@ describe('template runtime defaults', () => {
 
   test('rejects resource limits below their requests', () => {
     const values = templateRuntimeDefaults(template)
+    values.image = `registry.example.test/identity@sha256:${'a'.repeat(64)}`
     values.cpuLimit = '0.25'
     values.memoryLimit = '256'
 
@@ -80,6 +81,21 @@ describe('template runtime defaults', () => {
 
     values.command = `start\n${'x'.repeat(1_025)}`
     expect(templateRuntimeDefaultsSchema.safeParse(values).success).toBe(false)
+  })
+
+  test('measures image, command, and health limits in UTF-8 bytes', () => {
+    const values = templateRuntimeDefaults(template)
+    values.image = `${'é'.repeat(225)}@sha256:${'a'.repeat(64)}`
+    values.command = 'é'.repeat(513)
+    values.healthCheckPath = `/${'é'.repeat(1_024)}`
+
+    const result = templateRuntimeDefaultsSchema.safeParse(values)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.path.join('.'))).toEqual(
+        expect.arrayContaining(['image', 'command', 'healthCheckPath'])
+      )
+    }
   })
 
   test('loads saved image runtime and project resources ahead of catalog defaults', () => {

@@ -34,6 +34,7 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { templateEnvironmentVariableDefaultsToSecret } from '@/lib/project-environment-variables'
+import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import {
   serviceTemplateRuntimeDefaults,
   templateRuntimeDefaults,
@@ -55,7 +56,9 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 
 export function ServiceTemplateRuntimeCard({
   project,
@@ -132,7 +135,8 @@ export function ServiceTemplateRuntimeCard({
       {
         loading: 'Saving service runtime…',
         success: 'Service runtime saved for the next deployment',
-        error: 'Failed to save service runtime',
+        error: (error) =>
+          getErrorMessage(error, 'Failed to save service runtime'),
       }
     )
   }
@@ -152,6 +156,7 @@ export function ServiceTemplateRuntimeCard({
         </Card>
       ) : instanceQuery.data ? (
         <ServiceTemplateUpgradeCard
+          key={`${instanceQuery.data.applied.version}-${instanceQuery.data.latest?.version ?? 'none'}`}
           project={project}
           instance={instanceQuery.data}
           onUpgraded={async () => {
@@ -465,9 +470,17 @@ function ServiceTemplateUpgradeCard({
   const upgrade = useMutation({
     ...upgradeProjectServiceTemplateMutation(),
   })
-  const [configuration, setConfiguration] = useState<Record<string, string>>({})
   const latest = instance.latest
   const requiredConfiguration = instance.required_configuration
+  const [configuration, setConfiguration] = useState<Record<string, string>>(
+    () =>
+      Object.fromEntries(
+        requiredConfiguration.map((variable) => [
+          variable.name,
+          variable.default ?? '',
+        ])
+      )
+  )
   const missingValues = useMemo(
     () =>
       requiredConfiguration.filter(
@@ -475,17 +488,6 @@ function ServiceTemplateUpgradeCard({
       ),
     [configuration, requiredConfiguration]
   )
-
-  useEffect(() => {
-    setConfiguration((current) =>
-      Object.fromEntries(
-        requiredConfiguration.map((variable) => [
-          variable.name,
-          current[variable.name] ?? variable.default ?? '',
-        ])
-      )
-    )
-  }, [requiredConfiguration])
 
   if (!latest) {
     return instance.catalog_error ? (
@@ -526,7 +528,8 @@ function ServiceTemplateUpgradeCard({
       {
         loading: `Applying ${latest.slug} ${latest.version}…`,
         success: 'Template update saved for the next deployment',
-        error: 'Failed to update service template',
+        error: (error) =>
+          getErrorMessage(error, 'Failed to update service template'),
       }
     )
   }
@@ -568,13 +571,19 @@ function ServiceTemplateUpgradeCard({
         {instance.missing_services.length > 0 && (
           <div className="flex gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
             <Database className="mt-0.5 size-4 shrink-0 text-amber-600" />
-            <div>
+            <div className="flex-1">
               <p className="font-medium">Link the required managed service</p>
               <p className="mt-1 text-muted-foreground">
                 Add {instance.missing_services.join(', ')} to this project
                 before applying the update. Existing service links are never
                 removed automatically.
               </p>
+              <Button variant="outline" size="sm" className="mt-3" asChild>
+                <Link to={legacyDatabasesRedirectPath(project.slug)}>
+                  <Database className="mr-2 size-4" />
+                  Manage databases
+                </Link>
+              </Button>
             </div>
           </div>
         )}

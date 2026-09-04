@@ -457,45 +457,6 @@ pub struct UpdateGitHubRepoRequest {
 pub struct UpdateAutomaticDeployRequest {
     pub automatic_deploy: bool,
 }
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateEnvVar {
-    pub name: String,
-    pub example: String,
-    pub default: Option<String>,
-}
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct Template {
-    pub name: String,
-    pub github: Option<TemplateGitHub>,
-    pub description: Option<String>,
-    pub features: Option<Vec<String>>,
-    pub services: Option<Vec<String>>,
-    pub image: Option<String>,
-    pub preset: Option<String>,
-    pub env: Option<Vec<TemplateEnvVar>>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateGitHub {
-    pub owner: String,
-    pub repo: String,
-    pub path: Option<String>,
-    pub r#ref: String,
-}
-
-// Add this new struct with the request schema
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    pub environment_variables: Option<Vec<(String, String)>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
 // Add query parameters struct
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ContainerLogsQuery {

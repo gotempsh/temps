@@ -89,7 +89,7 @@ describe("validateNativeTemplateConfig", () => {
 
     expect(result.valid).toBeFalse();
     expect(result.errors).toContain(
-      "templates[0].image must use an immutable sha256 digest",
+      "templates[0].image must be at most 512 bytes and use an immutable sha256 digest",
     );
     expect(result.errors).toContain(
       "templates[0].managed_service_bindings.postgres must also be listed in services",
@@ -115,7 +115,7 @@ describe("validateNativeTemplateConfig", () => {
 
     expect(result.valid).toBeFalse();
     expect(result.errors).toContain(
-      "templates[0].image must use an immutable sha256 digest",
+      "templates[0].image must be at most 512 bytes and use an immutable sha256 digest",
     );
   });
 
@@ -138,7 +138,7 @@ describe("validateNativeTemplateConfig", () => {
 
     expect(result.valid).toBeFalse();
     expect(result.errors).toContain(
-      "templates[0].image must use an immutable sha256 digest",
+      "templates[0].image must be at most 512 bytes and use an immutable sha256 digest",
     );
   });
 
@@ -274,6 +274,109 @@ describe("validateNativeTemplateConfig", () => {
     );
     expect(result.errors).toContain(
       "templates[0].resources.memory_request must not exceed memory_limit",
+    );
+  });
+
+  test("matches server validation for service presets, ports, and environment names", () => {
+    const result = validateNativeTemplateConfig({
+      version: "2",
+      templates: [
+        {
+          slug: "invalid-service-contract",
+          name: "Invalid service contract",
+          kind: "service",
+          version: "1.0.0",
+          git: { url: "https://example.test/invalid-service.git" },
+          preset: "nextjs",
+          image: PINNED_IMAGE,
+          exposed_port: 65_536,
+          env_vars: [
+            { name: "" },
+            { name: "DUPLICATE" },
+            { name: "DUPLICATE" },
+            "not-an-object",
+          ],
+        },
+      ],
+    });
+
+    expect(result.valid).toBeFalse();
+    expect(result.errors).toContain(
+      "templates[0].preset must be dockerfile for service templates",
+    );
+    expect(result.errors).toContain(
+      "templates[0].exposed_port must be between 1 and 65535",
+    );
+    expect(result.errors).toContain(
+      "templates[0].env_vars[0].name cannot be empty",
+    );
+    expect(result.errors).toContain(
+      'templates[0].env_vars name "DUPLICATE" is declared more than once',
+    );
+    expect(result.errors).toContain(
+      "templates[0].env_vars[3] must be an object",
+    );
+  });
+
+  test("matches server runtime-contract limits", () => {
+    const result = validateNativeTemplateConfig({
+      version: "2",
+      templates: [
+        {
+          slug: "invalid-runtime",
+          name: "Invalid runtime",
+          kind: "service",
+          version: "1.0.0",
+          git: { url: "https://example.test/service.git" },
+          preset: "dockerfile",
+          image: `@sha256:${"a".repeat(64)}`,
+          exposed_port: 3000,
+          command: Array.from({ length: 65 }, () => "arg"),
+          health_check_path: "https://attacker.test/ready",
+        },
+      ],
+    });
+
+    expect(result.valid).toBeFalse();
+    expect(result.errors).toContain(
+      "templates[0].image must be at most 512 bytes and use an immutable sha256 digest",
+    );
+    expect(result.errors).toContain(
+      "templates[0].command cannot contain more than 64 arguments",
+    );
+    expect(result.errors).toContain(
+      "templates[0].health_check_path must be a safe relative HTTP path starting with '/'",
+    );
+  });
+
+  test("measures runtime limits in UTF-8 bytes", () => {
+    const result = validateNativeTemplateConfig({
+      version: "2",
+      templates: [
+        {
+          slug: "utf8-runtime",
+          name: "UTF-8 runtime",
+          kind: "service",
+          version: "1.0.0",
+          git: { url: "https://example.test/service.git" },
+          preset: "dockerfile",
+          image: `${"é".repeat(225)}@sha256:${"a".repeat(64)}`,
+          exposed_port: 3000,
+          command: ["é".repeat(513)],
+          health_check_path: `/${"é".repeat(1_024)}`,
+        },
+      ],
+    });
+
+    expect(result.valid).toBeFalse();
+    expect(result.errors).toContain(
+      "templates[0].image must be at most 512 bytes and use an immutable sha256 digest",
+    );
+    expect(result.errors).toContain(
+      "templates[0].command arguments must be non-empty, at most 1024 bytes, and contain no control characters",
+    );
+    expect(result.errors).toContain(
+      "templates[0].health_check_path must be a safe relative HTTP path starting with '/'",
     );
   });
 
@@ -419,6 +522,8 @@ describe("readAndValidateTemplatePath", () => {
     const result = await readAndValidateTemplatePath(directory);
 
     expect(result.valid).toBeFalse();
-    expect(result.errors.some((error) => error.includes("Symbolic links"))).toBeTrue();
+    expect(
+      result.errors.some((error) => error.includes("Symbolic links")),
+    ).toBeTrue();
   });
 });

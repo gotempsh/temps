@@ -460,6 +460,15 @@ const NEVER_ALLOWED_SERVICE_KEYS: &[&str] = &[
     "security_opt",
     "sysctls",
     "volumes_from",
+    "external_links",
+    "label_file",
+    "post_start",
+    "pre_stop",
+    "provider",
+    "container_name",
+    "blkio_config",
+    "storage_opt",
+    "memswap_limit",
     "group_add",
     "runtime",
     "oom_kill_disable",
@@ -485,6 +494,9 @@ const REPO_ONLY_SERVICE_KEYS: &[&str] = &[
     "volumes",
     "shm_size",
     "labels",
+    "build",
+    "image",
+    "env_file",
 ];
 
 fn validate_preview_override(

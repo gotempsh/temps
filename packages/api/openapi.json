@@ -9093,6 +9093,20 @@
       "CreateProjectFromTemplateResponse": {
         "description": "Response after creating a project from template",
         "properties": {
+          "deployment_error": {
+            "description": "Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_queued": {
+            "description": "Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "message": {
             "description": "Message with additional info",
             "type": "string"

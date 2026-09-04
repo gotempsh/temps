@@ -857,6 +857,15 @@ class Projects {
   updateSettings = (options: Parameters<typeof sdk.updateProjectSettings>[0]) =>
     sdk.updateProjectSettings({ ...options, client: this.client });
 
+  getServiceTemplate = (options: Parameters<typeof sdk.getProjectServiceTemplate>[0]) =>
+    sdk.getProjectServiceTemplate({ ...options, client: this.client });
+
+  updateServiceRuntime = (options: Parameters<typeof sdk.updateServiceTemplateRuntime>[0]) =>
+    sdk.updateServiceTemplateRuntime({ ...options, client: this.client });
+
+  upgradeServiceTemplate = (options: Parameters<typeof sdk.upgradeProjectServiceTemplate>[0]) =>
+    sdk.upgradeProjectServiceTemplate({ ...options, client: this.client });
+
   // Deployments
   getDeployments = (options: Parameters<typeof sdk.getProjectDeployments>[0]) =>
     sdk.getProjectDeployments({ ...options, client: this.client });

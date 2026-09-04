@@ -735,7 +735,7 @@ format.
     checks, and project-scoped persistent volumes.
   - Failed containers are retained without public traffic for authenticated log
     inspection, with inline UI access and CLI retrieval, then removed on the
-    next deployment or project/environment deletion.
+    next successful deployment or project/environment deletion.
   - Deployment-stage logs and runtime container logs stream successfully; a
     transport failure is distinguishable from a container that emitted no logs.
 

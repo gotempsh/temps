@@ -115,8 +115,14 @@ export function filterTemplatesByKind(
   kind: string | undefined,
 ): TemplateResponse[] {
   if (!kind) return templates;
+  const normalizedKind = kind.toLowerCase();
+  if (normalizedKind !== "starter" && normalizedKind !== "service") {
+    throw new Error(
+      `Invalid template kind "${kind}". Expected "starter" or "service".`,
+    );
+  }
   return templates.filter(
-    (template) => template.kind.toLowerCase() === kind.toLowerCase(),
+    (template) => template.kind.toLowerCase() === normalizedKind,
   );
 }
 

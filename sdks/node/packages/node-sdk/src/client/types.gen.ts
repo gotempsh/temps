@@ -1428,17 +1428,53 @@ export type CreatePlanResponse = {
  */
 export type CreateProjectFromTemplateRequest = {
     /**
-     * Enable automatic deployment on push (defaults to true)
+     * Enable automatic deployment on push (defaults to true). Only honoured in
+     * fork mode; public-repo deploys cannot receive push webhooks.
      */
     automatic_deploy?: boolean;
+    /**
+     * Optional image entrypoint arguments. An empty list explicitly uses the
+     * image's own default command instead of the template command.
+     */
+    command?: Array<string> | null;
+    /**
+     * CPU limit override in microcores. Zero means uncapped.
+     */
+    cpu_limit?: number | null;
+    /**
+     * CPU request override in microcores (1_000_000 = one CPU core).
+     */
+    cpu_request?: number | null;
     /**
      * Environment variables to set (key-value pairs)
      */
     environment_variables?: Array<EnvVarInput>;
     /**
-     * Git provider connection ID (required to create the repository)
+     * Public container port override.
      */
-    git_provider_connection_id: number;
+    exposed_port?: number | null;
+    /**
+     * Git provider connection ID. When omitted, the project deploys directly
+     * from the template's public source repository instead of forking it.
+     */
+    git_provider_connection_id?: number | null;
+    /**
+     * Relative HTTP health-check path override.
+     */
+    health_check_path?: string | null;
+    /**
+     * Optional prebuilt-image override. Curated template values remain the
+     * default when this is omitted. Accepted only for image templates.
+     */
+    image?: string | null;
+    /**
+     * Memory limit override in MiB. Zero means uncapped.
+     */
+    memory_limit?: number | null;
+    /**
+     * Memory request override in MiB.
+     */
+    memory_request?: number | null;
     /**
      * Whether to make the repository private (defaults to true)
      */
@@ -1448,9 +1484,10 @@ export type CreateProjectFromTemplateRequest = {
      */
     project_name: string;
     /**
-     * Name for the new repository to create
+     * Name for the new repository to create. Required in fork mode; ignored in
+     * one-click public-repo mode.
      */
-    repository_name: string;
+    repository_name?: string | null;
     /**
      * Owner/organization for the new repository (defaults to authenticated user)
      */
@@ -1469,6 +1506,14 @@ export type CreateProjectFromTemplateRequest = {
  * Response after creating a project from template
  */
 export type CreateProjectFromTemplateResponse = {
+    /**
+     * Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.
+     */
+    deployment_error?: string | null;
+    /**
+     * Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.
+     */
+    deployment_queued?: boolean | null;
     /**
      * Message with additional info
      */
@@ -3161,6 +3206,11 @@ export type EnvVarTemplateResponse = {
      */
     default?: string | null;
     /**
+     * Frontend-side generator hint for the default value
+     * (e.g. `app_url`, `random_secret`, `random_hex_32`)
+     */
+    default_generator?: string | null;
+    /**
      * Description of what this variable is used for
      */
     description?: string | null;
@@ -3176,6 +3226,10 @@ export type EnvVarTemplateResponse = {
      * Whether this variable is required
      */
     required: boolean;
+    /**
+     * Whether values must use the protected secret reveal path.
+     */
+    secret: boolean;
 };
 
 /**
@@ -5448,6 +5502,7 @@ export type ListTemplatesQuery = {
      * Only return featured templates
      */
     featured?: boolean | null;
+    kind?: null | TemplateKind;
     /**
      * Filter templates by tag
      */
@@ -7151,10 +7206,41 @@ export type ProjectQuery = {
 
 export type ProjectResponse = {
     /**
+     * Opt-in to AI summarization of metric alert notifications (NULL/false = off).
+     */
+    ai_alert_summaries_enabled?: boolean | null;
+    /**
+     * Opt-in to AI summarization of API traffic analytics (NULL/false = off).
+     */
+    ai_api_traffic_summary_enabled?: boolean | null;
+    /**
+     * Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
+     */
+    ai_debug_chat_enabled?: boolean | null;
+    /**
+     * Opt-in to AI propose-then-confirm write capability (false = off).
+     */
+    ai_write_actions_enabled: boolean;
+    /**
+     * Whether this project also accepts deployments from a source other than
+     * `source_type` — chiefly, whether a Git-backed project will take an
+     * uploaded source archive (`drop`). `null` or `false` means only the
+     * configured `source_type` (plus Docker images and static bundles, which
+     * every project accepts) may be deployed.
+     */
+    allow_alternate_sources?: boolean | null;
+    /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
      */
     attack_mode: boolean;
     created_at: number;
+    /**
+     * ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed
+     * from cross-project discovery results. Default true (consistent with the
+     * OSS global-observability model where any OtelRead holder can query any
+     * project's telemetry).
+     */
+    cross_project_trace_sharing: boolean;
     /**
      * Deployment configuration (resources, autoscaling, features)
      */
@@ -7164,28 +7250,101 @@ export type ProjectResponse = {
      * Enable automatic preview environment creation for each branch
      */
     enable_preview_environments: boolean;
+    /**
+     * Opt-in to native error-tracking source context (false = off). When on,
+     * Temps stores uploaded source files and shows source code in stack traces.
+     */
+    error_source_context_enabled: boolean;
+    /**
+     * Where auto-capture reads source from (relative to the checkout). Null =
+     * the deployment's Docker build context.
+     */
+    error_source_root?: string | null;
     git_provider_connection_id?: number | null;
+    /**
+     * Git provider behind `git_provider_connection_id`: `github`,
+     * `github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when
+     * the project has no connection (public repository, Docker image or
+     * uploaded source).
+     *
+     * Clients must use this rather than guessing the host from `git_url`: a
+     * self-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and
+     * a connected project may have no clone URL stored at all.
+     */
+    git_provider_type?: string | null;
     /**
      * Git clone URL for the repository (used for public repos without a provider connection)
      */
     git_url?: string | null;
+    /**
+     * GitLab webhook ID installed on the connected repository.
+     * `null` when no GitLab webhook is installed (not connected to GitLab,
+     * or webhook was removed / never created).
+     */
+    gitlab_webhook_id?: number | null;
     id: number;
+    /**
+     * Hours to retain built Docker images before nightly cleanup. Null = use the
+     * system-wide default from settings.
+     */
+    image_retention_hours?: number | null;
+    /**
+     * Authoritative repository visibility. A missing connection alone does
+     * not imply that an incompletely configured repository is public.
+     */
+    is_public_repo: boolean;
     last_deployment?: number | null;
     main_branch: string;
     name: string;
     preset?: string | null;
+    preset_config?: null | PresetConfigSchema;
     /**
-     * Preset-specific configuration (Dockerfile path, build context, etc.)
+     * Idle timeout (seconds) for on-demand preview environments.
      */
-    preset_config?: unknown;
+    preview_envs_idle_timeout_seconds: number;
+    /**
+     * When true, newly-created preview environments default to on-demand mode
+     * (containers stop after the configured idle timeout to save resources).
+     */
+    preview_envs_on_demand: boolean;
+    /**
+     * Wake timeout (seconds) for on-demand preview environments.
+     */
+    preview_envs_wake_timeout_seconds: number;
+    /**
+     * Product lifecycle classification. `service` projects are tied to a
+     * persisted, versioned template release; this is independent from the
+     * deployment transport in `source_type`.
+     */
+    project_type: string;
     repo_name?: string | null;
     repo_owner?: string | null;
+    /**
+     * Logo from the immutable service-template release applied to this
+     * project. Clients should prefer it over a deployed site's favicon.
+     */
+    service_template_image_url?: string | null;
+    /**
+     * Exact service-template version currently applied to the project.
+     */
+    service_template_version?: string | null;
     slug: string;
     /**
      * Source type for deployments (git, docker_image, or static_files)
      */
     source_type: SourceType;
+    /**
+     * Bundled template slug that created this project. Clients use this to
+     * present template-specific runtime configuration instead of generic
+     * source-build controls.
+     */
+    template_slug?: string | null;
     updated_at: number;
+    /**
+     * Opt-in Trivy vulnerability scanning of this project's deployed Docker
+     * images. Off by default — project owners explicitly enable it.
+     */
+    vulnerability_scanning_enabled: boolean;
 };
 
 export type ProjectServiceInfo = {
@@ -9319,6 +9478,10 @@ export type TailLogsRequest = {
  */
 export type TemplateResponse = {
     /**
+     * Optional command passed to the image entrypoint.
+     */
+    command?: Array<string> | null;
+    /**
      * Short description
      */
     description?: string | null;
@@ -9326,6 +9489,10 @@ export type TemplateResponse = {
      * Environment variables template
      */
     env_vars: Array<EnvVarTemplateResponse>;
+    /**
+     * Container port the prebuilt image listens on (image deploys only).
+     */
+    exposed_port?: number | null;
     /**
      * Feature highlights
      */
@@ -9335,6 +9502,15 @@ export type TemplateResponse = {
      */
     git: GitRefResponse;
     /**
+     * HTTP health-check path probed after the container starts (image deploys).
+     */
+    health_check_path?: string | null;
+    /**
+     * Prebuilt Docker image reference. When set, the one-click deploy pulls and
+     * runs this image directly (no build); when absent it builds from `git`.
+     */
+    image?: string | null;
+    /**
      * URL to template image/icon
      */
     image_url?: string | null;
@@ -9343,6 +9519,18 @@ export type TemplateResponse = {
      */
     is_featured: boolean;
     /**
+     * Gallery this template belongs to.
+     */
+    kind: TemplateKind;
+    /**
+     * Managed-service environment aliases used at deployment time.
+     */
+    managed_service_bindings: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
+    /**
      * Display name
      */
     name: string;
@@ -9350,6 +9538,12 @@ export type TemplateResponse = {
      * Framework/preset to use
      */
     preset: string;
+    resources?: null | TemplateResources;
+    /**
+     * URL to a wide screenshot/banner preview of the deployed template.
+     * Absent for templates that don't have one captured yet.
+     */
+    screenshot_url?: string | null;
     /**
      * Required external services
      */
@@ -9362,6 +9556,10 @@ export type TemplateResponse = {
      * Tags/categories for filtering
      */
     tags: Array<string>;
+    /**
+     * Immutable release identifier for service templates.
+     */
+    version: string;
 };
 
 /**
@@ -29990,4 +30188,384 @@ export type CreateGenericProviderErrors = {
     401: unknown;
     403: unknown;
     500: unknown;
+};
+
+export type EnvVarTemplate = {
+    /**
+     * Default value if not provided by user
+     */
+    default?: string | null;
+    /**
+     * Frontend-side generator for the default value. Recognised values:
+     * `app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),
+     * `random_hex_32` (32-byte hex). Unknown values are ignored client-side.
+     */
+    default_generator?: string | null;
+    /**
+     * Description of what this variable is used for
+     */
+    description?: string | null;
+    /**
+     * Example value for documentation
+     */
+    example?: string | null;
+    /**
+     * Name of the environment variable
+     */
+    name: string;
+    /**
+     * Whether this variable is required
+     */
+    required?: boolean;
+    /**
+     * Explicit sensitivity classification for credentials whose names do not
+     * match the conservative built-in heuristic.
+     */
+    secret?: boolean;
+};
+
+export type ProjectTemplate = {
+    /**
+     * Optional command passed to the container image. This is needed for
+     * production images whose default command is intentionally a development
+     * mode (for example Keycloak).
+     */
+    command?: Array<string> | null;
+    /**
+     * Short description
+     */
+    description?: string | null;
+    /**
+     * Environment variables template
+     */
+    env_vars?: Array<EnvVarTemplate>;
+    /**
+     * Container port the prebuilt image listens on (used for routing when
+     * deploying from `image`). Falls back to the image's EXPOSE / 3000 default.
+     */
+    exposed_port?: number | null;
+    /**
+     * Feature highlights
+     */
+    features?: Array<string>;
+    /**
+     * Git repository reference (supports any git provider). Always present as
+     * the source-of-truth / build fallback, even for image-based templates.
+     */
+    git: GitRef;
+    /**
+     * HTTP health-check path probed after the container starts (image deploys
+     * can't read `.temps.yaml`). Must start with '/'. Defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
+     * Prebuilt Docker image reference (e.g. "ghcr.io/org/app:latest"). When set,
+     * the one-click deploy pulls and runs this image directly (source_type
+     * docker_image) instead of building from `git` — instant, no BuildKit. When
+     * absent, the template builds from source.
+     */
+    image?: string | null;
+    /**
+     * URL to template image/icon
+     */
+    image_url?: string | null;
+    /**
+     * Whether the template is featured/promoted
+     */
+    is_featured?: boolean;
+    /**
+     * Whether the template is publicly visible
+     */
+    is_public?: boolean;
+    /**
+     * Gallery this template belongs to. Older configurations default to a
+     * source-code starter, preserving their existing behaviour.
+     */
+    kind?: TemplateKind;
+    /**
+     * Environment aliases populated from a linked managed service. The outer
+     * key is the Temps service type and each inner entry maps an application
+     * variable to a variable supplied by that service.
+     *
+     * Example: `postgres.KC_DB_USERNAME: POSTGRES_USER`.
+     */
+    managed_service_bindings?: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
+    /**
+     * Display name
+     */
+    name: string;
+    /**
+     * Framework/preset to use (e.g., "nextjs", "fastapi", "dockerfile")
+     */
+    preset: string;
+    /**
+     * Preset-specific configuration
+     */
+    preset_config?: unknown;
+    resources?: null | TemplateResources;
+    /**
+     * URL to a full screenshot/banner preview of the deployed template (e.g.
+     * `/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the
+     * template card; optional — templates without one show no banner.
+     */
+    screenshot_url?: string | null;
+    /**
+     * Required external services (e.g., ["postgres", "redis"])
+     */
+    services?: Array<string>;
+    /**
+     * Unique identifier for the template (used in URLs)
+     */
+    slug: string;
+    /**
+     * Sort order for display (lower = first)
+     */
+    sort_order?: number;
+    /**
+     * Tags/categories for filtering
+     */
+    tags?: Array<string>;
+    /**
+     * Version of this template release. Service projects pin this value and
+     * the complete resolved definition so catalog updates are always an
+     * explicit, reviewable upgrade rather than a silent runtime mutation.
+     */
+    version?: string;
+};
+
+export type ServiceTemplateChangeKind = 'added' | 'removed' | 'changed';
+
+export type ServiceTemplateInstance = {
+    /**
+     * Catalog schema used to deserialize `template`.
+     */
+    schema_version: string;
+    /**
+     * Stable service family identifier.
+     */
+    slug: string;
+    /**
+     * Exact resolved release from which this project was created/upgraded.
+     */
+    template: ProjectTemplate;
+    /**
+     * Applied template release.
+     */
+    version: string;
+};
+
+export type ServiceTemplateInstanceResponse = {
+    applied: ServiceTemplateInstance;
+    /**
+     * The catalog definition changed without a version bump. Applying it is
+     * intentionally blocked because mutable releases make upgrades and
+     * rollbacks non-reproducible.
+     */
+    catalog_drift: boolean;
+    /**
+     * User-safe explanation when the active catalog could not provide this
+     * service family. The applied snapshot remains authoritative and editable.
+     */
+    catalog_error?: string | null;
+    changes: Array<ServiceTemplateUpgradeChange>;
+    latest?: null | ServiceTemplateInstance;
+    /**
+     * Managed service families that must be linked before this release can be
+     * applied. Existing links are never removed automatically.
+     */
+    missing_services: Array<string>;
+    project_id: number;
+    /**
+     * Required target inputs that are not currently configured and cannot be
+     * filled from a template default or generator.
+     */
+    required_configuration: Array<EnvVarTemplate>;
+    upgrade_available: boolean;
+};
+
+export type ServiceTemplateUpgradeChange = {
+    current?: string | null;
+    field: string;
+    kind: ServiceTemplateChangeKind;
+    target?: string | null;
+};
+
+export type TemplateKind = 'starter' | 'service';
+
+export type TemplateResources = {
+    cpu_limit?: number | null;
+    cpu_request?: number | null;
+    memory_limit?: number | null;
+    memory_request?: number | null;
+};
+
+export type UpdateServiceTemplateRuntimeRequest = {
+    /**
+     * Empty means use the image's own default command.
+     */
+    command?: Array<string>;
+    cpuLimit?: number | null;
+    cpuRequest?: number | null;
+    exposedPort?: number | null;
+    healthCheckPath: string;
+    imageRef: string;
+    memoryLimit?: number | null;
+    memoryRequest?: number | null;
+};
+
+export type UpgradeServiceTemplateRequest = {
+    /**
+     * Values for inputs introduced by the target release. Existing project
+     * values are preserved and cannot be overwritten through this endpoint.
+     */
+    environment_variables?: Array<EnvVarInput>;
+    /**
+     * Optimistic target selected from the preview. The server rejects a stale
+     * target if the catalog changes between preview and apply.
+     */
+    target_version: string;
+};
+
+export type UpdateServiceTemplateRuntimeData = {
+    body: UpdateServiceTemplateRuntimeRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-runtime';
+};
+
+export type UpdateServiceTemplateRuntimeErrors = {
+    /**
+     * Invalid service runtime
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateServiceTemplateRuntimeResponses = {
+    /**
+     * Service runtime updated successfully
+     */
+    200: ProjectResponse;
+};
+
+export type UpdateServiceTemplateRuntimeResponse = UpdateServiceTemplateRuntimeResponses[keyof UpdateServiceTemplateRuntimeResponses];
+
+export type GetProjectServiceTemplateData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-template';
+};
+
+export type GetProjectServiceTemplateErrors = {
+    /**
+     * Project is not a service
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+};
+
+export type GetProjectServiceTemplateResponses = {
+    /**
+     * Applied service release and upgrade preview
+     */
+    200: ServiceTemplateInstanceResponse;
+};
+
+export type GetProjectServiceTemplateResponse = GetProjectServiceTemplateResponses[keyof GetProjectServiceTemplateResponses];
+
+export type UpgradeProjectServiceTemplateData = {
+    body: UpgradeServiceTemplateRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-template/upgrade';
+};
+
+export type UpgradeProjectServiceTemplateErrors = {
+    /**
+     * Invalid or stale upgrade
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project or template not found
+     */
+    404: unknown;
+};
+
+export type UpgradeProjectServiceTemplateResponses = {
+    /**
+     * Service template upgraded
+     */
+    200: ProjectResponse;
+};
+
+export type UpgradeProjectServiceTemplateResponse = UpgradeProjectServiceTemplateResponses[keyof UpgradeProjectServiceTemplateResponses];
+
+export type GitRef = {
+    /**
+     * Path within the repository (for monorepos)
+     * Also accepts "subfolder" as an alias in YAML/JSON
+     */
+    path?: string | null;
+    /**
+     * Git reference (branch, tag, or commit)
+     */
+    ref?: string;
+    /**
+     * Git repository URL (e.g., "https://github.com/owner/repo.git" or "https://gitlab.com/owner/repo.git")
+     */
+    url: string;
 };

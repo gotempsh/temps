@@ -398,11 +398,30 @@ pub const VALID_SERVICES: &[&str] = &[
     "postgres", "mariadb", "redis", "mongodb", "s3", "kv", "blob", "rustfs",
 ];
 
+/// Canonical compatibility family for a managed-service type.
+///
+/// RustFS implements the S3 API, so templates that require object storage may
+/// use either the native S3 service or RustFS. Historical aliases are accepted
+/// here as well so every API, deployment, and UI path applies the same rule.
+pub fn canonical_managed_service_type(service_type: &str) -> String {
+    match service_type.trim().to_ascii_lowercase().as_str() {
+        "postgresql" => "postgres".to_string(),
+        "mysql" => "mariadb".to_string(),
+        "object_storage" | "object-storage" | "rustfs" => "s3".to_string(),
+        normalized => normalized.to_string(),
+    }
+}
+
+pub fn managed_service_types_compatible(required: &str, selected: &str) -> bool {
+    canonical_managed_service_type(required) == canonical_managed_service_type(selected)
+}
+
 fn is_pinned_image_reference(image: &str) -> bool {
-    image.rsplit_once('@').is_some_and(|(_, digest)| {
-        digest
-            .strip_prefix("sha256:")
-            .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()))
+    image.rsplit_once('@').is_some_and(|(name, digest)| {
+        !name.trim().is_empty()
+            && digest.strip_prefix("sha256:").is_some_and(|hash| {
+                hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit())
+            })
     })
 }
 
@@ -644,23 +663,14 @@ pub struct TemplateService {
 impl TemplateService {
     /// Create a new template service with an optional config file path
     /// Bundled templates are loaded automatically; external file can override them
-    pub fn new(config_path: Option<std::path::PathBuf>) -> Self {
-        // Load bundled templates by default
-        let config = match bundled_templates_config() {
-            Ok(config) => {
-                info!("Loaded {} bundled templates", config.templates.len());
-                config.clone()
-            }
-            Err(e) => {
-                warn!("Failed to parse bundled templates: {}", e);
-                TemplatesConfig::default()
-            }
-        };
+    pub fn new(config_path: Option<std::path::PathBuf>) -> Result<Self, TemplateConfigError> {
+        let config = bundled_templates_config()?.clone();
+        info!("Loaded {} bundled templates", config.templates.len());
 
-        Self {
+        Ok(Self {
             config: Arc::new(RwLock::new(config)),
             config_path,
-        }
+        })
     }
 
     /// Load templates from the configured file path (overrides bundled templates)
@@ -836,12 +846,35 @@ impl TemplateService {
             }
         }
 
-        if template
-            .command
-            .as_ref()
-            .is_some_and(|command| command.is_empty() || command.iter().any(|part| part.is_empty()))
-        {
-            errors.push("Command must contain only non-empty arguments".to_string());
+        if let Some(command) = &template.command {
+            if command.is_empty() {
+                errors.push("Command must contain only non-empty arguments".to_string());
+            }
+            if command.len() > 64 {
+                errors.push("Command cannot contain more than 64 arguments".to_string());
+            }
+            if command.iter().any(|part| {
+                part.trim().is_empty() || part.len() > 1_024 || part.chars().any(char::is_control)
+            }) {
+                errors.push(
+                    "Command arguments must be non-empty, at most 1024 bytes, and contain no control characters"
+                        .to_string(),
+                );
+            }
+        }
+
+        if let Some(path) = template.health_check_path.as_deref() {
+            if path.len() > 2_048
+                || !path.starts_with('/')
+                || path.contains('@')
+                || path.contains("://")
+                || path.chars().any(char::is_control)
+            {
+                errors.push(
+                    "Health-check path must be a safe relative HTTP path starting with '/'"
+                        .to_string(),
+                );
+            }
         }
 
         if let Some(resources) = &template.resources {
@@ -1147,6 +1180,15 @@ templates:
     }
 
     #[test]
+    fn managed_service_compatibility_uses_one_canonical_family() {
+        assert!(managed_service_types_compatible("postgresql", "postgres"));
+        assert!(managed_service_types_compatible("mysql", "MARIADB"));
+        assert!(managed_service_types_compatible("s3", "rustfs"));
+        assert!(managed_service_types_compatible("object-storage", "S3"));
+        assert!(!managed_service_types_compatible("redis", "postgres"));
+    }
+
+    #[test]
     fn test_get_by_slug() {
         let config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).unwrap();
 
@@ -1295,6 +1337,26 @@ templates:
     }
 
     #[test]
+    fn service_template_rejects_invalid_runtime_contract() {
+        let mut template = bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be part of the reviewed catalog");
+        template.image = Some(format!("@sha256:{}", "a".repeat(64)));
+        template.command = Some(vec!["ok".to_string(); 65]);
+        template.health_check_path = Some("https://attacker.test/ready".to_string());
+
+        let errors = TemplateService::validate_template(&template);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("immutable sha256 image digest")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("more than 64 arguments")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("Health-check path")));
+    }
+
+    #[test]
     fn template_resources_reject_requests_above_limits() {
         let mut template = bundled_template_by_slug("keycloak")
             .expect("Keycloak should be part of the reviewed catalog");
@@ -1358,7 +1420,7 @@ templates:
 
     #[tokio::test]
     async fn test_template_service() {
-        let service = TemplateService::new(None);
+        let service = TemplateService::new(None).expect("bundled templates must load");
 
         // Set config directly for testing
         let config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).unwrap();
@@ -1385,7 +1447,7 @@ templates:
 
     #[tokio::test]
     async fn private_templates_are_not_available_through_public_lookups() {
-        let service = TemplateService::new(None);
+        let service = TemplateService::new(None).expect("bundled templates must load");
         let mut template = bundled_template_by_slug("keycloak")
             .expect("Keycloak should be part of the reviewed catalog");
         template.is_public = false;
@@ -1413,7 +1475,8 @@ templates:
         let mut file = tempfile::NamedTempFile::new().expect("temporary template catalog");
         file.write_all(SAMPLE_CONFIG.as_bytes())
             .expect("write version-one catalog");
-        let service = TemplateService::new(Some(file.path().to_path_buf()));
+        let service = TemplateService::new(Some(file.path().to_path_buf()))
+            .expect("bundled templates must load");
 
         service
             .load()
@@ -1437,7 +1500,8 @@ templates:
         let mut file = tempfile::NamedTempFile::new().expect("temporary template catalog");
         file.write_all(yaml.as_bytes())
             .expect("write incompatible service catalog");
-        let service = TemplateService::new(Some(file.path().to_path_buf()));
+        let service = TemplateService::new(Some(file.path().to_path_buf()))
+            .expect("bundled templates must load");
 
         let error = service
             .load()
@@ -1461,7 +1525,7 @@ templates:
         let mut file = tempfile::NamedTempFile::new().expect("temporary template catalog");
         file.write_all(yaml.as_bytes())
             .expect("write incompatible service catalog");
-        let service = TemplateService::new(None);
+        let service = TemplateService::new(None).expect("bundled templates must load");
 
         let error = service
             .load_additional(file.path())

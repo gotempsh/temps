@@ -14,6 +14,8 @@ const SUPPORTED_KINDS = new Set(["starter", "service"]);
 const MAX_TEMPLATE_DIRECTORY_DEPTH = 16;
 const MAX_TEMPLATE_FILES = 1_000;
 const MAX_TEMPLATE_YAML_BYTES = 1024 * 1024;
+const utf8ByteLength = (value: string): number =>
+  new TextEncoder().encode(value).length;
 const SUPPORTED_MANAGED_SERVICES = new Set([
   "postgres",
   "mariadb",
@@ -192,6 +194,11 @@ export function validateNativeTemplateConfig(
       } else if (!isSemanticVersion(value.version)) {
         errors.push(`${prefix}.version must use Semantic Versioning`);
       }
+      if (value.preset !== "dockerfile") {
+        errors.push(
+          `${prefix}.preset must be dockerfile for service templates`,
+        );
+      }
     }
 
     if (!isRecord(value.git)) {
@@ -225,15 +232,59 @@ export function validateNativeTemplateConfig(
         )
       ) {
         errors.push(`${prefix}.command must contain non-empty arguments`);
+      } else {
+        const command = value.command as string[];
+        if (command.length > 64) {
+          errors.push(
+            `${prefix}.command cannot contain more than 64 arguments`,
+          );
+        }
+        if (
+          command.some(
+            (part) =>
+              part.trim() === "" ||
+              utf8ByteLength(part) > 1_024 ||
+              Array.from(part).some((character) => {
+                const code = character.codePointAt(0);
+                return code !== undefined && (code <= 31 || code === 127);
+              }),
+          )
+        ) {
+          errors.push(
+            `${prefix}.command arguments must be non-empty, at most 1024 bytes, and contain no control characters`,
+          );
+        }
+      }
+    }
+
+    if (value.health_check_path !== undefined) {
+      const path = value.health_check_path;
+      if (
+        typeof path !== "string" ||
+        utf8ByteLength(path) > 2_048 ||
+        !path.startsWith("/") ||
+        path.includes("@") ||
+        path.includes("://") ||
+        Array.from(path).some((character) => {
+          const code = character.codePointAt(0);
+          return code !== undefined && (code <= 31 || code === 127);
+        })
+      ) {
+        errors.push(
+          `${prefix}.health_check_path must be a safe relative HTTP path starting with '/'`,
+        );
       }
     }
 
     if (value.kind === "service") {
       if (
         typeof value.image !== "string" ||
+        utf8ByteLength(value.image) > 512 ||
         !pinnedImageReference(value.image)
       ) {
-        errors.push(`${prefix}.image must use an immutable sha256 digest`);
+        errors.push(
+          `${prefix}.image must be at most 512 bytes and use an immutable sha256 digest`,
+        );
       }
       if (value.resources !== undefined) {
         if (!isRecord(value.resources)) {
@@ -281,9 +332,10 @@ export function validateNativeTemplateConfig(
       }
       if (
         !Number.isInteger(value.exposed_port) ||
-        Number(value.exposed_port) <= 0
+        Number(value.exposed_port) <= 0 ||
+        Number(value.exposed_port) > 65_535
       ) {
-        errors.push(`${prefix}.exposed_port must be a positive integer`);
+        errors.push(`${prefix}.exposed_port must be between 1 and 65535`);
       }
     }
 
@@ -305,8 +357,25 @@ export function validateNativeTemplateConfig(
     if (value.env_vars !== undefined && !Array.isArray(value.env_vars)) {
       errors.push(`${prefix}.env_vars must be an array`);
     } else if (Array.isArray(value.env_vars)) {
+      const environmentVariableNames = new Set<string>();
       value.env_vars.forEach((variable, variableIndex) => {
-        if (!isRecord(variable)) return;
+        if (!isRecord(variable)) {
+          errors.push(`${prefix}.env_vars[${variableIndex}] must be an object`);
+          return;
+        }
+        const name =
+          typeof variable.name === "string" ? variable.name.trim() : "";
+        if (name === "") {
+          errors.push(
+            `${prefix}.env_vars[${variableIndex}].name cannot be empty`,
+          );
+        } else if (environmentVariableNames.has(name)) {
+          errors.push(
+            `${prefix}.env_vars name "${name}" is declared more than once`,
+          );
+        } else {
+          environmentVariableNames.add(name);
+        }
         if (
           isSecretEnvironmentVariable(variable) &&
           Object.prototype.hasOwnProperty.call(variable, "default")
@@ -372,7 +441,9 @@ async function yamlFilesIn(
 
   const metadata = await lstat(path);
   if (metadata.isSymbolicLink()) {
-    throw new Error(`Symbolic links are not allowed in template paths: ${path}`);
+    throw new Error(
+      `Symbolic links are not allowed in template paths: ${path}`,
+    );
   }
   if (metadata.isFile()) {
     if (extname(path) !== ".yaml") return files;

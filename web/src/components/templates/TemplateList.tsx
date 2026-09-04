@@ -13,11 +13,11 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   AlertCircle,
   Search,
   Star,
-  Loader2,
   LayoutGrid,
   List,
   RefreshCw,
@@ -98,8 +98,10 @@ export function TemplateList({
 
   if (isLoadingTemplates) {
     return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      <div className="grid gap-4 md:grid-cols-2" aria-label="Loading templates">
+        {[0, 1, 2, 3].map((item) => (
+          <Skeleton key={item} className="h-52 rounded-xl" />
+        ))}
       </div>
     )
   }
@@ -152,6 +154,7 @@ export function TemplateList({
               size="sm"
               className="rounded-r-none"
               onClick={() => setViewMode('grid')}
+              aria-label="Show templates as a grid"
             >
               <LayoutGrid className="h-4 w-4" />
             </Button>
@@ -160,6 +163,7 @@ export function TemplateList({
               size="sm"
               className="rounded-l-none"
               onClick={() => setViewMode('list')}
+              aria-label="Show templates as a list"
             >
               <List className="h-4 w-4" />
             </Button>

@@ -247,6 +247,27 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
         "a service project must persist its exact template release"
     );
 
+    for (slug_column, case) in [("NULL", "null"), ("'   '", "blank")] {
+        let statement = format!(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type, service_template, template_slug) \
+             VALUES ('Invalid service identity', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                     'invalid-service-{case}', 'service', '{{}}'::jsonb, {slug_column})"
+        );
+        assert!(
+            db.execute_unprepared(&statement).await.is_err(),
+            "a service project with a {case} template slug must be rejected"
+        );
+    }
+
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type, service_template, template_slug) \
+         VALUES ('Valid service', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                 'valid-service', 'service', '{}'::jsonb, 'keycloak')",
+    )
+    .await?;
+
     let server_with_release = db
         .execute_unprepared(
             "INSERT INTO projects \

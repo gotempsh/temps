@@ -1999,9 +1999,8 @@ pub async fn update_project_deployment_config(
     Ok(Json(ProjectResponse::map_from_project(updated_project)))
 }
 
-/// Atomically replace a service-template project's image runtime and resource
-/// profile. This endpoint is deliberately separate from generic project
-/// settings because these fields form one deployable configuration.
+/// Return the immutable service-template release applied to a project together
+/// with catalog drift, missing requirements, and an available upgrade preview.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/service-template",
@@ -2087,7 +2086,11 @@ pub async fn get_project_service_template(
                 .template
                 .services
                 .iter()
-                .filter(|service| !linked_service_types.contains(&service.to_ascii_lowercase()))
+                .filter(|service| {
+                    !linked_service_types.iter().any(|linked| {
+                        temps_core::templates::managed_service_types_compatible(service, linked)
+                    })
+                })
                 .cloned()
                 .collect()
         })
@@ -2195,7 +2198,11 @@ pub async fn upgrade_project_service_template(
         .template
         .services
         .iter()
-        .filter(|service| !linked_service_types.contains(&service.to_ascii_lowercase()))
+        .filter(|service| {
+            !linked_service_types.iter().any(|linked| {
+                temps_core::templates::managed_service_types_compatible(service, linked)
+            })
+        })
         .cloned()
         .collect::<Vec<_>>();
     if !missing_services.is_empty() {
@@ -2866,6 +2873,20 @@ fn project_created_from_template_telemetry_event(
     .with("service_count", service_count as i64)
 }
 
+fn image_deployment_dispatch_feedback(queued: bool) -> (Option<bool>, Option<String>) {
+    if queued {
+        (Some(true), None)
+    } else {
+        (
+            Some(false),
+            Some(
+                "The project was created, but its initial deployment could not be queued. Open the project and select Deploy to retry."
+                    .to_string(),
+            ),
+        )
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum TemplateServiceSelectionError {
     Missing(Vec<String>),
@@ -2938,6 +2959,15 @@ fn has_template_runtime_overrides(
         || request.health_check_path.is_some()
 }
 
+fn is_pinned_sha256_image_reference(image: &str) -> bool {
+    image.rsplit_once('@').is_some_and(|(name, digest)| {
+        !name.trim().is_empty()
+            && digest.strip_prefix("sha256:").is_some_and(|hash| {
+                hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
+            })
+    })
+}
+
 fn resolve_image_template_runtime(
     template: &temps_core::templates::ProjectTemplate,
     request: &super::templates::CreateProjectFromTemplateRequest,
@@ -2966,6 +2996,12 @@ fn resolve_image_template_runtime(
     {
         return Err(TemplateRuntimeOverrideError::InvalidImage {
             reason: "the image reference cannot contain whitespace or control characters"
+                .to_string(),
+        });
+    }
+    if !is_pinned_sha256_image_reference(image_ref) {
+        return Err(TemplateRuntimeOverrideError::InvalidImage {
+            reason: "use an immutable image reference ending in @sha256:<64 hex characters>"
                 .to_string(),
         });
     }
@@ -3053,9 +3089,9 @@ fn validate_template_service_selection(
     let missing = required_services
         .iter()
         .filter(|required| {
-            !selected_service_types
-                .iter()
-                .any(|selected| selected.eq_ignore_ascii_case(required))
+            !selected_service_types.iter().any(|selected| {
+                temps_core::templates::managed_service_types_compatible(required, selected)
+            })
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -3068,7 +3104,9 @@ fn validate_template_service_selection(
         .filter(|required| {
             selected_service_types
                 .iter()
-                .filter(|selected| selected.eq_ignore_ascii_case(required))
+                .filter(|selected| {
+                    temps_core::templates::managed_service_types_compatible(required, selected)
+                })
                 .count()
                 > 1
         })
@@ -3373,9 +3411,9 @@ async fn canonical_template_app_url(
 
 /// Create a new project from a template
 ///
-/// Creates a new repository from a template and sets up the project with the
-/// specified configuration. The template is cloned to a new repository under
-/// the authenticated user's account or specified organization.
+/// Image-backed service templates are created directly from their pinned image.
+/// Source-backed starter templates can either use their public repository or
+/// create a repository under the selected Git provider account.
 #[utoipa::path(
     post,
     path = "/projects/from-template",
@@ -3739,6 +3777,8 @@ pub async fn create_project_from_template(
     //    resolves the target environment, pulls the image, and runs it — no
     //    build. Failure to enqueue is logged but doesn't fail project creation
     //    (the user can redeploy from the UI).
+    let mut deployment_queued = None;
+    let mut deployment_error = None;
     if let Some(runtime) = image_to_deploy {
         let deploy_job =
             temps_core::Job::DeployImageRequested(temps_core::DeployImageRequestedJob {
@@ -3753,11 +3793,13 @@ pub async fn create_project_from_template(
                 "Failed to queue image deploy for project {} (image {}): {}",
                 project.id, runtime.image_ref, e
             );
+            (deployment_queued, deployment_error) = image_deployment_dispatch_feedback(false);
         } else {
             info!(
                 "Queued image deploy for project {} from image {}",
                 project.id, runtime.image_ref
             );
+            (deployment_queued, deployment_error) = image_deployment_dispatch_feedback(true);
         }
     }
 
@@ -3806,7 +3848,12 @@ pub async fn create_project_from_template(
 
     // 7. Return the response with the source/repository URL.
     let deploy_note = match deploy_mode {
-        "image" => "Deployed from the template's prebuilt image (no build).",
+        "image" if deployment_queued == Some(true) => {
+            "Initial deployment queued from the template's prebuilt image (no build)."
+        }
+        "image" => {
+            "Project created from the template's prebuilt image; deployment requires a retry."
+        }
         "fork" => "Repository created and initialized with template code.",
         _ => "Deployed directly from the template's public source repository.",
     };
@@ -3820,6 +3867,8 @@ pub async fn create_project_from_template(
             "Project created successfully from template '{}'. {} Services required: {:?}",
             template.name, deploy_note, template.services
         ),
+        deployment_queued,
+        deployment_error,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -3830,13 +3879,13 @@ mod tests {
     use super::{
         authorize_storage_service_scopes, canonicalize_template_environment_variables,
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
-        drop_preset_candidate_from, image_template_preset_config,
-        missing_required_template_configuration, parse_owner_repo_from_git_url,
-        production_environment_variable_names, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, require_template_creation_permissions,
-        resolve_image_template_runtime, service_template_changes,
-        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
-        TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        drop_preset_candidate_from, image_deployment_dispatch_feedback,
+        image_template_preset_config, missing_required_template_configuration,
+        parse_owner_repo_from_git_url, production_environment_variable_names,
+        project_created_from_template_telemetry_event, require_git_settings_permissions,
+        require_template_creation_permissions, resolve_image_template_runtime,
+        service_template_changes, validate_template_service_selection, DropPresetCandidate,
+        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -3880,6 +3929,10 @@ mod tests {
             Err(TemplateServiceSelectionError::Missing(required.clone()))
         );
         assert!(validate_template_service_selection(&required, &["POSTGRES".to_string()]).is_ok());
+        assert!(
+            validate_template_service_selection(&["s3".to_string()], &["rustfs".to_string()])
+                .is_ok()
+        );
         assert_eq!(
             validate_template_service_selection(
                 &required,
@@ -4063,7 +4116,8 @@ mod tests {
         let template = temps_core::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled");
         let mut request = image_template_request();
-        request.image = Some("quay.io/keycloak/keycloak:27.0.0".to_string());
+        let override_image = format!("quay.io/keycloak/keycloak@sha256:{}", "a".repeat(64));
+        request.image = Some(override_image.clone());
         request.command = Some(Vec::new());
         request.cpu_request = Some(750_000);
         request.cpu_limit = Some(1_500_000);
@@ -4076,7 +4130,7 @@ mod tests {
             .expect("valid overrides should resolve")
             .expect("Keycloak should resolve to image mode");
 
-        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:27.0.0");
+        assert_eq!(runtime.image_ref, override_image);
         assert_eq!(runtime.command, None);
         assert_eq!(runtime.cpu_request, Some(750_000));
         assert_eq!(runtime.cpu_limit, Some(1_500_000));
@@ -4096,6 +4150,19 @@ mod tests {
         assert!(matches!(
             resolve_image_template_runtime(&template, &request),
             Err(TemplateRuntimeOverrideError::InvalidHealthCheckPath { .. })
+        ));
+    }
+
+    #[test]
+    fn image_template_runtime_rejects_mutable_image_tags() {
+        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be bundled");
+        let mut request = image_template_request();
+        request.image = Some("quay.io/keycloak/keycloak:latest".to_string());
+
+        assert!(matches!(
+            resolve_image_template_runtime(&template, &request),
+            Err(TemplateRuntimeOverrideError::InvalidImage { .. })
         ));
     }
 
@@ -4458,6 +4525,19 @@ mod tests {
 
         assert_eq!(event.properties["template_source"], "bundled");
         assert_eq!(event.properties["template_slug"], "observability-starter");
+    }
+
+    #[test]
+    fn failed_image_dispatch_reports_partial_success_with_retry_guidance() {
+        let (queued, error) = image_deployment_dispatch_feedback(false);
+        assert_eq!(queued, Some(false));
+        assert!(error
+            .as_deref()
+            .is_some_and(|message| message.contains("select Deploy to retry")));
+
+        let (queued, error) = image_deployment_dispatch_feedback(true);
+        assert_eq!(queued, Some(true));
+        assert!(error.is_none());
     }
 
     #[test]

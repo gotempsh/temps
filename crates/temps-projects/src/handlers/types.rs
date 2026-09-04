@@ -173,7 +173,8 @@ pub struct ProjectEnvVarInput {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,
-    /// Exact slug returned by service-template preflight. Normal project creation omits it.
+    /// Optimistically reserved slug used by template creation to ensure the
+    /// persisted project receives the URL shown during configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_slug: Option<String>,
     pub repo_name: Option<String>,

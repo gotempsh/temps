@@ -1249,7 +1249,7 @@ impl DeployImageJob {
             .log(
             context,
             format!(
-                "Stopped and retained {} failed app container(s) for authenticated log inspection. They are not routed publicly and the next deployment removes them.",
+                "Stopped and retained {} failed app container(s) for authenticated log inspection. They are not routed publicly and the next successful deployment removes them.",
                 candidates.len()
             ),
         )

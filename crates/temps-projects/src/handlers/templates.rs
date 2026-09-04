@@ -169,7 +169,10 @@ pub struct ListTagsResponse {
 
 /// Request to create a project from a template
 ///
-/// Supports two deploy modes:
+/// Supports three deploy modes:
+///   * **Native image service mode** — curated service templates deploy a
+///     digest-pinned container image and retain their template release identity,
+///     runtime configuration, and managed-service bindings.
 ///   * **Fork mode** — when `git_provider_connection_id` is set, the template
 ///     repo is cloned into a new repository under the user's Git account and the
 ///     project tracks that fork (git-push deploys, automatic deploy on push).
@@ -274,6 +277,12 @@ pub struct CreateProjectFromTemplateResponse {
     pub template_slug: String,
     /// Message with additional info
     pub message: String,
+    /// Whether the initial deployment was successfully queued. This is set for
+    /// native image service templates; Git-backed modes use their pipeline flow.
+    pub deployment_queued: Option<bool>,
+    /// Actionable retry guidance when project creation succeeded but deployment
+    /// dispatch did not. Internal queue errors are never exposed.
+    pub deployment_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -373,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_template_service_integration() {
-        let service = TemplateService::new(None);
+        let service = TemplateService::new(None).expect("bundled templates must load");
 
         // Create test config
         let yaml = r#"

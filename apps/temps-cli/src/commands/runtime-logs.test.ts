@@ -4,6 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   parseDeploymentId,
+  runtimeLogConnectionFailed,
   selectRuntimeLogContainer,
 } from "./runtime-logs.js";
 
@@ -45,5 +46,21 @@ describe("parseDeploymentId", () => {
 
   test("rejects integers that are not safe in JavaScript", () => {
     expect(parseDeploymentId("9007199254740992")).toBeUndefined();
+  });
+});
+
+describe("runtimeLogConnectionFailed", () => {
+  test("treats a clean WebSocket close as success", () => {
+    expect(runtimeLogConnectionFailed(1000, false)).toBeFalse();
+  });
+
+  test("treats transport errors and abnormal closes as failures", () => {
+    expect(runtimeLogConnectionFailed(1000, true)).toBeTrue();
+    expect(runtimeLogConnectionFailed(1006, false)).toBeTrue();
+  });
+
+  test("does not infer transport state from application log contents", () => {
+    expect(runtimeLogConnectionFailed(1000, false)).toBeFalse();
+    expect(runtimeLogConnectionFailed(1011, false)).toBeTrue();
   });
 });

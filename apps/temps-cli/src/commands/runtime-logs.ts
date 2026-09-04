@@ -47,6 +47,18 @@ export function parseDeploymentId(value: string): number | undefined {
   return Number.isSafeInteger(deploymentId) ? deploymentId : undefined;
 }
 
+export function runtimeLogConnectionFailed(
+  closeCode: number,
+  websocketErrored: boolean,
+): boolean {
+  return websocketErrored || closeCode !== 1000;
+}
+
+function failRuntimeLogs(message: string): void {
+  failSpinner(message);
+  process.exitCode = 1;
+}
+
 export function registerRuntimeLogsCommand(program: Command): void {
   program
     .command("runtime-logs")
@@ -75,6 +87,7 @@ export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
     warning("No project specified");
     info("Use: bunx @temps-sdk/cli runtime-logs --project <slug>");
     info("Or link this directory: bunx @temps-sdk/cli link <slug>");
+    process.exitCode = 1;
     return;
   }
 
@@ -92,7 +105,7 @@ export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
   });
 
   if (projectError || !projectData) {
-    failSpinner(`Project "${projectName}" not found`);
+    failRuntimeLogs(`Project "${projectName}" not found`);
     return;
   }
   succeedSpinner(`Found project: ${projectData.name}`);
@@ -105,13 +118,13 @@ export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
   });
 
   if (envError || !environments || environments.length === 0) {
-    failSpinner("No environments found");
+    failRuntimeLogs("No environments found");
     return;
   }
 
   const environment = environments.find((e) => e.name === options.environment);
   if (!environment) {
-    failSpinner(`Environment "${options.environment}" not found`);
+    failRuntimeLogs(`Environment "${options.environment}" not found`);
     info(
       `Available environments: ${environments.map((e) => e.name).join(", ")}`,
     );
@@ -127,7 +140,7 @@ export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
   if (options.deployment) {
     const deploymentId = parseDeploymentId(options.deployment);
     if (deploymentId == null) {
-      failSpinner(`Invalid deployment ID "${options.deployment}"`);
+      failRuntimeLogs(`Invalid deployment ID "${options.deployment}"`);
       return;
     }
     const { data, error } = await listContainerHistory({
@@ -139,7 +152,9 @@ export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
       query: { deployment_id: deploymentId, limit: 100 },
     });
     if (error || !data) {
-      failSpinner(`Unable to fetch containers for deployment ${deploymentId}`);
+      failRuntimeLogs(
+        `Unable to fetch containers for deployment ${deploymentId}`,
+      );
       return;
     }
     containers = data.containers.filter((container) => container.is_current);
@@ -152,14 +167,14 @@ export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
       },
     });
     if (error || !data) {
-      failSpinner("Unable to fetch running containers");
+      failRuntimeLogs("Unable to fetch running containers");
       return;
     }
     containers = data.containers;
   }
 
   if (containers.length === 0) {
-    failSpinner(
+    failRuntimeLogs(
       options.deployment
         ? `No live retained containers found for deployment ${options.deployment}`
         : "No running containers found",
@@ -185,6 +200,7 @@ export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
     } else {
       warning("No container available");
     }
+    process.exitCode = 1;
     return;
   }
 
@@ -259,6 +275,7 @@ async function connectWebSocket(
     } as any);
 
     let sigintHandler: (() => void) | null = null;
+    let websocketErrored = false;
 
     ws.onopen = () => {
       if (follow) {
@@ -271,10 +288,13 @@ async function connectWebSocket(
     };
 
     ws.onmessage = (event) => {
-      formatLogMessage(event.data.toString());
+      const message = event.data.toString();
+      formatLogMessage(message);
     };
 
     ws.onerror = (error) => {
+      websocketErrored = true;
+      process.exitCode = 1;
       console.error(colors.error("WebSocket error:"), error);
     };
 
@@ -282,6 +302,10 @@ async function connectWebSocket(
       // Clean up the SIGINT handler
       if (sigintHandler) {
         process.removeListener("SIGINT", sigintHandler);
+      }
+
+      if (runtimeLogConnectionFailed(event.code, websocketErrored)) {
+        process.exitCode = 1;
       }
 
       if (follow) {

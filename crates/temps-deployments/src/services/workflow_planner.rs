@@ -8,7 +8,7 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
-use temps_core::{EncryptionService, SecretsManagerResolver};
+use temps_core::{canonical_managed_service_type, EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
 use thiserror::Error;
@@ -469,7 +469,7 @@ impl WorkflowPlanner {
                     continue;
                 }
             };
-            let service_type = service.service_type.to_ascii_lowercase();
+            let service_type = canonical_managed_service_type(&service.service_type);
             match self
                 .external_service_manager
                 .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
@@ -3499,7 +3499,7 @@ mod tests {
             .find(|job| job.job_id == "prepare_source_bundle")
             .expect("uploaded Compose must prepare its source archive");
         assert_eq!(prepare.job_type, "PrepareSourceBundleJob");
-        assert_eq!(prepare.dependencies, Some(serde_json::json!([])));
+        assert_eq!(prepare.dependencies, None);
         assert_eq!(
             prepare
                 .job_config

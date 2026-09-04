@@ -56,13 +56,24 @@ function hasControlCharacters(value: string): boolean {
   })
 }
 
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length
+}
+
 export const templateRuntimeDefaultsSchema = z
   .object({
     image: z
       .string()
       .trim()
       .min(1, 'Image reference is required')
-      .max(512, 'Image reference cannot exceed 512 characters')
+      .refine(
+        (value) => utf8ByteLength(value) <= 512,
+        'Image reference cannot exceed 512 bytes'
+      )
+      .regex(
+        /^.+@sha256:[0-9a-f]{64}$/i,
+        'Image reference must use an immutable SHA-256 digest'
+      )
       .refine(
         (value) =>
           !Array.from(value).some((character) => /\s/.test(character)) &&
@@ -83,7 +94,7 @@ export const templateRuntimeDefaultsSchema = z
       if (
         argumentsList.some(
           (argument) =>
-            argument.length > 1_024 || hasControlCharacters(argument)
+            utf8ByteLength(argument) > 1_024 || hasControlCharacters(argument)
         )
       ) {
         context.addIssue({
@@ -111,7 +122,10 @@ export const templateRuntimeDefaultsSchema = z
       .string()
       .trim()
       .min(1, 'Health-check path is required')
-      .max(2048, 'Health-check path cannot exceed 2048 characters')
+      .refine(
+        (value) => utf8ByteLength(value) <= 2_048,
+        'Health-check path cannot exceed 2048 bytes'
+      )
       .refine(
         (value) =>
           value.startsWith('/') &&

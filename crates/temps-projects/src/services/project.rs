@@ -639,7 +639,11 @@ fn template_resource_value(
 fn missing_required_service_types(required: &[String], linked: &HashSet<String>) -> Vec<String> {
     required
         .iter()
-        .filter(|service| !linked.contains(&service.to_ascii_lowercase()))
+        .filter(|service| {
+            !linked.iter().any(|linked_service| {
+                temps_core::templates::managed_service_types_compatible(service, linked_service)
+            })
+        })
         .cloned()
         .collect()
 }
@@ -654,18 +658,28 @@ fn validate_service_binding_compatibility(
     target: &temps_core::templates::ProjectTemplate,
 ) -> Result<(), ProjectError> {
     for required_service in &applied.services {
-        if !target
-            .services
-            .iter()
-            .any(|target_service| target_service.eq_ignore_ascii_case(required_service))
-        {
+        if !target.services.iter().any(|target_service| {
+            temps_core::templates::managed_service_types_compatible(
+                required_service,
+                target_service,
+            )
+        }) {
             return Err(ProjectError::InvalidInput(format!(
                 "Template upgrade cannot remove required managed service '{required_service}'; older deployments require it for safe rollback"
             )));
         }
     }
     for (service_type, applied_bindings) in &applied.managed_service_bindings {
-        let target_bindings = target.managed_service_bindings.get(service_type);
+        let target_bindings = target
+            .managed_service_bindings
+            .iter()
+            .find(|(target_service_type, _)| {
+                temps_core::templates::managed_service_types_compatible(
+                    service_type,
+                    target_service_type,
+                )
+            })
+            .map(|(_, bindings)| bindings);
         for (application_variable, service_variable) in applied_bindings {
             let preserved = target_bindings
                 .and_then(|bindings| bindings.get(application_variable))
@@ -4014,7 +4028,12 @@ impl ProjectService {
             let count = linked_services
                 .iter()
                 .filter_map(|(_, service)| service.as_ref())
-                .filter(|service| service.service_type.eq_ignore_ascii_case(required))
+                .filter(|service| {
+                    temps_core::templates::managed_service_types_compatible(
+                        required,
+                        &service.service_type,
+                    )
+                })
                 .count();
             if count > 1 {
                 return Err(ProjectError::InvalidInput(format!(

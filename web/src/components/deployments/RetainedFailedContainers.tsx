@@ -18,6 +18,7 @@ import {
   ChevronDown,
   ChevronUp,
   ExternalLink,
+  RefreshCw,
   ScrollText,
 } from 'lucide-react'
 import { useState } from 'react'
@@ -29,6 +30,32 @@ interface RetainedFailedContainersProps {
   environmentId: number
   deploymentId: number
   deploymentStatus: string | null | undefined
+}
+
+export function RetainedFailedContainersLoadError({
+  onRetry,
+}: {
+  onRetry: () => void
+}) {
+  return (
+    <Card className="border-destructive/40">
+      <CardContent className="flex flex-col gap-3 p-6 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h3 className="text-sm font-semibold">
+            Could not load retained deployment containers
+          </h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            The deployment failed, but its diagnostic container status could not
+            be retrieved.
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={onRetry}>
+          <RefreshCw className="mr-2 h-4 w-4" />
+          Retry
+        </Button>
+      </CardContent>
+    </Card>
+  )
 }
 
 /**
@@ -47,7 +74,7 @@ export function RetainedFailedContainers({
     null
   )
   const isFailed = deploymentStatus === 'failed'
-  const { data, isPending, isError } = useQuery({
+  const { data, isPending, isError, refetch } = useQuery({
     ...listContainerHistoryOptions({
       path: {
         project_id: projectId,
@@ -61,7 +88,10 @@ export function RetainedFailedContainers({
     enabled: isFailed && environmentId > 0,
   })
 
-  if (!isFailed || isError) return null
+  if (!isFailed) return null
+  if (isError) {
+    return <RetainedFailedContainersLoadError onRetry={() => void refetch()} />
+  }
   if (isPending) {
     return (
       <Card>
