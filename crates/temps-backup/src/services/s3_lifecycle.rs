@@ -109,6 +109,19 @@ fn get_source_lock(s3_source_id: i32) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Retry policy for the two small bookkeeping writes
+/// (`begin_reconcile_attempt`, `record_reconcile_attempt`) that guard the
+/// retry marker: a handful of fast retries, since these are single-row
+/// local DB round-trips, not calls to an external API. Enough to ride out a
+/// dropped pool connection or a momentary Postgres restart without
+/// meaningfully delaying the reconcile, but bounded so a genuine outage
+/// still surfaces as an error rather than hanging.
+fn reconcile_bookkeeping_retry() -> temps_core::retry::RetryConfig {
+    temps_core::retry::RetryConfig::new(3)
+        .with_base_delay(std::time::Duration::from_millis(100))
+        .with_max_delay(std::time::Duration::from_secs(1))
+}
+
 /// Reconciles S3 bucket lifecycle policies with the retention values
 /// configured on `backup_schedules`. Stateless — every call recomputes
 /// the desired state from the database.
@@ -230,23 +243,34 @@ impl S3LifecycleService {
     /// Atomically claim the next reconcile "generation" for `s3_source_id`
     /// and return it. Pairs with `record_reconcile_attempt`, which only
     /// applies its write while this is still the newest claimed generation.
+    ///
+    /// Retried with backoff: a bare transient DB error here (a dropped pool
+    /// connection, a momentary Postgres restart) would otherwise abort the
+    /// whole reconcile before it even reaches the S3 call, leaving no
+    /// retry marker recorded — indistinguishable from the source having
+    /// converged, and (once its last schedule is disabled) permanently
+    /// excluded from the sweep with a stale lifecycle rule still in S3.
     async fn begin_reconcile_attempt(&self, s3_source_id: i32) -> Result<i32, BackupError> {
-        let row = self
-            .db
-            .query_one(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE s3_sources SET lifecycle_reconcile_generation = lifecycle_reconcile_generation + 1 \
-                 WHERE id = $1 RETURNING lifecycle_reconcile_generation",
-                [s3_source_id.into()],
-            ))
+        reconcile_bookkeeping_retry()
+            .retry(|| async {
+                let row = self
+                    .db
+                    .query_one(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "UPDATE s3_sources SET lifecycle_reconcile_generation = lifecycle_reconcile_generation + 1 \
+                         WHERE id = $1 RETURNING lifecycle_reconcile_generation",
+                        [s3_source_id.into()],
+                    ))
+                    .await
+                    .map_err(BackupError::Database)?
+                    .ok_or_else(|| BackupError::NotFound {
+                        resource: "s3_source".to_string(),
+                        detail: format!("id {}", s3_source_id),
+                    })?;
+                row.try_get("", "lifecycle_reconcile_generation")
+                    .map_err(BackupError::Database)
+            })
             .await
-            .map_err(BackupError::Database)?
-            .ok_or_else(|| BackupError::NotFound {
-                resource: "s3_source".to_string(),
-                detail: format!("id {}", s3_source_id),
-            })?;
-        row.try_get("", "lifecycle_reconcile_generation")
-            .map_err(BackupError::Database)
     }
 
     /// Persist whether the reconcile attempt for `s3_source_id` failed, so
@@ -270,23 +294,36 @@ impl S3LifecycleService {
     /// a stale write is simply dropped (`exec` reports 0 rows affected,
     /// which isn't an error — the newer attempt already recorded, or will
     /// record, the outcome that matters).
+    ///
+    /// Also retried with backoff, for the same reason as
+    /// `begin_reconcile_attempt`: a bare transient DB error on this write
+    /// alone (distinct from the S3 call succeeding or failing) must not be
+    /// the difference between "retry marker recorded" and "source silently
+    /// drops out of the sweep."
     async fn record_reconcile_attempt(
         &self,
         s3_source_id: i32,
         generation: i32,
         failed: bool,
     ) -> Result<(), BackupError> {
-        temps_entities::s3_sources::Entity::update_many()
-            .col_expr(
-                temps_entities::s3_sources::Column::LifecycleReconcileFailedAt,
-                sea_orm::sea_query::Expr::value(failed.then(chrono::Utc::now)),
-            )
-            .filter(temps_entities::s3_sources::Column::Id.eq(s3_source_id))
-            .filter(temps_entities::s3_sources::Column::LifecycleReconcileGeneration.eq(generation))
-            .exec(self.db.as_ref())
+        reconcile_bookkeeping_retry()
+            .retry(|| async {
+                temps_entities::s3_sources::Entity::update_many()
+                    .col_expr(
+                        temps_entities::s3_sources::Column::LifecycleReconcileFailedAt,
+                        sea_orm::sea_query::Expr::value(failed.then(chrono::Utc::now)),
+                    )
+                    .filter(temps_entities::s3_sources::Column::Id.eq(s3_source_id))
+                    .filter(
+                        temps_entities::s3_sources::Column::LifecycleReconcileGeneration
+                            .eq(generation),
+                    )
+                    .exec(self.db.as_ref())
+                    .await
+                    .map(|_| ())
+                    .map_err(BackupError::Database)
+            })
             .await
-            .map(|_| ())
-            .map_err(BackupError::Database)
     }
 
     /// S3 sources actually in scope for Temps-managed lifecycle rules:
