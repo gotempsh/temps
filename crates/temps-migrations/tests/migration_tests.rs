@@ -295,7 +295,7 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
 }
 
 #[tokio::test]
-async fn test_managed_monitor_migration_backfill_uniqueness_down_and_reup() -> anyhow::Result<()> {
+async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyhow::Result<()> {
     if external_db_configured() {
         println!("Skipping managed-monitor migration test: external database configured");
         return Ok(());
@@ -374,7 +374,23 @@ async fn test_managed_monitor_migration_backfill_uniqueness_down_and_reup() -> a
     assert_eq!(rows[0].try_get::<String>("", "name")?, "Custom readiness");
     assert!(!rows[0].try_get::<bool>("", "is_managed")?);
     assert_eq!(rows[1].try_get::<String>("", "name")?, "production Monitor");
-    assert!(rows[1].try_get::<bool>("", "is_managed")?);
+    assert!(
+        !rows[1].try_get::<bool>("", "is_managed")?,
+        "an ordinary user-editable name is not durable ownership provenance"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
+
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'Temps managed', 'web', 60, true, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-test-production'",
+    )
+    .await?;
 
     let duplicate = db
         .execute_unprepared(
@@ -389,10 +405,60 @@ async fn test_managed_monitor_migration_backfill_uniqueness_down_and_reup() -> a
         "only one managed monitor is allowed per environment"
     );
 
-    Migrator::down(&db, Some(1)).await?;
-    assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
-    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared("DELETE FROM status_monitors WHERE name = 'Temps managed'")
+        .await?;
+    db.execute_unprepared(
+        "UPDATE status_monitors SET is_managed = TRUE WHERE name = 'production Monitor'",
+    )
+    .await?;
+    assert_eq!(
+        db.query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS count FROM status_monitors WHERE is_managed = TRUE".to_string(),
+        ))
+        .await?
+        .expect("managed monitor count row")
+        .try_get::<i64>("", "count")?,
+        1,
+        "simulate the ownership inferred by the previously shipped migration"
+    );
+
+    Migrator::up(&db, None).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
+    let corrected = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("default-named user monitor remains present");
+    assert!(
+        !corrected.try_get::<bool>("", "is_managed")?,
+        "the forward corrective migration must demote ownership inferred by the shipped migration"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("default-named user monitor remains present after rollback");
+    assert!(
+        restored.try_get::<bool>("", "is_managed")?,
+        "rolling back the corrective migration must restore the captured ownership state"
+    );
+
+    Migrator::up(&db, Some(1)).await?;
+    let corrected_again = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("default-named user monitor remains present after reapplying correction");
+    assert!(!corrected_again.try_get::<bool>("", "is_managed")?);
     Ok(())
 }
 

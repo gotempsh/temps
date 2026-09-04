@@ -7,10 +7,58 @@ import {
   historicalImageRuntime,
   serviceTemplateDeployOverrides,
   serviceTemplateRuntimeDefaults,
+  shouldSynchronizeServiceTemplateRuntimeForm,
   templateRuntimeDefaults,
   templateRuntimeDefaultsSchema,
   templateRuntimeOverrides,
 } from './template-runtime-defaults'
+
+describe('service template runtime form synchronization', () => {
+  test('does not replace dirty edits when project data refetches', () => {
+    expect(
+      shouldSynchronizeServiceTemplateRuntimeForm(
+        true,
+        'persisted-runtime-v1',
+        'persisted-runtime-v2',
+        41,
+        41
+      )
+    ).toBe(false)
+  })
+
+  test('synchronizes a clean form only when persisted defaults change', () => {
+    expect(
+      shouldSynchronizeServiceTemplateRuntimeForm(
+        false,
+        'persisted-runtime-v1',
+        'persisted-runtime-v2',
+        41,
+        41
+      )
+    ).toBe(true)
+    expect(
+      shouldSynchronizeServiceTemplateRuntimeForm(
+        false,
+        'persisted-runtime-v2',
+        'persisted-runtime-v2',
+        41,
+        41
+      )
+    ).toBe(false)
+  })
+
+  test('always synchronizes when the form is reused for another project', () => {
+    expect(
+      shouldSynchronizeServiceTemplateRuntimeForm(
+        true,
+        'project-a-runtime',
+        'project-b-runtime',
+        41,
+        42
+      )
+    ).toBe(true)
+  })
+})
 
 const template = {
   image: 'registry.example.test/identity:26.7.2',

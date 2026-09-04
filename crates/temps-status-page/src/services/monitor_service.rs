@@ -1253,6 +1253,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_monitor_does_not_claim_a_user_monitor_with_the_default_name() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+        let user_monitor = service
+            .create_monitor(
+                project.id,
+                CreateMonitorRequest {
+                    name: format!("{} Monitor", environment.name),
+                    monitor_type: "web".to_string(),
+                    environment_id: environment.id,
+                    check_interval_seconds: Some(60),
+                    check_path: Some("/user-health".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let managed_monitor = service
+            .ensure_monitor_for_environment(project.id, environment.id, &environment.name)
+            .await
+            .unwrap();
+
+        assert_ne!(managed_monitor.id, user_monitor.id);
+        service
+            .update_managed_check_path_for_environment(
+                project.id,
+                environment.id,
+                Some("/deployed-health"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_monitor(user_monitor.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/user-health")
+        );
+        assert_eq!(
+            service
+                .get_monitor(managed_monitor.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/deployed-health")
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_environment_events_create_one_managed_monitor() {
         let Ok(test_db) = TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");

@@ -219,6 +219,7 @@ mod m20260831_000002_backfill_acme_verification_method;
 mod m20260902_000001_backup_safety_and_provenance;
 mod m20260903_000001_add_service_project_identity;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
+mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 
 pub struct Migrator;
 
@@ -481,6 +482,7 @@ impl MigratorTrait for Migrator {
             ),
             Box::new(m20260831_000002_add_managed_status_monitors::Migration),
             Box::new(m20260903_000001_add_service_project_identity::Migration),
+            Box::new(m20260904_000001_reset_ambiguous_managed_status_monitors::Migration),
         ]
     }
 }
@@ -523,6 +525,10 @@ mod registry_tests {
             (
                 "m20260831_000002_add_managed_status_monitors",
                 "m20260903_000001_add_service_project_identity",
+            ),
+            (
+                "m20260903_000001_add_service_project_identity",
+                "m20260904_000001_reset_ambiguous_managed_status_monitors",
             ),
         ] {
             let shipped_position = names

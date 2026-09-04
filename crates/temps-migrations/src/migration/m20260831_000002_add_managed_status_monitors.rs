@@ -23,25 +23,10 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Before provenance existed, automatic monitors were created with this
-        // deterministic name. Backfill only that exact convention; all other
-        // monitors remain user-managed and will never be rewritten by deploys.
-        manager
-            .get_connection()
-            .execute_unprepared(
-                "UPDATE status_monitors AS monitor \
-                 SET is_managed = TRUE \
-                 FROM environments AS environment \
-                 WHERE monitor.environment_id = environment.id \
-                   AND monitor.name = environment.name || ' Monitor' \
-                   AND monitor.id = ( \
-                       SELECT MIN(candidate.id) \
-                       FROM status_monitors AS candidate \
-                       WHERE candidate.environment_id = environment.id \
-                         AND candidate.name = environment.name || ' Monitor' \
-                   )",
-            )
-            .await?;
+        // Existing rows have no durable provenance. Their names and runtime
+        // settings were always user-editable, so none can safely be claimed as
+        // platform-managed during migration. The next deployment creates a
+        // separate managed monitor while preserving every existing monitor.
         manager
             .get_connection()
             .execute_unprepared(
