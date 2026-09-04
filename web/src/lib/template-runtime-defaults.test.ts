@@ -19,7 +19,9 @@ describe('service template runtime form synchronization', () => {
       shouldSynchronizeServiceTemplateRuntimeForm(
         true,
         'persisted-runtime-v1',
-        'persisted-runtime-v2'
+        'persisted-runtime-v2',
+        41,
+        41
       )
     ).toBe(false)
   })
@@ -29,16 +31,32 @@ describe('service template runtime form synchronization', () => {
       shouldSynchronizeServiceTemplateRuntimeForm(
         false,
         'persisted-runtime-v1',
-        'persisted-runtime-v2'
+        'persisted-runtime-v2',
+        41,
+        41
       )
     ).toBe(true)
     expect(
       shouldSynchronizeServiceTemplateRuntimeForm(
         false,
         'persisted-runtime-v2',
-        'persisted-runtime-v2'
+        'persisted-runtime-v2',
+        41,
+        41
       )
     ).toBe(false)
+  })
+
+  test('always synchronizes when the form is reused for another project', () => {
+    expect(
+      shouldSynchronizeServiceTemplateRuntimeForm(
+        true,
+        'project-a-runtime',
+        'project-b-runtime',
+        41,
+        42
+      )
+    ).toBe(true)
   })
 })
 

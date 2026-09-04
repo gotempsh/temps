@@ -98,6 +98,7 @@ export function ServiceTemplateRuntimeCard({
   )
   const runtimeDefaultsKey = JSON.stringify(runtimeDefaults)
   const appliedDefaultsKey = useRef<string | null>(null)
+  const appliedProjectId = useRef<number | null>(null)
   const isDirty = form.formState.isDirty
 
   useEffect(() => {
@@ -105,14 +106,17 @@ export function ServiceTemplateRuntimeCard({
       !shouldSynchronizeServiceTemplateRuntimeForm(
         isDirty,
         appliedDefaultsKey.current,
-        runtimeDefaultsKey
+        runtimeDefaultsKey,
+        appliedProjectId.current,
+        project.id
       )
     ) {
       return
     }
     form.reset(runtimeDefaults)
     appliedDefaultsKey.current = runtimeDefaultsKey
-  }, [form, isDirty, runtimeDefaults, runtimeDefaultsKey])
+    appliedProjectId.current = project.id
+  }, [form, isDirty, project.id, runtimeDefaults, runtimeDefaultsKey])
 
   const template = instanceQuery.data?.applied.template
   const appliedVersion = instanceQuery.data?.applied.version

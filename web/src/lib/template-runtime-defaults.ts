@@ -260,9 +260,13 @@ export function serviceTemplateRuntimeDefaults(
 export function shouldSynchronizeServiceTemplateRuntimeForm(
   isDirty: boolean,
   appliedDefaultsKey: string | null,
-  nextDefaultsKey: string
+  nextDefaultsKey: string,
+  appliedProjectId: number | null,
+  nextProjectId: number
 ): boolean {
-  return !isDirty && appliedDefaultsKey !== nextDefaultsKey
+  const projectChanged =
+    appliedProjectId !== null && appliedProjectId !== nextProjectId
+  return projectChanged || (!isDirty && appliedDefaultsKey !== nextDefaultsKey)
 }
 
 export function serviceTemplateDeployOverrides(
