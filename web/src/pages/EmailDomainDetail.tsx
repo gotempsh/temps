@@ -7,7 +7,6 @@ import {
   deleteEmailDomain,
   getDomain,
   getEmailStats,
-  getProjects,
   listEmailDomainProjects,
   authorizeEmailDomainProject,
   revokeEmailDomainProject,
@@ -20,7 +19,6 @@ import {
   type EmailProviderResponse,
   type EmailStatsResponse,
   type AuthorizedEmailDomainProjectResponse,
-  type ProjectResponse,
   type SetupDnsResponse,
 } from '@/api/client'
 import {
@@ -28,6 +26,7 @@ import {
   DnsVerificationSummary,
   StatusPill,
 } from '@/components/email/EmailDomainsManagement'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -63,12 +62,10 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Input } from '@/components/ui/input'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useDebounce } from '@/hooks/useDebounce'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -133,16 +130,6 @@ async function fetchAuthorizedProjects(domainId: number): Promise<AuthorizedEmai
   return response.data ?? []
 }
 
-async function fetchProjects(search: string): Promise<ProjectResponse[]> {
-  const response = await getProjects({
-    query: { page: 1, per_page: 25, search: search.trim() || undefined },
-  })
-  if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch projects'))
-  }
-  return response.data.projects
-}
-
 const STAT_DIVIDER_CLASSES = cn(
   // Mobile: 2 columns — vertical divider on the right column, horizontal
   // divider once a second row starts (items 3+, since there are 5 items).
@@ -200,9 +187,6 @@ export function EmailDomainDetail() {
 
   const [selectedDnsProviderId, setSelectedDnsProviderId] = useState<number | null>(null)
   const [dnsSetupResult, setDnsSetupResult] = useState<SetupDnsResponse | null>(null)
-  const [selectedProjectId, setSelectedProjectId] = useState<string>('')
-  const [projectSearch, setProjectSearch] = useState('')
-  const debouncedProjectSearch = useDebounce(projectSearch, 300)
   const [projectToRevoke, setProjectToRevoke] = useState<AuthorizedEmailDomainProjectResponse | null>(null)
 
   const {
@@ -246,23 +230,9 @@ export function EmailDomainDetail() {
     enabled: !!id,
   })
 
-  const {
-    data: allProjects = [],
-    isLoading: isLoadingProjects,
-    error: projectsError,
-    refetch: refetchProjects,
-  } = useQuery({
-    queryKey: ['projects', 'email-domain-authorization', debouncedProjectSearch],
-    queryFn: () => fetchProjects(debouncedProjectSearch),
-    enabled: canManageAuthorizations,
-  })
-
   const domain = domainDetails?.domain
   const dnsRecords = domainDetails?.dns_records ?? []
   const provider = providers?.find((p) => p.id === domain?.provider_id)
-  const availableProjects = allProjects.filter(
-    project => !authorizedProjects.some(authorized => authorized.id === project.id),
-  )
 
   useEffect(() => {
     setBreadcrumbs([
@@ -283,26 +253,29 @@ export function EmailDomainDetail() {
       return response.data
     },
     onSuccess: (data) => {
-      const verifiedCount = data.dns_records.filter(r => r.status === 'verified').length
-      const totalCount = data.dns_records.length
-      const pendingCount = data.dns_records.filter(r => r.status === 'pending').length
-      const failedCount = data.dns_records.filter(r => r.status === 'failed').length
+      // MX is optional — exclude it from the counts shown to the user so the
+      // toast reflects the records that actually gate the domain status.
+      const required = data.dns_records.filter(r => r.record_type !== 'MX')
+      const verifiedCount = required.filter(r => r.status === 'verified').length
+      const totalCount = required.length
+      const pendingCount = required.filter(r => r.status === 'pending').length
+      const failedCount = required.filter(r => r.status === 'failed').length
 
       if (data.domain.status === 'verified') {
         toast.success('Domain verified', {
-          description: `All ${totalCount} DNS records are properly configured.`,
+          description: `All ${totalCount} required DNS records are properly configured.`,
         })
       } else if (failedCount > 0) {
         toast.error('Some DNS records failed verification', {
-          description: `${failedCount} of ${totalCount} records failed.`,
+          description: `${failedCount} of ${totalCount} required records failed.`,
         })
       } else if (pendingCount > 0) {
         toast.warning('Verification in progress', {
-          description: `${verifiedCount} of ${totalCount} records verified. DNS propagation can take up to 48 hours.`,
+          description: `${verifiedCount} of ${totalCount} required records verified. DNS propagation can take up to 48 hours.`,
         })
       } else {
         toast.info('Verification status updated', {
-          description: `${verifiedCount} of ${totalCount} records verified.`,
+          description: `${verifiedCount} of ${totalCount} required records verified.`,
         })
       }
 
@@ -370,7 +343,6 @@ export function EmailDomainDetail() {
       }
     },
     onSuccess: () => {
-      setSelectedProjectId('')
       queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
       toast.success('Project authorized', {
         description: 'Deployments in this project can now send from this domain.',
@@ -476,8 +448,11 @@ export function EmailDomainDetail() {
 
   const hasDnsProviders = dnsProviders && dnsProviders.length > 0
   const isVerified = domain.status === 'verified'
-  const verifiedCount = dnsRecords.filter(r => r.status === 'verified').length
-  const totalCount = dnsRecords.length
+  // MX is optional — exclude it from the "N of M verified" tally in the
+  // overview panel and card description, consistent with DnsVerificationSummary.
+  const requiredDnsRecords = dnsRecords.filter(r => r.record_type !== 'MX')
+  const verifiedCount = requiredDnsRecords.filter(r => r.status === 'verified').length
+  const totalCount = requiredDnsRecords.length
 
   return (
     <div className="flex-1 overflow-auto">
@@ -837,54 +812,24 @@ export function EmailDomainDetail() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                {canManageAuthorizations && !authorizationsError && !projectsError && <div className="space-y-2">
-                  <Input
-                    aria-label="Search projects"
-                    value={projectSearch}
-                    onChange={event => {
-                      setProjectSearch(event.target.value)
-                      setSelectedProjectId('')
-                    }}
-                    placeholder="Search projects by name or slug"
-                  />
-                  <div className="flex gap-2">
-                  <Select value={selectedProjectId} onValueChange={setSelectedProjectId}>
-                    <SelectTrigger
-                      aria-label="Project to authorize"
-                      className="min-w-0 flex-1"
-                      disabled={isLoadingProjects}
-                    >
-                      <SelectValue placeholder={isLoadingProjects ? 'Loading projects…' : 'Select a project'} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {availableProjects.length === 0 ? (
-                        <div className="px-2 py-6 text-center text-sm text-muted-foreground">
-                          No matching projects
-                        </div>
-                      ) : (
-                        availableProjects.map(project => (
-                          <SelectItem key={project.id} value={String(project.id)}>
-                            {project.name}
-                          </SelectItem>
-                        ))
-                      )}
-                    </SelectContent>
-                  </Select>
-                  <Button
-                    variant="outline"
-                    onClick={() => authorizeProjectMutation.mutate(Number(selectedProjectId))}
-                    disabled={!selectedProjectId || authorizeProjectMutation.isPending}
-                  >
-                    {authorizeProjectMutation.isPending && <Loader2 className="mr-2 size-4 animate-spin" />}
-                    Authorize
-                  </Button>
+                {canManageAuthorizations && !authorizationsError && (
+                  <div className="flex items-center gap-2">
+                    <ProjectSelect
+                      value={null}
+                      onValueChange={(projectId) => {
+                        if (projectId != null) authorizeProjectMutation.mutate(projectId)
+                      }}
+                      allowAll={false}
+                      excludeIds={authorizedProjects.map((p) => p.id)}
+                      placeholder="Search projects by name or slug"
+                      disabled={authorizeProjectMutation.isPending}
+                      className="w-full sm:w-full"
+                    />
+                    {authorizeProjectMutation.isPending && (
+                      <Loader2 className="size-4 shrink-0 animate-spin text-muted-foreground" />
+                    )}
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    {availableProjects.length === 0
-                      ? 'No projects match this search or all matches are already authorized.'
-                      : `Showing ${availableProjects.length} of up to 25 matches. Refine the search to find another project.`}
-                  </p>
-                </div>}
+                )}
 
                 {isLoadingAuthorizations ? (
                   <Skeleton className="h-16 w-full" />
@@ -895,17 +840,6 @@ export function EmailDomainDetail() {
                     <AlertDescription className="flex items-center justify-between gap-3">
                       <span>{authorizationsError.message}</span>
                       <Button variant="outline" size="sm" onClick={() => refetchAuthorizations()}>
-                        Retry
-                      </Button>
-                    </AlertDescription>
-                  </Alert>
-                ) : projectsError && canManageAuthorizations ? (
-                  <Alert variant="destructive">
-                    <AlertCircle className="size-4" />
-                    <AlertTitle>Could not load available projects</AlertTitle>
-                    <AlertDescription className="flex items-center justify-between gap-3">
-                      <span>{projectsError.message}</span>
-                      <Button variant="outline" size="sm" onClick={() => refetchProjects()}>
                         Retry
                       </Button>
                     </AlertDescription>
