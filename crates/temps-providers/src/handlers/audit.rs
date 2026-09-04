@@ -24,6 +24,20 @@ pub struct ExternalServiceUpdatedAudit {
     pub updated_parameter_names: Vec<String>,
 }
 
+/// A deliberate, operator-initiated move of a Postgres service's continuous
+/// WAL-G archiving to a different S3 source. Audited both directions since
+/// it's consequential: base backups taken before this call have WAL segments
+/// under `previous_s3_source_id` that will no longer be verifiable once
+/// archiving points at `new_s3_source_id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WalgArchiveSourceRepointedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub previous_s3_source_id: Option<i32>,
+    pub new_s3_source_id: i32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceParameterRevealedAudit {
     pub context: AuditContext,
@@ -245,6 +259,29 @@ pub struct ExternalServiceClusterMemberPromotedAudit {
 impl AuditOperation for ExternalServiceCreatedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for WalgArchiveSourceRepointedAudit {
+    fn operation_type(&self) -> String {
+        "WALG_ARCHIVE_SOURCE_REPOINTED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

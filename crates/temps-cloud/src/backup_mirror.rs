@@ -239,7 +239,6 @@ async fn sweep(
 
     let mut resources = SweepResources::load(db, encryption, &candidates).await?;
     let mut made_progress = false;
-    let mut retry_required = false;
 
     for backup in candidates {
         // Inspection results are useful only while constructing one backup's
@@ -282,34 +281,39 @@ async fn sweep(
                     Some(&reason),
                 )
                 .await?;
-                // Deliberately does NOT set `retry_required`. `Unsupported`
-                // means this specific backup already has its own long
-                // `retry_after` window from `mirror_retry_delay`, so it is
-                // excluded from `DUE_BACKUPS_SQL` on its own — it needs no
-                // help from the outer loop. Treating it the same as
-                // `StageError::Retry` here doubled the backoff: one
-                // permanently-unsupported backup (e.g. an empty RustFS
+                // Never degrades the sweep-wide cadence (see `next_sweep_interval`,
+                // below). `Unsupported` means this specific backup already has
+                // its own long `retry_after` window from `mirror_retry_delay`,
+                // so it is excluded from `DUE_BACKUPS_SQL` on its own — it needs
+                // no help from the outer loop. Folding it into a shared signal
+                // let one permanently-unsupported backup (e.g. an empty RustFS
                 // mirror, or an old WAL-G repository missing the
-                // `temps_backup_id` tag) would ratchet the *whole* sweep's
-                // cadence up to `MAX_SWEEP_INTERVAL` and hold it there
-                // indefinitely, delaying discovery of every other backup on
-                // the instance — including brand new, healthy ones — by up
-                // to 15 minutes each tick, with no way to recover short of
-                // clearing the offending backup.
+                // `temps_backup_id` tag) ratchet the *whole* sweep's cadence up
+                // to `MAX_SWEEP_INTERVAL` and hold it there indefinitely,
+                // delaying discovery of every other backup on the instance —
+                // including brand new, healthy ones — with no way to recover
+                // short of clearing the offending backup.
             }
             Err(StageError::Retry(error)) => {
                 warn!(backup_id = %backup.backup_id, error = %error, "Cloud backup mirror unavailable; will retry without affecting the local backup");
                 persist_state(db, backup.id, tenant_id, "retry", "transient", Some(&error)).await?;
-                retry_required = true;
+                // Same reasoning as `Unsupported` above: `mirror_retry_delay(
+                // "transient", attempt_count)` already gives this backup its
+                // own bounded exponential backoff, and `DUE_BACKUPS_SQL`
+                // already excludes it until that window elapses. Most `Retry`
+                // causes (WAL not archived yet, a slow S3 listing, a
+                // transient Cloud 5xx) are properties of this one backup or
+                // this one call, not of the whole instance — one Postgres
+                // backup waiting on WAL archiving must not ratchet every
+                // other backup's, and every other *service's*, reporting
+                // cadence to `MAX_SWEEP_INTERVAL`.
             }
         }
     }
     if let Some(watermark) = selection.watermark {
         advance_discovery_cursor(db, tenant_id, watermark).await?;
     }
-    Ok(if retry_required {
-        SweepOutcome::Retry
-    } else if made_progress {
+    Ok(if made_progress {
         SweepOutcome::Progress
     } else {
         SweepOutcome::Idle
@@ -989,6 +993,7 @@ async fn mirror_walg_backup(
             backup.s3_location
         ))
     })?;
+    let service_id = external.as_ref().map(|external| external.service_id);
     let (source, engine, postgres_major) = load_postgres_identity(resources, external).await?;
     let source_config = resources.source(backup.s3_source_id)?;
     let client = resources.client(backup.s3_source_id)?;
@@ -1058,6 +1063,27 @@ async fn mirror_walg_backup(
         .collect::<std::collections::BTreeSet<_>>();
     for (segment, bound) in [(&first_wal, "start"), (&last_wal, "finish")] {
         if !archived.contains(segment.as_str()) {
+            // A missing segment is ordinarily just WAL catching up — but if
+            // this service's continuous archiving has since been pinned to a
+            // *different* S3 source (see `walg_archive_s3_source_id` on
+            // `external_services`, and the guard in
+            // `postgres_walg::PostgresWalgEngine::run`), and this backup's
+            // base snapshot predates that pin, its WAL segments were written
+            // to the source archiving no longer targets. They will never
+            // appear under this prefix no matter how long we wait.
+            let pinned_before_this_backup = service_id
+                .and_then(|service_id| resources.service(service_id).ok())
+                .and_then(|service| service.walg_archive_pinned_at)
+                .is_some_and(|pinned_at| backup.started_at < pinned_at);
+            if pinned_before_this_backup {
+                return Err(StageError::Unsupported(format!(
+                    "WAL-G snapshot {backup_name}: WAL segment {segment}, which covers its \
+                     {bound} LSN, was never archived to {wal_prefix}. This backup's base \
+                     snapshot predates the last time this service's WAL archive source was \
+                     pinned, so its WAL was written to a source that is no longer tracked and \
+                     can never appear here."
+                )));
+            }
             return Err(StageError::Retry(format!(
                 "WAL-G snapshot {backup_name} is not ready to mirror: WAL segment {segment}, \
                  which covers its {bound} LSN, has not been archived to {wal_prefix} yet. \
@@ -2726,6 +2752,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
+            walg_archive_s3_source_id: None,
+            walg_archive_pinned_at: None,
         };
         let source = temps_entities::s3_sources::Model {
             id: 7,
@@ -3174,6 +3202,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
+            walg_archive_s3_source_id: None,
+            walg_archive_pinned_at: None,
         }
         .into_active_model()
         .insert(&db)
@@ -3318,6 +3348,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
+            walg_archive_s3_source_id: None,
+            walg_archive_pinned_at: None,
         };
 
         assert_eq!(
@@ -4126,6 +4158,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
+            walg_archive_s3_source_id: None,
+            walg_archive_pinned_at: None,
         }
         .into_active_model()
         .insert(&db)

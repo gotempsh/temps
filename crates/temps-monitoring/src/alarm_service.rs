@@ -1558,6 +1558,8 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
+            walg_archive_s3_source_id: None,
+            walg_archive_pinned_at: None,
         }
     }
 

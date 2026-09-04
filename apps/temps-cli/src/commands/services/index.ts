@@ -18,6 +18,7 @@ import {
   listServiceProjects,
   updateService,
   upgradeService,
+  repointWalgArchiveSource,
   importExternalService,
   linkServiceToProject,
   unlinkServiceFromProject,
@@ -181,6 +182,11 @@ interface UpgradeOptions {
   version?: string
 }
 
+interface RepointWalgArchiveSourceOptions {
+  id: string
+  s3Source: string
+}
+
 interface ImportOptions {
   type?: string
   name?: string
@@ -315,6 +321,17 @@ export function registerServicesCommands(program: Command): void {
     .requiredOption('--id <id>', 'Service ID')
     .option('-v, --version <version>', 'Docker image to upgrade to (e.g., postgres:18-alpine)')
     .action(upgradeServiceAction)
+
+  services
+    .command('repoint-walg-source')
+    .description(
+      "Repoint a Postgres service's WAL-G continuous archiving to a different S3 source. " +
+        'Base backups taken before this call keep their WAL under the previous source and ' +
+        'will no longer be verifiable once archiving points at the new one.',
+    )
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--s3-source <id>', 'S3 source ID to point WAL-G archiving at')
+    .action(repointWalgArchiveSourceAction)
 
   services
     .command('import')
@@ -1067,6 +1084,42 @@ async function upgradeServiceAction(options: UpgradeOptions): Promise<void> {
 
   success('Service upgrade initiated')
   info(`Run: temps services show --id ${options.id} to check the status`)
+}
+
+async function repointWalgArchiveSourceAction(options: RepointWalgArchiveSourceOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID')
+    return
+  }
+
+  const newS3SourceId = parseInt(options.s3Source, 10)
+  if (isNaN(newS3SourceId)) {
+    warning('Invalid S3 source ID')
+    return
+  }
+
+  const result = await withSpinner('Repointing WAL-G archive source...', async () => {
+    const { data, error } = await repointWalgArchiveSource({
+      client,
+      path: { id },
+      body: { new_s3_source_id: newS3SourceId },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  success('WAL-G archive source repointed')
+  if (result) {
+    keyValue('Service ID', String(result.service_id))
+    keyValue('S3 source', String(result.walg_archive_s3_source_id))
+    keyValue('Pinned at', result.walg_archive_pinned_at)
+  }
 }
 
 async function importServiceAction(options: ImportOptions): Promise<void> {

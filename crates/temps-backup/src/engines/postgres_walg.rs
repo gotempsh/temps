@@ -81,6 +81,8 @@ impl BackupEngine for PostgresWalgEngine {
                 reason: format!("service {} not found", service_id),
             })?;
 
+        ensure_walg_archive_source_pin(deps.db.as_ref(), &service, s3_source_id).await?;
+
         let s3_source = v2_common::load_s3_source(deps.db.as_ref(), s3_source_id).await?;
         let s3_client = v2_common::build_s3_client(
             &s3_source,
@@ -321,6 +323,99 @@ impl BackupEngine for PostgresWalgEngine {
 
 // ── Local helpers ────────────────────────────────────────────────────────────
 
+/// Pin this service's continuous WAL-G archiving to one stable S3 source, or
+/// refuse a run that would silently move it.
+///
+/// WAL-G requires a base backup and the WAL segments covering its start/end
+/// LSN to live under the same S3 prefix to be restorable. Before this pin
+/// existed, `enable_continuous_archiving` re-pointed `archive_command` to
+/// whichever source's credentials the *triggering* run happened to carry —
+/// harmless for a service with exactly one S3 source in play, but silent data
+/// loss the moment two backup schedules for the same service target
+/// different sources: WAL segments follow whichever schedule ran last, while
+/// each schedule's own base backups keep landing wherever *it* points, so
+/// every base backup taken while a different schedule was "active" ends up
+/// with WAL segments that will never appear back where its own source
+/// expects them.
+///
+/// First call for a service establishes the pin — defaulting to this
+/// instance's Cloud-managed S3 source when one exists (Cloud only ever
+/// tracks that one source, so this is what makes "it just shows up in Cloud"
+/// the out-of-the-box behavior), falling back to whatever source this run
+/// itself uses when there is no Cloud-managed source to prefer. Every
+/// subsequent call must match the pin exactly; a mismatch is a config error
+/// the operator must resolve deliberately (point the schedule at the pinned
+/// source, or call the explicit repoint API to move the pin), not something
+/// safe to paper over by re-pointing archiving out from under a service with
+/// backups depending on where it currently points.
+async fn ensure_walg_archive_source_pin(
+    db: &sea_orm::DatabaseConnection,
+    service: &temps_entities::external_services::Model,
+    requested_source_id: i32,
+) -> Result<(), BackupError> {
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+
+    if let Some(pinned_source_id) = service.walg_archive_s3_source_id {
+        if pinned_source_id == requested_source_id {
+            return Ok(());
+        }
+        return Err(BackupError::PermanentFailure {
+            reason: format!(
+                "service {} ('{}') has its WAL-G continuous archiving pinned to S3 source {}, \
+                 but this backup requests S3 source {}. Archiving cannot silently move between \
+                 sources without stranding base backups whose WAL segments already live under \
+                 the pinned source. Point this backup's schedule at S3 source {pinned_source_id}, \
+                 or explicitly repoint the service's WAL archive source if you intend to move it.",
+                service.id, service.name, pinned_source_id, requested_source_id,
+            ),
+        });
+    }
+
+    let default_source_id = temps_entities::s3_sources::Entity::find()
+        .filter(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+        .one(db)
+        .await
+        .map_err(|e| BackupError::Failed {
+            reason: format!(
+                "db error looking up the Cloud-managed S3 source for service {}: {}",
+                service.id, e
+            ),
+        })?
+        .map(|source| source.id)
+        .unwrap_or(requested_source_id);
+
+    if default_source_id != requested_source_id {
+        return Err(BackupError::PermanentFailure {
+            reason: format!(
+                "service {} ('{}') has no WAL-G archive source pinned yet, and this instance has \
+                 a Cloud-managed S3 source ({default_source_id}) that new services default to — \
+                 but this backup requests S3 source {requested_source_id} instead. Point this \
+                 backup's schedule at S3 source {default_source_id}, or explicitly repoint the \
+                 service's WAL archive source if you intend to use {requested_source_id} instead.",
+                service.id, service.name,
+            ),
+        });
+    }
+
+    let now = chrono::Utc::now();
+    temps_entities::external_services::ActiveModel {
+        id: Set(service.id),
+        walg_archive_s3_source_id: Set(Some(default_source_id)),
+        walg_archive_pinned_at: Set(Some(now)),
+        ..Default::default()
+    }
+    .update(db)
+    .await
+    .map_err(|e| BackupError::Failed {
+        reason: format!(
+            "db error pinning service {} to WAL archive source {default_source_id}: {}",
+            service.id, e
+        ),
+    })?;
+
+    Ok(())
+}
+
 struct PgParams {
     username: String,
     password: String,
@@ -526,6 +621,146 @@ async fn list_total_s3_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn service_row(
+        walg_archive_s3_source_id: Option<i32>,
+    ) -> temps_entities::external_services::Model {
+        let now = chrono::Utc::now();
+        temps_entities::external_services::Model {
+            id: 42,
+            name: "test-svc".to_string(),
+            service_type: "postgres".to_string(),
+            topology: "standalone".to_string(),
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            node_id: None,
+            version: None,
+            slug: None,
+            config: None,
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            walg_archive_s3_source_id,
+            walg_archive_pinned_at: walg_archive_s3_source_id.map(|_| now),
+        }
+    }
+
+    fn s3_source_row(id: i32, managed_by_cloud: bool) -> temps_entities::s3_sources::Model {
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::Model {
+            id,
+            name: format!("source-{id}"),
+            bucket_name: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "ciphertext".to_string(),
+            secret_key: "ciphertext".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A backup that requests the same source the service is already pinned
+    /// to must proceed without touching the database at all — the common
+    /// case, on every backup after the first.
+    #[tokio::test]
+    async fn matching_pin_is_a_pure_no_op() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = service_row(Some(2));
+
+        let result = ensure_walg_archive_source_pin(&db, &service, 2).await;
+
+        assert!(result.is_ok());
+    }
+
+    /// A backup that requests a *different* source than the one already
+    /// pinned must be refused, not silently honoured — honouring it is
+    /// exactly the bug this pin exists to prevent (WAL segments split
+    /// across two buckets with no way to tell which base backups can ever
+    /// be verified again).
+    #[tokio::test]
+    async fn mismatched_pin_is_rejected_not_silently_moved() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = service_row(Some(2));
+
+        let result = ensure_walg_archive_source_pin(&db, &service, 7).await;
+
+        let error = result.expect_err("a source mismatch must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("pinned to S3 source 2") && message.contains("requests S3 source 7"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    /// First backup for a service with no Cloud-managed source on the
+    /// instance pins to whatever source that first backup itself uses —
+    /// the only sensible default when there is nothing to prefer.
+    #[tokio::test]
+    async fn first_backup_with_no_managed_source_pins_to_the_requested_source() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results::<temps_entities::s3_sources::Model, _, _>(vec![vec![]])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(vec![vec![service_row(Some(5))]])
+            .into_connection();
+        let service = service_row(None);
+
+        let result = ensure_walg_archive_source_pin(&db, &service, 5).await;
+
+        assert!(result.is_ok(), "unexpected error: {result:?}");
+        let log = db.into_transaction_log();
+        assert!(
+            log.iter().any(|entry| {
+                let rendered = format!("{entry:?}").to_lowercase();
+                rendered.contains("update") && rendered.contains("external_services")
+            }),
+            "expected an UPDATE against external_services, got: {log:?}"
+        );
+    }
+
+    /// A Cloud-managed source exists but this backup targets a different
+    /// one: refuse rather than silently pin to whichever ran first, since
+    /// that's exactly the non-determinism (whichever of several enabled
+    /// schedules happens to fire first wins) that caused stuck backups in
+    /// the first place.
+    #[tokio::test]
+    async fn first_backup_against_the_wrong_source_is_rejected_when_a_managed_source_exists() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![s3_source_row(2, true)]])
+            .into_connection();
+        let service = service_row(None);
+
+        let result = ensure_walg_archive_source_pin(&db, &service, 7).await;
+
+        let error = result.expect_err("a non-managed-source first run must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("Cloud-managed S3 source (2)")
+                && message.contains("requests S3 source 7"),
+            "unexpected error message: {message}"
+        );
+    }
 
     /// Regression test for the 0.1.0 hardening pass.
     ///

@@ -33962,6 +33962,20 @@
         ],
         "type": "object"
       },
+      "RepointWalgArchiveSourceRequest": {
+        "description": "Deliberately, explicitly move where a Postgres service's continuous\nWAL-G archiving points. See\n`ExternalServiceManager::repoint_walg_archive_source` for why this is a\ndedicated, guarded operation rather than something a schedule change\ndoes implicitly.",
+        "properties": {
+          "new_s3_source_id": {
+            "description": "The S3 source WAL-G archiving should point at from now on.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "new_s3_source_id"
+        ],
+        "type": "object"
+      },
       "RepositoryComposeServicesResponse": {
         "properties": {
           "path": {
@@ -49026,6 +49040,27 @@
           "critical"
         ],
         "type": "string"
+      },
+      "WalgArchiveSourceResponse": {
+        "properties": {
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "walg_archive_pinned_at": {
+            "type": "string"
+          },
+          "walg_archive_s3_source_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "walg_archive_s3_source_id",
+          "walg_archive_pinned_at"
+        ],
+        "type": "object"
       },
       "WebhookConfig": {
         "description": "Configuration for a generic webhook notification provider",
@@ -66315,6 +66350,59 @@
           }
         },
         "summary": "Postgres WAL & archive health snapshot",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/walg-archive-source": {
+      "post": {
+        "description": "Deliberately, explicitly moves where a Postgres service's continuous\nWAL-G archiving (`archive_command`) writes WAL segments. Cloud's backup\nmirror (and any WAL-G restore) needs a base backup and the WAL segments\ncovering its start/end LSN under the same S3 prefix — base backups taken\nbefore this call have WAL under the *previous* source and will no\nlonger be verifiable once archiving points at the new one.\n\nThis exists because a backup schedule that requests a different S3\nsource than the one archiving is currently pinned to is refused, not\nsilently honoured (see `ExternalServiceManager::repoint_walg_archive_source`\nfor the incident this prevents). Call this endpoint to deliberately move\nthe pin instead — for example, to switch a service from an operator's\nown S3 source onto Temps Cloud's managed one.",
+        "operationId": "repointWalgArchiveSource",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepointWalgArchiveSourceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalgArchiveSourceResponse"
+                }
+              }
+            },
+            "description": "WAL archive source repointed"
+          },
+          "400": {
+            "description": "Service is not Postgres, or the requested S3 source does not exist"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Repoint a Postgres service's WAL-G archive source",
         "tags": [
           "External Services"
         ]

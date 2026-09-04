@@ -15807,6 +15807,20 @@ export type RenewalAttemptResponse = {
     verification_method: string;
 };
 
+/**
+ * Deliberately, explicitly move where a Postgres service's continuous
+ * WAL-G archiving points. See
+ * `ExternalServiceManager::repoint_walg_archive_source` for why this is a
+ * dedicated, guarded operation rather than something a schedule change
+ * does implicitly.
+ */
+export type RepointWalgArchiveSourceRequest = {
+    /**
+     * The S3 source WAL-G archiving should point at from now on.
+     */
+    new_s3_source_id: number;
+};
+
 export type RepositoryComposeServicesResponse = {
     path: string;
     repositoryId: number;
@@ -22535,6 +22549,12 @@ export type WalWarning = {
 };
 
 export type WalWarningSeverity = 'warning' | 'critical';
+
+export type WalgArchiveSourceResponse = {
+    service_id: number;
+    walg_archive_pinned_at: string;
+    walg_archive_s3_source_id: number;
+};
 
 /**
  * Configuration for a generic webhook notification provider
@@ -33330,6 +33350,42 @@ export type GetPostgresWalHealthResponses = {
 };
 
 export type GetPostgresWalHealthResponse = GetPostgresWalHealthResponses[keyof GetPostgresWalHealthResponses];
+
+export type RepointWalgArchiveSourceData = {
+    body: RepointWalgArchiveSourceRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/walg-archive-source';
+};
+
+export type RepointWalgArchiveSourceErrors = {
+    /**
+     * Service is not Postgres, or the requested S3 source does not exist
+     */
+    400: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RepointWalgArchiveSourceResponses = {
+    /**
+     * WAL archive source repointed
+     */
+    200: WalgArchiveSourceResponse;
+};
+
+export type RepointWalgArchiveSourceResponse = RepointWalgArchiveSourceResponses[keyof RepointWalgArchiveSourceResponses];
 
 export type ExternalServiceEnablePgStatStatementsData = {
     body?: never;

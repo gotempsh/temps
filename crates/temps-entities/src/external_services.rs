@@ -79,6 +79,23 @@ pub struct Model {
     /// API. This allows a newly-created, not-yet-linked service to be claimed
     /// by that same user during project creation without trusting a guessed ID.
     pub created_by_user_id: Option<i32>,
+    /// The one S3 source this Postgres service's continuous WAL-G archiving
+    /// (`archive_command`) is pinned to. WAL-G requires a base backup and the
+    /// WAL segments covering its start/end LSN to live under the same S3
+    /// prefix to be restorable, so archiving cannot silently move between
+    /// sources on every backup run without stranding earlier base backups.
+    /// NULL until the first WAL-G backup (or an explicit repoint) establishes
+    /// a pin. Added by
+    /// `m20260904_000003_add_walg_archive_source_to_external_services`.
+    pub walg_archive_s3_source_id: Option<i32>,
+    /// When `walg_archive_s3_source_id` was established or last deliberately
+    /// changed. Lets the Cloud mirror tell "this backup's WAL is still
+    /// catching up" (its `started_at` is after this) apart from "this
+    /// backup's WAL was written to a since-abandoned source and can never
+    /// appear here" (its `started_at` is before this) — the latter is
+    /// permanent, not worth retrying forever. Added by
+    /// `m20260904_000003_add_walg_archive_source_to_external_services`.
+    pub walg_archive_pinned_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

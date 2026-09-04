@@ -16,6 +16,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`services projects`](#services-projects)
 - [`services update`](#services-update)
 - [`services upgrade`](#services-upgrade)
+- [`services repoint-walg-source`](#services-repoint-walg-source)
 - [`services import`](#services-import)
 - [`services link`](#services-link)
 - [`services unlink`](#services-unlink)
@@ -48,6 +49,7 @@ Manage external services (databases, caches, storage)
 - `projects` - List projects linked to a service
 - `update` - Update a service
 - `upgrade` - Upgrade a service to a newer version
+- `repoint-walg-source` - Repoint a Postgres service's WAL-G continuous archiving to a different S3 source. Base backups taken before this call keep their WAL under the previous source and will no longer be verifiable once archiving points at the new one.
 - `import` - Import an existing external service
 - `link` - Link a service to a project
 - `unlink` - Unlink a service from a project
@@ -187,6 +189,17 @@ Upgrade a service to a newer version
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
 | `-v, --version <version>` | Docker image to upgrade to (e.g., postgres:18-alpine) | - | No |
+
+### `services repoint-walg-source`
+
+Repoint a Postgres service's WAL-G continuous archiving to a different S3 source. Base backups taken before this call keep their WAL under the previous source and will no longer be verifiable once archiving points at the new one.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--s3-source <id>` | S3 source ID to point WAL-G archiving at | - | Yes |
 
 ### `services import`
 
@@ -491,7 +504,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
-| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service. | - | No |
+| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |

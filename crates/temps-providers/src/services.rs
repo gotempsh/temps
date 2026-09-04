@@ -2961,6 +2961,156 @@ impl ExternalServiceManager {
         }
     }
 
+    /// Deliberately, explicitly move a Postgres service's continuous WAL-G
+    /// archiving to a different S3 source, physically re-pointing
+    /// `archive_command` (not just updating the pin's bookkeeping columns —
+    /// see `crates/temps-providers/src/externalsvc/postgres.rs`'s
+    /// `force_reenable_continuous_archiving`).
+    ///
+    /// Only ever call this on purpose, and only when you accept that base
+    /// backups taken before this call have WAL segments under the *old*
+    /// source that will never be visible under the new one again — Cloud's
+    /// mirror (or any WAL-G restore) can no longer verify them going
+    /// forward. `walg_archive_pinned_at` records the moment of the switch so
+    /// `crates/temps-cloud/src/backup_mirror.rs` can tell those backups
+    /// apart from ones taken after the switch, which are expected to
+    /// resolve normally as WAL catches up.
+    pub async fn repoint_walg_archive_source(
+        &self,
+        service_id: i32,
+        new_s3_source_id: i32,
+    ) -> Result<external_services::Model, ExternalServiceError> {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let service = self.get_service(service_id).await?;
+        if !matches!(
+            service.service_type.to_ascii_lowercase().as_str(),
+            "postgres" | "postgresql" | "timescale" | "timescaledb"
+        ) {
+            return Err(ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            });
+        }
+
+        let s3_source = temps_entities::s3_sources::Entity::find_by_id(new_s3_source_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| ExternalServiceError::DatabaseError {
+                reason: format!("looking up S3 source {}: {}", new_s3_source_id, e),
+            })?
+            .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!("S3 source {} does not exist", new_s3_source_id),
+            })?;
+
+        let access_key = self
+            .encryption_service
+            .decrypt_string(&s3_source.access_key_id)
+            .map_err(|e| ExternalServiceError::DecryptionFailed {
+                service_id,
+                param_name: "access_key_id".to_string(),
+                reason: e.to_string(),
+            })?;
+        let secret_key = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|e| ExternalServiceError::DecryptionFailed {
+                service_id,
+                param_name: "secret_key".to_string(),
+                reason: e.to_string(),
+            })?;
+        let session_token = s3_source
+            .session_token
+            .as_deref()
+            .map(|token| self.encryption_service.decrypt_string(token))
+            .transpose()
+            .map_err(|e| ExternalServiceError::DecryptionFailed {
+                service_id,
+                param_name: "session_token".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let s3_credentials = crate::S3Credentials {
+            access_key_id: access_key,
+            secret_key,
+            session_token,
+            region: s3_source.region.clone(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: s3_source.bucket_name.clone(),
+            bucket_path: s3_source.bucket_path.clone(),
+            force_path_style: s3_source.force_path_style.unwrap_or(true),
+        };
+
+        // Layout must match `crates/temps-backup/src/engines/postgres_walg.rs`
+        // exactly: WAL-G requires a base backup and the WAL segments covering
+        // its start/end LSN under the same prefix to be restorable.
+        let subpath_root = format!("external_services/postgres/{}", service.name);
+        let bucket_path_clean = s3_source.bucket_path.trim_matches('/');
+        let walg_prefix = if bucket_path_clean.is_empty() {
+            format!(
+                "s3://{}/{}/walg",
+                s3_source.bucket_name,
+                subpath_root.trim_matches('/'),
+            )
+        } else {
+            format!(
+                "s3://{}/{}/{}/walg",
+                s3_source.bucket_name,
+                bucket_path_clean,
+                subpath_root.trim_matches('/'),
+            )
+        };
+
+        let config_json = service
+            .config
+            .as_deref()
+            .map(|encrypted| self.encryption_service.decrypt_string(encrypted))
+            .transpose()
+            .map_err(|e| ExternalServiceError::DecryptionFailed {
+                service_id,
+                param_name: "config".to_string(),
+                reason: e.to_string(),
+            })?
+            .unwrap_or_else(|| "{}".to_string());
+        let service_config = crate::externalsvc::ServiceConfig {
+            name: service.name.clone(),
+            service_type: crate::externalsvc::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null),
+        };
+
+        let postgres = crate::externalsvc::postgres::PostgresService::new(
+            service.name.clone(),
+            Arc::clone(&self.docker),
+        );
+        postgres
+            .force_reenable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
+            .await
+            .map_err(|e| ExternalServiceError::DockerError {
+                id: service_id,
+                reason: format!("failed to repoint WAL archiving: {}", e),
+            })?;
+
+        let now = chrono::Utc::now();
+        external_services::ActiveModel {
+            id: Set(service.id),
+            walg_archive_s3_source_id: Set(Some(new_s3_source_id)),
+            walg_archive_pinned_at: Set(Some(now)),
+            ..Default::default()
+        }
+        .update(self.db.as_ref())
+        .await
+        .map_err(|e| ExternalServiceError::DatabaseError {
+            reason: format!(
+                "pinning service {} to WAL archive source {}: {}",
+                service_id, new_s3_source_id, e
+            ),
+        })?;
+
+        self.get_service(service_id).await
+    }
+
     async fn get_service_info(
         &self,
         service_id: i32,
@@ -13726,6 +13876,8 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
+            walg_archive_s3_source_id: None,
+            walg_archive_pinned_at: None,
         }
     }
 
