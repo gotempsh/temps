@@ -491,3 +491,130 @@ mod error_metrics_layer_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod command_tree_tests {
+    use std::collections::BTreeSet;
+
+    use clap::{error::ErrorKind, Command, CommandFactory};
+
+    use super::Cli;
+
+    fn leaf_paths(command: &Command, prefix: &[String], paths: &mut BTreeSet<String>) {
+        let visible_subcommands: Vec<&Command> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .collect();
+
+        if visible_subcommands.is_empty() {
+            if !prefix.is_empty() {
+                paths.insert(prefix.join(" "));
+            }
+            return;
+        }
+
+        for subcommand in visible_subcommands {
+            let mut next = prefix.to_vec();
+            next.push(subcommand.get_name().to_string());
+            leaf_paths(subcommand, &next, paths);
+        }
+    }
+
+    fn expected_leaf_paths() -> BTreeSet<String> {
+        [
+            "agent",
+            "api-key",
+            "backfill clickhouse",
+            "backup list",
+            "backup restore",
+            "backup restore-service",
+            "build",
+            "deploy git",
+            "deploy image",
+            "deploy static",
+            "doctor",
+            "domain add",
+            "domain cert-status",
+            "domain delete",
+            "domain import",
+            "domain list",
+            "domain order cancel",
+            "domain order create",
+            "domain order finalize",
+            "domain order list",
+            "domain order show",
+            "domain provision",
+            "domain show",
+            "edge",
+            "firecracker setup",
+            "join",
+            "migrate",
+            "network diag",
+            "network peers",
+            "network status",
+            "node drain",
+            "node list",
+            "node remove",
+            "node show",
+            "node undrain",
+            "proxy",
+            "reset-admin-password",
+            "sandbox create",
+            "sandbox exec",
+            "sandbox list",
+            "sandbox show",
+            "sandbox stop",
+            "serve",
+            "services blob disable",
+            "services blob enable",
+            "services blob status",
+            "services kv disable",
+            "services kv enable",
+            "services kv status",
+            "setup",
+            "upgrade",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn every_rust_cli_leaf_is_in_the_audited_inventory() {
+        Cli::command().debug_assert();
+        let command = Cli::command();
+
+        let mut actual = BTreeSet::new();
+        leaf_paths(&command, &[], &mut actual);
+
+        let expected = expected_leaf_paths();
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let unexpected: Vec<_> = actual.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "CLI command inventory drifted; missing={missing:?}, unexpected={unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn every_rust_cli_leaf_renders_help_without_running_side_effects() {
+        let command = Cli::command();
+        let mut paths = BTreeSet::new();
+        leaf_paths(&command, &[], &mut paths);
+
+        for path in paths {
+            let mut argv = vec!["temps".to_string()];
+            argv.extend(path.split_whitespace().map(str::to_string));
+            argv.push("--help".to_string());
+
+            let error = Cli::command()
+                .try_get_matches_from(argv)
+                .expect_err("--help must short-circuit command execution");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::DisplayHelp,
+                "`temps {path} --help` did not render help: {error}"
+            );
+        }
+    }
+}

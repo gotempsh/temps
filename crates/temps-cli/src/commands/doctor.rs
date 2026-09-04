@@ -190,9 +190,8 @@ impl DoctorCommand {
         } else if let Ok(d) = std::env::var("TEMPS_DATA_DIR") {
             PathBuf::from(d)
         } else {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".temps")
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            default_data_dir(&home)
         }
     }
 
@@ -860,6 +859,24 @@ impl DoctorCommand {
     }
 }
 
+/// Resolve the default installation layout without overriding an explicit
+/// `--data-dir` or `TEMPS_DATA_DIR`. Current installs use `~/.temps`, while
+/// older deployment scripts placed runtime secrets in `~/.temps/data`.
+fn default_data_dir(home: &Path) -> PathBuf {
+    let root = home.join(".temps");
+    let nested = root.join("data");
+    let root_has_runtime_files =
+        root.join("auth_secret").is_file() || root.join("encryption_key").is_file();
+    let nested_has_runtime_files =
+        nested.join("auth_secret").is_file() || nested.join("encryption_key").is_file();
+
+    if !root_has_runtime_files && nested_has_runtime_files {
+        nested
+    } else {
+        root
+    }
+}
+
 /// Check if a URL is reachable via HTTPS.
 async fn check_url_reachable(label: &'static str, url: &str, report: &mut DiagnosticReport) {
     let client = reqwest::Client::builder()
@@ -1034,5 +1051,29 @@ mod tests {
         assert_eq!(report.pass_count, 2);
         assert_eq!(report.warn_count, 1);
         assert_eq!(report.fail_count, 1);
+    }
+
+    #[test]
+    fn default_data_dir_detects_legacy_nested_runtime_layout() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let nested = home.path().join(".temps/data");
+        std::fs::create_dir_all(&nested).expect("create nested data directory");
+        std::fs::write(nested.join("auth_secret"), "test-secret")
+            .expect("write nested auth secret");
+
+        assert_eq!(default_data_dir(home.path()), nested);
+    }
+
+    #[test]
+    fn default_data_dir_prefers_current_root_layout() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let root = home.path().join(".temps");
+        let nested = root.join("data");
+        std::fs::create_dir_all(&nested).expect("create nested data directory");
+        std::fs::write(root.join("auth_secret"), "current-secret").expect("write root auth secret");
+        std::fs::write(nested.join("auth_secret"), "legacy-secret")
+            .expect("write nested auth secret");
+
+        assert_eq!(default_data_dir(home.path()), root);
     }
 }

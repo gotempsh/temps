@@ -17,7 +17,7 @@ use temps_entities::{
     prelude::{DeploymentConfigSnapshot, DeploymentMetadata, GitPushEvent},
     types::PipelineStatus,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Debug)]
 pub enum JobProcessorError {
@@ -283,11 +283,12 @@ impl JobProcessorService {
                             });
                         }
                         _ => {
-                            // Ignore jobs that aren't handled by this processor
-                            info!("Ignoring unhandled job: {}", job);
-                            debug!(
-                                "Job type not handled by deployment processor: {}",
-                                std::any::type_name_of_val(&job)
+                            // The queue is broadcast to several specialized
+                            // processors. Seeing another processor's event is
+                            // expected, not an unhandled system error.
+                            trace!(
+                                "Deployment processor skipped event owned by another subscriber: {}",
+                                job
                             );
                         }
                     }
