@@ -11,7 +11,9 @@ mod traits;
 #[cfg(test)]
 pub mod mock;
 
+pub(crate) use scaleway::verify_scaleway_credentials;
 pub use scaleway::{ScalewayCredentials, ScalewayProvider};
+pub(crate) use ses::verify_ses_credentials;
 pub(crate) use ses::DEFAULT_CONFIGURATION_SET;
 pub use ses::{SesCredentials, SesProvider};
 pub use smtp::{SmtpCredentials, SmtpEncryption, SmtpProvider};

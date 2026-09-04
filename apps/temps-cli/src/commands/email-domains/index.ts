@@ -7,6 +7,7 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   listEmailDomains,
   createEmailDomain,
+  importEmailDomain,
   getDomain as getEmailDomain,
   deleteEmailDomain,
   getDomainByName as getEmailDomainByName,
@@ -29,6 +30,13 @@ import {
 interface CreateOptions {
   domain?: string
   providerId?: string
+  yes?: boolean
+}
+
+interface ImportOptions {
+  domain?: string
+  providerId?: string
+  providerIdentityId?: string
   yes?: boolean
 }
 
@@ -90,6 +98,21 @@ export function registerEmailDomainsCommands(program: Command): void {
     .option('--provider-id <id>', 'Email provider ID')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createDomainAction)
+
+  emailDomains
+    .command('import')
+    .description(
+      'Import an existing domain identity that was already provisioned in the provider console. ' +
+      'Fetches the current verification state without re-creating the identity.'
+    )
+    .option('-d, --domain <domain>', 'Domain name (e.g., mail.example.com)')
+    .option('--provider-id <id>', 'Email provider ID')
+    .option(
+      '--provider-identity-id <id>',
+      'Provider-internal identity UUID (required for Scaleway; omit for SES)'
+    )
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
+    .action(importDomainAction)
 
   emailDomains
     .command('show')
@@ -351,6 +374,88 @@ async function createDomainAction(options: CreateOptions): Promise<void> {
     newline()
     info(`Run "temps email-domains setup-dns --id ${result.domain.id}" to auto-configure DNS`)
     info(`Run "temps email-domains verify --id ${result.domain.id}" after DNS is configured`)
+  }
+}
+
+async function importDomainAction(options: ImportOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  let domain: string
+  let providerId: number
+  let providerIdentityId: string | undefined
+
+  const isAutomation = options.yes && options.domain && options.providerId
+
+  if (isAutomation) {
+    domain = options.domain!
+    providerId = parseInt(options.providerId!, 10)
+    if (isNaN(providerId)) {
+      warning('Invalid provider ID')
+      return
+    }
+    providerIdentityId = options.providerIdentityId
+  } else {
+    domain = options.domain || await promptText({
+      message: 'Domain name to import (e.g., mail.example.com)',
+      required: true,
+    })
+
+    const providerIdStr = options.providerId || await promptText({
+      message: 'Email provider ID',
+      required: true,
+    })
+    providerId = parseInt(providerIdStr, 10)
+    if (isNaN(providerId)) {
+      warning('Invalid provider ID')
+      return
+    }
+
+    providerIdentityId = options.providerIdentityId || await promptText({
+      message: 'Provider identity ID (leave blank for SES, required for Scaleway)',
+      required: false,
+    }) || undefined
+  }
+
+  newline()
+  info(`Importing email domain ${colors.bold(domain)} from provider ${providerId}`)
+
+  const result = await withSpinner('Importing email domain...', async () => {
+    const { data, error } = await importEmailDomain({
+      client,
+      body: {
+        domain,
+        provider_id: providerId,
+        provider_identity_id: providerIdentityId ?? null,
+      },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  newline()
+  success(`Email domain ${domain} imported`)
+
+  if (result?.domain) {
+    const d = result.domain
+    keyValue('ID', d.id)
+    keyValue('Status', statusBadge(d.status === 'verified' ? 'active' : d.status))
+    if (d.last_verified_at) {
+      keyValue('Last Verified', formatDate(d.last_verified_at))
+    }
+    if (d.verification_error) {
+      keyValue('Verification Error', colors.error(d.verification_error))
+    }
+  }
+
+  if (result?.dns_records && result.dns_records.length > 0) {
+    newline()
+    info('DNS records (configure if not already set):')
+    for (const record of result.dns_records) {
+      keyValue(`${record.record_type}`, `${record.name} -> ${record.value}`)
+    }
+    newline()
+    info(`Run "temps email-domains verify --id ${result.domain.id}" to refresh verification status`)
   }
 }
 

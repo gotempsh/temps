@@ -124,6 +124,98 @@ pub struct SesCredentials {
     pub endpoint_url: Option<String>,
 }
 
+/// Verify that the given SES credentials are accepted by AWS.
+///
+/// Calls `GetAccount` — a no-parameter, read-only operation that returns
+/// account-level info (sandbox status, enforcement status, etc.). It creates
+/// no resources and has no side effects. This is intentionally NOT routed
+/// through `SesProvider::new()` because that method calls
+/// `create_configuration_set()` as a side effect, which would be wrong to
+/// trigger just to check credentials.
+///
+/// Authentication failure codes recognised:
+/// - `InvalidClientTokenId` — the access key ID does not exist.
+/// - `SignatureDoesNotMatch` — the secret access key is wrong.
+/// - `AuthFailure` / `InvalidAccessKeyId` — alternate AWS forms.
+///
+/// `AccessDenied` for `ses:GetAccount` is treated as **success**: the key is
+/// valid, it simply lacks this particular permission. Narrowly-scoped SES
+/// policies (send-only) frequently omit `ses:GetAccount`.
+///
+/// `SdkError::DispatchFailure` and `SdkError::TimeoutError` become
+/// `EmailError::ProviderUnreachable` to distinguish network failures from
+/// credential rejections.
+pub(crate) async fn verify_ses_credentials(
+    credentials: &SesCredentials,
+    region: &str,
+) -> Result<(), EmailError> {
+    use aws_sdk_sesv2::error::SdkError;
+
+    let creds = Credentials::new(
+        &credentials.access_key_id,
+        &credentials.secret_access_key,
+        None,
+        None,
+        "temps-email-verify",
+    );
+
+    let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(region.to_string()))
+        .credentials_provider(creds);
+
+    if let Some(ref endpoint_url) = credentials.endpoint_url {
+        config_builder = config_builder.endpoint_url(endpoint_url);
+    }
+
+    let config = config_builder.load().await;
+    let client = Client::new(&config);
+
+    match client.get_account().send().await {
+        Ok(_) => Ok(()),
+        Err(SdkError::DispatchFailure(e)) => Err(EmailError::ProviderUnreachable {
+            provider_type: "ses".to_string(),
+            reason: format!(
+                "could not connect to AWS SES in region '{}'. \
+                 Verify that the Temps server can reach the AWS SES endpoint: {:?}",
+                region, e
+            ),
+        }),
+        Err(SdkError::TimeoutError(e)) => Err(EmailError::ProviderUnreachable {
+            provider_type: "ses".to_string(),
+            reason: format!(
+                "connection to AWS SES in region '{}' timed out. \
+                 Verify that the Temps server can reach the AWS SES endpoint: {:?}",
+                region, e
+            ),
+        }),
+        Err(SdkError::ServiceError(service_err)) => {
+            let code = service_err.err().meta().code().unwrap_or_default();
+            match code {
+                // These codes indicate the credentials themselves are wrong.
+                "InvalidClientTokenId"
+                | "SignatureDoesNotMatch"
+                | "AuthFailure"
+                | "InvalidAccessKeyId" => Err(EmailError::InvalidCredentials {
+                    provider_type: "ses".to_string(),
+                    reason: format!(
+                        "AWS rejected the credentials ({}). \
+                         Check the access key ID and secret access key: {}",
+                        code,
+                        service_err.err()
+                    ),
+                }),
+                // Any other service error (AccessDenied for ses:GetAccount,
+                // TooManyRequests, etc.) means the key reached AWS and was
+                // processed — treat as valid credentials.
+                _ => Ok(()),
+            }
+        }
+        // ResponseError or ConstructionFailure — the key reached AWS so it
+        // works; treat as valid.
+        Err(_) => Ok(()),
+    }
+}
+
 /// Default configuration set name for SES event tracking. Shared with the
 /// event-tracking auto-setup service, which attaches the SNS event
 /// destination to this same set so every send (they all pass through it —
@@ -287,7 +379,11 @@ impl EmailProvider for SesProvider {
         })
     }
 
-    async fn verify_identity(&self, domain: &str) -> Result<VerificationStatus, EmailError> {
+    async fn verify_identity(
+        &self,
+        domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError> {
         debug!("Verifying SES identity for domain: {}", domain);
 
         let result = self
@@ -331,6 +427,7 @@ impl EmailProvider for SesProvider {
     async fn get_identity_details(
         &self,
         domain: &str,
+        _provider_identity_id: Option<&str>,
     ) -> Result<DomainIdentityDetails, EmailError> {
         debug!("Getting SES identity details for domain: {}", domain);
 
@@ -444,7 +541,11 @@ impl EmailProvider for SesProvider {
         })
     }
 
-    async fn delete_identity(&self, domain: &str) -> Result<(), EmailError> {
+    async fn delete_identity(
+        &self,
+        domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError> {
         debug!("Deleting SES identity for domain: {}", domain);
 
         self.client

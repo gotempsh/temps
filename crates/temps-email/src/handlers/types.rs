@@ -304,6 +304,29 @@ pub struct CreateEmailDomainRequest {
     pub domain: String,
 }
 
+/// Request body for importing an already-provisioned email domain.
+///
+/// Use this when the domain identity was created directly in the email
+/// provider's own console or API — Temps will look it up rather than
+/// attempting to re-create it, avoiding duplicate or conflicting identities.
+///
+/// `provider_identity_id` is required for Scaleway (where the provider keys
+/// lookups off an internal UUID rather than the domain name) and optional for
+/// SES (which uses the domain name for all lookups). If a required field is
+/// missing, the provider will surface a clear error.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportEmailDomainRequest {
+    /// Provider ID to import the domain into
+    pub provider_id: i32,
+    /// Domain name (e.g., "updates.example.com")
+    #[schema(example = "updates.example.com")]
+    pub domain: String,
+    /// Provider-internal identity identifier. Required for Scaleway (the domain
+    /// UUID shown in the Scaleway console); ignored/optional for SES.
+    #[schema(example = "12345678-1234-1234-1234-123456789012")]
+    pub provider_identity_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DnsRecordResponse {
     /// Record type: TXT, CNAME, MX

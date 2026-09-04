@@ -22,6 +22,111 @@ pub struct ScalewayCredentials {
     pub project_id: String,
 }
 
+/// Verify that the given Scaleway credentials are accepted by the TEM API.
+///
+/// Makes a single authenticated read-only GET request to list domains for the
+/// project (page_size=1). This validates the API key, project ID, and region
+/// together without creating any resources.
+///
+/// Returns:
+/// - `Ok(())` if credentials are accepted (even if the project has no domains yet).
+/// - `Err(EmailError::InvalidCredentials)` if the API key or project access is
+///   definitively rejected (HTTP 401 or 403).
+/// - `Err(EmailError::ProviderUnreachable)` if the API could not be contacted
+///   (network/DNS error or an unexpected HTTP status from the API).
+pub(crate) async fn verify_scaleway_credentials(
+    credentials: &ScalewayCredentials,
+    region: &str,
+) -> Result<(), EmailError> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|source| EmailError::ScalewayClientBuild { source })?;
+
+    let url = format!("{}/regions/{}/domains", ScalewayProvider::BASE_URL, region);
+
+    let response = client
+        .get(&url)
+        .query(&[
+            ("project_id", credentials.project_id.as_str()),
+            ("page_size", "1"),
+        ])
+        .header("X-Auth-Token", &credentials.api_key)
+        .send()
+        .await
+        .map_err(|e| {
+            let reason = if e.is_connect() {
+                format!(
+                    "could not connect to Scaleway API at {}. \
+                     Verify that the Temps server can reach api.scaleway.com on port 443: {}",
+                    url, e
+                )
+            } else if e.is_timeout() {
+                format!(
+                    "connection to Scaleway API timed out after 10 s. \
+                     Verify that the Temps server can reach api.scaleway.com on port 443: {}",
+                    e
+                )
+            } else {
+                format!("network error reaching Scaleway API: {}", e)
+            };
+            EmailError::ProviderUnreachable {
+                provider_type: "scaleway".to_string(),
+                reason,
+            }
+        })?;
+
+    match response.status() {
+        s if s.is_success() => Ok(()),
+        reqwest::StatusCode::UNAUTHORIZED => {
+            let body = response.text().await.unwrap_or_else(|_| String::new());
+            Err(EmailError::InvalidCredentials {
+                provider_type: "scaleway".to_string(),
+                reason: format!(
+                    "the API key was rejected (HTTP 401). \
+                     Check that the key is valid and has Transactional Email permissions. \
+                     Scaleway error: {}",
+                    body.trim()
+                ),
+            })
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            let body = response.text().await.unwrap_or_else(|_| String::new());
+            Err(EmailError::InvalidCredentials {
+                provider_type: "scaleway".to_string(),
+                reason: format!(
+                    "access denied (HTTP 403). The API key does not have access to \
+                     Transactional Email in project '{}'. \
+                     Verify the project ID and that the key has the \
+                     'transactional_email:write' permission. \
+                     Scaleway error: {}",
+                    credentials.project_id,
+                    body.trim()
+                ),
+            })
+        }
+        reqwest::StatusCode::NOT_FOUND => Err(EmailError::InvalidCredentials {
+            provider_type: "scaleway".to_string(),
+            reason: format!(
+                "region '{}' was not found on the Scaleway Transactional Email API. \
+                     Valid regions are: fr-par, nl-ams.",
+                region
+            ),
+        }),
+        s => {
+            let body = response.text().await.unwrap_or_else(|_| String::new());
+            Err(EmailError::ProviderUnreachable {
+                provider_type: "scaleway".to_string(),
+                reason: format!(
+                    "unexpected response from Scaleway API (HTTP {}): {}",
+                    s,
+                    body.trim()
+                ),
+            })
+        }
+    }
+}
+
 /// Scaleway TEM provider implementation
 pub struct ScalewayProvider {
     client: Client,
@@ -59,15 +164,38 @@ impl ScalewayProvider {
 }
 
 // Scaleway API response types
+
+/// A single ready-to-publish DNS name/value pair from Scaleway's `records` object.
+/// These are the full, ready-to-configure values Scaleway's console displays,
+/// as opposed to the flat `spf_config`/`dkim_config` snippet fields.
+#[derive(Debug, Deserialize)]
+struct ScalewayRecordEntry {
+    name: String,
+    value: String,
+}
+
+/// The nested `records` object in Scaleway domain responses, containing
+/// full ready-to-publish DNS records (not just the fragment/snippet fields).
+#[derive(Debug, Deserialize)]
+struct ScalewayDomainRecords {
+    /// Full SPF record value (e.g. `v=spf1 include:_spf.tem.scaleway.com ~all`)
+    spf: Option<ScalewayRecordEntry>,
+    /// Required blackhole MX record (e.g. `10 blackhole.tem.scaleway.com`)
+    mx: Option<ScalewayRecordEntry>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ScalewayDomainResponse {
     id: String,
     #[allow(dead_code)]
     name: String,
     status: String,
+    /// Raw SPF snippet (`include:…` only). Prefer `records.spf.value` when present.
     spf_config: Option<String>,
     dkim_config: Option<String>,
     last_error: Option<String>,
+    /// Ready-to-publish DNS records. Present on all current API responses.
+    records: Option<ScalewayDomainRecords>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +238,18 @@ struct ScalewayEmailAddress {
     name: Option<String>,
 }
 
+/// Split a Scaleway MX record value like `"10 blackhole.tem.scaleway.com"` into
+/// `(priority, host)`. Falls back to `(None, raw_value)` when the format is
+/// not `"<u16> <host>"` so no data is silently lost.
+fn parse_scaleway_mx_value(raw: &str) -> (Option<u16>, String) {
+    if let Some((priority_str, host)) = raw.split_once(' ') {
+        if let Ok(priority) = priority_str.parse::<u16>() {
+            return (Some(priority), host.to_string());
+        }
+    }
+    (None, raw.to_string())
+}
+
 #[async_trait]
 impl EmailProvider for ScalewayProvider {
     async fn create_identity(&self, domain: &str) -> Result<DomainIdentity, EmailError> {
@@ -146,14 +286,31 @@ impl EmailProvider for ScalewayProvider {
             .await
             .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
 
-        // Parse SPF config
-        let spf_record = domain_response.spf_config.map(|spf| DnsRecord {
-            record_type: "TXT".to_string(),
-            name: domain.to_string(),
-            value: spf,
-            priority: None,
-            status: DnsRecordStatus::Pending,
-        });
+        // Prefer records.spf (full publishable record) over the raw spf_config snippet,
+        // which is only the include:… fragment and not a valid SPF record on its own.
+        let spf_record = if let Some(records_spf) = domain_response
+            .records
+            .as_ref()
+            .and_then(|r| r.spf.as_ref())
+        {
+            Some(DnsRecord {
+                record_type: "TXT".to_string(),
+                name: records_spf.name.clone(),
+                value: records_spf.value.clone(),
+                priority: None,
+                status: DnsRecordStatus::Pending,
+            })
+        } else {
+            // Fallback: wrap the snippet in a minimal valid SPF record so the
+            // user always gets a publishable value, even if records is absent.
+            domain_response.spf_config.map(|spf_snippet| DnsRecord {
+                record_type: "TXT".to_string(),
+                name: domain.to_string(),
+                value: format!("v=spf1 {} ~all", spf_snippet),
+                priority: None,
+                status: DnsRecordStatus::Pending,
+            })
+        };
 
         // Parse DKIM config
         let dkim_records = if let Some(dkim) = domain_response.dkim_config {
@@ -168,24 +325,51 @@ impl EmailProvider for ScalewayProvider {
             Vec::new()
         };
 
+        // Scaleway requires a blackhole MX record for domain verification.
+        let mx_record = domain_response
+            .records
+            .as_ref()
+            .and_then(|r| r.mx.as_ref())
+            .map(|records_mx| {
+                let (priority, host) = parse_scaleway_mx_value(&records_mx.value);
+                DnsRecord {
+                    record_type: "MX".to_string(),
+                    name: records_mx.name.clone(),
+                    value: host,
+                    priority,
+                    status: DnsRecordStatus::Pending,
+                }
+            });
+
         Ok(DomainIdentity {
             provider_identity_id: domain_response.id,
             spf_record,
             dkim_records,
             dkim_selector: Some("scw".to_string()),
-            mx_record: None,
-            // Scaleway doesn't support custom MAIL FROM - SPF/DKIM go directly on root domain
+            mx_record,
             mail_from_subdomain: None,
         })
     }
 
-    async fn verify_identity(&self, domain: &str) -> Result<VerificationStatus, EmailError> {
+    async fn verify_identity(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError> {
         debug!("Verifying Scaleway identity for domain: {}", domain);
+
+        let identity_id = provider_identity_id.ok_or_else(|| {
+            EmailError::Scaleway(format!(
+                "Cannot verify domain '{}': no Scaleway domain UUID is stored. \
+                 The domain may not have completed initial provisioning.",
+                domain
+            ))
+        })?;
 
         // First, trigger the check
         let check_response = self
             .client
-            .post(self.api_url(&format!("/domains/{}/check", urlencoding::encode(domain))))
+            .post(self.api_url(&format!("/domains/{}/check", identity_id)))
             .header("X-Auth-Token", &self.api_key)
             .send()
             .await
@@ -206,7 +390,7 @@ impl EmailProvider for ScalewayProvider {
         // Then get the domain status
         let response = self
             .client
-            .get(self.api_url(&format!("/domains/{}", urlencoding::encode(domain))))
+            .get(self.api_url(&format!("/domains/{}", identity_id)))
             .header("X-Auth-Token", &self.api_key)
             .send()
             .await
@@ -244,13 +428,22 @@ impl EmailProvider for ScalewayProvider {
     async fn get_identity_details(
         &self,
         domain: &str,
+        provider_identity_id: Option<&str>,
     ) -> Result<DomainIdentityDetails, EmailError> {
         debug!("Getting Scaleway identity details for domain: {}", domain);
+
+        let identity_id = provider_identity_id.ok_or_else(|| {
+            EmailError::Scaleway(format!(
+                "Cannot get details for domain '{}': no Scaleway domain UUID is stored. \
+                 The domain may not have completed initial provisioning.",
+                domain
+            ))
+        })?;
 
         // Get the domain status from Scaleway
         let response = self
             .client
-            .get(self.api_url(&format!("/domains/{}", urlencoding::encode(domain))))
+            .get(self.api_url(&format!("/domains/{}", identity_id)))
             .header("X-Auth-Token", &self.api_key)
             .send()
             .await
@@ -289,21 +482,40 @@ impl EmailProvider for ScalewayProvider {
         // Verify records via DNS lookup for accurate per-record status
         let dns_verifier = DnsVerifier::new();
 
-        // Build SPF record with DNS-verified status
-        let spf_record = if let Some(spf) = domain_response.spf_config {
-            // Scaleway SPF includes "include:_spf.scw-tem.cloud"
+        // Build SPF record — prefer records.spf (full publishable record) over the
+        // raw spf_config snippet, which is only the include:… fragment.
+        let spf_record = if let Some(records_spf) = domain_response
+            .records
+            .as_ref()
+            .and_then(|r| r.spf.as_ref())
+        {
             let spf_status = dns_verifier
-                .verify_spf_record(domain, "_spf.scw-tem.cloud")
+                .verify_spf_record(domain, "_spf.tem.scaleway.com")
                 .await;
             Some(DnsRecord {
                 record_type: "TXT".to_string(),
-                name: domain.to_string(),
-                value: spf,
+                name: records_spf.name.clone(),
+                value: records_spf.value.clone(),
                 priority: None,
                 status: spf_status,
             })
         } else {
-            None
+            // Fallback: wrap the snippet in a minimal valid SPF record.
+            match domain_response.spf_config {
+                Some(spf_snippet) => {
+                    let spf_status = dns_verifier
+                        .verify_spf_record(domain, "_spf.tem.scaleway.com")
+                        .await;
+                    Some(DnsRecord {
+                        record_type: "TXT".to_string(),
+                        name: domain.to_string(),
+                        value: format!("v=spf1 {} ~all", spf_snippet),
+                        priority: None,
+                        status: spf_status,
+                    })
+                }
+                None => None,
+            }
         };
 
         // Build DKIM record with DNS-verified status
@@ -321,22 +533,52 @@ impl EmailProvider for ScalewayProvider {
             Vec::new()
         };
 
+        // Scaleway requires a blackhole MX record for domain verification.
+        let mx_record = if let Some(records_mx) =
+            domain_response.records.as_ref().and_then(|r| r.mx.as_ref())
+        {
+            let (priority, host) = parse_scaleway_mx_value(&records_mx.value);
+            let mx_status = dns_verifier
+                .verify_mx_record(&records_mx.name, &host, priority)
+                .await;
+            Some(DnsRecord {
+                record_type: "MX".to_string(),
+                name: records_mx.name.clone(),
+                value: host,
+                priority,
+                status: mx_status,
+            })
+        } else {
+            None
+        };
+
         Ok(DomainIdentityDetails {
             overall_status,
             spf_record,
             dkim_records,
-            mx_record: None, // Scaleway doesn't use MX records
-            // Scaleway doesn't support custom MAIL FROM - all records on root domain
+            mx_record,
             mail_from_subdomain: None,
         })
     }
 
-    async fn delete_identity(&self, domain: &str) -> Result<(), EmailError> {
+    async fn delete_identity(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError> {
         debug!("Deleting Scaleway identity for domain: {}", domain);
+
+        let identity_id = provider_identity_id.ok_or_else(|| {
+            EmailError::Scaleway(format!(
+                "Cannot delete domain '{}': no Scaleway domain UUID is stored. \
+                 The domain may not have completed initial provisioning.",
+                domain
+            ))
+        })?;
 
         let response = self
             .client
-            .delete(self.api_url(&format!("/domains/{}", urlencoding::encode(domain))))
+            .delete(self.api_url(&format!("/domains/{}", identity_id)))
             .header("X-Auth-Token", &self.api_key)
             .send()
             .await
@@ -523,6 +765,112 @@ mod tests {
                 "4xx (status={status}) must not be retryable, got: {err:?}"
             );
         }
+    }
+
+    // ── parse_scaleway_mx_value ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_scaleway_mx_value_standard_format() {
+        let (priority, host) = parse_scaleway_mx_value("10 blackhole.tem.scaleway.com");
+        assert_eq!(priority, Some(10));
+        assert_eq!(host, "blackhole.tem.scaleway.com");
+    }
+
+    #[test]
+    fn parse_scaleway_mx_value_unexpected_format_returns_raw() {
+        // If the value doesn't start with a u16, return the whole string as the host.
+        let (priority, host) = parse_scaleway_mx_value("blackhole.tem.scaleway.com");
+        assert_eq!(priority, None);
+        assert_eq!(host, "blackhole.tem.scaleway.com");
+    }
+
+    #[test]
+    fn parse_scaleway_mx_value_zero_priority() {
+        let (priority, host) = parse_scaleway_mx_value("0 mx.example.com");
+        assert_eq!(priority, Some(0));
+        assert_eq!(host, "mx.example.com");
+    }
+
+    // ── records.spf round-trip ───────────────────────────────────────────────
+
+    /// Deserialising a full Scaleway domain response that contains the `records`
+    /// object must populate `records.spf` and `records.mx`.
+    #[test]
+    fn scaleway_domain_response_deserialises_records_object() {
+        let json = r#"{
+            "id": "uuid-1234",
+            "name": "example.com",
+            "status": "pending",
+            "spf_config": "include:_spf.tem.scaleway.com",
+            "dkim_config": "v=DKIM1; k=rsa; p=PUBLICKEY",
+            "last_error": null,
+            "records": {
+                "spf": {
+                    "name": "example.com",
+                    "value": "v=spf1 include:_spf.tem.scaleway.com ~all"
+                },
+                "dkim": {
+                    "name": "scw._domainkey.example.com",
+                    "value": "v=DKIM1; k=rsa; p=PUBLICKEY"
+                },
+                "dmarc": {
+                    "name": "_dmarc.example.com",
+                    "value": "v=DMARC1; p=none"
+                },
+                "mx": {
+                    "name": "example.com",
+                    "value": "10 blackhole.tem.scaleway.com"
+                }
+            }
+        }"#;
+
+        let response: ScalewayDomainResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, "uuid-1234");
+        assert_eq!(response.status, "pending");
+
+        let records = response
+            .records
+            .as_ref()
+            .expect("records should be present");
+
+        let spf = records.spf.as_ref().expect("records.spf should be present");
+        assert_eq!(spf.name, "example.com");
+        assert_eq!(spf.value, "v=spf1 include:_spf.tem.scaleway.com ~all");
+
+        let mx = records.mx.as_ref().expect("records.mx should be present");
+        assert_eq!(mx.name, "example.com");
+        assert_eq!(mx.value, "10 blackhole.tem.scaleway.com");
+    }
+
+    /// When `records` is absent (legacy / partial response), `spf_config` fallback
+    /// must produce a full publishable SPF record, not just the raw snippet.
+    #[test]
+    fn scaleway_domain_response_missing_records_still_deserialises() {
+        let json = r#"{
+            "id": "uuid-5678",
+            "name": "example.com",
+            "status": "unchecked",
+            "spf_config": "include:_spf.tem.scaleway.com",
+            "dkim_config": "v=DKIM1; k=rsa; p=PUBLICKEY",
+            "last_error": null
+        }"#;
+
+        let response: ScalewayDomainResponse = serde_json::from_str(json).unwrap();
+        assert!(
+            response.records.is_none(),
+            "records should be absent for this response"
+        );
+        // Verify the spf_config fallback path would produce a full SPF record.
+        let spf_snippet = response.spf_config.unwrap();
+        let full_spf = format!("v=spf1 {} ~all", spf_snippet);
+        assert!(
+            full_spf.starts_with("v=spf1"),
+            "fallback SPF must start with v=spf1"
+        );
+        assert!(
+            full_spf.ends_with("~all"),
+            "fallback SPF must end with ~all"
+        );
     }
 
     #[test]

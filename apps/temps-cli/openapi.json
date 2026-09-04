@@ -20249,6 +20249,34 @@
         },
         "type": "object"
       },
+      "ImportEmailDomainRequest": {
+        "description": "Request body for importing an already-provisioned email domain.\n\nUse this when the domain identity was created directly in the email\nprovider's own console or API — Temps will look it up rather than\nattempting to re-create it, avoiding duplicate or conflicting identities.\n\n`provider_identity_id` is required for Scaleway (where the provider keys\nlookups off an internal UUID rather than the domain name) and optional for\nSES (which uses the domain name for all lookups). If a required field is\nmissing, the provider will surface a clear error.",
+        "properties": {
+          "domain": {
+            "description": "Domain name (e.g., \"updates.example.com\")",
+            "example": "updates.example.com",
+            "type": "string"
+          },
+          "provider_id": {
+            "description": "Provider ID to import the domain into",
+            "format": "int32",
+            "type": "integer"
+          },
+          "provider_identity_id": {
+            "description": "Provider-internal identity identifier. Required for Scaleway (the domain\nUUID shown in the Scaleway console); ignored/optional for SES.",
+            "example": "12345678-1234-1234-1234-123456789012",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "provider_id",
+          "domain"
+        ],
+        "type": "object"
+      },
       "ImportExecutionStatus": {
         "description": "Import execution status",
         "enum": [
@@ -60381,6 +60409,61 @@
           }
         ],
         "summary": "Get an email domain by domain name with DNS records",
+        "tags": [
+          "Email Domains"
+        ]
+      }
+    },
+    "/email-domains/import": {
+      "post": {
+        "description": "Use this endpoint when the domain identity was created directly in the email\nprovider's console or API. Temps will fetch its current verification state\nrather than registering a new identity, preventing duplicate or conflicting\nprovider-side entries.",
+        "operationId": "import_email_domain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportEmailDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmailDomainWithDnsResponse"
+                }
+              }
+            },
+            "description": "Domain imported successfully"
+          },
+          "400": {
+            "description": "Invalid request or provider lookup failed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Provider not found"
+          },
+          "409": {
+            "description": "Domain already registered for this provider"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import an already-provisioned email domain from the provider",
         "tags": [
           "Email Domains"
         ]

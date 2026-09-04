@@ -14,8 +14,9 @@ use tracing::{debug, error};
 
 use crate::errors::EmailError;
 use crate::providers::{
-    EmailProvider, EmailProviderType, ScalewayCredentials, ScalewayProvider, SesCredentials,
-    SesProvider, SmtpCredentials, SmtpProvider,
+    verify_scaleway_credentials, verify_ses_credentials, EmailProvider, EmailProviderType,
+    ScalewayCredentials, ScalewayProvider, SesCredentials, SesProvider, SmtpCredentials,
+    SmtpProvider,
 };
 
 /// Service for managing email providers
@@ -95,6 +96,29 @@ impl ProviderService {
         }
     }
 
+    /// Verify that the given credentials are accepted by the real provider API
+    /// before persisting them.
+    ///
+    /// - Scaleway: performs a read-only `list-domains` call (page_size=1).
+    /// - SES: performs a read-only `GetAccount` call (no parameters, no side effects).
+    /// - SMTP: no lightweight read-only check is available without opening an
+    ///   actual SMTP session; verification is skipped and credentials are saved
+    ///   as supplied. Use the "Send test email" button after creating an SMTP
+    ///   provider to confirm the credentials work end-to-end.
+    async fn verify_provider_credentials(
+        &self,
+        credentials: &ProviderCredentials,
+        region: &str,
+    ) -> Result<(), EmailError> {
+        match credentials {
+            ProviderCredentials::Ses(creds) => verify_ses_credentials(creds, region).await,
+            ProviderCredentials::Scaleway(creds) => {
+                verify_scaleway_credentials(creds, region).await
+            }
+            ProviderCredentials::Smtp(_) => Ok(()), // skipped — see doc comment
+        }
+    }
+
     /// Create a new email provider
     pub async fn create(
         &self,
@@ -118,6 +142,13 @@ impl ProviderService {
             &request.region,
             sns_topic_arn.as_deref(),
         )?;
+
+        // Verify credentials against the real provider API before persisting.
+        // This catches typos in keys/secrets/project IDs at save time rather
+        // than failing silently later when a domain is first created or an
+        // email is first sent.
+        self.verify_provider_credentials(&request.credentials, &request.region)
+            .await?;
 
         // Serialize credentials to JSON
         let credentials_json = match &request.credentials {
@@ -272,12 +303,16 @@ impl ProviderService {
 
         let existing = self.get(id).await?;
         let existing_type = EmailProviderType::from_str(&existing.provider_type)?;
-        let effective_region = request.region.as_deref().unwrap_or(&existing.region);
+        let effective_region = request
+            .region
+            .as_deref()
+            .unwrap_or(&existing.region)
+            .to_owned();
         let effective_sns_topic = sns_topic_arn
             .as_ref()
             .map(|topic| topic.as_deref())
             .unwrap_or(existing.sns_topic_arn.as_deref());
-        validate_sns_topic_binding(&existing_type, effective_region, effective_sns_topic)?;
+        validate_sns_topic_binding(&existing_type, &effective_region, effective_sns_topic)?;
         let mut changed_fields: Vec<String> = Vec::new();
 
         let mut active: email_providers::ActiveModel = existing.clone().into();
@@ -326,6 +361,11 @@ impl ProviderService {
                     existing_type, new_type, id
                 )));
             }
+            // Verify the new credentials against the real provider API before
+            // persisting. `effective_region` already incorporates any
+            // region change in this same update request.
+            self.verify_provider_credentials(&new_credentials, &effective_region)
+                .await?;
             let credentials_json = match &new_credentials {
                 ProviderCredentials::Ses(c) => serde_json::to_string(c)?,
                 ProviderCredentials::Scaleway(c) => serde_json::to_string(c)?,
@@ -788,6 +828,34 @@ mod tests {
     }
 
     // ========== Unit Tests (no database required) ==========
+
+    /// SMTP credential verification is deliberately skipped (returns Ok
+    /// immediately) because there is no lightweight read-only SMTP call that
+    /// proves credentials without opening a real connection. Verify the skip
+    /// path returns Ok without making any network calls.
+    #[tokio::test]
+    async fn smtp_credentials_skip_verification() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = ProviderService::new(Arc::new(db), create_test_encryption_service());
+
+        let smtp_creds = ProviderCredentials::Smtp(crate::providers::SmtpCredentials {
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            username: Some("user@example.com".to_string()),
+            password: Some("s3cr3t".to_string()),
+            encryption: crate::providers::SmtpEncryption::Starttls,
+            accept_invalid_certs: false,
+        });
+
+        // This must complete without making any network calls or returning an error.
+        let result = service
+            .verify_provider_credentials(&smtp_creds, "smtp.example.com")
+            .await;
+        assert!(
+            result.is_ok(),
+            "SMTP credential verification must always return Ok: {result:?}"
+        );
+    }
 
     #[test]
     fn test_mask_string() {
@@ -1943,7 +2011,7 @@ mod tests {
                 assert_eq!(identity.provider_identity_id, test_domain);
 
                 // Verify the identity (LocalStack auto-verifies)
-                let verify_result = provider_instance.verify_identity(test_domain).await;
+                let verify_result = provider_instance.verify_identity(test_domain, None).await;
                 match verify_result {
                     Ok(status) => {
                         println!("Verification status for {}: {:?}", test_domain, status);
@@ -1955,7 +2023,7 @@ mod tests {
                 }
 
                 // Clean up - delete the identity
-                let delete_result = provider_instance.delete_identity(test_domain).await;
+                let delete_result = provider_instance.delete_identity(test_domain, None).await;
                 match delete_result {
                     Ok(_) => println!("Deleted identity for {}", test_domain),
                     Err(e) => println!("Delete failed (may be expected): {}", e),

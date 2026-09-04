@@ -155,7 +155,11 @@ impl EmailProvider for MockEmailProvider {
         })
     }
 
-    async fn verify_identity(&self, _domain: &str) -> Result<VerificationStatus, EmailError> {
+    async fn verify_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError> {
         self.verify_identity_count.fetch_add(1, Ordering::SeqCst);
 
         if self.should_fail_verify {
@@ -170,6 +174,7 @@ impl EmailProvider for MockEmailProvider {
     async fn get_identity_details(
         &self,
         domain: &str,
+        _provider_identity_id: Option<&str>,
     ) -> Result<DomainIdentityDetails, EmailError> {
         // Map verification status to DNS record status
         let record_status = match &self.verification_status {
@@ -210,7 +215,11 @@ impl EmailProvider for MockEmailProvider {
         })
     }
 
-    async fn delete_identity(&self, _domain: &str) -> Result<(), EmailError> {
+    async fn delete_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError> {
         self.delete_identity_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -279,7 +288,7 @@ mod tests {
     async fn test_mock_provider_verify_identity() {
         let provider = MockEmailProvider::new();
 
-        let status = provider.verify_identity("example.com").await.unwrap();
+        let status = provider.verify_identity("example.com", None).await.unwrap();
 
         assert!(matches!(status, VerificationStatus::Verified));
         assert_eq!(provider.verify_identity_call_count(), 1);
@@ -290,7 +299,7 @@ mod tests {
         let provider =
             MockEmailProvider::new().with_verification_status(VerificationStatus::Pending);
 
-        let status = provider.verify_identity("example.com").await.unwrap();
+        let status = provider.verify_identity("example.com", None).await.unwrap();
 
         assert!(matches!(status, VerificationStatus::Pending));
     }
@@ -299,7 +308,7 @@ mod tests {
     async fn test_mock_provider_verify_failure() {
         let provider = MockEmailProvider::new().with_verify_failure();
 
-        let result = provider.verify_identity("example.com").await;
+        let result = provider.verify_identity("example.com", None).await;
 
         assert!(result.is_err());
     }
@@ -353,7 +362,7 @@ mod tests {
     async fn test_mock_provider_delete_identity() {
         let provider = MockEmailProvider::new();
 
-        provider.delete_identity("example.com").await.unwrap();
+        provider.delete_identity("example.com", None).await.unwrap();
 
         assert_eq!(provider.delete_identity_call_count(), 1);
     }

@@ -207,13 +207,18 @@ impl EmailProvider for SmtpProvider {
 
     /// Imported SMTP domains have no records we can probe via the provider, so
     /// we report them as verified. The user is responsible for DNS upstream.
-    async fn verify_identity(&self, _domain: &str) -> Result<VerificationStatus, EmailError> {
+    async fn verify_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError> {
         Ok(VerificationStatus::Verified)
     }
 
     async fn get_identity_details(
         &self,
         _domain: &str,
+        _provider_identity_id: Option<&str>,
     ) -> Result<DomainIdentityDetails, EmailError> {
         Ok(DomainIdentityDetails {
             overall_status: VerificationStatus::Verified,
@@ -225,7 +230,11 @@ impl EmailProvider for SmtpProvider {
     }
 
     /// Nothing to delete upstream — caller still removes the row locally.
-    async fn delete_identity(&self, _domain: &str) -> Result<(), EmailError> {
+    async fn delete_identity(
+        &self,
+        _domain: &str,
+        _provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError> {
         Ok(())
     }
 
@@ -443,18 +452,21 @@ mod tests {
         assert!(identity.mx_record.is_none());
 
         assert!(matches!(
-            provider.verify_identity("example.com").await.unwrap(),
+            provider.verify_identity("example.com", None).await.unwrap(),
             VerificationStatus::Verified
         ));
 
-        let details = provider.get_identity_details("example.com").await.unwrap();
+        let details = provider
+            .get_identity_details("example.com", None)
+            .await
+            .unwrap();
         assert!(matches!(
             details.overall_status,
             VerificationStatus::Verified
         ));
         assert!(details.dkim_records.is_empty());
 
-        provider.delete_identity("example.com").await.unwrap();
+        provider.delete_identity("example.com", None).await.unwrap();
     }
 
     #[tokio::test]

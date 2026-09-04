@@ -9486,6 +9486,34 @@ export type ImportCredentials = {
 };
 
 /**
+ * Request body for importing an already-provisioned email domain.
+ *
+ * Use this when the domain identity was created directly in the email
+ * provider's own console or API — Temps will look it up rather than
+ * attempting to re-create it, avoiding duplicate or conflicting identities.
+ *
+ * `provider_identity_id` is required for Scaleway (where the provider keys
+ * lookups off an internal UUID rather than the domain name) and optional for
+ * SES (which uses the domain name for all lookups). If a required field is
+ * missing, the provider will surface a clear error.
+ */
+export type ImportEmailDomainRequest = {
+    /**
+     * Domain name (e.g., "updates.example.com")
+     */
+    domain: string;
+    /**
+     * Provider ID to import the domain into
+     */
+    provider_id: number;
+    /**
+     * Provider-internal identity identifier. Required for Scaleway (the domain
+     * UUID shown in the Scaleway console); ignored/optional for SES.
+     */
+    provider_identity_id?: string | null;
+};
+
+/**
  * Import execution status
  */
 export type ImportExecutionStatus = 'pending' | 'inprogress' | 'completed' | 'failed';
@@ -29461,6 +29489,49 @@ export type GetDomainByNameResponses = {
 };
 
 export type GetDomainByNameResponse = GetDomainByNameResponses[keyof GetDomainByNameResponses];
+
+export type ImportEmailDomainData = {
+    body: ImportEmailDomainRequest;
+    path?: never;
+    query?: never;
+    url: '/email-domains/import';
+};
+
+export type ImportEmailDomainErrors = {
+    /**
+     * Invalid request or provider lookup failed
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Domain already registered for this provider
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ImportEmailDomainResponses = {
+    /**
+     * Domain imported successfully
+     */
+    201: EmailDomainWithDnsResponse;
+};
+
+export type ImportEmailDomainResponse = ImportEmailDomainResponses[keyof ImportEmailDomainResponses];
 
 export type DeleteEmailDomainData = {
     body?: never;

@@ -190,15 +190,36 @@ pub trait EmailProvider: Send + Sync {
     /// send emails from @domain.com without knowing about the internal architecture.
     async fn create_identity(&self, domain: &str) -> Result<DomainIdentity, EmailError>;
 
-    /// Verify domain DNS configuration
-    async fn verify_identity(&self, domain: &str) -> Result<VerificationStatus, EmailError>;
+    /// Verify domain DNS configuration.
+    ///
+    /// `provider_identity_id` is the provider's internal UUID for the domain
+    /// (e.g. Scaleway's domain UUID stored in `email_domains.provider_identity_id`).
+    /// Providers that key off the domain name (SES, SMTP) may ignore it.
+    async fn verify_identity(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<VerificationStatus, EmailError>;
 
-    /// Get detailed identity info with per-record verification status
-    async fn get_identity_details(&self, domain: &str)
-        -> Result<DomainIdentityDetails, EmailError>;
+    /// Get detailed identity info with per-record verification status.
+    ///
+    /// `provider_identity_id` is the provider's internal UUID for the domain.
+    /// Providers that key off the domain name (SES, SMTP) may ignore it.
+    async fn get_identity_details(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<DomainIdentityDetails, EmailError>;
 
-    /// Delete domain identity
-    async fn delete_identity(&self, domain: &str) -> Result<(), EmailError>;
+    /// Delete domain identity.
+    ///
+    /// `provider_identity_id` is the provider's internal UUID for the domain.
+    /// Providers that key off the domain name (SES, SMTP) may ignore it.
+    async fn delete_identity(
+        &self,
+        domain: &str,
+        provider_identity_id: Option<&str>,
+    ) -> Result<(), EmailError>;
 
     /// Send an email
     async fn send(&self, email: &SendEmailRequest) -> Result<SendEmailResponse, EmailError>;
