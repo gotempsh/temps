@@ -163,11 +163,12 @@ use crate::services::secret_service::SecretService;
 
         // Preview gateway
         preview_gateway::LogsQuery,
-        preview_gateway::LogsResponse,
+        preview_gateway::PreviewGatewayLogsResponse,
         preview_gateway::UpgradeRequest,
         preview_gateway::PreviewGatewaySettingsResponse,
         preview_gateway::PatchSettingsRequest,
         crate::preview_gateway::GatewayStatus,
+        temps_core::problemdetails::ProblemDetails,
 
         // Skill definitions
         definitions::SkillDefinitionResponse,
