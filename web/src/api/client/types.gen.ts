@@ -10872,6 +10872,10 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
+export type PreviewGatewayLogsResponse = {
+    lines: Array<string>;
+};
+
 /**
  * Managed domain response
  */
@@ -40887,7 +40891,7 @@ export type GetPreviewGatewayLogsData = {
 };
 
 export type GetPreviewGatewayLogsResponses = {
-    200: LogsResponse;
+    200: PreviewGatewayLogsResponse;
 };
 
 export type GetPreviewGatewayLogsResponse = GetPreviewGatewayLogsResponses[keyof GetPreviewGatewayLogsResponses];
