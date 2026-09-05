@@ -200,29 +200,12 @@ impl DomainService {
         dns_records.push(Self::dmarc_record_template(&request.domain));
 
         // Compute the initial status from the fetched verification data.
-        // MX is optional and must not gate the domain status — only required
-        // (SPF/DKIM) failures block the domain from being usable.
-        let all_verified = Self::are_all_records_verified(&identity_details);
-        let any_required_failed = identity_details
-            .spf_record
-            .as_ref()
-            .map(|r| r.status == DnsRecordStatus::Failed)
-            .unwrap_or(false)
-            || identity_details
-                .dkim_records
-                .iter()
-                .any(|r| r.status == DnsRecordStatus::Failed);
-        let (status_str, last_verified_at) = if all_verified {
-            ("verified".to_string(), Some(chrono::Utc::now()))
-        } else if any_required_failed {
-            ("failed".to_string(), None)
-        } else {
-            match &identity_details.overall_status {
+        let (status_str, last_verified_at) =
+            match Self::resolve_verification_status(&identity_details) {
                 VerificationStatus::Verified => ("verified".to_string(), Some(chrono::Utc::now())),
                 VerificationStatus::Failed(_) => ("failed".to_string(), None),
                 _ => ("pending".to_string(), None),
-            }
-        };
+            };
 
         // Persist the new row.
         let active_model = email_domains::ActiveModel {
@@ -559,6 +542,43 @@ impl DomainService {
         true
     }
 
+    /// Resolve a domain's verification status from fetched identity details.
+    /// Shared by `import()` and `verify()` so the gate is defined once.
+    ///
+    /// "Verified" may ONLY come from `are_all_records_verified` (the required
+    /// SPF+DKIM record check). The provider's coarser `overall_status` field
+    /// can report Verified independently of per-record DKIM/SPF state (e.g.
+    /// before records are fully parsed, or a provider-side quirk) — trusting
+    /// it here would let a domain with missing/empty DKIM through the sending
+    /// gate, which is exactly the bug `are_all_records_verified` exists to
+    /// prevent. The provider's Failed signal is still honored as a hard
+    /// failure (e.g. revoked/bounced), but never promoted to Verified.
+    fn resolve_verification_status(details: &DomainIdentityDetails) -> VerificationStatus {
+        if Self::are_all_records_verified(details) {
+            return VerificationStatus::Verified;
+        }
+
+        let any_required_failed = details
+            .spf_record
+            .as_ref()
+            .map(|r| r.status == DnsRecordStatus::Failed)
+            .unwrap_or(false)
+            || details
+                .dkim_records
+                .iter()
+                .any(|r| r.status == DnsRecordStatus::Failed);
+        if any_required_failed {
+            return VerificationStatus::Failed(
+                "Some required DNS records failed verification".to_string(),
+            );
+        }
+
+        match &details.overall_status {
+            VerificationStatus::Failed(msg) => VerificationStatus::Failed(msg.clone()),
+            _ => VerificationStatus::Pending,
+        }
+    }
+
     /// List all domains
     pub async fn list(&self) -> Result<Vec<email_domains::Model>, EmailError> {
         let domains = email_domains::Entity::find()
@@ -631,33 +651,13 @@ impl DomainService {
             dns_records.push(mx.clone());
         }
 
-        // Check if all required DNS records are verified. MX is optional and
-        // DMARC is informational — see `are_all_records_verified` and
-        // `dmarc_record_template`'s doc comments.
-        let all_dns_verified = Self::are_all_records_verified(&identity_details);
-
-        // Only required (non-MX) record failures gate the domain status.
-        let any_required_failed = identity_details
-            .spf_record
-            .as_ref()
-            .map(|r| r.status == DnsRecordStatus::Failed)
-            .unwrap_or(false)
-            || identity_details
-                .dkim_records
-                .iter()
-                .any(|r| r.status == DnsRecordStatus::Failed);
-
-        // Determine final status based on required DNS record verification.
-        // MX and DMARC are intentionally excluded from this gate.
-        let status = if all_dns_verified {
+        // Determine final status based on required (SPF+DKIM) DNS record
+        // verification. MX and DMARC are intentionally excluded from this
+        // gate — see `resolve_verification_status`'s doc comment.
+        let status = Self::resolve_verification_status(&identity_details);
+        if matches!(status, VerificationStatus::Verified) {
             debug!("All required DNS records verified via DNS lookup, marking domain as verified");
-            VerificationStatus::Verified
-        } else if any_required_failed {
-            VerificationStatus::Failed("Some required DNS records failed verification".to_string())
-        } else {
-            // Use the provider's overall status for pending/other states
-            identity_details.overall_status
-        };
+        }
 
         dns_records.push(Self::dmarc_record_live(&domain.domain).await);
 
@@ -1170,6 +1170,94 @@ mod tests {
             !DomainService::are_all_records_verified(&details),
             "a missing SPF record must not vacuously satisfy the 'all verified' check"
         );
+    }
+
+    // ========== resolve_verification_status Tests ==========
+    // Regression coverage for the follow-up Greptile finding: the required-
+    // record check (`are_all_records_verified`) can correctly reject empty
+    // DKIM, but a naive fallback to the provider's coarse `overall_status`
+    // could still promote the domain to "verified" behind that check's back.
+
+    #[test]
+    fn overall_status_verified_cannot_override_empty_dkim() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        let status = DomainService::resolve_verification_status(&details);
+        assert!(
+            !matches!(status, VerificationStatus::Verified),
+            "an empty DKIM record list must not be overridden to Verified by the \
+             provider's overall_status, even when the provider reports Verified: {status:?}"
+        );
+    }
+
+    #[test]
+    fn overall_status_verified_cannot_override_missing_spf() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: None,
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        let status = DomainService::resolve_verification_status(&details);
+        assert!(
+            !matches!(status, VerificationStatus::Verified),
+            "a missing SPF record must not be overridden to Verified by the \
+             provider's overall_status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn all_required_records_verified_resolves_to_verified() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        assert!(matches!(
+            DomainService::resolve_verification_status(&details),
+            VerificationStatus::Verified
+        ));
+    }
+
+    #[test]
+    fn required_record_failure_resolves_to_failed() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Failed)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        assert!(matches!(
+            DomainService::resolve_verification_status(&details),
+            VerificationStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn provider_failed_status_still_surfaces_as_failed() {
+        // The provider's Failed signal is a hard failure (e.g. revoked or
+        // bounced) and must still be honored, even though its Verified
+        // signal is no longer trusted on its own.
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Failed("revoked by provider".to_string()),
+            spf_record: Some(make_spf(DnsRecordStatus::Pending)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Pending)],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        assert!(matches!(
+            DomainService::resolve_verification_status(&details),
+            VerificationStatus::Failed(_)
+        ));
     }
 
     // ========== Import Tests ==========
