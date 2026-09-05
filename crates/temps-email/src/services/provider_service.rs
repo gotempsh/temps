@@ -1280,13 +1280,24 @@ mod tests {
         };
         service.create(request1).await.unwrap();
 
+        // SMTP, not Scaleway: verify_provider_credentials makes a real network
+        // call to Scaleway's API for a Scaleway provider (no test seam exists
+        // to stub it), so a fake API key like this test previously used gets
+        // a definitive 401 in any environment with internet access and fails
+        // this unrelated "does list() return everything created" assertion.
+        // SMTP is the one provider type documented to skip verification
+        // entirely (see verify_provider_credentials's doc comment).
         let request2 = CreateProviderRequest {
             name: "Provider 2".to_string(),
-            provider_type: EmailProviderType::Scaleway,
-            region: "fr-par".to_string(),
-            credentials: ProviderCredentials::Scaleway(ScalewayCredentials {
-                api_key: "scw-api-key".to_string(),
-                project_id: "project-123".to_string(),
+            provider_type: EmailProviderType::Smtp,
+            region: "us-east-1".to_string(),
+            credentials: ProviderCredentials::Smtp(crate::providers::SmtpCredentials {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                encryption: crate::providers::SmtpEncryption::Starttls,
+                accept_invalid_certs: false,
             }),
         };
         service.create(request2).await.unwrap();
