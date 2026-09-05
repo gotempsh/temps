@@ -90,6 +90,15 @@ impl From<EmailError> for Problem {
                 .with_title("Provider Unreachable")
                 .with_detail(error.to_string()),
 
+            // The domain's Temps-side record is already gone by the time this
+            // is returned — 502 signals "the request mostly succeeded, but an
+            // upstream cleanup step failed" rather than "nothing happened".
+            EmailError::ProviderCleanupFailed { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Provider Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
+
             EmailError::Database(_)
             | EmailError::ProviderError(_)
             | EmailError::ProviderDeliveryUnknown(_)
@@ -905,14 +914,11 @@ pub async fn delete_email_domain(
         not_found().detail("Domain not found").build()
     })?;
 
-    state.domain_service.delete(id).await.map_err(|e| {
-        error!("Failed to delete email domain: {}", e);
-        internal_server_error()
-            .detail("Failed to delete domain")
-            .build()
-    })?;
+    let delete_result = state.domain_service.delete(id).await;
 
-    // Create audit log
+    // The domain's Temps-side row is gone in both the success case and the
+    // ProviderCleanupFailed case (see DomainService::delete) -- audit the
+    // deletion either way, before propagating a cleanup failure below.
     let audit = EmailDomainDeletedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -926,6 +932,8 @@ pub async fn delete_email_domain(
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
+
+    delete_result?;
 
     Ok(StatusCode::NO_CONTENT)
 }

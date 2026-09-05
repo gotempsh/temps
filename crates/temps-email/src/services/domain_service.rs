@@ -408,17 +408,18 @@ impl DomainService {
                     records.push(mx);
                 }
 
-                // Compute status via the same shared resolver used by import()/verify(),
-                // so a provider-side failure (e.g. a revoked identity) still takes
-                // precedence over DNS records that currently resolve as verified —
-                // see `resolve_verification_status`'s doc comment. DMARC and MX are
-                // deliberately excluded — see `dmarc_record_template`'s doc comment
-                // and `are_all_records_verified`'s doc comment.
-                let status = match Self::resolve_verification_status(&identity_details) {
-                    VerificationStatus::Verified => "verified".to_string(),
-                    VerificationStatus::Failed(_) => "failed".to_string(),
-                    _ => "pending".to_string(),
-                };
+                // Compute status via the same shared resolver AND the same
+                // status_fields string mapping used by import()/verify(), so
+                // a provider-side failure (e.g. a revoked identity) still
+                // takes precedence over DNS records that currently resolve as
+                // verified — see `resolve_verification_status`'s doc comment
+                // — and a TemporaryFailure/NotStarted status is reported
+                // distinctly here too, rather than collapsing to a generic
+                // "pending" that hides why the provider is unsure. DMARC and
+                // MX are deliberately excluded — see `dmarc_record_template`'s
+                // doc comment and `are_all_records_verified`'s doc comment.
+                let (status, _, _) =
+                    Self::status_fields(Self::resolve_verification_status(&identity_details));
 
                 records.push(Self::dmarc_record_live(&domain.domain).await);
 
@@ -738,21 +739,31 @@ impl DomainService {
             .create_provider_instance(&provider)
             .await?;
 
-        // Delete from provider (ignore errors - domain might already be deleted)
-        if let Err(e) = provider_instance
+        // Delete from provider first, but don't let a failure here (network
+        // error, revoked credentials, the identity-domain mismatch guard
+        // rejecting a stale UUID) block removing Temps' own record — an
+        // unreachable provider must not strand this domain forever, since
+        // the local row is also what the authorization/sending checks use.
+        let provider_delete_result = provider_instance
             .delete_identity(&domain.domain, domain.provider_identity_id.as_deref())
-            .await
-        {
-            error!(
-                "Failed to delete domain from provider (continuing anyway): {}",
-                e
-            );
-        }
+            .await;
 
         // Delete from database
         email_domains::Entity::delete_by_id(domain.id)
             .exec(self.db.as_ref())
             .await?;
+
+        if let Err(e) = provider_delete_result {
+            error!(
+                "Domain '{}' removed from Temps, but the provider-side identity could not be \
+                 deleted: {}",
+                domain.domain, e
+            );
+            return Err(EmailError::ProviderCleanupFailed {
+                domain: domain.domain,
+                reason: e.to_string(),
+            });
+        }
 
         info!("Deleted email domain: {}", domain.domain);
 

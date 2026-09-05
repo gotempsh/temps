@@ -25,6 +25,18 @@ pub enum EmailError {
     #[error("Domain '{domain}' already exists for provider {provider_id}")]
     DomainAlreadyExists { domain: String, provider_id: i32 },
 
+    /// The domain's row was removed from Temps, but the provider-side identity
+    /// could not be deleted (network failure, revoked credentials, or the
+    /// identity-domain mismatch guard rejecting a stale `provider_identity_id`).
+    /// Deliberately not rolled back: an unreachable provider must not strand
+    /// the local row forever, but the operator still needs to know a manual
+    /// cleanup on the provider's side may be required.
+    #[error(
+        "Domain '{domain}' was removed from Temps, but the provider-side identity could not be \
+         deleted and may still exist: {reason}"
+    )]
+    ProviderCleanupFailed { domain: String, reason: String },
+
     #[error("Email domain '{domain}' is not authorized for project {project_id}")]
     DomainNotAuthorized { domain: String, project_id: i32 },
 
