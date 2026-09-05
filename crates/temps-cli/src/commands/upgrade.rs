@@ -1012,12 +1012,14 @@ pub(crate) fn platform_target() -> anyhow::Result<String> {
 pub async fn fetch_latest_release_in_channel(
     channel: UpgradeChannel,
 ) -> anyhow::Result<GitHubRelease> {
-    fetch_latest_release_in_channel_from(channel, GITHUB_RELEASES_API).await
+    let target = platform_target()?;
+    fetch_latest_release_in_channel_from(channel, GITHUB_RELEASES_API, &target).await
 }
 
 async fn fetch_latest_release_in_channel_from(
     channel: UpgradeChannel,
     releases_api: &str,
+    target: &str,
 ) -> anyhow::Result<GitHubRelease> {
     let client = reqwest::Client::new();
     let mut releases = Vec::new();
@@ -1055,15 +1057,20 @@ async fn fetch_latest_release_in_channel_from(
         page += 1;
     }
 
-    pick_release_for_channel(releases, channel).ok_or_else(|| match channel {
+    pick_installable_release_for_channel(releases, channel, target).ok_or_else(|| match channel {
         UpgradeChannel::Stable => anyhow::anyhow!(
-            "No stable releases found. Try `--channel beta` to include prereleases."
+            "No stable releases with a temps-{}.tar.gz asset found. Try `--channel beta` to include prereleases.",
+            target
         ),
-        UpgradeChannel::Beta => anyhow::anyhow!("No releases found."),
+        UpgradeChannel::Beta => anyhow::anyhow!(
+            "No stable or beta releases with a temps-{}.tar.gz asset found.",
+            target
+        ),
         UpgradeChannel::Nightly => anyhow::anyhow!(
-            "No nightly releases found. The nightly build only cuts a new tag when \
+            "No nightly releases with a temps-{}.tar.gz asset found. The nightly build only cuts a new tag when \
              `main` has commits since the last one — check the 'Nightly Release' \
-             workflow run history, or try `--channel beta`."
+             workflow run history, or try `--channel beta`.",
+            target
         ),
     })
 }
@@ -1085,6 +1092,30 @@ fn pick_release_for_channel(
         })
         .max_by(|left, right| left.0.cmp(&right.0))
         .map(|(_, release)| release)
+}
+
+/// Select the newest release that this host can actually install. GitHub can
+/// contain semver-valid test releases without binary assets; selecting one of
+/// those makes `temps upgrade --check` fail even when an older, real release
+/// exists in the same channel.
+fn pick_installable_release_for_channel(
+    releases: Vec<GitHubRelease>,
+    channel: UpgradeChannel,
+    target: &str,
+) -> Option<GitHubRelease> {
+    let tarball_name = format!("temps-{}.tar.gz", target);
+    pick_release_for_channel(
+        releases
+            .into_iter()
+            .filter(|release| {
+                release
+                    .assets
+                    .iter()
+                    .any(|asset| asset.name == tarball_name)
+            })
+            .collect(),
+        channel,
+    )
 }
 
 /// Normalize a caller-supplied version into a release tag, rejecting anything
@@ -2803,6 +2834,21 @@ mod tests {
         }
     }
 
+    fn release_with_asset(
+        tag: &str,
+        prerelease: bool,
+        draft: bool,
+        asset_name: &str,
+    ) -> GitHubRelease {
+        let mut release = release(tag, prerelease, draft);
+        release.assets.push(GitHubAsset {
+            name: asset_name.to_string(),
+            browser_download_url: format!("https://example.test/{asset_name}"),
+            size: 1,
+        });
+        release
+    }
+
     #[test]
     fn channel_includes_only_non_prerelease_for_stable() {
         // Stable must reject any prerelease tag, even if it's newer.
@@ -2914,6 +2960,23 @@ mod tests {
     }
 
     #[test]
+    fn installable_picker_skips_newer_release_without_platform_asset() {
+        let releases = vec![
+            release("v1.3.0-test", true, false),
+            release_with_asset("v1.2.0-beta.4", true, false, "temps-darwin-arm64.tar.gz"),
+            release_with_asset("v1.1.0-beta.3", true, false, "temps-linux-amd64.tar.gz"),
+        ];
+
+        let picked =
+            pick_installable_release_for_channel(releases, UpgradeChannel::Beta, "darwin-arm64");
+
+        assert_eq!(
+            picked.expect("an installable beta should remain").tag_name,
+            "v1.2.0-beta.4"
+        );
+    }
+
+    #[test]
     fn release_lookup_continues_until_github_returns_a_short_page() {
         let nightlies: Vec<_> = (0..100)
             .map(|index| {
@@ -2947,7 +3010,11 @@ mod tests {
                             "tag_name": format!("v1.0.0-nightly.202609{:02}.abc1234", index),
                             "prerelease": true,
                             "draft": false,
-                            "assets": [],
+                            "assets": [{
+                                "name": "temps-test-target.tar.gz",
+                                "browser_download_url": "https://example.test/nightly.tar.gz",
+                                "size": 1
+                            }],
                             "html_url": "https://example.test/nightly"
                         })
                     })
@@ -2957,7 +3024,11 @@ mod tests {
                     "tag_name": "v0.0.8",
                     "prerelease": false,
                     "draft": false,
-                    "assets": [],
+                    "assets": [{
+                        "name": "temps-test-target.tar.gz",
+                        "browser_download_url": "https://example.test/stable.tar.gz",
+                        "size": 1
+                    }],
                     "html_url": "https://example.test/stable"
                 })]
             };
@@ -2979,6 +3050,7 @@ mod tests {
         let selected = fetch_latest_release_in_channel_from(
             UpgradeChannel::Stable,
             &format!("http://{address}/releases"),
+            "test-target",
         )
         .await
         .expect("stable release should be found on page two");
