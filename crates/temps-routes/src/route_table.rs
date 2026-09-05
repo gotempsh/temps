@@ -2033,7 +2033,7 @@ impl CachedPeerTable {
         }
 
         info!(
-            "Route table loaded with {} total entries ({} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards)",
+            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards",
             route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count
         );
         // Collect on-demand configs for awake environments so the idle sweep can track them.

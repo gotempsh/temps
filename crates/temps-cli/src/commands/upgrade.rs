@@ -299,6 +299,17 @@ impl UpgradeCommand {
             return Ok(());
         }
 
+        // Channel selection is not permission to go backwards. This matters
+        // when a beta installation runs plain `temps upgrade`: the newest
+        // stable release can be older than the installed beta. An explicit
+        // --version remains the deliberate escape hatch for rollback.
+        ensure_implicit_upgrade_is_not_downgrade(
+            self.version.as_deref(),
+            channel,
+            &current_version,
+            latest_version,
+        )?;
+
         // Find the matching asset
         let tarball_name = format!("temps-{}.tar.gz", target);
         let asset = release
@@ -839,6 +850,36 @@ pub(crate) fn is_newer_version(candidate: &str, current: &str) -> bool {
     }
 }
 
+/// Is `candidate` strictly older than `current`? Unparsable development or
+/// fork tags are not classified as downgrades so existing explicit workflows
+/// keep working; official release tags are always semver-shaped.
+fn is_older_version(candidate: &str, current: &str) -> bool {
+    match (version_sort_key(candidate), version_sort_key(current)) {
+        (Some(candidate_key), Some(current_key)) => candidate_key < current_key,
+        _ => false,
+    }
+}
+
+fn ensure_implicit_upgrade_is_not_downgrade(
+    requested_version: Option<&str>,
+    channel: UpgradeChannel,
+    current: &str,
+    candidate: &str,
+) -> anyhow::Result<()> {
+    if requested_version.is_none() && is_older_version(candidate, current) {
+        anyhow::bail!(
+            "Refusing to downgrade temps from {} to {} selected by the '{}' channel. \
+             Choose a channel that contains a newer release (for example `--channel beta`) \
+             or explicitly authorize the rollback with `--version {}`.",
+            current,
+            candidate,
+            channel.as_str(),
+            candidate
+        );
+    }
+    Ok(())
+}
+
 /// One background update check: fetch the newest release on this install's
 /// channel and return a notice if it is strictly newer than the running
 /// binary. Every failure path (network, GitHub quota, unparsable tags)
@@ -960,10 +1001,10 @@ pub(crate) fn platform_target() -> anyhow::Result<String> {
 
 /// Fetch the latest release on a given channel from GitHub.
 ///
-/// Pulls the first page of releases (per_page=20, GitHub's default ordering
-/// is most-recent-first) and returns the first one that belongs to the
-/// requested channel. 20 is enough to find the newest stable even on a
-/// project that ships many betas between stables.
+/// Pulls every release page and returns the greatest semantic version for the
+/// requested channel. GitHub orders by creation time, so nightly releases can
+/// push the latest stable beyond the first page and backfilled releases can
+/// violate semantic-version order.
 ///
 /// Note: this returns the channel's *newest* release, which may be older
 /// than the absolute newest tag — that's the point. A `Stable` host on a
@@ -971,42 +1012,71 @@ pub(crate) fn platform_target() -> anyhow::Result<String> {
 pub async fn fetch_latest_release_in_channel(
     channel: UpgradeChannel,
 ) -> anyhow::Result<GitHubRelease> {
-    let client = reqwest::Client::new();
-    let url = format!("{}?per_page=20", GITHUB_RELEASES_API);
-    let response = client
-        .get(&url)
-        .header("User-Agent", "temps-self-upgrade")
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch releases: {}", e))?;
+    let target = platform_target()?;
+    fetch_latest_release_in_channel_from(channel, GITHUB_RELEASES_API, &target).await
+}
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "GitHub API returned {} when fetching releases: {}",
-            status,
-            body
-        ));
+async fn fetch_latest_release_in_channel_from(
+    channel: UpgradeChannel,
+    releases_api: &str,
+    target: &str,
+) -> anyhow::Result<GitHubRelease> {
+    let client = reqwest::Client::new();
+    let mut releases = Vec::new();
+    let mut page = 1_u32;
+    loop {
+        let url = format!("{}?per_page=100&page={}", releases_api, page);
+        let response = client
+            .get(&url)
+            .header("User-Agent", "temps-self-upgrade")
+            .header("Accept", "application/vnd.github.v3+json")
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch release page {}: {}", page, e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "GitHub API returned {} when fetching release page {}: {}",
+                status,
+                page,
+                body
+            ));
+        }
+
+        let page_releases: Vec<GitHubRelease> = response.json().await.map_err(|e| {
+            anyhow::anyhow!("Failed to parse releases response page {}: {}", page, e)
+        })?;
+        let fetch_next_page = release_page_requires_next(&page_releases);
+        releases.extend(page_releases);
+
+        if !fetch_next_page {
+            break;
+        }
+        page += 1;
     }
 
-    let releases: Vec<GitHubRelease> = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse releases response: {}", e))?;
-
-    pick_release_for_channel(releases, channel).ok_or_else(|| match channel {
+    pick_installable_release_for_channel(releases, channel, target).ok_or_else(|| match channel {
         UpgradeChannel::Stable => anyhow::anyhow!(
-            "No stable releases found. Try `--channel beta` to include prereleases."
+            "No stable releases with a temps-{}.tar.gz asset found. Try `--channel beta` to include prereleases.",
+            target
         ),
-        UpgradeChannel::Beta => anyhow::anyhow!("No releases found."),
+        UpgradeChannel::Beta => anyhow::anyhow!(
+            "No stable or beta releases with a temps-{}.tar.gz asset found.",
+            target
+        ),
         UpgradeChannel::Nightly => anyhow::anyhow!(
-            "No nightly releases found. The nightly build only cuts a new tag when \
+            "No nightly releases with a temps-{}.tar.gz asset found. The nightly build only cuts a new tag when \
              `main` has commits since the last one — check the 'Nightly Release' \
-             workflow run history, or try `--channel beta`."
+             workflow run history, or try `--channel beta`.",
+            target
         ),
     })
+}
+
+fn release_page_requires_next(releases: &[GitHubRelease]) -> bool {
+    releases.len() == 100
 }
 
 /// Pure picker — split out so tests can drive it without an HTTP mock.
@@ -1014,7 +1084,38 @@ fn pick_release_for_channel(
     releases: Vec<GitHubRelease>,
     channel: UpgradeChannel,
 ) -> Option<GitHubRelease> {
-    releases.into_iter().find(|r| channel.includes(r))
+    releases
+        .into_iter()
+        .filter(|release| channel.includes(release))
+        .filter_map(|release| {
+            version_sort_key(&release.tag_name).map(|sort_key| (sort_key, release))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, release)| release)
+}
+
+/// Select the newest release that this host can actually install. GitHub can
+/// contain semver-valid test releases without binary assets; selecting one of
+/// those makes `temps upgrade --check` fail even when an older, real release
+/// exists in the same channel.
+fn pick_installable_release_for_channel(
+    releases: Vec<GitHubRelease>,
+    channel: UpgradeChannel,
+    target: &str,
+) -> Option<GitHubRelease> {
+    let tarball_name = format!("temps-{}.tar.gz", target);
+    pick_release_for_channel(
+        releases
+            .into_iter()
+            .filter(|release| {
+                release
+                    .assets
+                    .iter()
+                    .any(|asset| asset.name == tarball_name)
+            })
+            .collect(),
+        channel,
+    )
 }
 
 /// Normalize a caller-supplied version into a release tag, rejecting anything
@@ -2643,6 +2744,50 @@ mod tests {
     }
 
     #[test]
+    fn implicit_channel_selection_detects_downgrades() {
+        assert!(is_older_version("v0.0.8", "v0.1.0-beta.56"));
+        assert!(is_older_version("v1.0.0-beta.2", "v1.0.0"));
+        assert!(!is_older_version("v1.0.0", "v1.0.0-beta.2"));
+        assert!(!is_older_version("v1.0.0", "v1.0.0"));
+        assert!(!is_older_version("stable", "local-dev"));
+    }
+
+    #[test]
+    fn implicit_upgrade_policy_refuses_downgrades_but_allows_explicit_rollbacks() {
+        let error = ensure_implicit_upgrade_is_not_downgrade(
+            None,
+            UpgradeChannel::Stable,
+            "v0.1.0-beta.56",
+            "v0.0.8",
+        )
+        .expect_err("implicit stable selection must not downgrade a beta host");
+        assert!(error.to_string().contains("Refusing to downgrade"));
+        assert!(error.to_string().contains("--channel beta"));
+
+        assert!(ensure_implicit_upgrade_is_not_downgrade(
+            Some("v0.0.8"),
+            UpgradeChannel::Stable,
+            "v0.1.0-beta.56",
+            "v0.0.8",
+        )
+        .is_ok());
+        assert!(ensure_implicit_upgrade_is_not_downgrade(
+            None,
+            UpgradeChannel::Beta,
+            "v0.1.0-beta.56",
+            "v0.1.0-beta.57",
+        )
+        .is_ok());
+        assert!(ensure_implicit_upgrade_is_not_downgrade(
+            None,
+            UpgradeChannel::Stable,
+            "v1.0.0",
+            "v1.0.0",
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_update_check_interval_defaults_to_two_hours() {
         assert_eq!(
             DEFAULT_UPDATE_CHECK_INTERVAL,
@@ -2687,6 +2832,21 @@ mod tests {
             assets: vec![],
             html_url: String::new(),
         }
+    }
+
+    fn release_with_asset(
+        tag: &str,
+        prerelease: bool,
+        draft: bool,
+        asset_name: &str,
+    ) -> GitHubRelease {
+        let mut release = release(tag, prerelease, draft);
+        release.assets.push(GitHubAsset {
+            name: asset_name.to_string(),
+            browser_download_url: format!("https://example.test/{asset_name}"),
+            size: 1,
+        });
+        release
     }
 
     #[test]
@@ -2741,17 +2901,15 @@ mod tests {
     }
 
     #[test]
-    fn picker_returns_first_matching_in_response_order() {
-        // GitHub returns releases newest-first. Picker takes the first
-        // match, which is the newest release on that channel. We trust
-        // GitHub's ordering here — re-sorting by semver locally would
-        // also have to handle prerelease ordering correctly, and we'd
-        // rather lean on GitHub than reimplement it.
+    fn picker_returns_highest_semver_even_when_response_order_differs() {
+        // Release creation order is not semantic-version order when a release
+        // is backfilled or republished. The picker must not select an older
+        // candidate merely because GitHub returned it first.
         let releases = vec![
-            release("v1.3.0-beta.2", true, false), // newest, beta
-            release("v1.3.0-beta.1", true, false),
-            release("v1.2.0", false, false), // newest stable
             release("v1.1.0", false, false),
+            release("v1.3.0-beta.1", true, false),
+            release("v1.2.0", false, false),
+            release("v1.3.0-beta.2", true, false),
         ];
 
         let picked_stable = pick_release_for_channel(releases.clone(), UpgradeChannel::Stable);
@@ -2782,6 +2940,123 @@ mod tests {
             picked.expect("should fall through to v1.9.0").tag_name,
             "v1.9.0"
         );
+    }
+
+    #[test]
+    fn picker_skips_malformed_release_tags() {
+        let mixed = vec![
+            release("latest", false, false),
+            release("v1.9.0", false, false),
+        ];
+        assert_eq!(
+            pick_release_for_channel(mixed, UpgradeChannel::Stable)
+                .expect("valid semantic release should remain")
+                .tag_name,
+            "v1.9.0"
+        );
+
+        let malformed_only = vec![release("latest", false, false)];
+        assert!(pick_release_for_channel(malformed_only, UpgradeChannel::Stable).is_none());
+    }
+
+    #[test]
+    fn installable_picker_skips_newer_release_without_platform_asset() {
+        let releases = vec![
+            release("v1.3.0-test", true, false),
+            release_with_asset("v1.2.0-beta.4", true, false, "temps-darwin-arm64.tar.gz"),
+            release_with_asset("v1.1.0-beta.3", true, false, "temps-linux-amd64.tar.gz"),
+        ];
+
+        let picked =
+            pick_installable_release_for_channel(releases, UpgradeChannel::Beta, "darwin-arm64");
+
+        assert_eq!(
+            picked.expect("an installable beta should remain").tag_name,
+            "v1.2.0-beta.4"
+        );
+    }
+
+    #[test]
+    fn release_lookup_continues_until_github_returns_a_short_page() {
+        let nightlies: Vec<_> = (0..100)
+            .map(|index| {
+                release(
+                    &format!("v1.0.0-nightly.202609{:02}.abc1234", index),
+                    true,
+                    false,
+                )
+            })
+            .collect();
+
+        assert!(release_page_requires_next(&nightlies));
+
+        let mut page_with_stable = nightlies;
+        page_with_stable[99] = release("v0.0.8", false, false);
+        assert!(release_page_requires_next(&page_with_stable));
+        assert!(!release_page_requires_next(&page_with_stable[..99]));
+    }
+
+    #[tokio::test]
+    async fn release_fetch_reads_second_page_before_selecting_stable_version() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        use std::collections::HashMap;
+
+        async fn releases(Query(query): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+            let page = query.get("page").map(String::as_str).unwrap_or("1");
+            let releases = if page == "1" {
+                (0..100)
+                    .map(|index| {
+                        serde_json::json!({
+                            "tag_name": format!("v1.0.0-nightly.202609{:02}.abc1234", index),
+                            "prerelease": true,
+                            "draft": false,
+                            "assets": [{
+                                "name": "temps-test-target.tar.gz",
+                                "browser_download_url": "https://example.test/nightly.tar.gz",
+                                "size": 1
+                            }],
+                            "html_url": "https://example.test/nightly"
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![serde_json::json!({
+                    "tag_name": "v0.0.8",
+                    "prerelease": false,
+                    "draft": false,
+                    "assets": [{
+                        "name": "temps-test-target.tar.gz",
+                        "browser_download_url": "https://example.test/stable.tar.gz",
+                        "size": 1
+                    }],
+                    "html_url": "https://example.test/stable"
+                })]
+            };
+            Json(serde_json::Value::Array(releases))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/releases", get(releases)))
+                .await
+                .expect("test release server should run");
+        });
+
+        let selected = fetch_latest_release_in_channel_from(
+            UpgradeChannel::Stable,
+            &format!("http://{address}/releases"),
+            "test-target",
+        )
+        .await
+        .expect("stable release should be found on page two");
+
+        server.abort();
+        assert_eq!(selected.tag_name, "v0.0.8");
     }
 
     #[test]

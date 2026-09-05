@@ -12,6 +12,8 @@
 
 use clap::Args;
 
+use super::api_url::management_api_url;
+
 /// Join this machine to a Temps cluster as a worker node
 #[derive(Args)]
 pub struct JoinCommand {
@@ -283,7 +285,7 @@ impl JoinCommand {
         // opt-in does NOT apply to CLI binaries on purpose.
         let client = reqwest::Client::builder().build()?;
 
-        let register_url = format!("{}/api/internal/nodes/register", self.target);
+        let register_url = management_api_url(&self.target, "/internal/nodes/register");
 
         // Generate per-node mTLS material; send the CSR so the control plane
         // can sign a leaf for us (ADR-020 WS-2.1). The leaf must be valid for
@@ -440,9 +442,9 @@ impl JoinCommand {
         // hijack worker registration.
         let register_client = reqwest::Client::builder().build()?;
 
-        let register_url = format!(
-            "{}/api/internal/nodes/register",
-            relay_response.control_plane_url
+        let register_url = management_api_url(
+            &relay_response.control_plane_url,
+            "/internal/nodes/register",
         );
 
         let agent_port = self
