@@ -548,6 +548,17 @@ impl DomainService {
             return VerificationStatus::Failed(msg.clone());
         }
 
+        // A provider-reported temporary failure (e.g. SES's TEMPORARY_FAILURE)
+        // means records that were previously verified are no longer trusted by
+        // the provider. This must take the same precedence as `Failed` — a
+        // live DNS lookup that currently happens to resolve SPF/DKIM correctly
+        // must not silently promote the domain back to `Verified` and let it
+        // through the persisted sending gate while the provider itself is
+        // still unsure.
+        if let VerificationStatus::TemporaryFailure = &details.overall_status {
+            return VerificationStatus::TemporaryFailure;
+        }
+
         if Self::are_all_records_verified(details) {
             return VerificationStatus::Verified;
         }
@@ -1271,6 +1282,29 @@ mod tests {
                 VerificationStatus::Failed(_)
             ),
             "a provider-reported Failed status must win even when SPF/DKIM currently resolve verified"
+        );
+    }
+
+    #[test]
+    fn provider_temporary_failure_wins_even_when_records_currently_resolve_verified() {
+        // SES reports TEMPORARY_FAILURE when records that were previously
+        // verified are no longer trusted. A live DNS lookup that currently
+        // happens to resolve SPF/DKIM correctly must not silently promote
+        // the domain back to Verified and admit it through the persisted
+        // sending gate while the provider itself is still unsure.
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::TemporaryFailure,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        assert!(
+            matches!(
+                DomainService::resolve_verification_status(&details),
+                VerificationStatus::TemporaryFailure
+            ),
+            "a provider-reported TemporaryFailure must win even when SPF/DKIM currently resolve verified"
         );
     }
 
