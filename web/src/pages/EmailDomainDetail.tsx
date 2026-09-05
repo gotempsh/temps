@@ -26,6 +26,7 @@ import {
   DnsVerificationSummary,
   StatusPill,
 } from '@/components/email/EmailDomainsManagement'
+import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -188,6 +189,7 @@ export function EmailDomainDetail() {
   const [selectedDnsProviderId, setSelectedDnsProviderId] = useState<number | null>(null)
   const [dnsSetupResult, setDnsSetupResult] = useState<SetupDnsResponse | null>(null)
   const [projectToRevoke, setProjectToRevoke] = useState<AuthorizedEmailDomainProjectResponse | null>(null)
+  const [projectToAuthorize, setProjectToAuthorize] = useState<number | null>(null)
 
   const {
     data: domainDetails,
@@ -253,9 +255,12 @@ export function EmailDomainDetail() {
       return response.data
     },
     onSuccess: (data) => {
-      // MX is optional — exclude it from the counts shown to the user so the
-      // toast reflects the records that actually gate the domain status.
-      const required = data.dns_records.filter(r => r.record_type !== 'MX')
+      // MX and DMARC are both excluded from the backend's verification gate
+      // (are_all_records_verified) — exclude them from the counts shown here
+      // too, so the toast reflects the records that actually gate the status.
+      const required = data.dns_records.filter(
+        r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+      )
       const verifiedCount = required.filter(r => r.status === 'verified').length
       const totalCount = required.length
       const pendingCount = required.filter(r => r.status === 'pending').length
@@ -335,6 +340,17 @@ export function EmailDomainDetail() {
     },
   })
 
+  // Shares its cache with ProjectSelect's internal query (same key/args), so
+  // this adds no extra request — it only exists to resolve a name for the
+  // confirmation dialog below.
+  const projectsQuery = useQuery({
+    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
+    staleTime: 60_000,
+  })
+  const projectToAuthorizeName = projectsQuery.data?.projects.find(
+    (p) => p.id === projectToAuthorize
+  )?.name
+
   const authorizeProjectMutation = useMutation({
     mutationFn: async (projectId: number) => {
       const response = await authorizeEmailDomainProject({ path: { id: id!, project_id: projectId } })
@@ -343,6 +359,7 @@ export function EmailDomainDetail() {
       }
     },
     onSuccess: () => {
+      setProjectToAuthorize(null)
       queryClient.invalidateQueries({ queryKey: ['email-domain-projects', id] })
       toast.success('Project authorized', {
         description: 'Deployments in this project can now send from this domain.',
@@ -448,9 +465,12 @@ export function EmailDomainDetail() {
 
   const hasDnsProviders = dnsProviders && dnsProviders.length > 0
   const isVerified = domain.status === 'verified'
-  // MX is optional — exclude it from the "N of M verified" tally in the
-  // overview panel and card description, consistent with DnsVerificationSummary.
-  const requiredDnsRecords = dnsRecords.filter(r => r.record_type !== 'MX')
+  // MX and DMARC are both excluded from the "N of M verified" tally in the
+  // overview panel and card description, consistent with DnsVerificationSummary
+  // and the backend's are_all_records_verified gate.
+  const requiredDnsRecords = dnsRecords.filter(
+    r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+  )
   const verifiedCount = requiredDnsRecords.filter(r => r.status === 'verified').length
   const totalCount = requiredDnsRecords.length
 
@@ -817,7 +837,7 @@ export function EmailDomainDetail() {
                     <ProjectSelect
                       value={null}
                       onValueChange={(projectId) => {
-                        if (projectId != null) authorizeProjectMutation.mutate(projectId)
+                        if (projectId != null) setProjectToAuthorize(projectId)
                       }}
                       allowAll={false}
                       excludeIds={authorizedProjects.map((p) => p.id)}
@@ -912,6 +932,45 @@ export function EmailDomainDetail() {
               }}
             >
               {revokeProjectMutation.isPending ? 'Revoking...' : 'Revoke access'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={projectToAuthorize !== null}
+        onOpenChange={(open) => {
+          if (!open && !authorizeProjectMutation.isPending) {
+            setProjectToAuthorize(null)
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Authorize project to send email?</AlertDialogTitle>
+            <AlertDialogDescription>
+              <span className="font-medium text-foreground">
+                {projectToAuthorizeName ?? 'This project'}
+              </span>
+              {' '}will be able to send email from{' '}
+              <span className="font-medium text-foreground">{domain.domain}</span>.
+              Every deployment token in that project gains this ability immediately.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={authorizeProjectMutation.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={authorizeProjectMutation.isPending || projectToAuthorize === null}
+              onClick={(event) => {
+                event.preventDefault()
+                if (projectToAuthorize !== null) {
+                  authorizeProjectMutation.mutate(projectToAuthorize)
+                }
+              }}
+            >
+              {authorizeProjectMutation.isPending ? 'Authorizing...' : 'Authorize'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

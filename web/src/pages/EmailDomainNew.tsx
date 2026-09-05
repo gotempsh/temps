@@ -547,6 +547,8 @@ export function EmailDomainNew() {
     queryKey: ['email-providers'],
     queryFn: listEmailProviders,
   })
+  const isSelectedProviderScaleway =
+    providers.find((p) => p.id === providerId)?.provider_type === 'scaleway'
 
   const createMutation = useMutation({
     mutationFn: createEmailDomain,
@@ -609,6 +611,18 @@ export function EmailDomainNew() {
         }
       })
       setStep2Errors(errors)
+      return false
+    }
+
+    // Zod can't see the selected provider's type, so it can't make
+    // provider_identity_id conditionally required — Scaleway has no way to
+    // look up an existing identity by domain name alone, so without a UUID
+    // here the import would fail server-side with a provisioning-sounding
+    // error that doesn't describe this missing input at all.
+    if (mode === 'import' && isSelectedProviderScaleway && !providerIdentityId.trim()) {
+      setStep2Errors({
+        provider_identity_id: 'A Scaleway domain UUID is required to import this domain',
+      })
       return false
     }
 

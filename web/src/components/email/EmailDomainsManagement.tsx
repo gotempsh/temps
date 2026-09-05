@@ -211,12 +211,16 @@ function DnsRecordStatusBadge({ status }: { status?: DnsRecordStatus }) {
 }
 
 export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
-  // MX is optional (deliverability aid, not required for sending or
-  // authentication). Mirror Scaleway's own console, which puts SPF/DKIM/DMARC
-  // under "REQUIRED" and shows MX separately without that badge.
-  // The MX row still appears in DnsRecordsTable with its real status and an
-  // "Optional" label so users aren't confused by the exclusion here.
-  const requiredRecords = records.filter(r => r.record_type !== 'MX')
+  // MX and DMARC are both excluded from the "required" count, matching the
+  // backend's are_all_records_verified gate exactly: MX is a deliverability
+  // aid rather than a sending/auth prerequisite, and DMARC is a plain TXT
+  // record the domain owner sets independently (no provider API manages it),
+  // so requiring it here would report a domain as unverified even though the
+  // backend already considers SPF+DKIM sufficient and marked it "verified".
+  // Both rows still appear in DnsRecordsTable with their real status.
+  const requiredRecords = records.filter(
+    r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+  )
   const verifiedCount = requiredRecords.filter(r => r.status === 'verified').length
   const pendingCount = requiredRecords.filter(r => r.status === 'pending').length
   const failedCount = requiredRecords.filter(r => r.status === 'failed').length
@@ -412,9 +416,12 @@ export function EmailDomainsManagement() {
   const verifyMutation = useMutation({
     mutationFn: verifyEmailDomain,
     onSuccess: (data) => {
-      // MX is optional — exclude it from the counts shown to the user so the
-      // toast reflects the records that actually gate the domain status.
-      const required = data.dns_records.filter(r => r.record_type !== 'MX')
+      // MX and DMARC are both excluded — see DnsVerificationSummary's comment.
+      // Exclude them from the counts shown here too, so the toast reflects
+      // the records that actually gate the domain status.
+      const required = data.dns_records.filter(
+        r => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
+      )
       const verifiedCount = required.filter(r => r.status === 'verified').length
       const totalCount = required.length
       const pendingCount = required.filter(r => r.status === 'pending').length
