@@ -411,29 +411,16 @@ impl DomainService {
                     records.push(mx);
                 }
 
-                // Compute status based on required DNS records being verified.
-                // DMARC and MX are deliberately excluded — see
-                // `dmarc_record_template`'s doc comment and
-                // `are_all_records_verified`'s doc comment.
-                let all_verified = Self::are_all_records_verified(&identity_details);
-                let status = if all_verified {
-                    "verified".to_string()
-                } else {
-                    // Only required (non-MX) record failures gate the status.
-                    let any_required_failed = identity_details
-                        .spf_record
-                        .as_ref()
-                        .map(|r| r.status == DnsRecordStatus::Failed)
-                        .unwrap_or(false)
-                        || identity_details
-                            .dkim_records
-                            .iter()
-                            .any(|r| r.status == DnsRecordStatus::Failed);
-                    if any_required_failed {
-                        "failed".to_string()
-                    } else {
-                        "pending".to_string()
-                    }
+                // Compute status via the same shared resolver used by import()/verify(),
+                // so a provider-side failure (e.g. a revoked identity) still takes
+                // precedence over DNS records that currently resolve as verified —
+                // see `resolve_verification_status`'s doc comment. DMARC and MX are
+                // deliberately excluded — see `dmarc_record_template`'s doc comment
+                // and `are_all_records_verified`'s doc comment.
+                let status = match Self::resolve_verification_status(&identity_details) {
+                    VerificationStatus::Verified => "verified".to_string(),
+                    VerificationStatus::Failed(_) => "failed".to_string(),
+                    _ => "pending".to_string(),
                 };
 
                 records.push(Self::dmarc_record_live(&domain.domain).await);

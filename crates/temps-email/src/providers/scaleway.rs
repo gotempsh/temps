@@ -187,7 +187,6 @@ struct ScalewayDomainRecords {
 #[derive(Debug, Deserialize)]
 struct ScalewayDomainResponse {
     id: String,
-    #[allow(dead_code)]
     name: String,
     status: String,
     /// Raw SPF snippet (`include:…` only). Prefer `records.spf.value` when present.
@@ -248,6 +247,27 @@ fn parse_scaleway_mx_value(raw: &str) -> (Option<u16>, String) {
         }
     }
     (None, raw.to_string())
+}
+
+/// Verify that a Scaleway identity's own domain name matches the domain the
+/// caller asked for. Without this check, a stale or mistyped
+/// `provider_identity_id` (e.g. reused from a different domain) would
+/// silently bind DNS records and verification status computed for someone
+/// else's Scaleway identity to the requested domain.
+fn check_identity_domain_matches(
+    identity_id: &str,
+    identity_domain: &str,
+    requested_domain: &str,
+) -> Result<(), EmailError> {
+    if identity_domain.eq_ignore_ascii_case(requested_domain) {
+        Ok(())
+    } else {
+        Err(EmailError::Scaleway(format!(
+            "Scaleway identity '{}' belongs to domain '{}', not '{}'. \
+             Refusing to bind a mismatched domain-to-identity pair.",
+            identity_id, identity_domain, requested_domain
+        )))
+    }
 }
 
 #[async_trait]
@@ -465,6 +485,8 @@ impl EmailProvider for ScalewayProvider {
             .json()
             .await
             .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
+
+        check_identity_domain_matches(identity_id, &domain_response.name, domain)?;
 
         // Determine overall verification status
         let overall_status = match domain_response.status.as_str() {
@@ -789,6 +811,29 @@ mod tests {
         let (priority, host) = parse_scaleway_mx_value("0 mx.example.com");
         assert_eq!(priority, Some(0));
         assert_eq!(host, "mx.example.com");
+    }
+
+    // ── check_identity_domain_matches ────────────────────────────────────────
+
+    #[test]
+    fn identity_domain_matching_requested_domain_is_ok() {
+        assert!(check_identity_domain_matches("uuid-1234", "example.com", "example.com").is_ok());
+    }
+
+    #[test]
+    fn identity_domain_matching_case_insensitively_is_ok() {
+        assert!(check_identity_domain_matches("uuid-1234", "Example.COM", "example.com").is_ok());
+    }
+
+    #[test]
+    fn identity_domain_mismatch_is_rejected() {
+        let err = check_identity_domain_matches("uuid-1234", "other-domain.com", "example.com")
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("other-domain.com") && message.contains("example.com"),
+            "error must name both the identity's real domain and the requested domain, got: {message}"
+        );
     }
 
     // ── records.spf round-trip ───────────────────────────────────────────────
