@@ -551,9 +551,16 @@ impl DomainService {
     /// before records are fully parsed, or a provider-side quirk) — trusting
     /// it here would let a domain with missing/empty DKIM through the sending
     /// gate, which is exactly the bug `are_all_records_verified` exists to
-    /// prevent. The provider's Failed signal is still honored as a hard
-    /// failure (e.g. revoked/bounced), but never promoted to Verified.
+    /// prevent. The provider's Failed signal is checked FIRST and always
+    /// wins, even over records that currently resolve as verified: a
+    /// provider-side revocation/suspension is authoritative and must not be
+    /// overridden by DNS that simply hasn't caught up yet (stale resolver
+    /// cache, or the owner never removed old records).
     fn resolve_verification_status(details: &DomainIdentityDetails) -> VerificationStatus {
+        if let VerificationStatus::Failed(msg) = &details.overall_status {
+            return VerificationStatus::Failed(msg.clone());
+        }
+
         if Self::are_all_records_verified(details) {
             return VerificationStatus::Verified;
         }
@@ -573,10 +580,7 @@ impl DomainService {
             );
         }
 
-        match &details.overall_status {
-            VerificationStatus::Failed(msg) => VerificationStatus::Failed(msg.clone()),
-            _ => VerificationStatus::Pending,
-        }
+        VerificationStatus::Pending
     }
 
     /// List all domains
@@ -1258,6 +1262,27 @@ mod tests {
             DomainService::resolve_verification_status(&details),
             VerificationStatus::Failed(_)
         ));
+    }
+
+    #[test]
+    fn provider_failed_status_wins_even_when_records_currently_resolve_verified() {
+        // A provider-side revocation/suspension is authoritative and must not
+        // be silently overridden by DNS that hasn't caught up yet (e.g. a
+        // stale resolver cache, or the owner never removed the old records).
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Failed("suspended by provider".to_string()),
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        assert!(
+            matches!(
+                DomainService::resolve_verification_status(&details),
+                VerificationStatus::Failed(_)
+            ),
+            "a provider-reported Failed status must win even when SPF/DKIM currently resolve verified"
+        );
     }
 
     // ========== Import Tests ==========
