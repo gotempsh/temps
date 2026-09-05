@@ -38,6 +38,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use regex::Regex;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -148,6 +149,63 @@ pub const DEFAULT_PREVIEW_GATEWAY_HOST_PORT: u16 = 8090;
 
 /// Internal port the gateway listens on inside its container.
 const GATEWAY_CONTAINER_PORT: u16 = 8080;
+
+const MAX_GATEWAY_DIAGNOSTIC_CHARS: usize = 4_000;
+
+/// Redact credential-shaped values and bound Docker diagnostics before they
+/// cross an HTTP or log boundary. The complete safe context/source chain is
+/// retained so operational failures remain diagnosable.
+pub(crate) fn sanitize_gateway_diagnostic(diagnostic: &str, sensitive_values: &[&str]) -> String {
+    let mut sanitized = diagnostic.to_string();
+    for value in sensitive_values {
+        if !value.is_empty() {
+            sanitized = sanitized.replace(value, "[redacted]");
+        }
+    }
+
+    for (pattern, replacement) in [
+        (
+            r#"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+={0,2}"#,
+            "${1}[redacted]",
+        ),
+        (
+            r#"(?i)((?:authorization|proxy-authorization|x-registry-auth)\s*[:=]\s*)[^\r\n,;]+"#,
+            "${1}[redacted]",
+        ),
+        (r#"(://)[^\s/@]+@"#, "${1}[redacted]@"),
+        (
+            r#"\b[^\s/:@]+:[^\s/@]+@([A-Za-z0-9.-]+)"#,
+            "[redacted]@${1}",
+        ),
+        (
+            r#"(?i)([a-z][a-z0-9+.-]*://[^\s?]+)\?[^\s]+"#,
+            "${1}?[redacted]",
+        ),
+        (
+            r#"(?i)([\"']?\b[a-z0-9_-]*(?:password|passwd|token|secret|api[_-]?key|authorization)[a-z0-9_-]*[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+            "${1}[redacted]",
+        ),
+    ] {
+        if let Ok(regex) = Regex::new(pattern) {
+            sanitized = regex.replace_all(&sanitized, replacement).into_owned();
+        }
+    }
+
+    let mut chars = sanitized.chars();
+    let bounded: String = chars.by_ref().take(MAX_GATEWAY_DIAGNOSTIC_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}\n… diagnostic truncated; inspect authenticated server logs for more")
+    } else {
+        bounded
+    }
+}
+
+fn docker_operation_error(
+    context: impl Into<String>,
+    error: bollard::errors::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(error).context(context.into())
+}
 
 #[derive(Debug, Clone)]
 pub struct PreviewGatewaySpec {
@@ -299,7 +357,10 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
     );
     while let Some(item) = stream.next().await {
         if let Err(e) = item {
-            return Err(anyhow!("failed to pull image {}: {}", image, e));
+            return Err(docker_operation_error(
+                format!("failed to pull image {image}"),
+                e,
+            ));
         }
     }
     Ok(())
@@ -772,7 +833,7 @@ pub async fn inspect_status(
                 auto_upgrade: settings.auto_upgrade,
             });
         }
-        Err(e) => return Err(anyhow!("docker inspect failed: {}", e)),
+        Err(e) => return Err(docker_operation_error("docker inspect failed", e)),
     };
 
     let image = inspected.config.as_ref().and_then(|c| c.image.clone());
@@ -892,7 +953,7 @@ pub async fn tail_logs(docker: &Docker, container: &str, tail: usize) -> Result<
         .map(|chunk| chunk.map(|c| String::from_utf8_lossy(&c.into_bytes()).to_string()))
         .try_collect()
         .await
-        .map_err(|e| anyhow!("failed to tail gateway logs: {}", e))?;
+        .map_err(|e| docker_operation_error("failed to tail gateway logs", e))?;
 
     let joined = chunks.join("");
     Ok(joined.lines().map(|l| l.to_string()).collect())
@@ -902,6 +963,47 @@ pub async fn tail_logs(docker: &Docker, container: &str, tail: usize) -> Result<
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn docker_operation_error_preserves_bollard_source() {
+        let source = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "daemon rejected the requested port mapping".to_string(),
+        };
+        let error = docker_operation_error("failed to start preview gateway", source);
+
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to start preview gateway: Docker responded with status code 500: daemon rejected the requested port mapping"
+        );
+    }
+
+    #[test]
+    fn gateway_diagnostic_redacts_structured_and_registry_credentials() {
+        let diagnostic = concat!(
+            "registry user:password@example.test rejected ",
+            r#"{"token":"json-value","client_secret":"client-value"} "#,
+            "Authorization: Basic basic-value; X-Registry-Auth: registry-value; Bearer bearer-value"
+        );
+        let sanitized = sanitize_gateway_diagnostic(diagnostic, &[]);
+
+        assert!(sanitized.contains("[redacted]@example.test"));
+        assert!(sanitized.contains(r#""token":[redacted]"#));
+        assert!(sanitized.contains(r#""client_secret":[redacted]"#));
+        assert!(sanitized.contains("Authorization: [redacted]"));
+        assert!(sanitized.contains("X-Registry-Auth: [redacted]"));
+        assert!(sanitized.contains("Bearer [redacted]"));
+        for secret in [
+            "user:password",
+            "json-value",
+            "client-value",
+            "basic-value",
+            "registry-value",
+            "bearer-value",
+        ] {
+            assert!(!sanitized.contains(secret));
+        }
+    }
 
     #[test]
     fn default_gateway_image_is_immutable() {

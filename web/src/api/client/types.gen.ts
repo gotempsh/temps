@@ -4386,7 +4386,10 @@ export type CreateProjectAccessRequest = {
 /**
  * Request to create a project from a template
  *
- * Supports two deploy modes:
+ * Supports three deploy modes:
+ * * **Native image service mode** — curated service templates deploy a
+ * digest-pinned container image and retain their template release identity,
+ * runtime configuration, and managed-service bindings.
  * * **Fork mode** — when `git_provider_connection_id` is set, the template
  * repo is cloned into a new repository under the user's Git account and the
  * project tracks that fork (git-push deploys, automatic deploy on push).
@@ -4479,11 +4482,13 @@ export type CreateProjectFromTemplateRequest = {
  */
 export type CreateProjectFromTemplateResponse = {
     /**
-     * Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.
+     * Actionable retry guidance when project creation succeeded but deployment
+     * dispatch did not. Internal queue errors are never exposed.
      */
     deployment_error?: string | null;
     /**
-     * Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.
+     * Whether the initial deployment was successfully queued. This is set for
+     * native image service templates; Git-backed modes use their pipeline flow.
      */
     deployment_queued?: boolean | null;
     /**
@@ -4526,7 +4531,8 @@ export type CreateProjectRequest = {
      */
     environment_variables?: Array<ProjectEnvVarInput> | null;
     /**
-     * Exact slug returned by service-template preflight. Normal project creation omits it.
+     * Optimistically reserved slug used by template creation to ensure the
+     * persisted project receives the URL shown during configuration.
      */
     expected_slug?: string | null;
     /**
@@ -13609,6 +13615,10 @@ export type PresetResponse = {
      * Unique identifier slug for the preset
      */
     slug: string;
+};
+
+export type PreviewGatewayLogsResponse = {
+    lines: Array<string>;
 };
 
 /**
@@ -29389,17 +29399,37 @@ export type FinalizeOrderData = {
 
 export type FinalizeOrderErrors = {
     /**
+     * Bad request - account email or ACME order is invalid
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Domain or DNS provider permission denied
+     */
+    403: unknown;
     /**
      * Domain or order not found
      */
     404: unknown;
     /**
+     * Certificate issued but DNS cleanup requires operator action
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Certificate issued but DNS provider cleanup failed
+     */
+    502: unknown;
+    /**
+     * Certificate issued but DNS provider service is unavailable
+     */
+    503: unknown;
 };
 
 export type FinalizeOrderResponses = {
@@ -29440,6 +29470,10 @@ export type SetupDnsChallengeErrors = {
      * Domain or DNS provider not found
      */
     404: unknown;
+    /**
+     * Ambiguous managed DNS zone
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -29609,13 +29643,25 @@ export type ProvisionDomainData = {
 
 export type ProvisionDomainErrors = {
     /**
+     * Bad request - account email or challenge is invalid
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
     /**
+     * Domain permission denied or a user account is required
+     */
+    403: unknown;
+    /**
      * Domain not found
      */
     404: unknown;
+    /**
+     * DNS cleanup-aware order must use the finalize endpoint
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -40815,8 +40861,17 @@ export type GetPreviewGatewayLogsData = {
     url: '/preview-gateway/logs';
 };
 
+export type GetPreviewGatewayLogsErrors = {
+    /**
+     * Docker log request failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetPreviewGatewayLogsError = GetPreviewGatewayLogsErrors[keyof GetPreviewGatewayLogsErrors];
+
 export type GetPreviewGatewayLogsResponses = {
-    200: LogsResponse;
+    200: PreviewGatewayLogsResponse;
 };
 
 export type GetPreviewGatewayLogsResponse = GetPreviewGatewayLogsResponses[keyof GetPreviewGatewayLogsResponses];
@@ -40827,6 +40882,15 @@ export type RestartPreviewGatewayData = {
     query?: never;
     url: '/preview-gateway/restart';
 };
+
+export type RestartPreviewGatewayErrors = {
+    /**
+     * Gateway restart failed
+     */
+    500: ProblemDetails;
+};
+
+export type RestartPreviewGatewayError = RestartPreviewGatewayErrors[keyof RestartPreviewGatewayErrors];
 
 export type RestartPreviewGatewayResponses = {
     /**
@@ -40857,6 +40921,15 @@ export type PatchPreviewGatewaySettingsData = {
     url: '/preview-gateway/settings';
 };
 
+export type PatchPreviewGatewaySettingsErrors = {
+    /**
+     * Settings update failed
+     */
+    500: ProblemDetails;
+};
+
+export type PatchPreviewGatewaySettingsError = PatchPreviewGatewaySettingsErrors[keyof PatchPreviewGatewaySettingsErrors];
+
 export type PatchPreviewGatewaySettingsResponses = {
     200: PreviewGatewaySettingsResponse;
 };
@@ -40870,6 +40943,15 @@ export type GetPreviewGatewayStatusData = {
     url: '/preview-gateway/status';
 };
 
+export type GetPreviewGatewayStatusErrors = {
+    /**
+     * Docker status request failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetPreviewGatewayStatusError = GetPreviewGatewayStatusErrors[keyof GetPreviewGatewayStatusErrors];
+
 export type GetPreviewGatewayStatusResponses = {
     200: GatewayStatus;
 };
@@ -40882,6 +40964,15 @@ export type UpgradePreviewGatewayData = {
     query?: never;
     url: '/preview-gateway/upgrade';
 };
+
+export type UpgradePreviewGatewayErrors = {
+    /**
+     * Gateway upgrade failed
+     */
+    500: ProblemDetails;
+};
+
+export type UpgradePreviewGatewayError = UpgradePreviewGatewayErrors[keyof UpgradePreviewGatewayErrors];
 
 export type UpgradePreviewGatewayResponses = {
     /**

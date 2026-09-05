@@ -10341,6 +10341,7 @@ dependencies = [
  "libc",
  "pulldown-cmark",
  "rand 0.10.2",
+ "regex",
  "sea-orm",
  "serde",
  "serde_json",

@@ -49,6 +49,7 @@ walkdir = { workspace = true }
 pulldown-cmark = "0.13"
 libc = { workspace = true }
 rand = { workspace = true }
+regex = { workspace = true }
 hex = "0.4"
 sha2 = { workspace = true }
 
