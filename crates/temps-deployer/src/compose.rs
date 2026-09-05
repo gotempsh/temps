@@ -7818,7 +7818,18 @@ services:
         let override_yaml =
             executor.generate_security_override(compose, &[], &["webserver".to_string()]);
 
-        assert!(override_yaml.is_empty());
+        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let webserver = override_value["services"]["webserver"]
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            webserver.get("pids_limit").and_then(Value::as_u64),
+            Some(512)
+        );
+        assert_eq!(webserver.get("init"), None);
+        assert_eq!(webserver.get("privileged"), None);
+        assert!(!webserver.contains_key("cap_drop"));
+        assert!(!webserver.contains_key("security_opt"));
     }
 
     #[test]
@@ -7987,7 +7998,7 @@ services:
     }
 
     #[test]
-    fn test_security_override_skips_only_explicitly_unsandboxed_services() {
+    fn test_security_override_keeps_bounds_for_explicitly_unsandboxed_services() {
         let Some(executor) = test_executor() else {
             return;
         };
@@ -8002,12 +8013,21 @@ services:
         let override_yaml =
             executor.generate_security_override(compose, &[], &["webserver".to_string()]);
 
-        assert!(!override_yaml.contains("  webserver:"));
+        assert!(override_yaml.contains("  webserver:"));
         assert!(override_yaml.contains("  worker:"));
         assert_eq!(override_yaml.matches("cap_drop:").count(), 1);
         assert_eq!(override_yaml.matches("no-new-privileges:true").count(), 1);
-        assert_eq!(override_yaml.matches("pids_limit: 512").count(), 1);
+        assert_eq!(override_yaml.matches("pids_limit: 512").count(), 2);
         assert_eq!(override_yaml.matches("init: true").count(), 1);
+
+        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let webserver = override_value["services"]["webserver"]
+            .as_mapping()
+            .unwrap();
+        assert_eq!(webserver.get("init"), None);
+        assert_eq!(webserver.get("privileged"), None);
+        assert!(!webserver.contains_key("cap_drop"));
+        assert!(!webserver.contains_key("security_opt"));
     }
 
     #[tokio::test]
@@ -8111,7 +8131,7 @@ services:
         assert_ne!(image_owned_host.init, Some(true));
         assert!(image_owned_host.cap_drop.unwrap_or_default().is_empty());
         assert!(image_owned_host.security_opt.unwrap_or_default().is_empty());
-        assert!(image_owned_host.pids_limit.is_none());
+        assert_eq!(image_owned_host.pids_limit, Some(512));
 
         let sandboxed_host = sandboxed.host_config.unwrap();
         assert_eq!(sandboxed_host.init, Some(true));
@@ -8501,7 +8521,7 @@ services:
     }
 
     #[test]
-    fn test_security_override_is_empty_when_every_service_is_unsandboxed() {
+    fn test_security_override_preserves_bounds_when_every_service_is_unsandboxed() {
         let Some(executor) = test_executor() else {
             return;
         };
@@ -8510,7 +8530,21 @@ services:
         let override_yaml =
             executor.generate_security_override(compose, &[], &["webserver".to_string()]);
 
-        assert!(override_yaml.is_empty());
+        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let webserver = override_value["services"]["webserver"]
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            webserver.get("pids_limit").and_then(Value::as_u64),
+            Some(512)
+        );
+        assert!(webserver.contains_key("cpus"));
+        assert!(webserver.contains_key("mem_limit"));
+        assert!(webserver.contains_key("logging"));
+        assert_eq!(webserver.get("init"), None);
+        assert_eq!(webserver.get("privileged"), None);
+        assert!(!webserver.contains_key("cap_drop"));
+        assert!(!webserver.contains_key("security_opt"));
     }
 
     #[test]
@@ -8532,7 +8566,7 @@ services:
     }
 
     #[tokio::test]
-    async fn test_write_compose_files_removes_stale_security_override() {
+    async fn test_write_compose_files_rewrites_stale_security_override_with_runtime_bounds() {
         let Some(executor) = test_executor() else {
             return;
         };
@@ -8568,7 +8602,14 @@ services:
             .await
             .unwrap();
 
-        assert!(!stale_override.exists());
+        let rewritten = tokio::fs::read_to_string(&stale_override).await.unwrap();
+        assert!(rewritten.contains("pids_limit: 512"));
+        assert!(rewritten.contains("cpus:"));
+        assert!(rewritten.contains("mem_limit:"));
+        assert!(rewritten.contains("logging:"));
+        assert!(!rewritten.contains("cap_drop:"));
+        assert!(!rewritten.contains("no-new-privileges:true"));
+        assert!(!rewritten.contains("init: true"));
     }
 
     #[test]
