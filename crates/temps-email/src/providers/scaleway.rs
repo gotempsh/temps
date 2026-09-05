@@ -433,6 +433,8 @@ impl EmailProvider for ScalewayProvider {
             .await
             .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
 
+        check_identity_domain_matches(identity_id, &domain_response.name, domain)?;
+
         match domain_response.status.as_str() {
             "checked" | "verified" => Ok(VerificationStatus::Verified),
             "pending" | "unchecked" => Ok(VerificationStatus::Pending),
@@ -597,6 +599,37 @@ impl EmailProvider for ScalewayProvider {
                 domain
             ))
         })?;
+
+        // Deletion is destructive and irreversible, so confirm the UUID still
+        // belongs to this domain before sending it — a stale or mistyped
+        // `provider_identity_id` must never delete a different domain's
+        // provider-side identity. See `check_identity_domain_matches`.
+        let get_response = self
+            .client
+            .get(self.api_url(&format!("/domains/{}", identity_id)))
+            .header("X-Auth-Token", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| EmailError::Scaleway(format!("Failed to get domain: {}", e)))?;
+
+        if !get_response.status().is_success() {
+            let status = get_response.status();
+            let body = get_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(EmailError::Scaleway(format!(
+                "Failed to get domain ({}) before delete: {}",
+                status, body
+            )));
+        }
+
+        let domain_response: ScalewayDomainResponse = get_response
+            .json()
+            .await
+            .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
+
+        check_identity_domain_matches(identity_id, &domain_response.name, domain)?;
 
         let response = self
             .client
