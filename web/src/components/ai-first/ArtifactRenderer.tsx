@@ -10,6 +10,8 @@ import {
   Table2,
 } from 'lucide-react'
 import type { ThreadArtifactResponse } from '@/api/client'
+import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
+import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
 
 function stringValue(value: unknown): string {
   if (typeof value === 'string') return value
@@ -33,12 +35,86 @@ function objectPayload(value: unknown): Record<string, unknown> {
     : {}
 }
 
+function positiveInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : null
+}
+
+function ProjectCollectionArtifact({
+  artifact,
+  payload,
+}: {
+  artifact: ThreadArtifactResponse
+  payload: Record<string, unknown>
+}) {
+  const items = rows(payload.items ?? payload.rows)
+  const projects = items.flatMap((item) => {
+    const id = positiveInteger(item.id ?? item.project_id)
+    const name = stringValue(item.name)
+    const slug = stringValue(item.slug)
+    return name
+      ? [
+          {
+            id,
+            name,
+            slug,
+            repoName: stringValue(item.repo_name) || undefined,
+            repoOwner: stringValue(item.repo_owner) || undefined,
+            preset: stringValue(item.preset) || undefined,
+          },
+        ]
+      : []
+  })
+
+  return (
+    <GeneratedProjectCollection
+      title={artifact.title ?? 'Projects'}
+      presentation={{
+        items: projects,
+        total: projects.length,
+        page: 1,
+        perPage: projects.length,
+      }}
+    />
+  )
+}
+
 export function ArtifactRenderer({
   artifact,
 }: {
   artifact: ThreadArtifactResponse
 }) {
   const payload = objectPayload(artifact.payload)
+  const resourceType = stringValue(
+    payload.resource_type ?? payload.resourceType ?? payload.type
+  ).toLowerCase()
+  if (
+    artifact.kind === 'collection' &&
+    (resourceType === 'project' || resourceType === 'projects')
+  ) {
+    return <ProjectCollectionArtifact artifact={artifact} payload={payload} />
+  }
+  if (
+    (artifact.kind === 'resource' || artifact.kind === 'operation') &&
+    resourceType === 'deployment'
+  ) {
+    const reference = objectPayload(payload.reference)
+    const attributes = objectPayload(payload.attributes)
+    return (
+      <section className="overflow-hidden rounded-lg border border-blue-500/30 bg-blue-500/5">
+        <GeneratedDeploymentCard
+          paramsJson={JSON.stringify({ ...attributes, ...reference })}
+          resultJson={JSON.stringify({ ...attributes, ...reference })}
+          actionStatus="executed"
+          createdAt={artifact.created_at}
+          summary={stringValue(payload.summary) || undefined}
+          statusLabel="Queued"
+          statusClassName="text-blue-600 dark:text-blue-400"
+        />
+      </section>
+    )
+  }
   const payloadRows = rows(
     payload.nodes ??
       payload.steps ??

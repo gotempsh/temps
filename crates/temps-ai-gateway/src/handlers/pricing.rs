@@ -358,6 +358,51 @@ fn build_pricing() -> Vec<ModelPricing> {
         )
         .cache(0.0, 0.0, 0.01875)
         .build(),
+        // ── OpenRouter ──────────────────────────────────────────────────
+        // OpenRouter passes through hundreds of upstream models with
+        // per-model pricing that changes independently of Temps releases;
+        // this is a curated subset of popular routes, not the full catalog.
+        // Live per-request cost is billed by OpenRouter directly.
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-4o",
+            "GPT-4o (via OpenRouter)",
+            2.50,
+            10.0,
+        )
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-4o-mini",
+            "GPT-4o Mini (via OpenRouter)",
+            0.15,
+            0.60,
+        )
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "anthropic/claude-sonnet-5",
+            "Claude Sonnet 5 (via OpenRouter)",
+            2.0,
+            10.0,
+        )
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "meta-llama/llama-3.3-70b-instruct",
+            "Llama 3.3 70B (via OpenRouter)",
+            0.13,
+            0.40,
+        )
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "deepseek/deepseek-chat",
+            "DeepSeek Chat (via OpenRouter)",
+            0.28,
+            0.42,
+        )
+        .build(),
     ]
 }
 
@@ -403,6 +448,7 @@ mod tests {
         assert!(providers.contains(&"anthropic"));
         assert!(providers.contains(&"xai"));
         assert!(providers.contains(&"gemini"));
+        assert!(providers.contains(&"openrouter"));
     }
 
     #[test]

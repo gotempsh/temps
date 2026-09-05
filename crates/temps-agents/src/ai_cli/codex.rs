@@ -252,55 +252,54 @@ impl AiCliProvider for CodexCliProvider {
             }
         };
 
-        // Ask Codex for its redacted, versioned diagnostic report instead of
-        // reading auth.json. `codex exec` inherits the same CODEX_HOME/HOME, so
-        // a login detected here is the login Codex will actually use when the
-        // operator activates this provider. Doctor may exit non-zero because
-        // of unrelated network/MCP checks; auth is determined exclusively from
-        // checks.auth.credentials. Older CLIs fall back to `login status`.
+        // `codex login status` is the narrow, redacted readiness probe and
+        // normally returns immediately. Do not put `doctor --json` first:
+        // doctor also checks unrelated network/MCP state and can take longer
+        // than the provider catalog's entire timeout, making a healthy Codex
+        // login disappear intermittently. Only use the richer diagnostic as a
+        // compatibility fallback when login status cannot identify auth.
         let has_env_key = std::env::var("OPENAI_API_KEY").is_ok();
-        let doctor_output = tokio::time::timeout(
+        let login_output = tokio::time::timeout(
             STATUS_TIMEOUT,
             codex_command()
-                .args(["doctor", "--json"])
+                .args(["login", "status"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output(),
         )
         .await;
-
-        let doctor_auth_method = doctor_output
+        let login_auth_method = login_output
             .as_ref()
             .ok()
             .and_then(|result| result.as_ref().ok())
-            .and_then(|output| codex_doctor_auth_method(&String::from_utf8_lossy(&output.stdout)));
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                codex_auth_method(&combined)
+            });
 
-        let cli_auth_method = if doctor_auth_method.is_some() {
-            doctor_auth_method
+        let cli_auth_method = if login_auth_method.is_some() {
+            login_auth_method
         } else {
-            let login_output = tokio::time::timeout(
+            let doctor_output = tokio::time::timeout(
                 STATUS_TIMEOUT,
                 codex_command()
-                    .args(["login", "status"])
+                    .args(["doctor", "--json"])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .output(),
             )
             .await;
-            login_output
+            doctor_output
                 .as_ref()
                 .ok()
                 .and_then(|result| result.as_ref().ok())
                 .and_then(|output| {
-                    if !output.status.success() {
-                        return None;
-                    }
-                    let combined = format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    codex_auth_method(&combined)
+                    codex_doctor_auth_method(&String::from_utf8_lossy(&output.stdout))
                 })
         };
         let authenticated = has_env_key || cli_auth_method.is_some();

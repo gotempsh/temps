@@ -479,8 +479,37 @@ body {
   animation: log-fade-in 120ms ease-out both;
 }
 
+/* Small pixel-wave used by the AI workspace while a harness or one of its
+   tools is working. Semantic colours keep it legible in either console theme;
+   the reduced-motion block below leaves a quiet, static grid instead. */
+@keyframes ai-activity-pixel {
+  0%,
+  100% {
+    opacity: 0.16;
+  }
+  48% {
+    opacity: 1;
+  }
+}
+
+@keyframes ai-activity-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.ai-activity-pixel {
+  animation: ai-activity-pixel 650ms ease-in-out infinite;
+}
+
+.ai-activity-shimmer {
+  animation: ai-activity-shimmer 1.4s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .log-fresh-line {
+  .log-fresh-line,
+  .ai-activity-pixel,
+  .ai-activity-shimmer {
     animation: none;
   }
 }

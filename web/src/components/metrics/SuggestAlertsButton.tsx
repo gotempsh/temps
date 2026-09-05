@@ -3,18 +3,14 @@
 
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, Settings2, ShieldCheck, Sparkles } from 'lucide-react'
-import { toast } from 'sonner'
+import { useQuery } from '@tanstack/react-query'
+import { Settings2, Sparkles } from 'lucide-react'
 
 // REGEN: bun run openapi-ts — generated from the new
 // GET /projects/{project_id}/ai/readiness endpoint (operationId
 // get_chat_readiness). Imported from the generated SDK rather than hand-rolled
 // (project rule: always use the generated SDK in web/).
-import {
-  getChatReadinessOptions,
-  updateProjectSettingsMutation,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getChatReadinessOptions } from '@/api/client/@tanstack/react-query.gen'
 
 import { useAiAssistant } from '@/components/ai/AiAssistantContext'
 import { Button } from '@/components/ui/button'
@@ -29,11 +25,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  ENABLE_AI_WRITES_BODY,
-  focusedStartPrompt,
-  suggestAlertsState,
-} from './suggest-alerts-state'
+import { focusedStartPrompt, suggestAlertsState } from './suggest-alerts-state'
 
 const START_PROMPT =
   'Look at what this project already alerts on and what metrics it actually reports, then propose the alert rules worth adding. Ground every threshold in real values you queried, and backtest anomaly detectors before proposing them.'
@@ -69,13 +61,7 @@ interface SuggestAlertsButtonProps {
  * actually in and explains the next step:
  *
  * - no AI provider on the instance → point at Settings → AI Providers
- * - write actions off for this project → offer to turn them on, in one click,
- *   behind a confirmation that says what that grants
  * - everything ready → open the chat
- *
- * The two gates are independent and fixed in different places (one instance-wide,
- * one per project), which is why the readiness endpoint reports them separately
- * instead of as a single "unavailable".
  */
 export function SuggestAlertsButton({
   projectId,
@@ -85,27 +71,11 @@ export function SuggestAlertsButton({
   focusMetric,
 }: SuggestAlertsButtonProps) {
   const { open } = useAiAssistant()
-  const queryClient = useQueryClient()
   const [setupOpen, setSetupOpen] = useState(false)
 
   const readinessQuery = useQuery({
     ...getChatReadinessOptions({ path: { project_id: projectId } }),
     enabled: !!projectId,
-  })
-
-  const enableMutation = useMutation({
-    ...updateProjectSettingsMutation(),
-    meta: { errorTitle: 'Failed to enable AI write actions' },
-    onSuccess: () => {
-      toast.success('AI write actions enabled for this project')
-      queryClient.invalidateQueries({
-        predicate: (query) =>
-          (query.queryKey[0] as Record<string, unknown>)?._id ===
-          'getChatReadiness',
-      })
-      setSetupOpen(false)
-      openChat()
-    },
   })
 
   const openChat = () =>
@@ -130,12 +100,10 @@ export function SuggestAlertsButton({
 
   const readiness = readinessQuery.data
   const aiConfigured = readiness?.ai_configured === true
-  const writeEnabled = readiness?.write_actions_enabled === true
   const state = suggestAlertsState({
     isPending: readinessQuery.isPending,
     isError: readinessQuery.isError,
     aiConfigured,
-    writeEnabled,
   })
 
   // Don't offer an action whose outcome we can't predict yet.
@@ -162,70 +130,25 @@ export function SuggestAlertsButton({
 
       <AlertDialog open={setupOpen} onOpenChange={setSetupOpen}>
         <AlertDialogContent>
-          {state === 'configure-provider' ? (
-            <>
-              <AlertDialogHeader>
-                <AlertDialogTitle className="flex items-center gap-2">
-                  <Settings2 className="size-4" />
-                  Configure an AI provider first
-                </AlertDialogTitle>
-                <AlertDialogDescription>
-                  Suggesting alerts needs a model to reason over your metrics,
-                  and this instance has no AI provider configured yet. Add one
-                  on the AI Gateway page (you bring your own key — Temps stores
-                  it encrypted and calls the provider directly). Come back here
-                  afterwards and this button will open the chat.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Close</AlertDialogCancel>
-                <AlertDialogAction asChild>
-                  <Link to="/ai-gateway">Go to AI Gateway</Link>
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </>
-          ) : (
-            <>
-              <AlertDialogHeader>
-                <AlertDialogTitle className="flex items-center gap-2">
-                  <ShieldCheck className="size-4" />
-                  Enable AI write actions?
-                </AlertDialogTitle>
-                <AlertDialogDescription>
-                  To suggest alerts, the assistant needs to be able to{' '}
-                  <strong>propose</strong> changes to this project. Nothing runs
-                  automatically: each suggested rule appears in the chat as a
-                  separate action that waits for you to review and{' '}
-                  <strong>Confirm</strong> it, and it runs with your own
-                  permissions. You can turn this off anytime in Settings →
-                  Security.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel disabled={enableMutation.isPending}>
-                  Cancel
-                </AlertDialogCancel>
-                <AlertDialogAction
-                  disabled={enableMutation.isPending}
-                  onClick={(e) => {
-                    e.preventDefault()
-                    enableMutation.mutate({
-                      path: { project_id: projectId },
-                      // Enable the read-only chat too, so the project can never
-                      // end up with write actions on but the chat they're
-                      // proposed in switched off.
-                      body: ENABLE_AI_WRITES_BODY,
-                    })
-                  }}
-                >
-                  {enableMutation.isPending && (
-                    <Loader2 className="mr-1.5 size-4 animate-spin" />
-                  )}
-                  Enable and continue
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </>
-          )}
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <Settings2 className="size-4" />
+              Configure an AI provider first
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Suggesting alerts needs a model to reason over your metrics, and
+              this instance has no AI provider configured yet. Add one on the AI
+              Gateway page (you bring your own key — Temps stores it encrypted
+              and calls the provider directly). Come back here afterwards and
+              this button will open the chat.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Close</AlertDialogCancel>
+            <AlertDialogAction asChild>
+              <Link to="/ai-gateway">Go to AI Gateway</Link>
+            </AlertDialogAction>
+          </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </>

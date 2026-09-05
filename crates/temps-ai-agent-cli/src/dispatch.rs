@@ -15,16 +15,15 @@ use temps_ai::{
     ProviderCapabilities, RefreshPolicy, TokenStream, ToolExecutor, TurnServices,
 };
 
-/// Read seam for the instance-level provider preference (`ai_gateway_config`).
-/// Defined here rather than depended on from `temps-ai-gateway` so this crate
-/// stays free of a DB dependency — `temps-ai-gateway` implements this trait
-/// for its `ProviderPreferenceService` and hands `DispatchingAiService` an
-/// `Arc<dyn ActiveProviderReader>` at construction time.
+/// Read seam for instance-wide server-authored summary defaults.
+///
+/// The legacy active-harness method remains for source compatibility while
+/// callers migrate, but the registry never uses it for ordinary routing: a
+/// harness must be explicitly pinned by an application thread.
 #[async_trait]
 pub trait ActiveProviderReader: Send + Sync {
-    /// Returns the catalog id (e.g. `"claude_cli"`) of the active agent-CLI
-    /// provider when the instance-scoped preference is `"agent_cli"`, or
-    /// `None` when it's `"gateway"`, unset, or the row can't be read.
+    /// Deprecated compatibility seam. It is intentionally ignored by
+    /// [`AiProviderRegistry`]; host harnesses cannot be ambient defaults.
     async fn active_agent_cli_provider(&self) -> Option<String>;
 
     /// Instance-wide defaults for server-authored summary workloads. The
@@ -43,9 +42,7 @@ pub struct AiSummaryPreference {
     pub thinking_level: Option<String>,
 }
 
-/// A no-op reader that never selects an agent-CLI provider — used by
-/// [`AiProviderRegistry::new`] so callers without provider selection
-/// keep the original pure-passthrough-to-gateway behaviour unchanged.
+/// A no-op reader for callers that do not persist summary defaults.
 struct NeverAgentCli;
 
 #[async_trait]
@@ -55,11 +52,10 @@ impl ActiveProviderReader for NeverAgentCli {
     }
 }
 
-/// Routes each [`AiService`] call to whichever provider is currently active,
-/// so a BYOK provider key and a subscription-backed agent CLI are usable the
-/// same way — whichever the operator picked in the AI Provider Preference
-/// card drives every AI feature that reads through this seam, not just AI
-/// Workflows.
+/// Routes ordinary requests to the API gateway and explicit thread pins to an
+/// agent harness. There is deliberately no instance-wide active harness:
+/// a host harness carries filesystem and MCP capability and therefore must be
+/// selected by an application thread rather than an inference setting.
 ///
 /// Multi-turn function calling follows the pinned/active provider too. Agent
 /// CLI services receive a scoped executor and register it through their native
@@ -82,9 +78,8 @@ impl AiProviderRegistry {
         }
     }
 
-    /// Phase 2/3 constructor: routes to `agent_cli_services[id]` when
-    /// `preference` reports an active agent-CLI provider whose id is present
-    /// in the map, else falls back to `gateway`.
+    /// Constructor for the gateway plus explicitly addressable development
+    /// harnesses. The preference reader supplies summary defaults only.
     pub fn with_providers(
         gateway: Arc<dyn AiService>,
         preference: Arc<dyn ActiveProviderReader>,
@@ -108,20 +103,14 @@ impl AiProviderRegistry {
         Self::with_providers(gateway, preference, providers)
     }
 
-    /// The service to use for a workload an agent CLI can actually serve.
-    /// An explicit conversation pin fails closed when its service is missing;
-    /// only the instance-level preference may fall back to the gateway.
+    /// The service to use for a workload. An explicit harness pin fails closed
+    /// when its service is missing; an omitted provider is always gateway-only.
     async fn routed(&self, requested: Option<&str>) -> Option<Arc<dyn AiService>> {
         if let Some(id) = requested {
             if id == "gateway" || id.starts_with("gateway_key:") {
                 return Some(self.gateway.clone());
             }
             return self.agent_cli_services.get(id).cloned();
-        }
-        if let Some(id) = self.preference.active_agent_cli_provider().await {
-            if let Some(svc) = self.agent_cli_services.get(&id) {
-                return Some(svc.clone());
-            }
         }
         Some(self.gateway.clone())
     }
@@ -435,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_with_agent_cli_routes_complete_to_active_cli_provider() {
+    async fn omitted_provider_routes_to_gateway_even_when_a_harness_is_registered() {
         let gateway = tagged_service("gateway");
         let mut agent_cli_services = HashMap::new();
         agent_cli_services.insert("claude_cli".to_string(), tagged_service("claude_cli"));
@@ -454,7 +443,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.text, "claude_cli:test");
+        assert_eq!(result.text, "gateway:test");
     }
 
     #[tokio::test]
@@ -676,7 +665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_with_agent_cli_routes_scoped_tool_executor_to_active_cli() {
+    async fn omitted_provider_routes_scoped_tool_executor_to_gateway() {
         use futures::StreamExt;
 
         let gateway = tagged_service("gateway");
@@ -703,7 +692,7 @@ mod tests {
 
         assert!(matches!(
             stream.next().await,
-            Some(Ok(temps_ai::ChatStreamDelta::Text(text))) if text == "claude_cli:test:true"
+            Some(Ok(temps_ai::ChatStreamDelta::Text(text))) if text == "gateway:test:true"
         ));
     }
 }

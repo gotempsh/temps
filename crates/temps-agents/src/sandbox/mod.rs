@@ -358,6 +358,27 @@ pub trait SandboxProvider: Send + Sync {
     /// Create and start a new sandbox for a run.
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError>;
 
+    /// Attach a sandbox and a bounded set of application-owned data services
+    /// to an isolated per-application network. The default rejects the
+    /// operation; only providers capable of enforcing network membership
+    /// should implement it.
+    async fn configure_application_network(
+        &self,
+        handle: &SandboxHandle,
+        network_name: &str,
+        service_containers: &[String],
+    ) -> Result<(), AgentError> {
+        let _ = (network_name, service_containers);
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "application networks are not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
     /// Execute a command inside an existing sandbox, streaming stdout via callback.
     async fn exec(
         &self,

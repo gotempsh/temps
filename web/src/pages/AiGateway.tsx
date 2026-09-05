@@ -15,7 +15,6 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { SearchableSelect } from '@/components/ui/searchable-select'
-import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -112,7 +111,6 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { AI_CLI_PROVIDER_SHELL } from '@/lib/ai-cli-providers'
 import {
   listProviderKeys,
   createProviderKey,
@@ -124,18 +122,12 @@ import {
   updateProviderModel,
   updateProviderKey,
   testProviderKeyById,
-  saveAiProviderCredential,
   type ProviderKeyResponse,
-  type ProviderCatalogDto,
 } from '@/api/client'
 import {
   getAiProviderStatusOptions,
   getAiProviderStatusQueryKey,
-  updateAiProviderPreferenceMutation,
   updateAiSummaryPreferenceMutation,
-  listAiProvidersOptions,
-  listAiProvidersQueryKey,
-  refreshAiProviderStatusMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { useProjects } from '@/contexts/ProjectsContext'
@@ -146,7 +138,6 @@ import {
   aiProviderModels,
   getAiProvider,
 } from '@/lib/ai-providers'
-import { hostAuthLabel } from '@/lib/ai-cli-auth'
 import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
@@ -3408,6 +3399,7 @@ export function AgentActivity() {
               <SelectItem value="anthropic">Anthropic</SelectItem>
               <SelectItem value="xai">xAI</SelectItem>
               <SelectItem value="gemini">Google Gemini</SelectItem>
+              <SelectItem value="openrouter">OpenRouter</SelectItem>
               <SelectItem value="mistral">Mistral</SelectItem>
               <SelectItem value="deepseek">DeepSeek</SelectItem>
             </SelectContent>
@@ -3703,6 +3695,7 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
               <SelectItem value="anthropic">Anthropic</SelectItem>
               <SelectItem value="xai">xAI</SelectItem>
               <SelectItem value="gemini">Google Gemini</SelectItem>
+              <SelectItem value="openrouter">OpenRouter</SelectItem>
               <SelectItem value="mistral">Mistral</SelectItem>
               <SelectItem value="deepseek">DeepSeek</SelectItem>
             </SelectContent>
@@ -3947,148 +3940,6 @@ function DeleteConfirmDialog({
   )
 }
 
-// ============================================================================
-// Agent CLI credential dialog body (ADR-037) — the CLI-provider counterpart
-// to the BYOK "Add Provider Key" form above. Same dialog shell, different
-// fields: an auth-flavor picker (a CLI can accept a subscription OAuth
-// token, a plain API key, or a config file, depending on provider) plus one
-// credential blob, instead of display-name/key/base-url.
-// ============================================================================
-
-interface CliCredentialDialogBodyProps {
-  cli: ProviderCatalogDto
-  authType: string
-  onAuthTypeChange: (id: string) => void
-  credential: string
-  onCredentialChange: (value: string) => void
-  onSave: () => void
-  saving: boolean
-}
-
-function CliCredentialDialogBody({
-  cli,
-  authType,
-  onAuthTypeChange,
-  credential,
-  onCredentialChange,
-  onSave,
-  saving,
-}: CliCredentialDialogBodyProps) {
-  const selectedFlavor =
-    cli.auth_flavors.find((f) => f.id === authType) ?? cli.auth_flavors[0]
-
-  return (
-    <>
-      <DialogHeader>
-        <DialogTitle>Configure {cli.name}</DialogTitle>
-        <DialogDescription>
-          Your credential is encrypted at rest and injected into each agent
-          session on this host — not used for gateway BYOK routing.
-        </DialogDescription>
-      </DialogHeader>
-      <div className="grid gap-4 py-4">
-        <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
-          <AiProviderIcon provider={cli.id} size={36} />
-          <div className="min-w-0 flex-1 space-y-0.5">
-            <div className="text-sm font-medium">{cli.name}</div>
-            <div className="text-xs text-muted-foreground truncate">
-              Install:{' '}
-              <code className="bg-muted px-1 rounded">
-                {cli.install_command}
-              </code>
-            </div>
-            <div className="text-xs text-muted-foreground truncate">
-              Auth:{' '}
-              <code className="bg-muted px-1 rounded">{cli.auth_command}</code>
-            </div>
-          </div>
-        </div>
-
-        {cli.auth_flavors.length > 1 && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {cli.auth_flavors.map((flavor) => (
-              <button
-                key={flavor.id}
-                type="button"
-                onClick={() => onAuthTypeChange(flavor.id)}
-                className={`rounded-md border p-2.5 text-left transition-colors ${
-                  selectedFlavor?.id === flavor.id
-                    ? 'border-primary bg-primary/10'
-                    : 'border-border hover:border-primary/50'
-                }`}
-              >
-                <p className="text-xs font-medium">{flavor.label}</p>
-                <p className="text-[11px] text-muted-foreground mt-0.5">
-                  {flavor.description}
-                </p>
-              </button>
-            ))}
-          </div>
-        )}
-
-        <div className="grid gap-2">
-          <Label htmlFor="cliCredential">
-            {selectedFlavor?.label ?? 'Credential'}
-            {selectedFlavor?.env_var && (
-              <span className="ml-2 text-xs font-normal text-muted-foreground">
-                → injected as {selectedFlavor.env_var}
-              </span>
-            )}
-          </Label>
-          {selectedFlavor?.description && (
-            <p className="text-xs text-muted-foreground">
-              {selectedFlavor.description}
-            </p>
-          )}
-          {selectedFlavor?.format === 'config_file' ? (
-            <Textarea
-              id="cliCredential"
-              placeholder={
-                cli.credential_saved
-                  ? '••••••••••••• (saved — paste a new file body to replace)'
-                  : 'Paste the full file contents here...'
-              }
-              value={credential}
-              onChange={(e) => onCredentialChange(e.target.value)}
-              className="min-h-[140px] font-mono text-xs"
-            />
-          ) : (
-            <Input
-              id="cliCredential"
-              type="password"
-              placeholder={
-                cli.credential_saved
-                  ? '••••••••••••• (saved — paste a new value to replace)'
-                  : selectedFlavor?.format === 'oauth_token'
-                    ? 'Paste OAuth token...'
-                    : 'Paste API key...'
-              }
-              value={credential}
-              onChange={(e) => onCredentialChange(e.target.value)}
-            />
-          )}
-        </div>
-      </div>
-      <DialogFooter>
-        <Button
-          onClick={onSave}
-          disabled={saving || !credential.trim()}
-          className="w-full sm:w-auto"
-        >
-          {saving ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Saving…
-            </>
-          ) : (
-            'Save credential'
-          )}
-        </Button>
-      </DialogFooter>
-    </>
-  )
-}
-
 export function AiGatewayPage() {
   const queryClient = useQueryClient()
   const { data: settings } = useSettings()
@@ -4111,11 +3962,6 @@ export function AiGatewayPage() {
   const [newApiKey, setNewApiKey] = useState('')
   const [newBaseUrl, setNewBaseUrl] = useState('')
 
-  // Agent CLI credential form state — same dialog shell as BYOK, different
-  // fields (auth flavor + one credential blob instead of key/name/base-url).
-  const [newCliAuthType, setNewCliAuthType] = useState('')
-  const [newCliCredential, setNewCliCredential] = useState('')
-
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
   const gatewayEndpoint = `${externalUrl}/api/ai/v1`
@@ -4131,18 +3977,6 @@ export function AiGatewayPage() {
 
   const keys = keysData ?? []
 
-  // Agent CLI catalog (Claude Code, Codex, OpenCode) — rendered alongside
-  // the BYOK providers below so switching to a subscription-backed CLI is
-  // one list, not a separate settings surface (ADR-037 Phase 2).
-  const { data: cliCatalog, isLoading: cliCatalogLoading } = useQuery(
-    listAiProvidersOptions()
-  )
-  const cliProviders = cliCatalog?.providers ?? []
-  // Static shell so the three subscription CLI rows render immediately
-  // instead of popping in 2-3s late — that delay comes from the backend
-  // spawning a subprocess per CLI to check host auth status. Only the
-  // Status/Actions cells (which depend on that check) show a skeleton;
-  // provider name/description are known ahead of time.
   const { data: providerPreference } = useQuery(getAiProviderStatusOptions())
   const summaryStatus = providerPreference as
     | (typeof providerPreference & {
@@ -4154,29 +3988,6 @@ export function AiGatewayPage() {
         }
       })
     | undefined
-
-  const activeCliProviderId =
-    providerPreference?.active_provider_type === 'agent_cli'
-      ? providerPreference.agent_cli_provider_id
-      : null
-
-  const preferenceMutation = useMutation({
-    ...updateAiProviderPreferenceMutation(),
-    meta: { errorTitle: 'Failed to update AI provider preference' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: getAiProviderStatusQueryKey() })
-    },
-  })
-
-  const refreshProviderStatusMutation = useMutation({
-    ...refreshAiProviderStatusMutation(),
-    meta: { errorTitle: 'Failed to refresh AI provider status' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: getAiProviderStatusQueryKey() })
-      queryClient.invalidateQueries({ queryKey: listAiProvidersQueryKey() })
-      toast.success('Subscription provider authentication refreshed')
-    },
-  })
 
   const refreshAllGatewayModelsMutation = useMutation({
     mutationFn: () =>
@@ -4197,74 +4008,6 @@ export function AiGatewayPage() {
         description: apiErrorMessage(error),
       }),
   })
-
-  const activateCliProvider = (providerId: string, providerName: string) => {
-    preferenceMutation.mutate(
-      {
-        body: { provider_type: 'agent_cli', agent_cli_provider_id: providerId },
-      },
-      {
-        onSuccess: () => {
-          toast.success(`Routing AI workloads through ${providerName}`)
-        },
-      }
-    )
-  }
-
-  const switchToGateway = () => {
-    preferenceMutation.mutate(
-      { body: { provider_type: 'gateway', agent_cli_provider_id: null } },
-      {
-        onSuccess: () => {
-          toast.success('Routing AI workloads through the gateway (BYOK)')
-        },
-      }
-    )
-  }
-
-  // Save (or replace) a CLI's credential — same encrypted storage the
-  // /agent-sandbox/providers detail page uses, just surfaced inline here so
-  // "Configure" behaves like the BYOK dialog instead of navigating away.
-  const saveCliCredentialMutation = useMutation({
-    mutationFn: (vars: {
-      providerId: string
-      authType: string
-      credential: string
-    }) =>
-      saveAiProviderCredential({
-        path: { provider_id: vars.providerId },
-        body: { auth_type: vars.authType, credential: vars.credential },
-      }),
-    meta: { errorTitle: 'Failed to save credential' },
-    onSuccess: (_data, vars) => {
-      queryClient.invalidateQueries({ queryKey: listAiProvidersQueryKey() })
-      setDialogOpen(false)
-      resetForm()
-      toast.success(
-        `${cliProviders.find((p) => p.id === vars.providerId)?.name ?? vars.providerId} credential saved`
-      )
-    },
-  })
-
-  const handleSaveCliCredential = () => {
-    if (!newProvider) return
-    if (!newCliCredential.trim()) {
-      toast.error('Please paste a credential')
-      return
-    }
-    saveCliCredentialMutation.mutate({
-      providerId: newProvider,
-      authType: newCliAuthType,
-      credential: newCliCredential.trim(),
-    })
-  }
-
-  const openCliDialog = (cli: ProviderCatalogDto) => {
-    setNewProvider(cli.id)
-    setNewCliAuthType(cli.current_auth_type ?? cli.auth_flavors[0]?.id ?? '')
-    setNewCliCredential('')
-    setDialogOpen(true)
-  }
 
   // Create mutation
   const createMutation = useMutation({
@@ -4347,8 +4090,6 @@ export function AiGatewayPage() {
     setNewDisplayName('')
     setNewApiKey('')
     setNewBaseUrl('')
-    setNewCliAuthType('')
-    setNewCliCredential('')
   }
 
   const handleCreate = () => {
@@ -4387,9 +4128,6 @@ export function AiGatewayPage() {
     keys.some((k) => k.provider === p.id && k.is_active)
   )
 
-  // Which dialog body to render — set when a CLI row's "Configure"/"Update
-  // credential" action opened the shared dialog (see openCliDialog above).
-  const dialogCliProvider = cliProviders.find((p) => p.id === newProvider)
   const effectiveSnippetProvider =
     snippetProvider || firstConfiguredProvider?.id || SUPPORTED_PROVIDERS[0].id
   const snippetModel =
@@ -4565,27 +4303,20 @@ console.log(response.choices[0].message.content);`,
           <div>
             <h2 className="text-lg font-semibold">AI providers</h2>
             <p className="text-sm text-muted-foreground">
-              Gateway keys and subscription CLIs available on this host.
+              Bring-your-own API keys used by the OpenAI-compatible gateway.
             </p>
           </div>
           <Button
             variant="outline"
             size="sm"
             onClick={() => {
-              refreshProviderStatusMutation.mutate({})
               refreshAllGatewayModelsMutation.mutate()
             }}
-            disabled={
-              refreshProviderStatusMutation.isPending ||
-              refreshAllGatewayModelsMutation.isPending
-            }
+            disabled={refreshAllGatewayModelsMutation.isPending}
           >
             <RefreshCw
               className={`mr-2 h-4 w-4 ${
-                refreshProviderStatusMutation.isPending ||
-                refreshAllGatewayModelsMutation.isPending
-                  ? 'animate-spin'
-                  : ''
+                refreshAllGatewayModelsMutation.isPending ? 'animate-spin' : ''
               }`}
             />
             Refresh auth &amp; models
@@ -4800,236 +4531,15 @@ console.log(response.choices[0].message.content);`,
                     </Fragment>
                   )
                 })}
-
-                {/* Subscription-backed agent CLIs (ADR-037 Phase 2) — same
-                      row shape as BYOK providers above, but only one CLI can
-                      be the active routing target at a time (unlike BYOK
-                      keys, which are additive). "Active" means this CLI is
-                      what AI Gateway requests currently route through.
-
-                      Host auth status is checked via a per-CLI subprocess
-                      spawn server-side, which takes a couple seconds — the
-                      rows below render immediately from a static shell so
-                      only the Status/Actions cells (the part that's
-                      actually waiting on that check) show a skeleton. */}
-                {cliCatalogLoading
-                  ? AI_CLI_PROVIDER_SHELL.map((shell) => (
-                      <TableRow key={shell.id} className="hover:bg-transparent">
-                        <TableCell className="py-2 pr-0" />
-                        <TableCell className="py-2">
-                          <div className="flex items-center gap-3 min-w-0">
-                            <AiProviderIcon provider={shell.id} size={32} />
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <span className="text-sm font-medium truncate">
-                                  {shell.name}
-                                </span>
-                                <Badge
-                                  variant="outline"
-                                  className="h-5 px-1.5 text-[10px] text-muted-foreground"
-                                >
-                                  Subscription
-                                </Badge>
-                              </div>
-                              <Skeleton className="h-3 w-48 mt-1" />
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="hidden lg:table-cell py-2">
-                          <Skeleton className="h-3 w-32" />
-                        </TableCell>
-                        <TableCell className="hidden sm:table-cell py-2">
-                          <Skeleton className="h-5 w-24" />
-                        </TableCell>
-                        <TableCell className="py-2 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            <Skeleton className="h-8 w-32" />
-                            <Skeleton className="h-8 w-8" />
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))
-                  : cliProviders.map((cli) => {
-                      const isActive = activeCliProviderId === cli.id
-                      const expanded = expandedProvider === cli.id
-                      return (
-                        <Fragment key={cli.id}>
-                          <TableRow
-                            className="cursor-pointer"
-                            onClick={() =>
-                              setExpandedProvider(expanded ? null : cli.id)
-                            }
-                          >
-                            <TableCell className="py-2 pr-0">
-                              <ChevronRight
-                                className={`h-4 w-4 text-muted-foreground transition-transform ${expanded ? 'rotate-90' : ''}`}
-                              />
-                            </TableCell>
-                            <TableCell className="py-2">
-                              <div className="flex items-center gap-3 min-w-0">
-                                <AiProviderIcon provider={cli.id} size={32} />
-                                <div className="min-w-0">
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-sm font-medium truncate">
-                                      {cli.name}
-                                    </span>
-                                    <Badge
-                                      variant="outline"
-                                      className="h-5 px-1.5 text-[10px] text-muted-foreground"
-                                    >
-                                      Subscription
-                                    </Badge>
-                                    {cli.host_authenticated && (
-                                      <Badge
-                                        variant="secondary"
-                                        className="h-5 px-1.5 text-[10px]"
-                                      >
-                                        Host environment
-                                      </Badge>
-                                    )}
-                                  </div>
-                                  <p className="text-xs text-muted-foreground truncate">
-                                    {cli.host_authenticated
-                                      ? `${hostAuthLabel(cli.host_auth_method)} — available for host-routed AI tasks; sandbox workflows require a separate credential`
-                                      : (cli.host_auth_hint ??
-                                        'Not authenticated on this host yet')}
-                                  </p>
-                                </div>
-                              </div>
-                            </TableCell>
-                            <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
-                              <span className="line-clamp-1">
-                                {cli.models.length > 0
-                                  ? cli.models.join(', ')
-                                  : 'Model selection lives in the CLI’s own config'}
-                              </span>
-                            </TableCell>
-                            <TableCell className="hidden sm:table-cell py-2">
-                              {isActive ? (
-                                <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
-                                  Active
-                                </Badge>
-                              ) : cli.host_authenticated ? (
-                                <Badge
-                                  variant="secondary"
-                                  className="justify-center whitespace-nowrap"
-                                >
-                                  Configured
-                                </Badge>
-                              ) : (
-                                <Badge
-                                  variant="outline"
-                                  className="justify-center whitespace-nowrap text-muted-foreground"
-                                >
-                                  Not configured
-                                </Badge>
-                              )}
-                            </TableCell>
-                            <TableCell
-                              className="py-2 text-right"
-                              onClick={(event) => event.stopPropagation()}
-                            >
-                              <div className="flex items-center justify-end gap-1.5">
-                                {isActive ? (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={switchToGateway}
-                                    disabled={preferenceMutation.isPending}
-                                  >
-                                    Switch to Gateway
-                                  </Button>
-                                ) : cli.host_authenticated ? (
-                                  <Button
-                                    variant="default"
-                                    size="sm"
-                                    onClick={() =>
-                                      activateCliProvider(cli.id, cli.name)
-                                    }
-                                    disabled={preferenceMutation.isPending}
-                                  >
-                                    Use this provider
-                                  </Button>
-                                ) : (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled
-                                    title={
-                                      cli.host_auth_hint ??
-                                      'Not authenticated on this host yet'
-                                    }
-                                  >
-                                    Not authenticated
-                                  </Button>
-                                )}
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8"
-                                  title={
-                                    cli.credential_saved
-                                      ? 'Update sandbox credential (used by the AI Workflows autofixer, not chat)'
-                                      : 'Configure sandbox credential (used by the AI Workflows autofixer, not chat)'
-                                  }
-                                  onClick={() => openCliDialog(cli)}
-                                >
-                                  <Wrench className="h-4 w-4" />
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                          {expanded && (
-                            <TableRow className="bg-muted/20 hover:bg-muted/20">
-                              <TableCell />
-                              <TableCell colSpan={4} className="pb-4 pt-1">
-                                <div className="space-y-2 rounded-md border bg-background p-3">
-                                  <div className="text-sm font-medium">
-                                    Models available through {cli.name}
-                                  </div>
-                                  <p className="text-xs text-muted-foreground">
-                                    {cli.host_version
-                                      ? `CLI ${cli.host_version} · `
-                                      : ''}
-                                    Catalog source: {cli.model_source}
-                                    {cli.models_refreshed_at
-                                      ? ` · refreshed ${new Date(cli.models_refreshed_at).toLocaleString()}`
-                                      : ''}
-                                  </p>
-                                  {cli.models.length > 0 ? (
-                                    <div className="flex flex-wrap gap-2">
-                                      {cli.models.map((model) => (
-                                        <Badge key={model} variant="outline">
-                                          <code className="text-xs">
-                                            {model}
-                                          </code>
-                                        </Badge>
-                                      ))}
-                                    </div>
-                                  ) : (
-                                    <p className="text-sm text-muted-foreground">
-                                      This CLI manages model selection in its
-                                      own configuration.
-                                    </p>
-                                  )}
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          )}
-                        </Fragment>
-                      )
-                    })}
               </TableBody>
             </Table>
           </div>
         )}
       </div>
 
-      {/* Add Provider Key Dialog — provider is locked (set by whichever
-          card opened the dialog). No Select inside the dialog; the
-          provider identity is shown as a header. Branches between the BYOK
-          key form and the agent-CLI credential form so "Configure" behaves
-          the same way regardless of which row opened it (ADR-037). */}
+      {/* Add Provider Key Dialog — gateway keys are the only credentials
+          configured here. Development harness credentials live with the
+          application runtime, never the inference gateway. */}
       <Dialog
         open={dialogOpen}
         onOpenChange={(open) => {
@@ -5038,116 +4548,104 @@ console.log(response.choices[0].message.content);`,
         }}
       >
         <DialogContent>
-          {dialogCliProvider ? (
-            <CliCredentialDialogBody
-              cli={dialogCliProvider}
-              authType={newCliAuthType}
-              onAuthTypeChange={setNewCliAuthType}
-              credential={newCliCredential}
-              onCredentialChange={setNewCliCredential}
-              onSave={handleSaveCliCredential}
-              saving={saveCliCredentialMutation.isPending}
-            />
-          ) : (
-            <>
-              <DialogHeader>
-                <DialogTitle>
-                  {newProvider
-                    ? `Configure ${providerName(newProvider)}`
-                    : 'Add Provider Key'}
-                </DialogTitle>
-                <DialogDescription>
-                  Your key is encrypted at rest and used only to route requests
-                  through the gateway.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="grid gap-4 py-4">
-                {newProvider && (
-                  <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
-                    <AiProviderIcon provider={newProvider} size={36} />
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium">
-                        {providerName(newProvider)}
-                      </div>
-                      <div className="text-xs text-muted-foreground truncate">
-                        {providerModels(newProvider)}
-                      </div>
+          <>
+            <DialogHeader>
+              <DialogTitle>
+                {newProvider
+                  ? `Configure ${providerName(newProvider)}`
+                  : 'Add Provider Key'}
+              </DialogTitle>
+              <DialogDescription>
+                Your key is encrypted at rest and used only to route requests
+                through the gateway.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-4 py-4">
+              {newProvider && (
+                <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
+                  <AiProviderIcon provider={newProvider} size={36} />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium">
+                      {providerName(newProvider)}
                     </div>
-                    {getAiProvider(newProvider)?.keyDocsUrl && (
-                      <a
-                        href={getAiProvider(newProvider)!.keyDocsUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs text-muted-foreground hover:text-foreground hover:underline shrink-0"
-                      >
-                        Get key →
-                      </a>
-                    )}
+                    <div className="text-xs text-muted-foreground truncate">
+                      {providerModels(newProvider)}
+                    </div>
                   </div>
-                )}
-                <div className="grid gap-2">
-                  <Label htmlFor="displayName">Display Name</Label>
-                  <Input
-                    id="displayName"
-                    placeholder="Production API Key"
-                    value={newDisplayName}
-                    onChange={(e) => setNewDisplayName(e.target.value)}
-                  />
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="apiKey">API Key</Label>
-                  <Input
-                    id="apiKey"
-                    type="password"
-                    placeholder="sk-..."
-                    value={newApiKey}
-                    onChange={(e) => setNewApiKey(e.target.value)}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Your key is encrypted at rest and never exposed in the
-                    dashboard.
-                  </p>
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="baseUrl">
-                    Custom Base URL{' '}
-                    <span className="text-muted-foreground font-normal">
-                      (optional)
-                    </span>
-                  </Label>
-                  <Input
-                    id="baseUrl"
-                    placeholder="https://api.openai.com/v1"
-                    value={newBaseUrl}
-                    onChange={(e) => setNewBaseUrl(e.target.value)}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Override the default API endpoint for this provider.
-                  </p>
-                </div>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                We&apos;ll verify the key works before saving — this usually
-                takes 1–2 seconds.
-              </p>
-              <DialogFooter>
-                <Button
-                  onClick={handleCreate}
-                  disabled={createMutation.isPending}
-                  className="w-full sm:w-auto"
-                >
-                  {createMutation.isPending ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Verifying &amp; saving…
-                    </>
-                  ) : (
-                    'Add key'
+                  {getAiProvider(newProvider)?.keyDocsUrl && (
+                    <a
+                      href={getAiProvider(newProvider)!.keyDocsUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-muted-foreground hover:text-foreground hover:underline shrink-0"
+                    >
+                      Get key →
+                    </a>
                   )}
-                </Button>
-              </DialogFooter>
-            </>
-          )}
+                </div>
+              )}
+              <div className="grid gap-2">
+                <Label htmlFor="displayName">Display Name</Label>
+                <Input
+                  id="displayName"
+                  placeholder="Production API Key"
+                  value={newDisplayName}
+                  onChange={(e) => setNewDisplayName(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="apiKey">API Key</Label>
+                <Input
+                  id="apiKey"
+                  type="password"
+                  placeholder="sk-..."
+                  value={newApiKey}
+                  onChange={(e) => setNewApiKey(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Your key is encrypted at rest and never exposed in the
+                  dashboard.
+                </p>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="baseUrl">
+                  Custom Base URL{' '}
+                  <span className="text-muted-foreground font-normal">
+                    (optional)
+                  </span>
+                </Label>
+                <Input
+                  id="baseUrl"
+                  placeholder="https://api.openai.com/v1"
+                  value={newBaseUrl}
+                  onChange={(e) => setNewBaseUrl(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Override the default API endpoint for this provider.
+                </p>
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              We&apos;ll verify the key works before saving — this usually takes
+              1–2 seconds.
+            </p>
+            <DialogFooter>
+              <Button
+                onClick={handleCreate}
+                disabled={createMutation.isPending}
+                className="w-full sm:w-auto"
+              >
+                {createMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Verifying &amp; saving…
+                  </>
+                ) : (
+                  'Add key'
+                )}
+              </Button>
+            </DialogFooter>
+          </>
         </DialogContent>
       </Dialog>
 

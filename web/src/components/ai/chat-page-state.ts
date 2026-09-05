@@ -5,6 +5,13 @@ export interface ChatRouteItem {
   public_id: string
 }
 
+/** Narrow the classic assistant to chats that can use its project routes. */
+export function hasProjectScope<T extends { project_id?: number | null }>(
+  conversation: T
+): conversation is T & { project_id: number } {
+  return conversation.project_id != null
+}
+
 export const CHAT_COMPOSER_MIN_HEIGHT = 72
 export const CHAT_COMPOSER_MAX_HEIGHT = 240
 

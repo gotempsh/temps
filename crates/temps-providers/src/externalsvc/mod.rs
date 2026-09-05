@@ -8,6 +8,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+/// Return the Docker summary whose name exactly matches `expected_name`.
+///
+/// Docker's `name` list filter is substring-based: filtering for `redis-cache`
+/// also returns `redis-cache-replica`. Lifecycle code must therefore verify the
+/// returned names before deciding that the requested managed service exists.
+pub(crate) fn exact_named_container<'a>(
+    containers: &'a [bollard::models::ContainerSummary],
+    expected_name: &str,
+) -> Option<&'a bollard::models::ContainerSummary> {
+    containers.iter().find(|container| {
+        container.names.as_ref().is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| name.trim_start_matches('/') == expected_name)
+        })
+    })
+}
+
 pub mod cluster_role;
 pub mod exec_util;
 pub mod managed_s3;
@@ -34,11 +52,32 @@ pub mod test_utils;
 #[cfg(test)]
 mod runtime_provisioning_tests {
     use super::{
-        is_container_not_found, missing_required_probe_credential, sanitize_probe_result,
-        set_runtime_container_name, validate_managed_probe_target, validate_runtime_target,
-        HealthProbeResult, RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError,
-        ServiceType,
+        exact_named_container, is_container_not_found, missing_required_probe_credential,
+        sanitize_probe_result, set_runtime_container_name, validate_managed_probe_target,
+        validate_runtime_target, HealthProbeResult, RuntimeProvisioningError, ServiceConfig,
+        ServiceHealthProbeError, ServiceType,
     };
+
+    #[test]
+    fn docker_substring_name_match_is_not_treated_as_the_requested_container() {
+        let sibling = bollard::models::ContainerSummary {
+            id: Some("sibling-id".to_string()),
+            names: Some(vec!["/redis-cache-replica".to_string()]),
+            ..Default::default()
+        };
+        let exact = bollard::models::ContainerSummary {
+            id: Some("exact-id".to_string()),
+            names: Some(vec!["/redis-cache".to_string()]),
+            ..Default::default()
+        };
+
+        assert!(exact_named_container(std::slice::from_ref(&sibling), "redis-cache").is_none());
+        assert_eq!(
+            exact_named_container(&[sibling, exact], "redis-cache")
+                .and_then(|container| container.id.as_deref()),
+            Some("exact-id")
+        );
+    }
 
     #[test]
     fn only_docker_404_means_container_absent() {

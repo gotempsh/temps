@@ -30,6 +30,59 @@ export interface ChatRuntimeSelection {
   permissionModeId: string | null
 }
 
+export interface ChatHarnessCatalogOption {
+  id: string
+  name: string
+  credential_saved: boolean
+  host_authenticated: boolean
+  runtime_models?: Array<{
+    id: string
+    name: string
+    thinking_modes: ChatSelectOption[]
+    tool_thinking_modes?: ChatSelectOption[] | null
+    default_thinking_mode_id?: string | null
+  }>
+  default_runtime_model_id?: string | null
+  permission_modes?: ChatSelectOption[]
+  default_permission_mode_id?: string | null
+}
+
+/** Host CLI threads use the Agent Sandbox catalog, regardless of scope. */
+export function usesHarnessCatalog(contextType: string): boolean {
+  return contextType === 'application' || contextType === 'global'
+}
+
+/** Convert the Agent Sandbox catalog into the provider-neutral chat shape. */
+export function chatHarnessProviderOptions(
+  providers: ChatHarnessCatalogOption[]
+): ChatProviderOption[] {
+  return providers
+    .filter(
+      (provider) => provider.credential_saved || provider.host_authenticated
+    )
+    .map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      auth_source: 'host_environment',
+      models: (provider.runtime_models ?? []).map((model) => ({
+        id: model.id,
+        name: model.name,
+        thinking_options: model.thinking_modes,
+        tool_thinking_options: model.tool_thinking_modes,
+        default_thinking_option_id: model.default_thinking_mode_id,
+      })),
+      default_model_id: provider.default_runtime_model_id,
+      model_discovery_status:
+        (provider.runtime_models?.length ?? 0) > 0 ? 'ready' : 'unavailable',
+      model_discovery_error:
+        (provider.runtime_models?.length ?? 0) > 0
+          ? null
+          : `Could not resolve models for ${provider.name}.`,
+      permission_modes: provider.permission_modes ?? [],
+      default_permission_mode_id: provider.default_permission_mode_id,
+    }))
+}
+
 function firstValidId(
   options: ChatSelectOption[],
   preferred?: string | null,
@@ -115,4 +168,38 @@ export function chatProviderLabel(provider: ChatProviderOption): string {
       ? 'Host environment'
       : 'configured key'
   return `${provider.name} · ${source}`
+}
+
+/** Keep provider protocol sentinels out of the user-facing runtime controls. */
+export function chatModelLabel(
+  provider: ChatProviderOption,
+  model: ChatModelOption
+): string {
+  const name = model.name.trim()
+  if (model.id === 'default' && name.toLowerCase() === 'default') {
+    return `${provider.name} model`
+  }
+  return name.replace(/^default\s*·\s*/i, '')
+}
+
+export function chatThinkingLabel(option: ChatSelectOption): string {
+  return option.id === 'default' ? 'Auto' : option.name
+}
+
+/** Radix copies a selected item's content into SelectValue. Keep that content
+ * text-only: the trigger owns the single thinking icon. */
+export function chatThinkingItemContent(option: ChatSelectOption): string {
+  return chatThinkingLabel(option)
+}
+
+export function chatPermissionLabel(option: ChatSelectOption): string {
+  switch (option.id) {
+    case 'auto':
+    case 'full-access':
+      return 'Auto'
+    case 'default':
+      return 'Ask each time'
+    default:
+      return option.name
+  }
 }

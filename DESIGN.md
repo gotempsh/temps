@@ -253,6 +253,21 @@ shadcn `Badge` variants: `default` · `secondary` · `destructive` · `outline`.
 - Submit buttons reflect loading state (`disabled={mutation.isPending}` +
   spinner icon).
 
+#### Searchable entity pickers
+
+Use a shadcn `Popover` + `Command` combobox when selecting a project, service,
+environment, or other relationship from a non-trivial set. A native `<select>`
+is reserved for short scalar choices.
+
+- The trigger and every result show the entity identity: favicon or product
+  logo, display name, stable slug/type, and a semantic status dot.
+- Search matches the display name and stable identifier.
+- Keep the current selection visible in the trigger and mark it with `Check`.
+- Use the shared rich picker component for an existing entity type before
+  creating another one-off combobox.
+- Fetch option collections with TanStack Query and keep cached results visible
+  during background refreshes.
+
 ### 6.6 Tables
 
 - Wrap in `<div className="overflow-x-auto">`.

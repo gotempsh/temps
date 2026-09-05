@@ -35,7 +35,7 @@ pub use provider::{
 pub use service::{AiError, AiRequest, AiResponse, AiService};
 pub use streaming::{
     ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    InteractionExecutor, PermissionDecision, PermissionKind, PermissionRequest, TokenStream,
-    ToolCall, ToolExecutor, TurnServices,
+    HarnessMcpServer, HarnessWorkspace, InteractionExecutor, PermissionDecision, PermissionKind,
+    PermissionRequest, SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
 pub use typed::{complete_text, complete_typed, extract_json_block};

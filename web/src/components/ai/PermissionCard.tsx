@@ -24,14 +24,7 @@
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
-import {
-  Check,
-  HelpCircle,
-  Loader2,
-  MapPin,
-  Shield,
-  X,
-} from 'lucide-react'
+import { Check, HelpCircle, Loader2, MapPin, Shield, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -40,6 +33,12 @@ import {
   untrustedMarkdownImage,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
+import {
+  GeneratedServiceLinkProposal,
+  GeneratedServiceProposal,
+  serviceLinkProposalViewModel,
+  serviceProposalViewModel,
+} from '@/components/ai/GeneratedServiceProposal'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -87,13 +86,13 @@ type PermissionDecision =
   | { type: 'reject_plan'; feedback?: string }
 
 async function resolvePermission(
-  projectId: number,
+  conversationBasePath: string,
   publicId: string,
   permissionId: string,
   decision: PermissionDecision
 ): Promise<void> {
   const res = await fetch(
-    `/api/projects/${projectId}/ai/conversations/${publicId}/permissions/${permissionId}/resolve`,
+    `${conversationBasePath}/${publicId}/permissions/${permissionId}/resolve`,
     {
       method: 'POST',
       credentials: 'include',
@@ -209,9 +208,9 @@ function QuestionVariant({
             {isSingle ? (
               <div className="flex flex-wrap gap-2">
                 {q.options.map((opt) => {
-                  const isSelected = (
-                    selections[q.question] ?? []
-                  ).includes(opt.label)
+                  const isSelected = (selections[q.question] ?? []).includes(
+                    opt.label
+                  )
                   return (
                     <Button
                       key={opt.label}
@@ -220,9 +219,7 @@ function QuestionVariant({
                       variant={isSelected ? 'default' : 'outline'}
                       className="h-7 px-3 text-xs"
                       title={opt.description}
-                      onClick={() =>
-                        handleSingleSelect(q.question, opt.label)
-                      }
+                      onClick={() => handleSingleSelect(q.question, opt.label)}
                     >
                       {opt.label}
                     </Button>
@@ -342,7 +339,9 @@ function PlanApprovalVariant({
         <div className={cn(proseClasses, 'max-h-72 overflow-auto')}>
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
-            rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+            rehypePlugins={[
+              [rehypeHighlight, { detect: true, ignoreMissing: true }],
+            ]}
             components={markdownComponents}
           >
             {plan}
@@ -435,12 +434,49 @@ function ToolApprovalVariant({
 }) {
   const [denying, setDenying] = useState(false)
   const [reason, setReason] = useState('')
+  const isPlatformWrite =
+    toolName === 'temps_write' || toolName === 'mcp__temps-chat__temps_write'
 
-  const fields =
+  const platformInput =
+    isPlatformWrite &&
     input !== null &&
     typeof input === 'object' &&
     !Array.isArray(input)
-      ? (Object.entries(input as Record<string, unknown>) as [string, unknown][])
+      ? (input as Record<string, unknown>)
+      : null
+  const operation =
+    typeof platformInput?.operation === 'string'
+      ? platformInput.operation
+      : null
+  const parameters = platformInput?.parameters
+  const serviceProposal =
+    operation === 'create_service' &&
+    parameters !== null &&
+    typeof parameters === 'object'
+      ? serviceProposalViewModel(JSON.stringify(parameters))
+      : null
+  const targetProjectId =
+    parameters !== null &&
+    typeof parameters === 'object' &&
+    !Array.isArray(parameters) &&
+    typeof (parameters as Record<string, unknown>).project_id === 'number'
+      ? ((parameters as Record<string, unknown>).project_id as number)
+      : typeof platformInput?.project_id === 'number'
+        ? platformInput.project_id
+        : null
+  const serviceLinkProposal =
+    operation === 'link_service_to_project'
+      ? serviceLinkProposalViewModel(parameters)
+      : null
+  const hasRichPlatformCard =
+    serviceProposal !== null || serviceLinkProposal !== null
+
+  const fields =
+    input !== null && typeof input === 'object' && !Array.isArray(input)
+      ? (Object.entries(input as Record<string, unknown>) as [
+          string,
+          unknown,
+        ][])
       : []
 
   return (
@@ -450,11 +486,35 @@ function ToolApprovalVariant({
           {toolName}
         </span>
         <span className="text-xs text-muted-foreground">
-          is requesting permission to run
+          {isPlatformWrite
+            ? 'will execute this platform change after approval'
+            : 'is requesting permission to run'}
         </span>
       </div>
 
-      {fields.length > 0 && (
+      {serviceProposal && (
+        <div className="overflow-hidden rounded-lg border bg-background">
+          <GeneratedServiceProposal
+            proposal={serviceProposal}
+            summary={
+              typeof platformInput?.summary === 'string'
+                ? platformInput.summary
+                : undefined
+            }
+            statusLabel="Awaiting your approval"
+            statusClassName="text-amber-600 dark:text-amber-400"
+            projectId={targetProjectId}
+          />
+        </div>
+      )}
+
+      {serviceLinkProposal && (
+        <div className="overflow-hidden rounded-lg border bg-background">
+          <GeneratedServiceLinkProposal proposal={serviceLinkProposal} />
+        </div>
+      )}
+
+      {fields.length > 0 && !hasRichPlatformCard && (
         <div className="space-y-1 rounded-lg border bg-background px-2.5 py-2 text-xs">
           {fields.map(([key, value]) =>
             key === 'command' ? (
@@ -528,7 +588,7 @@ function ToolApprovalVariant({
             onClick={() => onResolve({ type: 'allow_tool' })}
           >
             <Check className="h-3.5 w-3.5" />
-            Allow
+            {isPlatformWrite ? 'Approve & run' : 'Allow'}
           </Button>
           <Button
             type="button"
@@ -574,7 +634,8 @@ function resolvedSummary(decision: PermissionDecision): string {
 // ─── Public component ─────────────────────────────────────────────────────────
 
 export interface PermissionCardProps {
-  projectId: number
+  /** Base API path. User-owned AI workspace chats use `/api/ai/conversations`; legacy project chats use the project route. */
+  conversationBasePath: string
   /** Public ID of the conversation this permission belongs to. */
   conversationPublicId: string
   permission: PermissionRequest
@@ -582,10 +643,11 @@ export interface PermissionCardProps {
    * Called after the decision is accepted by the server (204). The model's
    * reply normally arrives over the SSE connection that was already open when
    * the question was asked — but that connection can die while the user is
-   * away deciding (tab backgrounded, network blip, dev server restart), in
-   * which case the answer is still delivered to the model and persisted, but
-   * the browser never sees it until a manual reload. The parent uses this to
-   * poll for the reply so it shows up without one.
+   * away deciding (tab backgrounded, network blip, dev server restart). The
+   * structured decision is still delivered through the provider callback and
+   * the resulting assistant turn is persisted, but the browser may miss its
+   * live events. The parent polls for that result so it appears without a
+   * manual reload.
    */
   onResolved?: () => void
 }
@@ -596,7 +658,7 @@ export interface PermissionCardProps {
  * error and remains interactive so the user can retry.
  */
 export function PermissionCard({
-  projectId,
+  conversationBasePath,
   conversationPublicId,
   permission,
   onResolved,
@@ -611,7 +673,7 @@ export function PermissionCard({
     setResolveError(null)
     try {
       await resolvePermission(
-        projectId,
+        conversationBasePath,
         conversationPublicId,
         permission.id,
         decision
@@ -665,9 +727,19 @@ export function PermissionCard({
       )}
     >
       {/* Header */}
-      <div className={cn('flex items-center gap-2 px-2.5 py-1.5 border-b', borderColor)}>
+      <div
+        className={cn(
+          'flex items-center gap-2 px-2.5 py-1.5 border-b',
+          borderColor
+        )}
+      >
         <KindIcon className={cn('h-3.5 w-3.5 shrink-0', iconColor)} />
-        <span className={cn('text-[11px] font-semibold uppercase tracking-wide', iconColor)}>
+        <span
+          className={cn(
+            'text-[11px] font-semibold uppercase tracking-wide',
+            iconColor
+          )}
+        >
           {kindLabel}
         </span>
         {permission.kind !== 'question' && (

@@ -24,6 +24,8 @@ temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
 temps-logs = { path = "../temps-logs" }
 temps-git = { path = "../temps-git" }
+temps-sandbox = { path = "../temps-sandbox" }
+temps-projects = { path = "../temps-projects" }
 tempfile = { workspace = true }
 
 axum = { workspace = true }
@@ -45,6 +47,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 regex = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs"] }
+walkdir = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 # `test-util` gives the paused clock used to exercise the turn deadline without

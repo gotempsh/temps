@@ -73,3 +73,6 @@ pub use traefik_discovery_service::*;
 
 pub mod cert_validator;
 pub use cert_validator::*;
+
+pub mod source_drop_service;
+pub use source_drop_service::*;

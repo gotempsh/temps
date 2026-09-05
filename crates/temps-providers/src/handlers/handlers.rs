@@ -539,6 +539,7 @@ async fn get_service(
     post,
     path = "/external-services",
     tag = "External Services",
+    description = "Create a managed external service. The `parameters` object is service-type-specific. Read `get_service_type_parameters` for the chosen `service_type` immediately before creating the service and provide every field that schema marks as required. Set `project_id` to create and link the service in one approval-gated operation.",
     request_body = CreateExternalServiceRequest,
     responses(
         (status = 201, description = "Service created successfully", body = ExternalServiceInfo),
@@ -553,6 +554,24 @@ async fn create_service(
     Json(request): Json<CreateExternalServiceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesCreate);
+
+    if let Some(project_id) = request.project_id {
+        project_permission_guard!(
+            auth,
+            ExternalServicesWrite,
+            project_id,
+            app_state.project_access_checker
+        );
+        project_scope_guard!(auth, project_id);
+        let service_type: crate::externalsvc::ServiceType = request.service_type.clone().into();
+        app_state
+            .external_service_manager
+            .validate_service_link_target(project_id, &service_type.to_string())
+            .await
+            .map_err(service_link_problem)?;
+    }
+
+    let target_project_id = request.project_id;
 
     let service_config = crate::services::CreateExternalServiceRequest {
         name: request.name.clone(),
@@ -577,6 +596,50 @@ async fn create_service(
         .await
     {
         Ok(service) => {
+            if let Some(project_id) = target_project_id {
+                if let Err(link_error) = app_state
+                    .external_service_manager
+                    .link_service_to_project(service.id, project_id)
+                    .await
+                {
+                    return Err(rollback_unlinked_service(
+                        &app_state,
+                        service.id,
+                        format!("could not link it to project {project_id}: {link_error}"),
+                    )
+                    .await);
+                }
+
+                if let Err(network_error) = reconcile_application_network(
+                    app_state.application_network_reconciler.as_ref(),
+                    project_id,
+                )
+                .await
+                {
+                    let unlink_error = app_state
+                        .external_service_manager
+                        .unlink_service_from_project(service.id, project_id)
+                        .await
+                        .err();
+                    if let Some(unlink_error) = unlink_error {
+                        return Err(internal_server_error()
+                            .detail(format!(
+                                "Service {} was created and linked to project {}, but workspace network reconciliation failed ({network_error}) and the link could not be rolled back: {unlink_error}",
+                                service.id, project_id
+                            ))
+                            .build());
+                    }
+                    return Err(rollback_unlinked_service(
+                        &app_state,
+                        service.id,
+                        format!(
+                            "workspace network reconciliation for project {project_id} failed: {network_error}"
+                        ),
+                    )
+                    .await);
+                }
+            }
+
             // Create audit log with metadata
             let audit = ExternalServiceCreatedAudit {
                 context: AuditContext {
@@ -659,6 +722,44 @@ async fn create_service(
                     .build())
             }
         }
+    }
+}
+
+fn service_link_problem(error: crate::services::ExternalServiceError) -> Problem {
+    match error {
+        crate::services::ExternalServiceError::ProjectNotFound { .. }
+        | crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+            not_found().detail(error.to_string()).build()
+        }
+        crate::services::ExternalServiceError::DuplicateServiceType { .. } => {
+            conflict().detail(error.to_string()).build()
+        }
+        _ => internal_server_error()
+            .detail(format!("Failed to link service: {error}"))
+            .build(),
+    }
+}
+
+async fn rollback_unlinked_service(
+    app_state: &AppState,
+    service_id: i32,
+    reason: String,
+) -> Problem {
+    match app_state
+        .external_service_manager
+        .delete_service(service_id)
+        .await
+    {
+        Ok(()) => internal_server_error()
+            .detail(format!(
+                "Service creation was rolled back because {reason}"
+            ))
+            .build(),
+        Err(cleanup_error) => internal_server_error()
+            .detail(format!(
+                "Service {service_id} was created, but {reason}; automatic cleanup also failed: {cleanup_error}"
+            ))
+            .build(),
     }
 }
 
@@ -2073,6 +2174,18 @@ async fn link_service_to_project(
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(service_id = id, project_id = request.project_id, error = %error, "failed to audit service link");
             }
+            reconcile_application_network(
+                app_state.application_network_reconciler.as_ref(),
+                request.project_id,
+            )
+            .await
+            .map_err(|error| {
+                internal_server_error()
+                    .detail(format!(
+                        "Service was linked, but application workspace network reconciliation failed closed: {error}"
+                    ))
+                    .build()
+            })?;
             Ok((StatusCode::CREATED, Json(info)))
         }
         Err(e) => match e {
@@ -2125,6 +2238,7 @@ async fn unlink_service_from_project(
     );
     project_scope_guard!(auth, project_id);
 
+
     match app_state
         .external_service_manager
         .unlink_service_from_project(id, project_id)
@@ -2150,6 +2264,18 @@ async fn unlink_service_from_project(
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(service_id = id, project_id, error = %error, "failed to audit service unlink");
             }
+            reconcile_application_network(
+                app_state.application_network_reconciler.as_ref(),
+                project_id,
+            )
+            .await
+            .map_err(|error| {
+                internal_server_error()
+                    .detail(format!(
+                        "Service was unlinked and affected application workspaces were stopped because network revocation could not be confirmed: {error}"
+                    ))
+                    .build()
+            })?;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => match e {
@@ -2161,6 +2287,19 @@ async fn unlink_service_from_project(
                 .detail(format!("Failed to unlink service: {}", e))
                 .build()),
         },
+    }
+}
+
+async fn reconcile_application_network(
+    reconciler: Option<&Arc<dyn temps_core::ApplicationDataNetworkReconciler>>,
+    project_id: i32,
+) -> Result<(), String> {
+    match reconciler {
+        Some(reconciler) => reconciler
+            .project_topology_changed(project_id)
+            .await
+            .map_err(|error| error.to_string()),
+        None => Ok(()),
     }
 }
 
@@ -3104,7 +3243,7 @@ mod tests {
     use axum::response::IntoResponse;
     use sea_orm::MockDatabase;
     use std::sync::Mutex;
-    use temps_entities::external_services;
+    use temps_entities::{external_services, project_services};
 
     #[derive(Clone, Default)]
     struct RecordingAuditLogger {
@@ -3142,6 +3281,196 @@ mod tests {
             }
             Ok(self.allowed_project_ids.contains(&project_id))
         }
+    }
+
+    struct NarrowedServiceAccessChecker;
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for NarrowedServiceAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(matches!(project_id, 7 | 99))
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(vec![if project_id == 7 {
+                temps_auth::Permission::ExternalServicesWrite.to_string()
+            } else {
+                temps_auth::Permission::ExternalServicesRead.to_string()
+            }]))
+        }
+    }
+
+    struct RecordingNetworkReconciler {
+        project_ids: Mutex<Vec<i32>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ApplicationDataNetworkReconciler for RecordingNetworkReconciler {
+        async fn project_topology_changed(
+            &self,
+            project_id: i32,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.project_ids
+                .lock()
+                .expect("network reconciler mutex should not be poisoned")
+                .push(project_id);
+            if self.fail {
+                Err("application data network unavailable".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_topology_change_reconciles_application_data_network() {
+        let recorder = Arc::new(RecordingNetworkReconciler {
+            project_ids: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let reconciler: Arc<dyn temps_core::ApplicationDataNetworkReconciler> = recorder.clone();
+
+        reconcile_application_network(Some(&reconciler), 17)
+            .await
+            .expect("network reconciliation should succeed");
+
+        assert_eq!(
+            recorder
+                .project_ids
+                .lock()
+                .expect("network reconciler mutex should not be poisoned")
+                .as_slice(),
+            [17]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_topology_change_propagates_network_failure() {
+        let reconciler: Arc<dyn temps_core::ApplicationDataNetworkReconciler> =
+            Arc::new(RecordingNetworkReconciler {
+                project_ids: Mutex::new(Vec::new()),
+                fail: true,
+            });
+
+        let error = reconcile_application_network(Some(&reconciler), 17)
+            .await
+            .expect_err("network failure must fail the service-link request");
+
+        assert!(error.contains("application data network unavailable"));
+    }
+
+    #[test]
+    fn service_link_errors_keep_not_found_and_duplicate_types_actionable() {
+        let missing =
+            service_link_problem(crate::services::ExternalServiceError::ProjectNotFound { id: 17 });
+        assert_eq!(missing.into_response().status(), StatusCode::NOT_FOUND);
+
+        let duplicate = service_link_problem(
+            crate::services::ExternalServiceError::DuplicateServiceType {
+                project_id: 17,
+                service_type: "postgres".to_string(),
+            },
+        );
+        assert_eq!(duplicate.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn linking_service_requires_write_access_to_an_existing_service_project() {
+        let now = chrono::Utc::now();
+        let service = external_services::Model {
+            id: 17,
+            name: "tenant-database".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: Some("tenant-database".to_string()),
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+        };
+        let linked_service = project_services::Model {
+            id: 1,
+            project_id: 99,
+            service_id: 17,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .append_query_results([vec![linked_service]])
+                .into_connection(),
+        );
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "service-link-authorization-test",
+        ));
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker client configuration should be available"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let network_reconciler = Arc::new(RecordingNetworkReconciler {
+            project_ids: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let state = Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: Some(Arc::new(NarrowedServiceAccessChecker)),
+            application_network_reconciler: Some(network_reconciler.clone()),
+        });
+
+        let result = link_service_to_project(
+            State(state),
+            Path(17),
+            RequireAuth(test_auth_context_with_role(temps_auth::Role::User)),
+            Json(LinkServiceRequest { project_id: 7 }),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a service from a read-only project must not be linked"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(network_reconciler
+            .project_ids
+            .lock()
+            .expect("network reconciler mutex should not be poisoned")
+            .is_empty());
     }
 
     struct ListProjectAccessChecker {
@@ -3573,6 +3902,7 @@ mod tests {
             config_service: None,
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: None,
+            application_network_reconciler: None,
         });
 
         let response = reveal_service_parameter(

@@ -166,6 +166,12 @@ const AI_MODE_PREFIXES = [
 ]
 const aiNavItems: PlatformNavItem[] = [
   {
+    title: 'Harnesses',
+    url: '/agent-sandbox/providers',
+    icon: Terminal,
+    featureKey: 'ai-chat',
+  },
+  {
     title: 'Providers',
     url: '/ai-gateway',
     icon: Sparkles,

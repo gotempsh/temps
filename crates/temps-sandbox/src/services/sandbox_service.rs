@@ -27,10 +27,14 @@ use sea_orm::{
 use temps_agents::sandbox::SandboxCreateConfig;
 use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
-use temps_entities::{agent_runs, projects, sandbox_events, sandboxes};
+use temps_entities::{
+    agent_runs, ai_application_projects, ai_application_workspaces, ai_applications, environments,
+    external_services, project_services, projects, sandbox_events, sandboxes, service_members,
+};
 use temps_git::GitProviderManager;
 
 use crate::error::{from_agent_error, SandboxError};
+use crate::services::exec::ExecOptions;
 use crate::services::job_tracker::JobTracker;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
@@ -61,6 +65,14 @@ pub enum SandboxSource {
         /// injects it as `username="x-access-token" + password=<token>`.
         /// Mutually exclusive with `username`/`password`.
         git_connection_id: Option<i32>,
+        /// Optional path relative to the sandbox work directory. This lets a
+        /// persistent sandbox host multiple projects without granting callers
+        /// an arbitrary container filesystem write primitive.
+        destination: Option<String>,
+        /// Remove the imported repository's `.git` directory after a
+        /// successful clone. AI workspaces use one outer repository and must
+        /// not retain nested Git metadata.
+        strip_git_metadata: bool,
     },
     /// Download a tarball (tar, tar.gz, tgz) from `url` and extract it
     /// into the sandbox work dir. The file at `url` must be reachable
@@ -71,18 +83,15 @@ pub enum SandboxSource {
 
 /// Lifecycle class of a sandbox (ADR-036).
 ///
-/// Both classes are suspended on idle by the expiration sweeper — the
-/// difference is what the *next* access does. An ephemeral sandbox is
-/// owned by whoever created it and returns `InvalidState` once stopped
-/// (the behaviour `@vercel/sandbox` consumers expect); a workspace is a
-/// place a human comes back to, so it wakes transparently instead.
+/// All sandbox compute may suspend on idle. A workspace is durable because its
+/// bind-mounted files and home volume never expire and are resumed or rebuilt
+/// automatically on the next access; it does not keep idle compute running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxLifecycle {
     /// Throwaway sandbox. Default for every caller that doesn't ask.
     #[default]
     Ephemeral,
-    /// Long-lived workspace: suspends on idle, wakes on access, never
-    /// auto-destroyed.
+    /// Long-lived files: compute may suspend, but is never auto-destroyed.
     Workspace,
 }
 
@@ -177,6 +186,133 @@ pub struct CreateSandboxRequest {
     /// `provider.create`. Mutually exclusive with `image`; validated in the
     /// handler before this field is populated.
     pub from_snapshot_artifact: Option<temps_agents::sandbox::SnapshotArtifact>,
+    /// Trusted host work directory for an internal caller. HTTP handlers
+    /// always leave this unset; it exists so the AI application workspace can
+    /// remain in its user-owned `<TEMPS_DATA_DIR>/ai-applications` tree while
+    /// still receiving a first-class sandbox row and preview identity.
+    pub host_work_dir_override: Option<PathBuf>,
+}
+
+/// First-class sandbox identity for a durable AI application workspace.
+/// `public_id` is safe to use with the preview gateway; the host path never
+/// crosses an HTTP boundary.
+#[derive(Debug, Clone)]
+pub struct ApplicationWorkspaceSandbox {
+    pub public_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplicationWorkspaceConfig {
+    pub desired_state: String,
+    pub image: Option<String>,
+    pub cpu_limit: f64,
+    pub memory_limit_mb: u64,
+    pub pids_limit: i64,
+    pub disk_limit_mb: u64,
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for ApplicationWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            desired_state: "running".to_string(),
+            // Persist and attest the effective default just like an explicit
+            // runtime selection. Leaving this as `None` made creation store
+            // the provider-resolved Node image, then made the very next lookup
+            // treat that healthy row as configuration-mismatched and rebuild
+            // the shared workspace container on every new chat.
+            image: Some(temps_agents::sandbox::docker::image_name_for_runtime(
+                "node",
+            )),
+            cpu_limit: 4.0,
+            memory_limit_mb: 8192,
+            pids_limit: 512,
+            disk_limit_mb: 10_240,
+            idle_timeout_secs: 900,
+        }
+    }
+}
+
+impl From<&ai_application_workspaces::Model> for ApplicationWorkspaceConfig {
+    fn from(value: &ai_application_workspaces::Model) -> Self {
+        Self {
+            desired_state: value.desired_state.clone(),
+            image: value.image.clone().or_else(|| {
+                (value.runtime != "custom")
+                    .then(|| temps_agents::sandbox::docker::image_name_for_runtime(&value.runtime))
+            }),
+            cpu_limit: value.cpu_limit,
+            memory_limit_mb: value.memory_limit_mb.max(0) as u64,
+            pids_limit: value.pids_limit,
+            disk_limit_mb: value.disk_limit_mb.max(0) as u64,
+            idle_timeout_secs: value.idle_timeout_secs.max(0) as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApplicationWorkspaceUsage {
+    pub memory_used_bytes: Option<u64>,
+    pub pids_used: Option<u64>,
+    pub disk_used_bytes: Option<u64>,
+    pub cpu_usage_usec: Option<u64>,
+    pub open_ports: Vec<u16>,
+}
+
+const APPLICATION_WORKSPACE_NAME_PREFIX: &str = "ai-application:";
+const SOURCE_IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
+const SOURCE_IMPORT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(130);
+const SOURCE_IMPORT_MAX_FILES: usize = 5_000;
+const SOURCE_IMPORT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const SOURCE_IMPORT_SYSTEM_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn managed_application_id_from_name(name: &str) -> Option<&str> {
+    name.strip_prefix(APPLICATION_WORKSPACE_NAME_PREFIX)
+        .filter(|application_id| !application_id.is_empty())
+}
+
+fn application_workspace_row_is_attested(
+    row: &sandboxes::Model,
+    application_public_id: &str,
+    host_work_dir: &Path,
+    config: &ApplicationWorkspaceConfig,
+) -> bool {
+    let metadata = row.metadata.as_ref().and_then(serde_json::Value::as_object);
+    let attested_application = metadata
+        .and_then(|value| value.get("managed_application_id"))
+        .and_then(serde_json::Value::as_str);
+    let attested_work_dir = metadata
+        .and_then(|value| value.get("managed_host_work_dir"))
+        .and_then(serde_json::Value::as_str);
+    attested_application == Some(application_public_id)
+        && attested_work_dir == host_work_dir.to_str()
+        && row.lifecycle == "workspace"
+        && row.work_dir == temps_agents::sandbox::SANDBOX_WORK_DIR
+        && row.image == config.image
+}
+
+const APPLICATION_WORKSPACE_USAGE_COMMAND: &str = "memory=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true); pids=$(cat /sys/fs/cgroup/pids.current 2>/dev/null || true); cpu=$(sed -n 's/^usage_usec //p' /sys/fs/cgroup/cpu.stat 2>/dev/null || true); disk=$(du -sb /home/temps/workspace 2>/dev/null | awk 'NR==1 {print $1}'); ports=$(if command -v ss >/dev/null 2>&1; then ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://'; else for socket_table in /proc/net/tcp /proc/net/tcp6; do test -r \"$socket_table\" || continue; awk 'NR > 1 && $4 == \"0A\" {split($2, address, \":\"); print address[2]}' \"$socket_table\"; done | while IFS= read -r hex_port; do printf '%d\\n' \"0x$hex_port\"; done; fi | sort -nu | paste -sd, -); printf 'memory=%s\\n' \"$memory\"; printf 'pids=%s\\n' \"$pids\"; printf 'cpu=%s\\n' \"$cpu\"; printf 'disk=%s\\n' \"$disk\"; printf 'ports=%s\\n' \"$ports\"";
+
+fn parse_application_workspace_usage(stdout: &str) -> ApplicationWorkspaceUsage {
+    let mut usage = ApplicationWorkspaceUsage::default();
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("memory=") {
+            usage.memory_used_bytes = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("pids=") {
+            usage.pids_used = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("cpu=") {
+            usage.cpu_usage_usec = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("disk=") {
+            usage.disk_used_bytes = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("ports=") {
+            usage.open_ports = value
+                .split(',')
+                .filter_map(|port| port.trim().parse::<u16>().ok())
+                .collect();
+        }
+    }
+    usage
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -248,6 +384,47 @@ fn source_kind(source: &SandboxSource) -> &'static str {
     }
 }
 
+/// Validate an optional source destination beneath the sandbox work dir.
+///
+/// This validation lives in the service layer as well as the HTTP DTO path
+/// because project-derived and future internal callers can bypass handlers.
+pub(crate) fn validate_source_destination(destination: Option<&str>) -> Result<(), SandboxError> {
+    let Some(destination) = destination else {
+        return Ok(());
+    };
+    if destination.is_empty() || destination.len() > 512 {
+        return Err(SandboxError::Validation {
+            message: "source destination must contain 1 to 512 characters".into(),
+        });
+    }
+    let path = Path::new(destination);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(SandboxError::Validation {
+            message:
+                "source destination must be a relative path without '.', '..', or platform prefixes"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+fn bounded_command_error(stderr: &str, stdout: &str) -> String {
+    const MAX_CHARS: usize = 1_000;
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        return "command exited without diagnostic output".to_string();
+    }
+    detail.chars().take(MAX_CHARS).collect()
+}
+
 /// Extract the `ports` array from a sandbox's `metadata` JSON blob.
 /// Tolerates missing/malformed data — a sandbox created before ports
 /// were tracked simply returns `[]`, and a value we can't parse is
@@ -301,6 +478,27 @@ async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxE
         SandboxSource::Tarball { url } => (url.as_str(), "tarball"),
     };
 
+    if let SandboxSource::Git {
+        depth,
+        destination,
+        strip_git_metadata,
+        ..
+    } = source
+    {
+        if depth.is_some_and(|value| value == 0 || value > 1_000) {
+            return Err(SandboxError::Validation {
+                message: "git clone depth must be between 1 and 1000".into(),
+            });
+        }
+        validate_source_destination(destination.as_deref())?;
+        if *strip_git_metadata && destination.is_none() {
+            return Err(SandboxError::Validation {
+                message: "strip_git_metadata requires a destination so the sandbox root repository cannot be removed"
+                    .into(),
+            });
+        }
+    }
+
     if url_has_embedded_credentials(url) {
         return Err(SandboxError::Validation {
             message: format!(
@@ -336,31 +534,65 @@ async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxE
     Ok(())
 }
 
-/// Does the URL carry `user:password@`?
+/// Does the URL carry any userinfo before the host?
 ///
-/// A bare `user@` is fine — git reads that as "prompt for a password" and it
-/// carries no secret. Only the colon form is a credential.
-///
-/// Shared with the handler so both entry points agree. The naive version —
-/// scanning for the first `@` anywhere after the scheme — false-positives on a
-/// URL that has an explicit port and an `@` later in the path
-/// (`https://host:8080/org/repo@v1.git`), because it reads the whole
-/// `host:8080/org/repo` as userinfo. Stopping at the first `/` is what makes
-/// that correct.
+/// Even a bare `user@` may be a token or sensitive account identifier. Clone
+/// credentials must travel only through the dedicated ephemeral credential
+/// channel, never through argv, process inspection, errors, or `.git/config`.
 pub(crate) fn url_has_embedded_credentials(url: &str) -> bool {
-    let Some(scheme_end) = url.find("://") else {
-        return false;
-    };
-    let rest = &url[scheme_end + 3..];
-    // Stop at the end of the authority. Userinfo always precedes the first
-    // `/`, `?` or `#`, so anything past them is path/query/fragment — an `@`
-    // there is not a credential (`https://host/org/repo@v1.git`, or a query
-    // like `?ref=a:b@c`, which a `/`-only split misread as userinfo).
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    match authority.find('@') {
-        Some(at) => authority[..at].contains(':'),
-        None => false,
+    url::Url::parse(url)
+        .map(|parsed| !parsed.username().is_empty() || parsed.password().is_some())
+        .unwrap_or(false)
+}
+
+fn default_git_provider_base_url(provider_type: &str) -> Option<&'static str> {
+    match provider_type.to_ascii_lowercase().as_str() {
+        "github" => Some("https://github.com"),
+        "gitlab" => Some("https://gitlab.com"),
+        "bitbucket" => Some("https://bitbucket.org"),
+        _ => None,
     }
+}
+
+fn validate_connection_clone_origin(
+    clone_url: &str,
+    provider: &temps_entities::git_providers::Model,
+) -> Result<(), SandboxError> {
+    let provider_url = provider
+        .base_url
+        .as_deref()
+        .or_else(|| default_git_provider_base_url(&provider.provider_type))
+        .ok_or_else(|| SandboxError::Validation {
+            message: format!(
+                "Git provider {} has no clone origin configured",
+                provider.id
+            ),
+        })?;
+    let clone = url::Url::parse(clone_url).map_err(|error| SandboxError::Validation {
+        message: format!("git source: invalid clone URL: {error}"),
+    })?;
+    let allowed = url::Url::parse(provider_url).map_err(|error| SandboxError::Validation {
+        message: format!(
+            "Git provider {} has an invalid base URL: {error}",
+            provider.id
+        ),
+    })?;
+    let same_origin = clone.scheme() == allowed.scheme()
+        && clone
+            .host_str()
+            .zip(allowed.host_str())
+            .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+        && clone.port_or_known_default() == allowed.port_or_known_default();
+    if !same_origin {
+        return Err(SandboxError::Validation {
+            message: format!(
+                "Git connection {} can only authenticate clones from {}",
+                provider.id,
+                allowed.origin().ascii_serialization()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Reject standalone lifecycle ops (`pause`/`resume`/`restart`/`resize`)
@@ -435,6 +667,19 @@ const MIN_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60; // 24 hours
 const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
 
+// Application workspaces are repositories, not disposable command scratch
+// space. This bootstrap runs *inside* the sandbox after create/recovery, so
+// both repository metadata and commits live on the same durable bind mount as
+// the files the development harness edits.
+const APPLICATION_GIT_BOOTSTRAP: &str = r#"set -eu
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git init --initial-branch=main . >/dev/null
+fi
+git config --local --get user.name >/dev/null 2>&1 || git config --local user.name 'Temps Workspace'
+git config --local --get user.email >/dev/null 2>&1 || git config --local user.email 'workspace@temps.sh'
+git config --local --get commit.gpgSign >/dev/null 2>&1 || git config --local commit.gpgSign false
+"#;
+
 pub struct SandboxService {
     db: Arc<DatabaseConnection>,
     registry: Arc<StandaloneSandboxRegistry>,
@@ -454,6 +699,17 @@ pub struct SandboxService {
     /// a sandbox is destroyed (ADR-037). `None` when snapshots are not
     /// enabled for this deployment (e.g. Firecracker-only).
     snapshot_service: Option<Arc<SnapshotService>>,
+    /// Serializes one-to-one application workspace realization. Concurrent
+    /// preview, diff and chat requests must never create two containers over
+    /// the same persistent bind mount.
+    application_workspace_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One source import per process prevents two requests targeting the same
+    /// sandbox from sharing its root-owned staging boundary.
+    source_import_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Issues project/environment-scoped database variables without giving a
+    /// sandbox a reusable Temps API token. Values are held only for the caller
+    /// that launches the sandbox process and are never persisted here.
+    runtime_credentials: Option<Arc<dyn temps_core::SandboxRuntimeCredentialsProvider>>,
 }
 
 impl SandboxService {
@@ -475,7 +731,18 @@ impl SandboxService {
             git_provider_manager,
             data_root,
             snapshot_service: None,
+            application_workspace_lock: Arc::new(tokio::sync::Mutex::new(())),
+            source_import_lock: Arc::new(tokio::sync::Mutex::new(())),
+            runtime_credentials: None,
         }
+    }
+
+    pub fn with_runtime_credentials(
+        mut self,
+        provider: Arc<dyn temps_core::SandboxRuntimeCredentialsProvider>,
+    ) -> Self {
+        self.runtime_credentials = Some(provider);
+        self
     }
 
     /// Set the snapshot service after construction (two-phase init).
@@ -534,7 +801,27 @@ impl SandboxService {
         Ok(row)
     }
 
-    /// List the caller's non-destroyed sandboxes, newest first.
+    /// Application workspaces are managed exclusively through the application
+    /// API, where every linked project is re-authorized. The generic sandbox
+    /// HTTP surface uses this discriminator to hide them completely.
+    pub async fn is_application_workspace(
+        &self,
+        public_id_value: &str,
+    ) -> Result<bool, SandboxError> {
+        if !public_id::is_valid(public_id_value) {
+            return Ok(false);
+        }
+        Ok(sandboxes::Entity::find()
+            .filter(sandboxes::Column::PublicId.eq(public_id_value))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .filter(sandboxes::Column::Name.starts_with("ai-application:"))
+            .count(self.db.as_ref())
+            .await?
+            > 0)
+    }
+
+    /// List all of the caller's non-destroyed sandboxes, newest first.
+    /// Creation source is presentation metadata, never a capability boundary.
     ///
     /// `lifecycle` and `project_id` are optional filters, both backed by
     /// partial indexes from the ADR-036 migration — but only for the
@@ -556,7 +843,10 @@ impl SandboxService {
         let page_size = page_size.unwrap_or(20).clamp(1, 100);
         let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::UserId.eq(user_id))
-            .filter(sandboxes::Column::Status.ne("destroyed"));
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .filter(
+                sandboxes::Column::Name.not_like(format!("{APPLICATION_WORKSPACE_NAME_PREFIX}%")),
+            );
         if let Some(lifecycle) = lifecycle {
             query = query.filter(sandboxes::Column::Lifecycle.eq(lifecycle.as_str()));
         }
@@ -851,6 +1141,8 @@ impl SandboxService {
             username: None,
             password: None,
             git_connection_id: project.git_provider_connection_id,
+            destination: None,
+            strip_git_metadata: false,
         }))
     }
 
@@ -920,6 +1212,14 @@ impl SandboxService {
             .clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
         let public_id_value = public_id::generate();
         let name = req.name.clone().unwrap_or_else(|| public_id_value.clone());
+        let managed_application_id = managed_application_id_from_name(&name);
+        if managed_application_id.is_some() && req.host_work_dir_override.is_none() {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "sandbox names beginning with '{APPLICATION_WORKSPACE_NAME_PREFIX}' are reserved for managed application workspaces"
+                ),
+            });
+        }
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(timeout as i64);
 
@@ -981,6 +1281,18 @@ impl SandboxService {
             if let Some(disk) = req.disk_size_mb {
                 meta.insert("disk_size_mb".into(), serde_json::json!(disk));
             }
+            if let Some(application_id) = managed_application_id {
+                meta.insert(
+                    "managed_application_id".into(),
+                    serde_json::json!(application_id),
+                );
+                if let Some(host_work_dir) = req.host_work_dir_override.as_ref() {
+                    meta.insert(
+                        "managed_host_work_dir".into(),
+                        serde_json::json!(host_work_dir.to_string_lossy()),
+                    );
+                }
+            }
             (!meta.is_empty()).then_some(serde_json::Value::Object(meta))
         };
         let active = sandboxes::ActiveModel {
@@ -1013,7 +1325,11 @@ impl SandboxService {
         let mut row = active.insert(self.db.as_ref()).await?;
 
         // Allocate host-side working directory.
-        let host_work_dir = self.data_root.join(&public_id_value);
+        let using_trusted_work_dir = req.host_work_dir_override.is_some();
+        let host_work_dir = req
+            .host_work_dir_override
+            .clone()
+            .unwrap_or_else(|| self.data_root.join(&public_id_value));
         if let Err(e) = tokio::fs::create_dir_all(&host_work_dir).await {
             // Roll back the DB row so a failed-to-create sandbox doesn't
             // linger as a "running" record with no container.
@@ -1067,7 +1383,9 @@ impl SandboxService {
                 // The work dir was already created above; without this the
                 // row goes to "destroyed" and no later `destroy_sandbox`
                 // can ever reach the directory again.
-                self.remove_work_dir(&public_id_value).await;
+                if !using_trusted_work_dir {
+                    self.remove_work_dir(&public_id_value).await;
+                }
                 self.mark_destroyed(row.id).await.ok();
                 return Err(SandboxError::CreateFailed {
                     user_id,
@@ -1119,7 +1437,9 @@ impl SandboxService {
                 // Seeding runs after the clone/extract, so by here the work
                 // dir can already hold a full repository — the largest
                 // single thing this service puts on disk.
-                self.remove_work_dir(&public_id_value).await;
+                if !using_trusted_work_dir {
+                    self.remove_work_dir(&public_id_value).await;
+                }
                 self.mark_destroyed(row.id).await.ok();
                 return Err(e);
             }
@@ -1149,6 +1469,680 @@ impl SandboxService {
             user_id
         );
         Ok(row)
+    }
+
+    /// Return the durable, preview-addressable sandbox assigned to one AI
+    /// application.  This is deliberately an internal service method rather
+    /// than an HTTP option: callers cannot choose an arbitrary host directory
+    /// or container label.
+    pub async fn get_or_create_application_workspace(
+        &self,
+        user_id: i32,
+        application_public_id: &str,
+        project_id: Option<i32>,
+        host_work_dir: PathBuf,
+    ) -> Result<ApplicationWorkspaceSandbox, SandboxError> {
+        self.get_or_create_application_workspace_with_config(
+            user_id,
+            application_public_id,
+            project_id,
+            host_work_dir,
+            ApplicationWorkspaceConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn get_or_create_application_workspace_with_config(
+        &self,
+        user_id: i32,
+        application_public_id: &str,
+        project_id: Option<i32>,
+        host_work_dir: PathBuf,
+        config: ApplicationWorkspaceConfig,
+    ) -> Result<ApplicationWorkspaceSandbox, SandboxError> {
+        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        if application_public_id.is_empty()
+            || application_public_id.len() > 200
+            || !application_public_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(SandboxError::Validation {
+                message: "application workspace identifier is invalid".to_string(),
+            });
+        }
+        if !host_work_dir.is_absolute() {
+            return Err(SandboxError::Validation {
+                message: "application workspace path must be absolute".to_string(),
+            });
+        }
+
+        let name = format!("{APPLICATION_WORKSPACE_NAME_PREFIX}{application_public_id}");
+        let mut existing = sandboxes::Entity::find()
+            .filter(sandboxes::Column::UserId.eq(Some(user_id)))
+            .filter(sandboxes::Column::Name.eq(&name))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .one(self.db.as_ref())
+            .await?;
+        if existing.as_ref().is_some_and(|row| {
+            !application_workspace_row_is_attested(
+                row,
+                application_public_id,
+                &host_work_dir,
+                &config,
+            )
+        }) {
+            if let Some(untrusted) = existing.take() {
+                tracing::warn!(
+                    sandbox_id = %untrusted.public_id,
+                    application_id = %application_public_id,
+                    "Replacing unattested or configuration-mismatched application workspace compute"
+                );
+                self.destroy_sandbox(&untrusted.public_id, user_id).await?;
+            }
+        }
+        let sandbox = if let Some(mut existing) = existing {
+            // `project_id` is the generic sandbox credential scope. Keep it
+            // aligned when an application changes its primary project.
+            if existing.project_id != project_id {
+                let mut active: sandboxes::ActiveModel = existing.clone().into();
+                active.project_id = Set(project_id);
+                existing = active.update(self.db.as_ref()).await?;
+            }
+            // Docker/VM state is not authoritative. If an operator or the
+            // daemon removed running compute, recreate it against the same
+            // application-owned host directory and named home volume.
+            if existing.status == "running"
+                && self
+                    .registry
+                    .get(existing.id, &existing.public_id)
+                    .await
+                    .is_err()
+            {
+                self.rebuild_application_workspace_locked(
+                    user_id,
+                    &existing.public_id,
+                    host_work_dir.clone(),
+                    config.clone(),
+                )
+                .await?;
+            } else if existing.status == "stopped" && config.desired_state == "running" {
+                // Idle suspension parks compute but never changes application
+                // desired state. Wake it on demand. If the parked container was
+                // removed externally, rebuild it from the same durable files.
+                match self.resume_sandbox(&existing.public_id, user_id).await {
+                    Ok(_) => {}
+                    Err(SandboxError::NotFound { .. }) => {
+                        self.rebuild_application_workspace_locked(
+                            user_id,
+                            &existing.public_id,
+                            host_work_dir.clone(),
+                            config.clone(),
+                        )
+                        .await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            ApplicationWorkspaceSandbox {
+                public_id: existing.public_id,
+            }
+        } else {
+            // A per-workspace password makes the bare opaque hostname useless on
+            // its own. The chat API returns only short-lived preview grants; this
+            // random value is immediately hashed and is never persisted or shown.
+            let preview_password =
+                format!("temps-preview-{}", hex::encode(rand::random::<[u8; 16]>()));
+            let row = self
+                .create_sandbox(
+                    user_id,
+                    CreateSandboxRequest {
+                        name: Some(name),
+                        timeout_secs: Some(config.idle_timeout_secs),
+                        preview_password: Some(preview_password),
+                        ports: Vec::new(),
+                        lifecycle: Some("workspace".to_string()),
+                        project_id,
+                        image: config.image,
+                        cpu_limit: Some(config.cpu_limit),
+                        memory_limit_mb: Some(config.memory_limit_mb),
+                        pids_limit: Some(config.pids_limit),
+                        disk_size_mb: Some(config.disk_limit_mb),
+                        host_work_dir_override: Some(host_work_dir),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            ApplicationWorkspaceSandbox {
+                public_id: row.public_id,
+            }
+        };
+
+        if config.desired_state == "running" {
+            self.prepare_application_git_workspace(&sandbox.public_id, user_id)
+                .await?;
+        }
+        Ok(sandbox)
+    }
+
+    pub async fn rebuild_application_workspace(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        host_work_dir: PathBuf,
+        config: ApplicationWorkspaceConfig,
+    ) -> Result<SandboxSummary, SandboxError> {
+        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        self.rebuild_application_workspace_locked(user_id, sandbox_public_id, host_work_dir, config)
+            .await
+    }
+
+    async fn rebuild_application_workspace_locked(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        host_work_dir: PathBuf,
+        config: ApplicationWorkspaceConfig,
+    ) -> Result<SandboxSummary, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        ensure_not_agent_run(&row)?;
+        self.jobs.abort_all(row.id).await;
+        let create_config =
+            application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+        let handle = self
+            .registry
+            .rebuild(row.id, sandbox_public_id, create_config)
+            .await
+            .map_err(|error| from_agent_error(sandbox_public_id, error))?;
+        let managed_application_id = managed_application_id_from_name(&row.name).map(str::to_owned);
+        let mut active: sandboxes::ActiveModel = row.into();
+        active.status = Set("running".to_string());
+        active.image = Set(Some(handle.image));
+        active.timeout_secs = Set(config.idle_timeout_secs as i32);
+        active.last_activity_at = Set(Utc::now());
+        active.expires_at = Set(idle_deadline(Utc::now(), config.idle_timeout_secs as i32));
+        active.metadata = Set(Some(serde_json::json!({
+            "disk_size_mb": config.disk_limit_mb,
+            "managed_application_id": managed_application_id,
+            "managed_host_work_dir": host_work_dir.to_string_lossy(),
+        })));
+        let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(updated.id, "rebuilt", None).await;
+        Ok(SandboxSummary::from(&updated))
+    }
+
+    pub async fn restore_application_workspace(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        host_work_dir: PathBuf,
+        config: ApplicationWorkspaceConfig,
+        artifact: &temps_agents::sandbox::SnapshotArtifact,
+    ) -> Result<SandboxSummary, SandboxError> {
+        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        ensure_not_agent_run(&row)?;
+        self.jobs.abort_all(row.id).await;
+        let backup = host_work_dir
+            .with_extension(format!("restore-backup-{}", Utc::now().timestamp_micros()));
+        tokio::fs::rename(&host_work_dir, &backup)
+            .await
+            .map_err(|source| SandboxError::CreateFailed {
+                user_id,
+                reason: format!("preserve workspace before restore: {source}"),
+            })?;
+        if let Err(source) = tokio::fs::create_dir_all(&host_work_dir).await {
+            let _ = tokio::fs::rename(&backup, &host_work_dir).await;
+            return Err(SandboxError::CreateFailed {
+                user_id,
+                reason: format!("create empty workspace restore target: {source}"),
+            });
+        }
+        let create_config =
+            application_sandbox_create_config(&row, host_work_dir.clone(), &config)?;
+        let restored = self
+            .registry
+            .restore(row.id, sandbox_public_id, artifact, create_config)
+            .await;
+        let handle = match restored {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&host_work_dir).await;
+                let _ = tokio::fs::rename(&backup, &host_work_dir).await;
+                return Err(from_agent_error(sandbox_public_id, error));
+            }
+        };
+        if let Err(error) = tokio::fs::remove_dir_all(&backup).await {
+            tracing::warn!(path = %backup.display(), %error, "restored workspace but could not remove backup directory");
+        }
+        let mut active: sandboxes::ActiveModel = row.into();
+        active.status = Set("running".to_string());
+        active.image = Set(Some(handle.image));
+        active.last_activity_at = Set(Utc::now());
+        active.expires_at = Set(idle_deadline(Utc::now(), config.idle_timeout_secs as i32));
+        let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(updated.id, "restored", None).await;
+        Ok(SandboxSummary::from(&updated))
+    }
+
+    pub async fn application_workspace_summary(
+        &self,
+        user_id: i32,
+        application_public_id: &str,
+    ) -> Result<Option<SandboxSummary>, SandboxError> {
+        let name = format!("{APPLICATION_WORKSPACE_NAME_PREFIX}{application_public_id}");
+        let row = sandboxes::Entity::find()
+            .filter(sandboxes::Column::UserId.eq(Some(user_id)))
+            .filter(sandboxes::Column::Name.eq(name))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .one(self.db.as_ref())
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut summary = SandboxSummary::from(&row);
+        if row.status == "running" && self.registry.get(row.id, &row.public_id).await.is_err() {
+            // The durable database row is desired state, not proof that
+            // disposable compute still exists. Callers can now distinguish a
+            // killed container and trigger idempotent recovery with the saved
+            // application configuration and host volume.
+            summary.status = "recovering".to_string();
+        }
+        Ok(Some(summary))
+    }
+
+    /// Make a newly-created application project directory writable by the
+    /// non-root sandbox user. A stopped or not-yet-created sandbox needs no
+    /// special handling: the provider normalizes the complete bind mount when
+    /// compute is next created or resumed.
+    pub async fn normalize_application_project_permissions(
+        &self,
+        user_id: i32,
+        application_public_id: &str,
+        project_slug: &str,
+    ) -> Result<(), SandboxError> {
+        if application_public_id.is_empty()
+            || project_slug.is_empty()
+            || !project_slug
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(SandboxError::Validation {
+                message: "application project workspace identifier is invalid".to_string(),
+            });
+        }
+        let Some(row) = sandboxes::Entity::find()
+            .filter(sandboxes::Column::UserId.eq(Some(user_id)))
+            .filter(sandboxes::Column::Name.eq(format!("ai-application:{application_public_id}")))
+            .filter(sandboxes::Column::Status.eq("running"))
+            .one(self.db.as_ref())
+            .await?
+        else {
+            return Ok(());
+        };
+        let container_path = format!(
+            "{}/projects/{project_slug}",
+            temps_agents::sandbox::user::SANDBOX_WORK_DIR
+        );
+        self.registry
+            .normalize_workspace_path(row.id, &row.public_id, &container_path)
+            .await
+            .map_err(|error| from_agent_error(&row.public_id, error))
+    }
+
+    /// Put the workspace and only the databases linked to its application
+    /// projects on a private, internal Docker network. This grants direct
+    /// data-plane reachability without placing a reusable Temps API token in
+    /// the sandbox and without exposing unrelated tenants' services.
+    pub async fn synchronize_application_data_network(
+        &self,
+        user_id: i32,
+        _application_public_id: &str,
+        sandbox_public_id: &str,
+        project_ids: &[i32],
+    ) -> Result<Vec<String>, SandboxError> {
+        self.synchronize_data_network(user_id, sandbox_public_id, project_ids)
+            .await
+    }
+
+    /// Reconcile the isolated data network for any sandbox from an authorized
+    /// list of project IDs. The network identity belongs to the sandbox, not
+    /// to whichever product surface created it.
+    pub async fn synchronize_data_network(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        project_ids: &[i32],
+    ) -> Result<Vec<String>, SandboxError> {
+        let _workspace_mutation = self.application_workspace_lock.lock().await;
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let containers = self
+            .application_data_service_containers(project_ids)
+            .await?;
+        let network_name = sandbox_data_network_name(sandbox_public_id)?;
+        self.registry
+            .configure_application_network(row.id, sandbox_public_id, &network_name, &containers)
+            .await
+            .map_err(|error| from_agent_error(sandbox_public_id, error))?;
+        Ok(containers)
+    }
+
+    /// Return the database containers currently implied by the committed
+    /// project topology without changing container or network state.
+    pub async fn application_data_service_count(
+        &self,
+        project_ids: &[i32],
+    ) -> Result<usize, SandboxError> {
+        Ok(self
+            .application_data_service_containers(project_ids)
+            .await?
+            .len())
+    }
+
+    /// Resolve the runtime variables available to this sandbox's attached
+    /// project. This is a sandbox primitive: application workspaces and
+    /// ordinary API-created sandboxes use the same path.
+    ///
+    /// The sandbox row is the authorization boundary. A caller cannot pass a
+    /// different project ID and use sandbox ownership to reveal that project's
+    /// credentials. Application workspaces keep `project_id` synchronized to
+    /// their primary project when they are prepared.
+    pub async fn runtime_environment(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+    ) -> Result<HashMap<String, String>, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let project_id = row.project_id.ok_or_else(|| SandboxError::Validation {
+            message: format!(
+                "sandbox {sandbox_public_id} is not attached to a project; attach a project before requesting database runtime variables"
+            ),
+        })?;
+        // Credentials without connectivity are unusable. Reconcile the generic
+        // sandbox data network at issuance time so API-created sandboxes get
+        // the same behavior as application workspaces, including services
+        // linked after the sandbox itself was created.
+        self.synchronize_data_network(user_id, sandbox_public_id, &[project_id])
+            .await?;
+        let environments = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .order_by_asc(environments::Column::CreatedAt)
+            .all(self.db.as_ref())
+            .await?;
+        let environment = environments
+            .iter()
+            .find(|environment| environment.name.eq_ignore_ascii_case("production"))
+            .or_else(|| environments.first())
+            .ok_or_else(|| SandboxError::RuntimeEnvironmentNotFound {
+                sandbox_id: sandbox_public_id.to_string(),
+                project_id,
+            })?;
+        let links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id))
+            .order_by_asc(project_services::Column::Id)
+            .all(self.db.as_ref())
+            .await?;
+        let provider =
+            self.runtime_credentials
+                .as_ref()
+                .ok_or_else(|| SandboxError::Unavailable {
+                    reason: "runtime credential provider is not registered".to_string(),
+                })?;
+        let service_count = links.len();
+        let mut variables = HashMap::new();
+        for link in links {
+            let issued = provider
+                .issue(link.service_id, project_id, environment.id)
+                .await
+                .map_err(|error| SandboxError::RuntimeCredentialsFailed {
+                    sandbox_id: sandbox_public_id.to_string(),
+                    service_id: link.service_id,
+                    reason: error.to_string(),
+                })?;
+            merge_runtime_variables(&mut variables, issued).map_err(|variable| {
+                SandboxError::RuntimeVariableConflict {
+                    sandbox_id: sandbox_public_id.to_string(),
+                    variable,
+                }
+            })?;
+        }
+        let mut variable_names = variables.keys().cloned().collect::<Vec<_>>();
+        variable_names.sort();
+        self.record_event(
+            row.id,
+            "runtime_credentials_issued",
+            Some(serde_json::json!({
+                "project_id": project_id,
+                "environment_id": environment.id,
+                "service_count": service_count,
+                "variable_names": variable_names,
+            })),
+        )
+        .await;
+        Ok(variables)
+    }
+
+    async fn application_data_service_containers(
+        &self,
+        project_ids: &[i32],
+    ) -> Result<Vec<String>, SandboxError> {
+        let links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.is_in(project_ids.iter().copied()))
+            .all(self.db.as_ref())
+            .await?;
+        let service_ids = links
+            .iter()
+            .map(|link| link.service_id)
+            .collect::<std::collections::HashSet<_>>();
+        let services = if service_ids.is_empty() {
+            Vec::new()
+        } else {
+            external_services::Entity::find()
+                .filter(external_services::Column::Id.is_in(service_ids.iter().copied()))
+                .all(self.db.as_ref())
+                .await?
+        };
+        let members = if service_ids.is_empty() {
+            Vec::new()
+        } else {
+            service_members::Entity::find()
+                .filter(service_members::Column::ServiceId.is_in(service_ids.iter().copied()))
+                .filter(service_members::Column::NodeId.is_null())
+                .all(self.db.as_ref())
+                .await?
+        };
+        let mut containers = Vec::new();
+        for service in services {
+            if service.node_id.is_some() {
+                continue;
+            }
+            let service_members = members
+                .iter()
+                .filter(|member| member.service_id == service.id)
+                .map(|member| member.container_name.clone())
+                .collect::<Vec<_>>();
+            if !service_members.is_empty() {
+                containers.extend(service_members);
+                continue;
+            }
+            let derived =
+                service
+                    .container_name
+                    .unwrap_or_else(|| match service.service_type.as_str() {
+                        "postgres" => format!("postgres-{}", service.name),
+                        "redis" => format!("redis-{}", service.name),
+                        "mongodb" => format!("temps-mongodb-{}", service.name),
+                        "mariadb" | "mysql" => format!("mariadb-{}", service.name),
+                        _ => String::new(),
+                    });
+            if !derived.is_empty() {
+                containers.push(derived);
+            }
+        }
+        containers.sort();
+        containers.dedup();
+        Ok(containers)
+    }
+
+    /// Reconcile every running application workspace linked to a project
+    /// after that project's service topology changes. Revocations are applied
+    /// from the committed database topology; if Docker cannot confirm the
+    /// narrower membership, compute is stopped so existing sockets cannot
+    /// retain access behind the control plane's back.
+    pub async fn reconcile_application_networks_for_project(
+        &self,
+        project_id: i32,
+    ) -> Result<(), SandboxError> {
+        let affected_links = ai_application_projects::Entity::find()
+            .filter(ai_application_projects::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+        if affected_links.is_empty() {
+            return Ok(());
+        }
+        let application_ids = affected_links
+            .iter()
+            .map(|link| link.application_id)
+            .collect::<Vec<_>>();
+        let applications = ai_applications::Entity::find()
+            .filter(ai_applications::Column::Id.is_in(application_ids))
+            .filter(ai_applications::Column::Status.eq("active"))
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut first_error = None;
+        for application in applications {
+            let project_ids = ai_application_projects::Entity::find()
+                .filter(ai_application_projects::Column::ApplicationId.eq(application.id))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|link| link.project_id)
+                .collect::<Vec<_>>();
+            let Some(summary) = self
+                .application_workspace_summary(application.created_by, &application.public_id)
+                .await?
+                .filter(|summary| matches!(summary.status.as_str(), "running" | "recovering"))
+            else {
+                continue;
+            };
+            if let Err(error) = self
+                .synchronize_application_data_network(
+                    application.created_by,
+                    &application.public_id,
+                    &summary.public_id,
+                    &project_ids,
+                )
+                .await
+            {
+                let quarantine_error = format!(
+                    "Application data-network reconciliation failed; workspace compute was stopped: {error}"
+                );
+                if let Err(persist_error) = ai_application_workspaces::Entity::update_many()
+                    .col_expr(
+                        ai_application_workspaces::Column::DesiredState,
+                        Expr::value("quarantined"),
+                    )
+                    .col_expr(
+                        ai_application_workspaces::Column::LastError,
+                        Expr::value(Some(quarantine_error)),
+                    )
+                    .col_expr(
+                        ai_application_workspaces::Column::UpdatedAt,
+                        Expr::value(Utc::now()),
+                    )
+                    .filter(ai_application_workspaces::Column::ApplicationId.eq(application.id))
+                    .exec(self.db.as_ref())
+                    .await
+                {
+                    tracing::error!(
+                        application_id = %application.public_id,
+                        error = %persist_error,
+                        "Failed to persist fail-closed application workspace quarantine"
+                    );
+                }
+                if let Err(stop_error) = self
+                    .pause_sandbox(&summary.public_id, application.created_by)
+                    .await
+                {
+                    tracing::error!(
+                        application_id = %application.public_id,
+                        sandbox_id = %summary.public_id,
+                        error = %stop_error,
+                        "Failed to stop workspace after data-network reconciliation failure"
+                    );
+                }
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub async fn application_workspace_usage(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+    ) -> Result<ApplicationWorkspaceUsage, SandboxError> {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), SOURCE_IMPORT_SYSTEM_PATH.to_string());
+        let output = self
+            .exec(
+                sandbox_public_id,
+                user_id,
+                ExecOptions {
+                    cmd: vec![
+                        "/bin/sh".to_string(),
+                        "-lc".to_string(),
+                        APPLICATION_WORKSPACE_USAGE_COMMAND.to_string(),
+                    ],
+                    env,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let usage = parse_application_workspace_usage(&output.stdout);
+        if usage.disk_used_bytes.is_none() {
+            return Err(SandboxError::ExecFailed {
+                sandbox_id: sandbox_public_id.to_string(),
+                reason: "workspace disk usage measurement returned no value".to_string(),
+            });
+        }
+        Ok(usage)
+    }
+
+    async fn prepare_application_git_workspace(
+        &self,
+        sandbox_public_id: &str,
+        user_id: i32,
+    ) -> Result<(), SandboxError> {
+        let result = self
+            .exec(
+                sandbox_public_id,
+                user_id,
+                ExecOptions {
+                    cmd: vec![
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        APPLICATION_GIT_BOOTSTRAP.to_string(),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if result.exit_code != 0 {
+            return Err(SandboxError::ExecFailed {
+                sandbox_id: sandbox_public_id.to_string(),
+                reason: format!(
+                    "initialize persistent Git workspace: {}",
+                    bounded_command_error(&result.stderr, &result.stdout)
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Seed a fresh sandbox's `/workspace` with the requested content.
@@ -1185,39 +2179,71 @@ impl SandboxService {
                 username,
                 password,
                 git_connection_id,
+                destination,
+                strip_git_metadata,
             } => {
                 // Resolve credentials. Priority: explicit (username,password)
                 // pair > git_connection_id > anonymous. The validator rejects
                 // the "both set" combination before we get here.
                 let creds = if let Some(conn_id) = git_connection_id {
-                    Some(self.resolve_connection_creds(user_id, *conn_id).await?)
+                    Some(
+                        self.resolve_connection_creds(user_id, *conn_id, url)
+                            .await?,
+                    )
                 } else if let (Some(u), Some(p)) = (username.as_deref(), password.as_deref()) {
                     Some((u.to_string(), p.to_string()))
                 } else {
                     None
                 };
 
+                validate_source_destination(destination.as_deref())?;
+                if *strip_git_metadata && destination.is_none() {
+                    return Err(SandboxError::Validation {
+                        message: "strip_git_metadata requires a destination so the sandbox root repository cannot be removed"
+                            .into(),
+                    });
+                }
+                let target_dir = destination
+                    .as_deref()
+                    .map(|relative| Path::new(&work_dir).join(relative))
+                    .unwrap_or_else(|| PathBuf::from(&work_dir));
+                let target_dir = target_dir.to_string_lossy().to_string();
+
                 self.run_git_clone(
                     &handle,
                     internal_id,
                     &work_dir,
+                    &target_dir,
                     url,
                     revision.as_deref(),
                     *depth,
                     creds,
+                    *strip_git_metadata,
                 )
                 .await
             }
             SandboxSource::Tarball { url } => {
-                // Stream the tarball straight into tar so we don't
-                // materialize the whole archive on disk. `tar -xzf -`
-                // handles both plain tar and gzip.
-                let script = format!(
-                    "set -eu; mkdir -p {wd} && curl -fsSL {url} | tar -C {wd} -xzf -",
-                    wd = shell_escape_service(&work_dir),
-                    url = shell_escape_service(url)
+                // Stream into a bounded staging directory. The monitor kills
+                // both curl and tar if extraction exceeds the deadline/quota,
+                // and only a complete import is copied into the workspace.
+                let staging_dir = source_import_staging_dir(handle.backend, internal_id);
+                let target_guard = source_target_guard_script(&work_dir, &work_dir);
+                let staging_prepare = source_import_staging_prepare_script(&staging_dir);
+                let extract = format!(
+                    "curl -fsS --max-redirs 0 {url} | tar --no-same-owner --no-same-permissions -C {stage} -xzf -",
+                    url = shell_escape_service(url),
+                    stage = shell_escape_service(&staging_dir),
                 );
-                self.exec_seed_script(&handle, internal_id, script).await
+                let bounded_extract = source_import_command_script(&staging_dir, &extract);
+                let bounds = source_import_bounds_script(&staging_dir);
+                let finalize = source_import_staging_finalize_script(&staging_dir);
+                let restore_target = source_target_restore_script();
+                let script = format!(
+                    "set -eu; {target_guard} trap '{restore_target}' EXIT; {staging_prepare} \
+                     {bounded_extract}{bounds}; {finalize}",
+                );
+                self.exec_seed_script_as_root(&handle, internal_id, script)
+                    .await
             }
         }
     }
@@ -1230,6 +2256,7 @@ impl SandboxService {
         &self,
         user_id: i32,
         connection_id: i32,
+        clone_url: &str,
     ) -> Result<(String, String), SandboxError> {
         let connection = self
             .git_provider_manager
@@ -1253,6 +2280,26 @@ impl SandboxService {
                 });
             }
         }
+
+        let provider = self
+            .git_provider_manager
+            .get_provider(connection.provider_id)
+            .await
+            .map_err(|error| SandboxError::Validation {
+                message: format!(
+                    "Git provider {} for connection {} is not available: {}",
+                    connection.provider_id, connection_id, error
+                ),
+            })?;
+        if !provider.is_active {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "Git provider {} for connection {} is inactive",
+                    provider.id, connection_id
+                ),
+            });
+        }
+        validate_connection_clone_origin(clone_url, &provider)?;
 
         let token = self
             .git_provider_manager
@@ -1279,20 +2326,38 @@ impl SandboxService {
         handle: &temps_agents::sandbox::SandboxHandle,
         internal_id: i32,
         work_dir: &str,
+        target_dir: &str,
         url: &str,
         revision: Option<&str>,
         depth: Option<u32>,
         creds: Option<(String, String)>,
+        strip_git_metadata: bool,
     ) -> Result<(), SandboxError> {
-        let askpass_path = "/tmp/.temps-askpass.sh";
+        // Destination creation is deliberately performed as the sandbox user.
+        // The privileged phase only opens and validates an already-existing
+        // directory, so a malicious symlink cannot make root create paths
+        // outside the workspace before validation.
+        self.ensure_source_target_as_sandbox_user(handle, internal_id, target_dir)
+            .await?;
+        let private_root = match handle.backend {
+            temps_agents::sandbox::SandboxBackend::Local => "/tmp",
+            _ => "/root",
+        };
+        let auth_dir = format!("{private_root}/.temps-source-auth-{internal_id}");
+        let askpass_path = format!("{auth_dir}/askpass.sh");
+        let staging_dir = source_import_staging_dir(handle.backend, internal_id);
 
         // Build the clone command. `-c credential.helper=` disables any
         // host-level credential helper so the password lands only via
         // the askpass shim and is never persisted to `.git/config`.
-        let mut clone_cmd = String::from("git -c credential.helper= clone");
-        if let Some(d) = depth {
-            clone_cmd.push_str(&format!(" --depth {}", d));
-        }
+        // Redirects are disabled for anonymous and authenticated clones. The
+        // source host was DNS-validated before this point; following a new
+        // location would otherwise bypass that decision.
+        let mut clone_cmd = String::from("git -c credential.helper= -c http.followRedirects=false");
+        clone_cmd.push_str(&format!(
+            " clone --depth {} --filter=blob:limit=33554432",
+            depth.unwrap_or(1)
+        ));
         if let Some(r) = revision {
             if !r.is_empty() {
                 // `--branch` accepts branches and tags. For raw commit
@@ -1304,7 +2369,7 @@ impl SandboxService {
         clone_cmd.push_str(&format!(
             " {} {}",
             shell_escape_service(url),
-            shell_escape_service(work_dir)
+            shell_escape_service(&staging_dir)
         ));
 
         // If revision didn't resolve to a branch/tag (e.g. raw SHA),
@@ -1312,12 +2377,21 @@ impl SandboxService {
         // already did the right thing.
         let checkout_cmd = match revision {
             Some(r) if !r.is_empty() => format!(
-                " || (git -C {wd} fetch origin {rev} && git -C {wd} checkout {rev})",
-                wd = shell_escape_service(work_dir),
+                " || (git -C {wd} -c credential.helper= -c http.followRedirects=false fetch origin {rev} && git -C {wd} checkout {rev})",
+                wd = shell_escape_service(&staging_dir),
                 rev = shell_escape_service(r)
             ),
             _ => String::new(),
         };
+        let target_guard = source_target_guard_script(work_dir, target_dir);
+        let staging_prepare = source_import_staging_prepare_script(&staging_dir);
+        let auth_prepare = source_import_staging_prepare_script(&auth_dir);
+        let bounded_clone =
+            source_import_command_script(&staging_dir, &format!("{clone_cmd}{checkout_cmd}"));
+        let cleanup = git_metadata_cleanup_script(&staging_dir, strip_git_metadata);
+        let bounds = source_import_bounds_script(&staging_dir);
+        let finalize = source_import_staging_finalize_script(&staging_dir);
+        let restore_target = source_target_restore_script();
 
         // Compose the shell script. When creds are present we write the
         // askpass shim, chmod it, and point git at it via env; the shim
@@ -1327,7 +2401,7 @@ impl SandboxService {
         let script = if creds.is_some() {
             format!(
                 "set -eu; \
-                 mkdir -p {wd}; \
+                 {target_guard} {staging_prepare} {auth_prepare} \
                  cat > {ask} <<'TEMPS_ASKPASS_EOF'\n\
 #!/bin/sh\n\
 case \"$1\" in\n\
@@ -1336,19 +2410,33 @@ case \"$1\" in\n\
 esac\n\
 TEMPS_ASKPASS_EOF\n\
                  chmod 700 {ask}; \
-                 trap 'shred -u {ask} 2>/dev/null || rm -f {ask}' EXIT; \
-                 GIT_ASKPASS={ask} GIT_TERMINAL_PROMPT=0 {clone}{checkout}",
-                wd = shell_escape_service(work_dir),
+                 trap 'shred -u {ask} 2>/dev/null || rm -f {ask}; find {auth_dir} -depth -delete 2>/dev/null || true; {restore_target}' EXIT; \
+                 GIT_ASKPASS={ask} GIT_TERMINAL_PROMPT=0 {bounded_clone}{cleanup}{bounds}; {finalize}",
+                target_guard = target_guard,
+                staging_prepare = staging_prepare,
+                auth_prepare = auth_prepare,
                 ask = askpass_path,
-                clone = clone_cmd,
-                checkout = checkout_cmd,
+                auth_dir = shell_escape_service(&auth_dir),
+                restore_target = restore_target,
+                bounded_clone = bounded_clone,
+                cleanup = cleanup,
+                bounds = bounds,
+                finalize = finalize,
             )
         } else {
             format!(
-                "set -eu; mkdir -p {wd}; GIT_TERMINAL_PROMPT=0 {clone}{checkout}",
-                wd = shell_escape_service(work_dir),
-                clone = clone_cmd,
-                checkout = checkout_cmd,
+                "set -eu; {target_guard} {staging_prepare} {auth_prepare} \
+                 trap 'find {auth_dir} -depth -delete 2>/dev/null || true; {restore_target}' EXIT; \
+                 GIT_TERMINAL_PROMPT=0 {bounded_clone}{cleanup}{bounds}; {finalize}",
+                target_guard = target_guard,
+                staging_prepare = staging_prepare,
+                auth_prepare = auth_prepare,
+                auth_dir = shell_escape_service(&auth_dir),
+                restore_target = restore_target,
+                bounded_clone = bounded_clone,
+                cleanup = cleanup,
+                bounds = bounds,
+                finalize = finalize,
             )
         };
 
@@ -1357,20 +2445,60 @@ TEMPS_ASKPASS_EOF\n\
             env_map.insert("GIT_USER".into(), u);
             env_map.insert("GIT_PASS".into(), p);
         }
+        env_map.insert("HOME".into(), auth_dir);
+        env_map.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
+        env_map.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
+        env_map.insert("GIT_CONFIG_SYSTEM".into(), "/dev/null".into());
 
-        self.exec_seed_script_with_env(handle, internal_id, script, env_map)
+        self.exec_seed_script_with_env_as_root(handle, internal_id, script, env_map)
             .await
     }
 
-    /// Run a seed script with no environment overrides. Helper used by
-    /// non-git sources (tarball today, potentially more later).
-    async fn exec_seed_script(
+    async fn ensure_source_target_as_sandbox_user(
+        &self,
+        handle: &temps_agents::sandbox::SandboxHandle,
+        internal_id: i32,
+        target_dir: &str,
+    ) -> Result<(), SandboxError> {
+        let cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("mkdir -p -- {}", shell_escape_service(target_dir)),
+        ];
+        let result = self
+            .registry
+            .provider()
+            .exec(
+                handle,
+                cmd,
+                HashMap::from([("PATH".to_string(), SOURCE_IMPORT_SYSTEM_PATH.to_string())]),
+                None,
+            )
+            .await
+            .map_err(|error| SandboxError::ExecFailed {
+                sandbox_id: handle_id_fallback(internal_id),
+                reason: format!("prepare source destination: {error}"),
+            })?;
+        if result.exit_code != 0 {
+            return Err(SandboxError::ExecFailed {
+                sandbox_id: handle_id_fallback(internal_id),
+                reason: format!(
+                    "prepare source destination exited with code {}: {}",
+                    result.exit_code,
+                    bounded_command_error(&result.stderr, &result.stdout)
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn exec_seed_script_as_root(
         &self,
         handle: &temps_agents::sandbox::SandboxHandle,
         internal_id: i32,
         script: String,
     ) -> Result<(), SandboxError> {
-        self.exec_seed_script_with_env(handle, internal_id, script, HashMap::new())
+        self.exec_seed_script_with_env_as_root(handle, internal_id, script, HashMap::new())
             .await
     }
 
@@ -1378,19 +2506,28 @@ TEMPS_ASKPASS_EOF\n\
     /// map may contain tokens. On non-zero exit we surface stdout/stderr
     /// but the sandbox layer scrubs them before they reach the user (the
     /// provider's exec impl is expected to honor this).
-    async fn exec_seed_script_with_env(
+    async fn exec_seed_script_with_env_as_root(
         &self,
         handle: &temps_agents::sandbox::SandboxHandle,
         internal_id: i32,
         script: String,
-        env_map: HashMap<String, String>,
+        mut env_map: HashMap<String, String>,
     ) -> Result<(), SandboxError> {
-        let cmd = vec!["sh".to_string(), "-c".to_string(), script];
-        let result = self
+        env_map.insert("PATH".into(), SOURCE_IMPORT_SYSTEM_PATH.into());
+        let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        let execution = self
             .registry
             .provider()
-            .exec(handle, cmd, env_map, None)
+            .exec_as_root(handle, cmd, env_map, None);
+        let result = tokio::time::timeout(SOURCE_IMPORT_PROVIDER_TIMEOUT, execution)
             .await
+            .map_err(|_| SandboxError::ExecFailed {
+                sandbox_id: handle_id_fallback(internal_id),
+                reason: format!(
+                    "source import exceeded the {} second safety limit",
+                    SOURCE_IMPORT_PROVIDER_TIMEOUT.as_secs()
+                ),
+            })?
             .map_err(|e| SandboxError::ExecFailed {
                 sandbox_id: handle_id_fallback(internal_id),
                 reason: format!("seed source exec: {}", e),
@@ -1400,8 +2537,9 @@ TEMPS_ASKPASS_EOF\n\
             return Err(SandboxError::ExecFailed {
                 sandbox_id: handle_id_fallback(internal_id),
                 reason: format!(
-                    "seed source exited with code {}: {}{}",
-                    result.exit_code, result.stdout, result.stderr
+                    "seed source exited with code {}: {}",
+                    result.exit_code,
+                    bounded_command_error(&result.stderr, &result.stdout)
                 ),
             });
         }
@@ -1467,18 +2605,20 @@ TEMPS_ASKPASS_EOF\n\
         self.record_event(row.id, "destroyed", None).await;
         self.mark_destroyed(row.id).await?;
 
-        // Nullify source_sandbox_id on any snapshot that references this
-        // sandbox (ADR-037). Best-effort: a failure here is not fatal to
-        // the destroy — the snapshot rows still exist and are usable, they
-        // just carry a stale integer reference to a now-gone sandbox.
-        if let Some(ref snap_svc) = self.snapshot_service {
-            if let Err(e) = snap_svc.nullify_source_sandbox(row.id).await {
-                tracing::warn!(
-                    sandbox_id = %public_id_value,
-                    internal_id = row.id,
-                    "destroy: failed to nullify source_sandbox_id on snapshots: {}",
-                    e
-                );
+        // Standalone snapshots may outlive their deleted sandbox without
+        // retaining an internal identity. Managed application snapshots keep
+        // immutable provenance so they can never become visible through the
+        // generic snapshot API after the compute row is destroyed.
+        if !row.name.starts_with(APPLICATION_WORKSPACE_NAME_PREFIX) {
+            if let Some(ref snap_svc) = self.snapshot_service {
+                if let Err(e) = snap_svc.nullify_source_sandbox(row.id).await {
+                    tracing::warn!(
+                        sandbox_id = %public_id_value,
+                        internal_id = row.id,
+                        "destroy: failed to nullify source_sandbox_id on snapshots: {}",
+                        e
+                    );
+                }
             }
         }
 
@@ -1538,10 +2678,10 @@ TEMPS_ASKPASS_EOF\n\
             });
         }
         self.jobs.abort_all(row.id).await;
-        self.registry
-            .stop(row.id, public_id_value)
-            .await
-            .map_err(|e| from_agent_error(public_id_value, e))?;
+        match self.registry.stop(row.id, public_id_value).await {
+            Ok(()) | Err(temps_agents::error::AgentError::SandboxNotFound { .. }) => {}
+            Err(error) => return Err(from_agent_error(public_id_value, error)),
+        }
         let now = Utc::now();
         let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
@@ -1692,6 +2832,8 @@ TEMPS_ASKPASS_EOF\n\
         user_id: i32,
         source: &SandboxSource,
     ) -> Result<sandboxes::Model, SandboxError> {
+        let _source_import = self.source_import_lock.lock().await;
+        validate_resolved_source(source).await?;
         let row = self.find_by_public_id(public_id_value, user_id).await?;
         if row.status != "running" {
             return Err(SandboxError::InvalidState {
@@ -1993,8 +3135,9 @@ TEMPS_ASKPASS_EOF\n\
 
     /// Load + authorize + return the internal ID, or a typed error that
     /// already includes the public ID. Exec/fs modules call this first.
-    /// Rejects stopped sandboxes with `InvalidState` (→ HTTP 409) — the
-    /// user must call `/resume` before running commands.
+    /// Explicitly stopped ephemeral sandboxes return `InvalidState` (→ HTTP
+    /// 409); durable workspaces wake transparently when either the row or the
+    /// provider reports that the runtime is stopped.
     ///
     /// **Wakes a suspended workspace as a side effect** (ADR-036), so only
     /// call it where the container must actually be running.
@@ -2004,13 +3147,14 @@ TEMPS_ASKPASS_EOF\n\
         user_id: i32,
     ) -> Result<(sandboxes::Model, i32), SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
+        let lifecycle = SandboxLifecycle::from_row(&row);
         if row.status == "stopped" {
             // Workspaces (ADR-036) are places a human comes back to, so a
             // suspended one wakes instead of erroring. Ephemeral sandboxes
             // keep the 409: their lifetime belongs to whoever created them,
             // and `@vercel/sandbox` consumers rely on a stopped sandbox
             // staying stopped rather than silently restarting under them.
-            if SandboxLifecycle::from_row(&row) == SandboxLifecycle::Workspace {
+            if lifecycle == SandboxLifecycle::Workspace {
                 return self.wake_workspace(row).await;
             }
             return Err(SandboxError::InvalidState {
@@ -2019,14 +3163,41 @@ TEMPS_ASKPASS_EOF\n\
                 operation: "exec or filesystem operation".into(),
             });
         }
+
+        // Docker (or another provider) can stop a container without passing
+        // through SandboxService: daemon pressure, an operator `docker kill`,
+        // or the application harness hard deadline are all legitimate ways to
+        // reach that state. In those cases the DB row still says `running`.
+        // Trusting only the row makes the first application-workspace access
+        // fail in `registry.get()` before the later harness recovery path gets
+        // a chance to start the container.
+        //
+        // Only workspaces auto-recover. Ephemeral sandboxes retain their
+        // caller-owned lifecycle semantics, and `registry.get()` below the
+        // service layer will still return a typed not-found error for them.
+        if row.status == "running" && lifecycle == SandboxLifecycle::Workspace {
+            match self.registry.get(row.id, public_id_value).await {
+                Ok(_) => {}
+                Err(temps_agents::error::AgentError::SandboxNotFound { .. }) => {
+                    tracing::warn!(
+                        sandbox_id = public_id_value,
+                        internal_id = row.id,
+                        "Workspace row says running but its provider runtime is stopped; waking it on access"
+                    );
+                    return self.wake_workspace(row).await;
+                }
+                Err(error) => return Err(from_agent_error(public_id_value, error)),
+            }
+        }
         let id = row.id;
         Ok((row, id))
     }
 
-    /// Start a suspended workspace's container and flip its row back to
-    /// `running`. Called from [`Self::resolve_id`] on the access path, so
-    /// the caller experiences it as a slow first request rather than a
-    /// failure.
+    /// Start a suspended workspace's container and reconcile its row to
+    /// `running`. Called from [`Self::resolve_id`] on the access path for both
+    /// an explicitly stopped row and a stale `running` row whose provider
+    /// runtime has died, so the caller experiences recovery as a slow first
+    /// request rather than a failure.
     ///
     /// A wake is a container start, not a create: the image is local, the
     /// home volume exists, and the work dir is still populated on the
@@ -2194,6 +3365,85 @@ TEMPS_ASKPASS_EOF\n\
     }
 }
 
+fn merge_runtime_variables(
+    destination: &mut HashMap<String, String>,
+    issued: HashMap<String, String>,
+) -> Result<(), String> {
+    for (name, value) in issued {
+        if destination
+            .get(&name)
+            .is_some_and(|existing| existing != &value)
+        {
+            return Err(name);
+        }
+        destination.insert(name, value);
+    }
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl temps_core::ApplicationDataNetworkReconciler for SandboxService {
+    async fn project_topology_changed(
+        &self,
+        project_id: i32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.reconcile_application_networks_for_project(project_id)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+fn sandbox_data_network_name(sandbox_public_id: &str) -> Result<String, SandboxError> {
+    let opaque_id = sandbox_public_id
+        .strip_prefix("sbx_")
+        .unwrap_or(sandbox_public_id);
+    if opaque_id.is_empty()
+        || opaque_id.len() > 40
+        || !opaque_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(SandboxError::Validation {
+            message: "sandbox data-network identifier is invalid".to_string(),
+        });
+    }
+    Ok(format!("temps-sandbox-data-{opaque_id}"))
+}
+
+fn application_sandbox_create_config(
+    row: &sandboxes::Model,
+    host_work_dir: PathBuf,
+    config: &ApplicationWorkspaceConfig,
+) -> Result<SandboxCreateConfig, SandboxError> {
+    let backend = row
+        .backend
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| SandboxError::Validation {
+            message: format!(
+                "application workspace '{}' has an unsupported backend",
+                row.public_id
+            ),
+        })?;
+    Ok(SandboxCreateConfig {
+        owner_user_id: None,
+        run_id: row.id,
+        container_name_override: Some(container_label_for(&row.public_id).to_string()),
+        host_work_dir,
+        workspace_volume: None,
+        image: config.image.clone(),
+        cpu_limit: Some(config.cpu_limit),
+        memory_limit_mb: Some(config.memory_limit_mb),
+        pids_limit: Some(config.pids_limit),
+        disk_size_mb: Some(config.disk_limit_mb),
+        network_mode: None,
+        env_vars: HashMap::new(),
+        idle_timeout: Duration::from_secs(config.idle_timeout_secs),
+        backend,
+    })
+}
+
 /// Placeholder "public id" used in error messages when the source-seed
 /// step fails before we propagate it upward. We already mapped the
 /// real public ID into the top-level Create error; this just gives the
@@ -2217,11 +3467,303 @@ fn shell_escape_service(s: &str) -> String {
     }
 }
 
+/// Open and lock the destination directory for a source import.
+///
+/// Publication later uses the retained descriptor at `/dev/fd/9`, not
+/// the mutable pathname. The descriptor is validated after it is opened and
+/// the directory is made root-only for the duration of the import. A sandbox
+/// process can therefore rename or replace the pathname while Git is running,
+/// but it cannot redirect the privileged copy or add symlinks beneath the
+/// directory being published into.
+fn source_target_guard_script(work_dir: &str, target_dir: &str) -> String {
+    let work_dir = shell_escape_service(work_dir);
+    let target_dir = shell_escape_service(target_dir);
+    if work_dir == target_dir {
+        return format!(
+            "test -d {work_dir} && test ! -L {work_dir} || {{ echo 'sandbox work directory must be a real directory' >&2; exit 64; }}; \
+             work_real=$(readlink -f -- {work_dir}); exec 9< {work_dir}; target_fd=/dev/fd/9; \
+             target_real=$(readlink -f -- \"$target_fd\"); [ \"$target_real\" = \"$work_real\" ] || {{ echo 'source destination changed while opening it' >&2; exit 64; }}; \
+             test -z \"$(find \"$target_fd\" -mindepth 1 -print -quit)\" || {{ echo 'source destination must be empty' >&2; exit 66; }}; \
+             if [ \"$(id -u)\" -eq 0 ]; then chown root:root \"$target_fd\"; chmod 700 \"$target_fd\"; fi;"
+        );
+    }
+    format!(
+        "test -d {work_dir} && test ! -L {work_dir} || {{ echo 'sandbox work directory must be a real directory' >&2; exit 64; }}; \
+         test -d {target_dir} || {{ echo 'source destination must already be a directory' >&2; exit 64; }}; \
+         work_real=$(readlink -f -- {work_dir}); exec 9< {target_dir}; target_fd=/dev/fd/9; \
+         target_real=$(readlink -f -- \"$target_fd\"); \
+         case \"$target_real/\" in \"$work_real/\"*) ;; *) echo 'source destination escapes the sandbox work directory' >&2; exit 64 ;; esac; \
+         test -z \"$(find \"$target_fd\" -mindepth 1 -print -quit)\" || {{ echo 'source destination must be an empty directory' >&2; exit 66; }}; \
+         if [ \"$(id -u)\" -eq 0 ]; then chown root:root \"$target_fd\"; chmod 700 \"$target_fd\"; fi;"
+    )
+}
+
+fn source_target_restore_script() -> &'static str {
+    "if [ \"$(id -u)\" -eq 0 ] && [ -d /dev/fd/9 ] && id -u temps >/dev/null 2>&1; then chown \"$(id -u temps):$(id -g temps)\" /dev/fd/9; chmod 755 /dev/fd/9; fi"
+}
+
+fn source_import_staging_dir(
+    backend: temps_agents::sandbox::SandboxBackend,
+    internal_id: i32,
+) -> String {
+    let private_root = match backend {
+        temps_agents::sandbox::SandboxBackend::Local => "/tmp",
+        _ => "/root",
+    };
+    format!("{private_root}/.temps-source-import-{internal_id}")
+}
+
+fn source_import_staging_prepare_script(staging_dir: &str) -> String {
+    let staging_dir = shell_escape_service(staging_dir);
+    format!(
+        "find {staging_dir} -depth -delete 2>/dev/null || true; mkdir -m 700 -p {staging_dir}; \
+         test ! -L {staging_dir} || {{ echo 'source staging directory must not be a symbolic link' >&2; exit 64; }};"
+    )
+}
+
+fn source_import_staging_finalize_script(staging_dir: &str) -> String {
+    let staging_dir = shell_escape_service(staging_dir);
+    format!(
+        "target_fd=/dev/fd/9; test -d \"$target_fd\" || exit 67; \
+         cd -P -- \"$target_fd\"; \
+         test -z \"$(find . -mindepth 1 -print -quit)\" || {{ echo 'source destination changed during import' >&2; exit 66; }}; \
+         cp -a {staging_dir}/. . || {{ find . -mindepth 1 -depth -delete 2>/dev/null || true; exit 67; }}; \
+         find {staging_dir} -depth -delete; \
+         if id -u temps >/dev/null 2>&1; then \
+           chown -R \"$(id -u temps):$(id -g temps)\" . || {{ find . -mindepth 1 -depth -delete 2>/dev/null || true; exit 67; }}; \
+           chmod 755 .; \
+         fi"
+    )
+}
+
+/// Execute Git under an in-container deadline while continuously enforcing
+/// the import quota. The outer Tokio timeout only drops a future; this inner
+/// process is what actually terminates Git and removes a partial checkout.
+fn source_import_command_script(target_dir: &str, command: &str) -> String {
+    let target_dir = shell_escape_service(target_dir);
+    let command = shell_escape_service(command);
+    format!(
+        "set +e; timeout -k 5 {timeout_secs} sh -c {command} & import_pid=$!; limit_exceeded=0; \
+         while kill -0 \"$import_pid\" 2>/dev/null; do \
+           entry_count=$(find {target_dir} -mindepth 1 -print 2>/dev/null | head -n {entry_probe} | wc -l | tr -d ' '); \
+           byte_count=$(du -sk {target_dir} 2>/dev/null | awk '{{print $1 * 1024}}'); byte_count=${{byte_count:-0}}; \
+           if [ \"$entry_count\" -gt {max_entries} ] || [ \"$byte_count\" -gt {max_bytes} ]; then \
+             limit_exceeded=1; kill -TERM \"$import_pid\" 2>/dev/null || true; break; \
+           fi; sleep 1; \
+         done; \
+         wait \"$import_pid\"; import_status=$?; set -e; \
+         if [ \"$limit_exceeded\" -eq 1 ]; then \
+           find {target_dir} -depth -delete 2>/dev/null || true; \
+           echo 'source import exceeds the 5000 entry or 256 MiB workspace limit' >&2; exit 65; \
+         fi; \
+         if [ \"$import_status\" -ne 0 ]; then \
+           find {target_dir} -depth -delete 2>/dev/null || true; exit \"$import_status\"; \
+         fi",
+        timeout_secs = SOURCE_IMPORT_TIMEOUT.as_secs(),
+        entry_probe = SOURCE_IMPORT_MAX_FILES + 1,
+        max_entries = SOURCE_IMPORT_MAX_FILES,
+        max_bytes = SOURCE_IMPORT_MAX_BYTES,
+    )
+}
+
+fn git_metadata_cleanup_script(target_dir: &str, strip_git_metadata: bool) -> String {
+    if strip_git_metadata {
+        format!(
+            "; find {git_dir} -depth -delete",
+            git_dir = shell_escape_service(&Path::new(target_dir).join(".git").to_string_lossy())
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn source_import_bounds_script(target_dir: &str) -> String {
+    let target_dir = shell_escape_service(target_dir);
+    format!(
+        "; file_count=$(find {target_dir} -mindepth 1 -print | head -n {file_probe} | wc -l | tr -d ' '); \
+         byte_count=$(du -sk {target_dir} | awk '{{print $1 * 1024}}'); \
+         if [ \"$file_count\" -gt {max_files} ] || [ \"$byte_count\" -gt {max_bytes} ]; then \
+           find {target_dir} -depth -delete 2>/dev/null || true; \
+           echo 'source import exceeds the 5000 entry or 256 MiB workspace limit' >&2; exit 65; \
+         fi",
+        file_probe = SOURCE_IMPORT_MAX_FILES + 1,
+        max_files = SOURCE_IMPORT_MAX_FILES,
+        max_bytes = SOURCE_IMPORT_MAX_BYTES,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::{Job, JobQueue, JobReceiver, QueueError};
+
+    #[test]
+    fn sandbox_data_network_names_are_stable_and_scoped() {
+        assert_eq!(
+            sandbox_data_network_name("sbx_abc123").expect("valid sandbox id"),
+            "temps-sandbox-data-abc123"
+        );
+    }
+
+    #[test]
+    fn source_destinations_are_bounded_relative_paths() {
+        for valid in ["project", "projects/web", "packages/api-v2"] {
+            assert!(validate_source_destination(Some(valid)).is_ok(), "{valid}");
+        }
+        for invalid in ["", ".", "../project", "projects/../escape", "/workspace"] {
+            assert!(
+                validate_source_destination(Some(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripped_git_metadata_targets_only_the_imported_repository() {
+        let cleanup = git_metadata_cleanup_script("/workspace/projects/web", true);
+        assert!(cleanup.contains("/workspace/projects/web/.git"));
+        assert!(!cleanup.contains("/workspace/.git "));
+        assert!(git_metadata_cleanup_script("/workspace/projects/web", false).is_empty());
+    }
+
+    #[test]
+    fn source_imports_use_bounded_staging_and_process_deadlines() {
+        let nested_stage =
+            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Docker, 42);
+        assert_eq!(nested_stage, "/root/.temps-source-import-42");
+        let local_stage =
+            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Local, 42);
+        assert_eq!(local_stage, "/tmp/.temps-source-import-42");
+
+        let command = source_import_command_script(&nested_stage, "git clone repo target");
+        assert!(command.contains("timeout -k 5 120"));
+        assert!(command.contains("find /root/.temps-source-import-42 -mindepth 1"));
+        assert!(command.contains("kill -TERM"));
+        assert!(command.contains("find /root/.temps-source-import-42 -depth -delete"));
+
+        let bounds = source_import_bounds_script(&nested_stage);
+        assert!(bounds.contains("-mindepth 1"));
+        assert!(!bounds.contains("-type f"));
+    }
+
+    #[test]
+    fn source_destination_guard_rejects_non_empty_targets() {
+        let guard = source_target_guard_script("/workspace", "/workspace/projects/web");
+        assert!(guard.contains("source destination must be an empty directory"));
+        assert!(guard.contains("exec 9< /workspace/projects/web"));
+        assert!(guard.contains("find \"$target_fd\" -mindepth 1"));
+        assert!(guard.contains("chmod 700 \"$target_fd\""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_publish_uses_retained_destination_after_symlink_swap() {
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().expect("temporary source import root");
+        let workspace = temp.path().join("workspace");
+        let target = workspace.join("projects/web");
+        let original = workspace.join("projects/web-original");
+        let outside = temp.path().join("outside");
+        let staging = temp.path().join("staging");
+        std::fs::create_dir_all(&target).expect("source destination");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::create_dir_all(&staging).expect("staging directory");
+        std::fs::write(staging.join("index.js"), b"safe").expect("staged source");
+
+        let guard = source_target_guard_script(
+            workspace.to_str().expect("utf-8 workspace"),
+            target.to_str().expect("utf-8 target"),
+        );
+        let finalize = source_import_staging_finalize_script(
+            staging.to_str().expect("utf-8 staging directory"),
+        );
+        let script = format!(
+            "set -eu; {guard} mv {target} {original}; ln -s {outside} {target}; {finalize}",
+            target = shell_escape_service(target.to_str().expect("utf-8 target")),
+            original = shell_escape_service(original.to_str().expect("utf-8 original")),
+            outside = shell_escape_service(outside.to_str().expect("utf-8 outside")),
+        );
+        let status = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .expect("execute source publication script");
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(original.join("index.js")).expect("published source"),
+            b"safe"
+        );
+        assert!(!outside.join("index.js").exists());
+        assert!(std::fs::symlink_metadata(&target)
+            .expect("replacement symlink")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn sandbox_data_network_names_reject_docker_name_injection() {
+        for invalid in ["", "../shared", "app id", "app/name"] {
+            assert!(matches!(
+                sandbox_data_network_name(invalid),
+                Err(SandboxError::Validation { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn application_workspace_reuse_requires_server_attestation() {
+        let host_work_dir = PathBuf::from("/var/lib/temps/ai-applications/app_example");
+        let config = ApplicationWorkspaceConfig::default();
+        let now = Utc::now();
+        let mut managed = sandboxes::Model {
+            id: 7,
+            public_id: "sbx_deadbeef01234567".to_string(),
+            user_id: Some(1),
+            agent_run_id: None,
+            name: "ai-application:app_example".to_string(),
+            status: "running".to_string(),
+            image: config.image.clone(),
+            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            timeout_secs: 3600,
+            metadata: Some(serde_json::json!({
+                "managed_application_id": "app_example",
+                "managed_host_work_dir": host_work_dir,
+            })),
+            backend: Some("docker".to_string()),
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            preview_password_hash: None,
+            preview_password_hint: None,
+            lifecycle: "workspace".to_string(),
+            project_id: None,
+            source_repo_url: None,
+        };
+
+        assert!(config.image.is_some(), "the default image must be attested");
+
+        assert!(application_workspace_row_is_attested(
+            &managed,
+            "app_example",
+            &host_work_dir,
+            &config
+        ));
+
+        managed.image = Some("attacker/custom-image:latest".to_string());
+        assert!(!application_workspace_row_is_attested(
+            &managed,
+            "app_example",
+            &host_work_dir,
+            &config
+        ));
+        assert_eq!(
+            managed_application_id_from_name("ai-application:app_example"),
+            Some("app_example")
+        );
+        assert_eq!(managed_application_id_from_name("ordinary-sandbox"), None);
+    }
 
     struct NoopJobQueue;
 
@@ -2687,7 +4229,7 @@ mod storage_cleanup_tests {
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temps_agents::error::AgentError;
     use temps_agents::sandbox::{
         SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
@@ -2706,7 +4248,12 @@ mod storage_cleanup_tests {
         /// `start` errors — the wake-on-access failure path.
         fail_start: bool,
         destroys: AtomicUsize,
-        starts: AtomicUsize,
+        creates: Arc<AtomicUsize>,
+        starts: Arc<AtomicUsize>,
+        /// Provider truth can differ from the database after an out-of-band
+        /// container kill. `start` flips this back to true so the complete
+        /// wake-and-retry path can be exercised without Docker.
+        alive: Arc<AtomicBool>,
     }
 
     impl FakeProvider {
@@ -2717,7 +4264,9 @@ mod storage_cleanup_tests {
                 fail_destroy: false,
                 fail_start: false,
                 destroys: AtomicUsize::new(0),
-                starts: AtomicUsize::new(0),
+                creates: Arc::new(AtomicUsize::new(0)),
+                starts: Arc::new(AtomicUsize::new(0)),
+                alive: Arc::new(AtomicBool::new(true)),
             }
         }
     }
@@ -2742,6 +4291,8 @@ mod storage_cleanup_tests {
                     reason: "image pull failed".into(),
                 });
             }
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            self.alive.store(true, Ordering::SeqCst);
             Ok(handle_for(
                 config.container_name_override.as_deref().unwrap_or("x"),
             ))
@@ -2766,7 +4317,7 @@ mod storage_cleanup_tests {
         }
 
         async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
-            Ok(true)
+            Ok(self.alive.load(Ordering::SeqCst))
         }
 
         async fn write_file(
@@ -2833,6 +4384,7 @@ mod storage_cleanup_tests {
                     reason: format!("daemon unreachable while starting {}", handle.sandbox_name),
                 });
             }
+            self.alive.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -2998,6 +4550,103 @@ mod storage_cleanup_tests {
 
     const PUBLIC_ID: &str = "sbx_deadbeef01234567";
 
+    #[tokio::test]
+    async fn application_workspace_fails_when_in_sandbox_git_bootstrap_fails() {
+        let data_root = unique_data_root("application-git-bootstrap");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let application_work_dir = data_root.join("app_example");
+        let existing = sandboxes::Model {
+            name: "ai-application:app_example".to_string(),
+            lifecycle: "workspace".to_string(),
+            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            image: ApplicationWorkspaceConfig::default().image,
+            metadata: Some(serde_json::json!({
+                "managed_application_id": "app_example",
+                "managed_host_work_dir": application_work_dir,
+            })),
+            ..row(PUBLIC_ID, None)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Existing application sandbox lookup.
+            .append_query_results([vec![existing.clone()]])
+            // `exec` ownership lookup.
+            .append_query_results([vec![existing]])
+            // Activity touch performed before provider exec.
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let mut provider = FakeProvider::new();
+        provider.fail_exec = true;
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let error = service
+            .get_or_create_application_workspace(1, "app_example", None, application_work_dir)
+            .await
+            .expect_err("a failed Git bootstrap must fail workspace preparation");
+
+        assert!(matches!(error, SandboxError::ExecFailed { .. }));
+        assert!(error
+            .to_string()
+            .contains("initialize persistent Git workspace"));
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn application_workspace_rebuilds_killed_provider_before_git_bootstrap() {
+        let data_root = unique_data_root("application-provider-recovery");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let application_work_dir = data_root.join("app_example");
+        let existing = sandboxes::Model {
+            name: "ai-application:app_example".to_string(),
+            lifecycle: "workspace".to_string(),
+            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            image: ApplicationWorkspaceConfig::default().image,
+            metadata: Some(serde_json::json!({
+                "managed_application_id": "app_example",
+                "managed_host_work_dir": application_work_dir,
+            })),
+            ..row(PUBLIC_ID, None)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Existing application sandbox lookup.
+            .append_query_results([vec![existing.clone()]])
+            // Git-bootstrap exec ownership lookup sees the stale running row.
+            .append_query_results([vec![existing.clone()]])
+            // Provider wake reconciles the row before exec is attempted.
+            .append_query_results([vec![existing.clone()]])
+            // Event/runtime reconciliation may re-resolve the durable row;
+            // every resolution must keep returning the same identity.
+            .append_query_results([vec![existing.clone()]])
+            .append_query_results([vec![existing]])
+            // Activity touch performed before provider exec.
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let creates = provider.creates.clone();
+        let starts = provider.starts.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let sandbox = service
+            .get_or_create_application_workspace(1, "app_example", None, application_work_dir)
+            .await
+            .expect("application preparation must wake its stopped provider runtime");
+
+        assert_eq!(sandbox.public_id, PUBLIC_ID);
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            1,
+            "Git bootstrap must be preceded by exactly one provider rebuild"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
     /// A row in the given lifecycle class and status. Used by the
     /// workspace wake tests below.
     fn row_with(public_id: &str, lifecycle: &str, status: &str) -> sandboxes::Model {
@@ -3133,6 +4782,43 @@ mod storage_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn resolve_id_wakes_workspace_when_row_is_running_but_provider_is_stopped() {
+        // Reproduces an application harness hitting its hard deadline: the
+        // provider stops the Docker container to kill the orphaned process,
+        // but the standalone sandbox row remains `running`. The next Git
+        // bootstrap/exec must recover the workspace instead of failing before
+        // the harness-level recovery path can run.
+        let data_root = unique_data_root("wake-stale-running-workspace");
+        let stale_row = row_with(PUBLIC_ID, "workspace", "running");
+        let recovered_row = stale_row.clone();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // resolve_id ownership lookup returns the stale DB state.
+            .append_query_results([vec![stale_row]])
+            // wake_workspace status reconciliation returns a live row.
+            .append_query_results([vec![recovered_row]])
+            .into_connection();
+
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let starts = provider.starts.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let (row, id) = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect("a provider-stopped workspace must wake despite a stale running row");
+
+        assert_eq!(id, 7);
+        assert_eq!(row.status, "running");
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "provider start must run exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
     async fn resolve_id_surfaces_a_failed_wake_instead_of_swallowing_it() {
         // A workspace that silently fails to wake and then reports
         // "not found" on every later call is exactly the dead end a
@@ -3233,6 +4919,8 @@ mod storage_cleanup_tests {
                 git_connection_id,
                 username,
                 password,
+                destination,
+                strip_git_metadata,
             } => {
                 assert_eq!(url, "https://github.com/acme/api.git");
                 assert_eq!(revision.as_deref(), Some("main"));
@@ -3241,6 +4929,8 @@ mod storage_cleanup_tests {
                     "a workspace gets full history — you cannot rebase in a shallow clone"
                 );
                 assert_eq!(git_connection_id, Some(3));
+                assert!(destination.is_none());
+                assert!(!strip_git_metadata);
                 assert!(
                     username.is_none() && password.is_none(),
                     "credentials must resolve server-side from the connection, \
@@ -3317,12 +5007,12 @@ mod storage_cleanup_tests {
     // ── Resolved-source validation ───────────────────────────────────────
 
     #[test]
-    fn embedded_credentials_are_detected_only_in_userinfo() {
+    fn all_embedded_userinfo_is_rejected() {
         assert!(url_has_embedded_credentials(
             "https://user:secret@github.com/org/repo.git"
         ));
-        // A bare user is not a credential — git treats it as "prompt".
-        assert!(!url_has_embedded_credentials(
+        // A bare user can itself be a token or sensitive account identifier.
+        assert!(url_has_embedded_credentials(
             "https://user@github.com/org/repo.git"
         ));
         assert!(!url_has_embedded_credentials(
@@ -3348,6 +5038,52 @@ mod storage_cleanup_tests {
         ));
     }
 
+    fn git_provider(
+        provider_type: &str,
+        base_url: Option<&str>,
+    ) -> temps_entities::git_providers::Model {
+        let now = Utc::now();
+        temps_entities::git_providers::Model {
+            id: 7,
+            name: "fixture".to_string(),
+            provider_type: provider_type.to_string(),
+            base_url: base_url.map(str::to_string),
+            api_url: None,
+            auth_method: "pat".to_string(),
+            auth_config: serde_json::json!({}),
+            webhook_secret: None,
+            is_active: true,
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn stored_git_credentials_are_bound_to_the_provider_origin() {
+        let github = git_provider("github", None);
+        assert!(
+            validate_connection_clone_origin("https://github.com/acme/repo.git", &github).is_ok()
+        );
+        assert!(validate_connection_clone_origin(
+            "https://credentials.example/acme/repo.git",
+            &github
+        )
+        .is_err());
+
+        let enterprise = git_provider("github", Some("https://git.example.test:8443"));
+        assert!(validate_connection_clone_origin(
+            "https://git.example.test:8443/acme/repo.git",
+            &enterprise
+        )
+        .is_ok());
+        assert!(validate_connection_clone_origin(
+            "https://git.example.test/acme/repo.git",
+            &enterprise
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn resolved_source_rejects_embedded_credentials() {
         // This is the project-derived path's guard: a legacy `projects.git_url`
@@ -3360,6 +5096,8 @@ mod storage_cleanup_tests {
             username: None,
             password: None,
             git_connection_id: None,
+            destination: None,
+            strip_git_metadata: false,
         };
         let err = validate_resolved_source(&source)
             .await
@@ -3384,6 +5122,8 @@ mod storage_cleanup_tests {
                 username: None,
                 password: None,
                 git_connection_id: None,
+                destination: None,
+                strip_git_metadata: false,
             };
             assert!(
                 validate_resolved_source(&source).await.is_err(),
@@ -3829,5 +5569,57 @@ mod storage_cleanup_tests {
             "work dir must be removed even when nullify failed"
         );
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn application_workspace_usage_parses_atomic_metrics_and_ports() {
+        let usage = parse_application_workspace_usage(
+            "memory=1048576\npids=17\ncpu=332401\ndisk=26376\nports=3000,8080\n",
+        );
+
+        assert_eq!(usage.memory_used_bytes, Some(1_048_576));
+        assert_eq!(usage.pids_used, Some(17));
+        assert_eq!(usage.cpu_usage_usec, Some(332_401));
+        assert_eq!(usage.disk_used_bytes, Some(26_376));
+        assert_eq!(usage.open_ports, vec![3000, 8080]);
+    }
+
+    #[test]
+    fn application_workspace_usage_command_has_proc_socket_fallback() {
+        assert!(APPLICATION_WORKSPACE_USAGE_COMMAND.contains("/proc/net/tcp"));
+        assert!(APPLICATION_WORKSPACE_USAGE_COMMAND.contains("/proc/net/tcp6"));
+        assert!(APPLICATION_WORKSPACE_USAGE_COMMAND.contains("du -sb /home/temps/workspace"));
+    }
+
+    #[test]
+    fn runtime_variables_merge_without_losing_identical_shared_values() {
+        let mut variables = HashMap::from([("SHARED_HOST".to_string(), "database".to_string())]);
+
+        merge_runtime_variables(
+            &mut variables,
+            HashMap::from([
+                ("SHARED_HOST".to_string(), "database".to_string()),
+                ("REDIS_URL".to_string(), "redis://database:6379".to_string()),
+            ]),
+        )
+        .expect("identical shared values should be accepted");
+
+        assert_eq!(variables.len(), 2);
+        assert_eq!(variables["REDIS_URL"], "redis://database:6379");
+    }
+
+    #[test]
+    fn runtime_variables_reject_ambiguous_service_credentials() {
+        let mut variables =
+            HashMap::from([("DATABASE_URL".to_string(), "postgres://one".to_string())]);
+
+        let conflict = merge_runtime_variables(
+            &mut variables,
+            HashMap::from([("DATABASE_URL".to_string(), "postgres://two".to_string())]),
+        )
+        .expect_err("different values for one runtime name must be rejected");
+
+        assert_eq!(conflict, "DATABASE_URL");
+        assert_eq!(variables["DATABASE_URL"], "postgres://one");
     }
 }

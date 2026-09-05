@@ -372,10 +372,6 @@ pub struct ProjectResponse {
     pub attack_mode: bool,
     /// Opt-in to AI summarization of metric alert notifications (NULL/false = off).
     pub ai_alert_summaries_enabled: Option<bool>,
-    /// Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
-    pub ai_debug_chat_enabled: Option<bool>,
-    /// Opt-in to AI propose-then-confirm write capability (false = off).
-    pub ai_write_actions_enabled: bool,
     /// Opt-in to AI summarization of API traffic analytics (NULL/false = off).
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in to native error-tracking source context (false = off). When on,
@@ -454,8 +450,6 @@ impl ProjectResponse {
             git_url: project.git_url,
             attack_mode: project.attack_mode,
             ai_alert_summaries_enabled: project.ai_alert_summaries_enabled,
-            ai_debug_chat_enabled: project.ai_debug_chat_enabled,
-            ai_write_actions_enabled: project.ai_write_actions_enabled,
             ai_api_traffic_summary_enabled: project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: project.error_source_context_enabled,
             vulnerability_scanning_enabled: project.vulnerability_scanning_enabled,
@@ -823,10 +817,6 @@ pub struct UpdateProjectSettingsRequest {
     pub attack_mode: Option<bool>,
     /// Opt in to AI summarization of metric alert notifications (ADR-021).
     pub ai_alert_summaries_enabled: Option<bool>,
-    /// Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).
-    pub ai_debug_chat_enabled: Option<bool>,
-    /// Opt in to AI propose-then-confirm write capability.
-    pub ai_write_actions_enabled: Option<bool>,
     /// Opt in to AI summarization of API traffic analytics.
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt in to native error-tracking source context (source-file upload +
@@ -896,8 +886,6 @@ impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjec
             preview_envs_wake_timeout_seconds: request.preview_envs_wake_timeout_seconds,
             preset_config: request.preset_config,
             ai_alert_summaries_enabled: request.ai_alert_summaries_enabled,
-            ai_debug_chat_enabled: request.ai_debug_chat_enabled,
-            ai_write_actions_enabled: request.ai_write_actions_enabled,
             cross_project_trace_sharing: request.cross_project_trace_sharing,
             error_source_context_enabled: request.error_source_context_enabled,
             vulnerability_scanning_enabled: request.vulnerability_scanning_enabled,

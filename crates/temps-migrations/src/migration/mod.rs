@@ -221,6 +221,12 @@ mod m20260903_000001_add_service_project_identity;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
 mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 mod m20260831_000001_ai_first_applications;
+mod m20260901_000001_persist_ai_turn_state;
+mod m20260901_000002_user_owned_ai_conversations;
+mod m20260903_000001_application_workspace_topology;
+mod m20260903_000002_harden_application_workspaces;
+mod m20260903_000003_application_workspace_quarantine;
+mod m20260903_000004_repair_application_primary_projects;
 
 pub struct Migrator;
 
@@ -485,6 +491,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20260903_000001_add_service_project_identity::Migration),
             Box::new(m20260904_000001_reset_ambiguous_managed_status_monitors::Migration),
             Box::new(m20260831_000001_ai_first_applications::Migration),
+            Box::new(m20260901_000001_persist_ai_turn_state::Migration),
+            Box::new(m20260901_000002_user_owned_ai_conversations::Migration),
+            Box::new(m20260903_000001_application_workspace_topology::Migration),
+            Box::new(m20260903_000002_harden_application_workspaces::Migration),
+            Box::new(m20260903_000003_application_workspace_quarantine::Migration),
+            Box::new(m20260903_000004_repair_application_primary_projects::Migration),
         ]
     }
 }

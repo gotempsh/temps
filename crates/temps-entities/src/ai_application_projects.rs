@@ -12,6 +12,9 @@ pub struct Model {
     pub id: i64,
     pub application_id: i64,
     pub project_id: i32,
+    /// Exactly one link per application is primary. The service layer keeps
+    /// this invariant transactional; a partial unique index prevents races.
+    pub is_primary: bool,
     pub created_at: DBDateTime,
 }
 

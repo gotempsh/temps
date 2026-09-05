@@ -3245,6 +3245,15 @@ impl ExternalService for PostgresService {
         let schema = schemars::schema_for!(PostgresInputConfig);
         let mut schema_json = serde_json::to_value(schema).ok()?;
 
+        // `PostgresInputConfig` can deserialize absent values with defaults, but
+        // service creation deliberately requires callers to choose the database
+        // and username explicitly (see `PostgresParameterStrategy`). Schemars
+        // interprets serde defaults as "optional", so without this correction
+        // the public service-type schema contradicts the creation validator.
+        // The dashboard and AI both consume this schema; publishing the wrong
+        // required set makes them learn by failing POST /external-services.
+        schema_json["required"] = serde_json::json!(["database", "username"]);
+
         // Add metadata about which fields are editable
         if let Some(properties) = schema_json
             .get_mut("properties")
@@ -5028,6 +5037,22 @@ mod tests {
             .unwrap_or(false);
 
         assert!(is_editable, "docker_image should be editable");
+    }
+
+    #[test]
+    fn test_parameter_schema_matches_required_creation_credentials() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-required-schema".to_string(), docker);
+
+        let schema = service
+            .get_parameter_schema()
+            .expect("PostgreSQL creation schema should exist");
+        let required = schema["required"]
+            .as_array()
+            .expect("PostgreSQL creation schema should declare required fields");
+
+        assert!(required.iter().any(|field| field == "database"));
+        assert!(required.iter().any(|field| field == "username"));
     }
 
     #[test]

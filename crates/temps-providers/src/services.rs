@@ -332,6 +332,63 @@ fn default_topology() -> String {
     "standalone".to_string()
 }
 
+/// Add the canonical create-form defaults to a service parameter schema.
+///
+/// Both the console and AI chat read this schema. Keeping the suggested name
+/// and materialized parameter defaults here prevents chat from inventing a
+/// second set of defaults (notably a bare `redis` name that can collide with
+/// an existing `redis-*` managed container).
+fn service_creation_schema(
+    service_type: ServiceType,
+    schema: serde_json::Value,
+) -> serde_json::Value {
+    use rand::{distr::Alphanumeric, RngExt};
+
+    // Match the console's lowercase alpha-numeric four-character suffix.
+    let suffix: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .map(char::from)
+        .filter(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        .take(4)
+        .collect();
+    service_creation_schema_with_suffix(service_type, schema, &suffix)
+}
+
+fn service_creation_schema_with_suffix(
+    service_type: ServiceType,
+    mut schema: serde_json::Value,
+    suffix: &str,
+) -> serde_json::Value {
+    let parameter_defaults = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter_map(|(name, property)| {
+                    property
+                        .get("default")
+                        .cloned()
+                        .map(|value| (name.clone(), value))
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(schema_object) = schema.as_object_mut() {
+        schema_object.insert(
+            "x-temps-creation-defaults".to_string(),
+            serde_json::json!({
+                "name": format!("{}-{}", service_type, suffix),
+                "parameters": parameter_defaults,
+                "topology": "standalone",
+                "node_id": null,
+            }),
+        );
+    }
+    schema
+}
+
 /// Request spec for a single cluster member.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterMemberRequest {
@@ -8658,6 +8715,41 @@ echo "[restore] Pre-seed complete"
             .map_err(ExternalServiceError::from)
     }
 
+    /// Check a target before provisioning a new service that should be linked
+    /// to it. This prevents starting a database container only to discover
+    /// that the project is missing or already has this service type.
+    pub async fn validate_service_link_target(
+        &self,
+        project_id_val: i32,
+        service_type: &str,
+    ) -> Result<(), ExternalServiceError> {
+        // Verify project exists
+        let _project = projects::Entity::find_by_id(project_id_val)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
+
+        // Check for duplicate service type
+        // Get all existing project_services for this project
+        let existing_links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id_val))
+            .all(self.db.as_ref())
+            .await?;
+
+        // Check if any existing service has the same type
+        for existing_link in existing_links {
+            let existing_service = self.get_service(existing_link.service_id).await?;
+            if existing_service.service_type == service_type {
+                return Err(ExternalServiceError::DuplicateServiceType {
+                    project_id: project_id_val,
+                    service_type: service_type.to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn get_service_environment_variables(
         &self,
         service_id_val: i32,
@@ -9671,7 +9763,9 @@ echo "[restore] Pre-seed complete"
         service_type: ServiceType,
     ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
         let service_instance = self.create_service_instance("temp".to_string(), service_type);
-        Ok(service_instance.get_parameter_schema())
+        Ok(service_instance
+            .get_parameter_schema()
+            .map(|schema| service_creation_schema(service_type, schema)))
     }
 
     pub async fn get_service_details_by_slug(
@@ -11319,6 +11413,42 @@ async fn precreate_cluster_members(
     Ok(pre_created)
 }
 
+#[async_trait::async_trait]
+impl temps_core::SandboxRuntimeCredentialsProvider for ExternalServiceManager {
+    async fn issue(
+        &self,
+        service_id: i32,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<HashMap<String, String>, temps_core::SandboxRuntimeCredentialsError> {
+        self.get_runtime_env_vars(service_id, project_id, environment_id)
+            .await
+            .map_err(|error| match error {
+                ExternalServiceError::ServiceNotFound { id } => {
+                    temps_core::SandboxRuntimeCredentialsError::ServiceNotFound { service_id: id }
+                }
+                ExternalServiceError::EnvironmentNotFound {
+                    environment_id,
+                    project_id,
+                } => temps_core::SandboxRuntimeCredentialsError::EnvironmentNotFound {
+                    environment_id,
+                    project_id,
+                },
+                ExternalServiceError::ServiceNotLinkedToProject {
+                    service_id,
+                    project_id,
+                } => temps_core::SandboxRuntimeCredentialsError::ServiceNotLinked {
+                    service_id,
+                    project_id,
+                },
+                other => temps_core::SandboxRuntimeCredentialsError::Provider {
+                    service_id,
+                    reason: other.to_string(),
+                },
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11351,6 +11481,34 @@ mod tests {
             1
         ));
         assert!(!generated_schedule_loses_last_target(None, 0));
+    }
+
+    #[test]
+    fn service_creation_schema_exposes_console_defaults_to_all_clients() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "port": { "type": "integer", "default": 6379 },
+                "docker_image": {
+                    "type": "string",
+                    "default": "gotempsh/redis-walg:8-bookworm"
+                },
+                "password": { "type": "string" }
+            }
+        });
+
+        let enriched = service_creation_schema_with_suffix(ServiceType::Redis, schema, "a1b2");
+        let defaults = &enriched["x-temps-creation-defaults"];
+
+        assert_eq!(defaults["name"], "redis-a1b2");
+        assert_eq!(defaults["topology"], "standalone");
+        assert!(defaults["node_id"].is_null());
+        assert_eq!(defaults["parameters"]["port"], 6379);
+        assert_eq!(
+            defaults["parameters"]["docker_image"],
+            "gotempsh/redis-walg:8-bookworm"
+        );
+        assert!(defaults["parameters"].get("password").is_none());
     }
 
     // ── Cluster write availability ──────────────────────────────────────

@@ -49,14 +49,13 @@ impl TempsPlugin for AiGatewayPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
-            let provider_key_service =
-                Arc::new(ProviderKeyService::new(db.clone(), encryption_service));
+            let provider_key_service = Arc::new(ProviderKeyService::new(
+                db.clone(),
+                encryption_service.clone(),
+            ));
             context.register_service(provider_key_service.clone());
 
-            let provider_preference_service = Arc::new(ProviderPreferenceService::new(
-                db.clone(),
-                provider_key_service.clone(),
-            ));
+            let provider_preference_service = Arc::new(ProviderPreferenceService::new(db.clone()));
             context.register_service(provider_preference_service.clone());
 
             let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
@@ -123,6 +122,105 @@ impl TempsPlugin for AiGatewayPlugin {
             // synchronous HashMap lookup.
             let config_service = context.require_service::<temps_config::ConfigService>();
             let ai_cli_scratch_dir = config_service.get_data_subdir("ai-cli-scratch");
+            let application_workspace_root = config_service.get_data_subdir("ai-applications");
+            let sandbox_provider =
+                context.get_service::<dyn temps_agents::sandbox::SandboxProvider>();
+            let sandbox_model_relay = Arc::new(
+                temps_ai_agent_cli::SandboxModelRelayService::new().map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "failed to initialize sandbox model relay: {error}"
+                    ))
+                })?,
+            );
+            context.register_service(sandbox_model_relay.clone());
+            let sandbox_credentials: temps_ai_agent_cli::SandboxCredentialResolver = {
+                let config_service = config_service.clone();
+                let encryption_service = encryption_service.clone();
+                Arc::new(move |provider_id| {
+                    let config_service = config_service.clone();
+                    let encryption_service = encryption_service.clone();
+                    let provider_id = provider_id.to_string();
+                    Box::pin(async move {
+                        let settings = config_service.get_settings().await.map_err(|error| {
+                            temps_ai::AiError::Provider {
+                                purpose: "chat.application.credentials".to_string(),
+                                reason: format!(
+                                    "could not load the Agent Sandbox credential configuration: {error}"
+                                ),
+                            }
+                        })?;
+                        let provider_config = settings.agent_sandbox.provider_config(&provider_id);
+                        let encrypted = provider_config
+                            .credentials_encrypted
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| temps_ai::AiError::Provider {
+                                purpose: "chat.application.credentials".to_string(),
+                                reason: format!(
+                                    "{} is not authenticated in Agent Sandbox settings",
+                                    provider_id
+                                ),
+                            })?;
+                        let credential =
+                            encryption_service
+                                .decrypt_string(&encrypted)
+                                .map_err(|error| temps_ai::AiError::Provider {
+                                    purpose: "chat.application.credentials".to_string(),
+                                    reason: format!(
+                                    "could not unlock the Agent Sandbox credential for {}: {error}",
+                                    provider_id
+                                ),
+                                })?;
+                        let provider = temps_agents::ai_cli::find_provider(&provider_id)
+                            .ok_or_else(|| temps_ai::AiError::Provider {
+                                purpose: "chat.application.credentials".to_string(),
+                                reason: format!("unknown development harness '{}'", provider_id),
+                            })?;
+                        let auth_type = if provider_config.auth_type.is_empty() {
+                            provider.default_flavor().id
+                        } else {
+                            &provider_config.auth_type
+                        };
+                        let flavor = provider.flavor(auth_type).ok_or_else(|| {
+                            temps_ai::AiError::Provider {
+                                purpose: "chat.application.credentials".to_string(),
+                                reason: format!(
+                                    "Agent Sandbox authentication type '{}' is not valid for {}",
+                                    auth_type, provider_id
+                                ),
+                            }
+                        })?;
+                        let internal_api_url = config_service.resolve_internal_url().await;
+                        let credentials = match flavor.format {
+                            temps_agents::ai_cli::catalog::CredentialFormat::ApiKey
+                                if provider_id == "claude_cli" =>
+                            {
+                                temps_ai_agent_cli::SandboxHarnessCredentials::anthropic_api_key(
+                                    credential,
+                                    internal_api_url,
+                                )
+                            }
+                            temps_agents::ai_cli::catalog::CredentialFormat::OauthToken
+                                if provider_id == "claude_cli" =>
+                            {
+                                temps_ai_agent_cli::SandboxHarnessCredentials::claude_oauth_token(
+                                    credential,
+                                    internal_api_url,
+                                )
+                            }
+                            _ => {
+                                return Err(temps_ai::AiError::Provider {
+                                    purpose: "chat.application.credentials".to_string(),
+                                    reason: format!(
+                                        "secure provider relay is not implemented for development harness '{}' yet",
+                                        provider_id
+                                    ),
+                                })
+                            }
+                        };
+                        Ok(credentials)
+                    })
+                })
+            };
             if let Err(e) = tokio::fs::create_dir_all(&ai_cli_scratch_dir).await {
                 tracing::error!(
                     scratch_dir = %ai_cli_scratch_dir.display(),
@@ -140,12 +238,25 @@ impl TempsPlugin for AiGatewayPlugin {
             for registration in temps_agents::ai_cli::PROVIDER_CATALOG {
                 if let Some(provider) = temps_agents::ai_cli::create_provider(registration.id) {
                     let provider: Arc<dyn temps_agents::ai_cli::AiCliProvider> = provider.into();
-                    let svc = Arc::new(temps_ai_agent_cli::AgentCliAiService::new(
+                    let mut svc = temps_ai_agent_cli::AgentCliAiService::new(
                         provider,
                         ai_cli_scratch_dir.clone(),
                         AI_CLI_TIMEOUT,
                         AI_CLI_CONCURRENCY,
-                    ));
+                    );
+                    if let Some(sandbox_provider) = &sandbox_provider {
+                        svc = svc.with_temps_sandbox(
+                            sandbox_provider.clone(),
+                            application_workspace_root.clone(),
+                            sandbox_credentials.clone(),
+                            sandbox_model_relay.clone(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Temps sandbox provider is unavailable; application harness turns will fail closed"
+                        );
+                    }
+                    let svc = Arc::new(svc);
                     agent_cli_services.insert(
                         registration.id.to_string(),
                         svc as Arc<dyn temps_ai::AiService>,

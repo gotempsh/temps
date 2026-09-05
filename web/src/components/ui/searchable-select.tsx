@@ -42,6 +42,10 @@ interface SearchableSelectProps {
   contentClassName?: string
   /** Use strict case-insensitive substring matching instead of cmdk fuzzy matching. */
   searchMode?: 'fuzzy' | 'contains'
+  /** Optional leading icon rendered before the trigger label. */
+  icon?: React.ReactNode
+  /** Native title attribute on the trigger button (tooltip on hover). */
+  title?: string
 }
 
 export function SearchableSelect({
@@ -55,6 +59,8 @@ export function SearchableSelect({
   className,
   contentClassName,
   searchMode = 'fuzzy',
+  icon,
+  title,
 }: SearchableSelectProps) {
   const [open, setOpen] = React.useState(false)
 
@@ -83,13 +89,17 @@ export function SearchableSelect({
           role="combobox"
           aria-expanded={open}
           disabled={disabled}
+          title={title}
           className={cn(
             'h-10 w-full justify-between font-normal',
             !selected && 'text-muted-foreground',
             className
           )}
         >
-          <span className="truncate">{selected?.label ?? placeholder}</span>
+          <span className="flex min-w-0 items-center">
+            {icon}
+            <span className="truncate">{selected?.label ?? placeholder}</span>
+          </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>

@@ -9,9 +9,10 @@ use temps_core::EncryptionService;
 const CIPHERTEXT_FIELD: &str = "__temps_encrypted_v1";
 const DISPLAY_FIELD: &str = "__temps_display";
 
-/// Conservative detector used before an application-chat message or generated
-/// artifact can be persisted. False positives are intentionally diverted to
-/// the credential broker; plaintext must never enter the AI transcript.
+/// Conservative detector used before a generated artifact can be persisted.
+/// Chat messages are not rejected by this heuristic; artifacts still fail
+/// closed because they are rendered and stored outside the conversational
+/// transcript.
 pub(crate) fn contains_likely_credential(value: &str) -> bool {
     static CREDENTIAL: OnceLock<regex::Regex> = OnceLock::new();
     CREDENTIAL
@@ -35,8 +36,7 @@ pub(crate) fn contains_likely_credential(value: &str) -> bool {
 }
 
 /// Catch opaque tokens which cannot be identified safely by provider prefix.
-/// This deliberately errs on the side of blocking a token-looking fragment in
-/// application chat; credentials have a dedicated secret/connector flow.
+/// This remains deliberately conservative for generated artifacts.
 fn contains_high_entropy_token(value: &str) -> bool {
     value
         .split(|character: char| {
@@ -73,22 +73,44 @@ fn character_classes(value: &str) -> usize {
 
 /// Recursively replace values under credential-like keys.
 pub(crate) fn redact_value(value: &serde_json::Value) -> serde_json::Value {
-    const SENSITIVE: &[&str] = &["value", "secret", "password", "token", "key"];
+    const SENSITIVE: &[&str] = &[
+        "value",
+        "secret",
+        "password",
+        "token",
+        "key",
+        "credential",
+        "authorization",
+        "cookie",
+        "headers",
+        "webhook",
+    ];
     match value {
-        serde_json::Value::Object(object) => serde_json::Value::Object(
-            object
-                .iter()
-                .map(|(key, value)| {
-                    let lower = key.to_ascii_lowercase();
-                    let value = if SENSITIVE.iter().any(|needle| lower.contains(needle)) {
-                        serde_json::Value::String("***".to_string())
-                    } else {
-                        redact_value(value)
-                    };
-                    (key.clone(), value)
-                })
-                .collect(),
-        ),
+        serde_json::Value::Object(object) => {
+            // Generic webhook provider configs use the deliberately neutral
+            // field name `url`. In that schema the sibling method/headers
+            // fields identify it as a delivery endpoint whose path commonly
+            // embeds a credential; ordinary public URLs remain visible.
+            let webhook_config = object.contains_key("url")
+                && object.contains_key("method")
+                && object.contains_key("headers");
+            serde_json::Value::Object(
+                object
+                    .iter()
+                    .map(|(key, value)| {
+                        let lower = key.to_ascii_lowercase();
+                        let sensitive = SENSITIVE.iter().any(|needle| lower.contains(needle))
+                            || (webhook_config && lower == "url");
+                        let value = if sensitive {
+                            serde_json::Value::String("***".to_string())
+                        } else {
+                            redact_value(value)
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect(),
+            )
+        }
         serde_json::Value::Array(values) => {
             serde_json::Value::Array(values.iter().map(redact_value).collect())
         }
@@ -175,6 +197,34 @@ pub(crate) fn redact_text(value: &str) -> String {
     provider.replace_all(&scrubbed, "[redacted]").into_owned()
 }
 
+/// Redact unified diff content without destroying its line shape. Ordinary
+/// assignment scrubbing runs first; any remaining provider-prefixed,
+/// connection-string, private-key, AWS, GitHub, or high-entropy credential
+/// causes the complete payload portion of that diff line to be hidden.
+pub(crate) fn redact_workspace_diff(value: &str) -> String {
+    let scrubbed = redact_text(value);
+    let mut output = String::with_capacity(scrubbed.len());
+    for chunk in scrubbed.split_inclusive('\n') {
+        let (line, newline) = chunk
+            .strip_suffix('\n')
+            .map_or((chunk, ""), |line| (line, "\n"));
+        if contains_likely_credential(line) {
+            let prefix = line
+                .chars()
+                .next()
+                .filter(|character| matches!(character, '+' | '-' | ' '));
+            if let Some(prefix) = prefix {
+                output.push(prefix);
+            }
+            output.push_str("[credential redacted]");
+        } else {
+            output.push_str(line);
+        }
+        output.push_str(newline);
+    }
+    output
+}
+
 /// Redact complete CLI value tokens using the same quote-aware token boundary
 /// rules as `temps-ai-api-tools::cli::tokenize`. This deliberately handles
 /// mixed quoted/unquoted tokens and the parser's legacy acceptance of an
@@ -231,6 +281,7 @@ fn is_sensitive_cli_flag(token: &str) -> bool {
     };
     let flag = flag.to_ascii_lowercase();
     flag == "value"
+        || flag == "config"
         || ["password", "secret", "token", "key"]
             .iter()
             .any(|needle| flag.contains(needle))
@@ -298,6 +349,28 @@ mod tests {
     }
 
     #[test]
+    fn notification_provider_credentials_are_redacted_from_review_and_results() {
+        let provider = serde_json::json!({
+            "provider_type": "webhook",
+            "config": {
+                "url": "https://hooks.example.test/services/private-path",
+                "method": "POST",
+                "headers": {"X-Signature": "private-signature"}
+            }
+        });
+        let redacted = redact_value(&provider);
+        assert_eq!(redacted["config"]["url"], "***");
+        assert_eq!(redacted["config"]["headers"], "***");
+
+        let command = serde_json::json!({
+            "command": "notifications create_notification_provider --config '{\"url\":\"https://hooks.example.test/private\"}'"
+        });
+        let display = redact_json_string(&command.to_string());
+        assert!(!display.contains("hooks.example.test"));
+        assert!(display.contains("--config ***"));
+    }
+
+    #[test]
     fn write_command_arguments_are_safe_for_sse_and_history() {
         let arguments = serde_json::json!({
             "command": "projects create_environment_variable --name DATABASE_URL --value 'postgres://user:pass@db/app' --api-key sk-live-abcdef"
@@ -327,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_and_jwt_like_tokens_are_detected_before_ai_persistence() {
+    fn opaque_and_jwt_like_tokens_are_detected_before_artifact_persistence() {
         for value in [
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -385,5 +458,20 @@ mod tests {
         let display = redact_text(error);
         assert!(!display.contains("hunter2"));
         assert!(!display.contains("token-abcdef"));
+    }
+
+    #[test]
+    fn workspace_diff_redacts_provider_tokens_and_database_urls() {
+        let diff = concat!(
+            "@@ -1,2 +1,3 @@\n",
+            "+GITHUB_TOKEN=ghp_123456789012345678901234567890123456\n",
+            "+DATABASE_URL=postgres://admin:supersecret@postgres/app\n",
+            "+PUBLIC_NAME=temps\n",
+        );
+        let display = redact_workspace_diff(diff);
+        assert!(!display.contains("ghp_"));
+        assert!(!display.contains("supersecret"));
+        assert!(display.contains("+[credential redacted]"));
+        assert!(display.contains("+PUBLIC_NAME=temps"));
     }
 }

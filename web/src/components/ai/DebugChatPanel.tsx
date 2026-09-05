@@ -6,26 +6,23 @@ import {
   findConversation,
   getAiProviderStatus,
   getConversation,
-  getProject,
-  listPendingActions,
+  listAiProviders,
   refreshAiProviderStatus,
-  type PendingActionResponse,
-  updateProjectSettings,
+  type ConversationDetailResponse,
+  type ConversationResponse,
 } from '@/api/client'
 import {
   PermissionCard,
   type PermissionRequest,
 } from '@/components/ai/PermissionCard'
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+  createdServiceId,
+  GeneratedServiceProposal,
+  serviceProposalViewModel,
+} from '@/components/ai/GeneratedServiceProposal'
+import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
+import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
+import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -39,10 +36,12 @@ import { Textarea } from '@/components/ui/textarea'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   Check,
-  Bot,
+  ArrowDown,
   Brain,
   ChevronDown,
   ChevronRight,
+  FileText,
+  Image as ImageIcon,
   Info,
   Lock,
   Loader2,
@@ -61,6 +60,10 @@ import {
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
 import { CopyButton } from '@/components/ui/copy-button'
+import {
+  SearchableSelect,
+  type SearchableSelectOption,
+} from '@/components/ui/searchable-select'
 import { cn } from '@/lib/utils'
 import {
   useCallback,
@@ -75,9 +78,14 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { useAiAssistant } from './AiAssistantContext'
 import {
+  chatHarnessProviderOptions,
+  chatModelLabel,
+  chatPermissionLabel,
   chatProviderLabel,
+  chatThinkingItemContent,
   reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
+  usesHarnessCatalog,
   type ChatProviderOption,
   type ChatRuntimeSelection,
 } from './chat-runtime-options'
@@ -88,11 +96,22 @@ import {
 } from './chat-page-state'
 import {
   assistantParts,
-  unrepresentedPendingActions,
+  isTempsWriteToolName,
   type ChatMessage,
+  type ChatAttachment,
   type ChatPart,
   type ToolCall,
 } from './chat-message-parts'
+import {
+  prependHistoryPage,
+  reconcileLatestHistoryPage,
+  restoredHistoryScrollTop,
+  shouldLoadEarlierMessages,
+} from './chat-history-pagination'
+import {
+  projectCollectionFromApplicationProjectWrite,
+  projectCollectionFromTool,
+} from './tool-result-presentation'
 // highlight.js token theme for fenced code blocks. github-dark reads well on the
 // dark code surface used in both light and dark app themes.
 import 'highlight.js/styles/github-dark.css'
@@ -154,6 +173,85 @@ function MessageCopyButton({ text }: { text: string }) {
   )
 }
 
+function formatAttachmentSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+function ChatAttachments({
+  attachments,
+  onRemove,
+  contentBase,
+}: {
+  attachments: ChatAttachment[]
+  onRemove?: (id: string) => void
+  contentBase?: string
+}) {
+  if (attachments.length === 0) return null
+  return (
+    <div className="flex max-w-full flex-wrap gap-2">
+      {attachments.map((attachment) => {
+        const contentUrl = contentBase
+          ? `${contentBase}/${encodeURIComponent(attachment.id)}?name=${encodeURIComponent(attachment.name)}`
+          : undefined
+        const previewUrl =
+          attachment.preview_url ??
+          (attachment.is_image ? contentUrl : undefined)
+        const contents = (
+          <>
+            {attachment.is_image && previewUrl ? (
+              <img
+                src={previewUrl}
+                alt=""
+                className="size-10 shrink-0 rounded-md object-cover"
+              />
+            ) : attachment.is_image ? (
+              <ImageIcon className="size-5 shrink-0 text-muted-foreground" />
+            ) : (
+              <FileText className="size-5 shrink-0 text-muted-foreground" />
+            )}
+            <div className="min-w-0 pr-1">
+              <p className="truncate text-xs font-medium">{attachment.name}</p>
+              <p className="text-[10px] text-muted-foreground">
+                {formatAttachmentSize(attachment.size_bytes)}
+              </p>
+            </div>
+            {onRemove && (
+              <button
+                type="button"
+                onClick={() => onRemove(attachment.id)}
+                className="absolute right-1 top-1 rounded-full bg-background/90 p-0.5 text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/attachment:opacity-100"
+                aria-label={`Remove ${attachment.name}`}
+              >
+                <X className="size-3" />
+              </button>
+            )}
+          </>
+        )
+        const className =
+          'group/attachment relative flex max-w-56 items-center gap-2 overflow-hidden rounded-lg border border-border/70 bg-background/80 p-1.5 text-left text-foreground'
+        return contentUrl && !onRemove ? (
+          <a
+            key={attachment.id}
+            href={contentUrl}
+            target="_blank"
+            rel="noreferrer"
+            className={`${className} transition-colors hover:bg-muted/70`}
+            aria-label={`Open ${attachment.name}`}
+          >
+            {contents}
+          </a>
+        ) : (
+          <div key={attachment.id} className={className}>
+            {contents}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 /**
  * Maps a `getConversation` response into the panel's `ChatMessage[]` state,
  * including a still-unresolved permission request (ADR-038 Phase 2) as a live,
@@ -162,22 +260,26 @@ function MessageCopyButton({ text }: { text: string }) {
  */
 function mapConversationDetail(detail: {
   messages?: Array<{
+    cursor?: string
     role: string
     content: string
     created_at?: string
     tools?: ChatMessage['tools'] | null
     parts?: ChatPart[] | null
+    attachments?: ChatAttachment[] | null
   }> | null
   pending_permission?: PermissionRequest | null
 }): ChatMessage[] {
   const mapped: ChatMessage[] = (detail.messages ?? []).map((m) => {
     const rawParts = m.parts
     return {
+      server_cursor: m.cursor,
       role: m.role,
       content: m.content,
       created_at: m.created_at,
       tools: m.tools ?? undefined,
       parts: rawParts && rawParts.length > 0 ? rawParts : undefined,
+      attachments: m.attachments ?? undefined,
     }
   })
   const pendingPermission = detail.pending_permission
@@ -201,6 +303,21 @@ function mapConversationDetail(detail: {
   return mapped
 }
 
+type ConversationHistoryPage = {
+  has_more: boolean
+  next_before?: string | null
+}
+
+type PaginatedConversationDetail = ConversationDetailResponse & {
+  page?: ConversationHistoryPage
+}
+
+function conversationHistoryPage(detail: {
+  page?: ConversationHistoryPage
+}): ConversationHistoryPage {
+  return detail.page ?? { has_more: false, next_before: null }
+}
+
 /**
  * Pop the trailing optimistic assistant turn if it never received anything.
  * Checking `content` alone isn't enough: a pending permission card lives in
@@ -209,7 +326,96 @@ function mapConversationDetail(detail: {
  * (ADR-038 Phase 2).
  */
 type SetMessages = React.Dispatch<React.SetStateAction<ChatMessage[]>>
-type SetError = React.Dispatch<React.SetStateAction<string | null>>
+
+export interface ChatFailure {
+  code: string
+  title: string
+  detail: string
+  retryable: boolean
+}
+
+type SetChatFailure = React.Dispatch<React.SetStateAction<ChatFailure | null>>
+
+const UNKNOWN_CHAT_FAILURE: ChatFailure = {
+  code: 'harness_failed',
+  title: 'AI harness failed',
+  detail:
+    'The selected harness stopped before Temps received a reply. Retry once; if it repeats, check its authentication, selected model, and the server logs.',
+  retryable: true,
+}
+
+function localChatFailure(
+  title: string,
+  detail: string,
+  code = 'chat_request_failed',
+  retryable = true
+): ChatFailure {
+  return { code, title, detail, retryable }
+}
+
+function isSafeFailureText(value: unknown, maxLength: number): value is string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > maxLength
+  )
+    return false
+  return !/(?:\/run\/secrets|\/home\/|\/Users\/|\/tmp\/|authorization\s*:|bearer\s+|api[_ -]?key\s*[:=]|token\s*[:=]|tmcp_|sk-[A-Za-z0-9])/i.test(
+    value
+  )
+}
+
+/** Decode the browser-safe error envelope sent on the conversation wire.
+ * Unknown/legacy payloads are intentionally not echoed: older servers could
+ * include subprocess paths or credential-shaped provider diagnostics. */
+export function parseChatFailure(data: string): ChatFailure {
+  try {
+    const parsed = JSON.parse(data) as Partial<ChatFailure>
+    if (
+      isSafeFailureText(parsed.code, 80) &&
+      isSafeFailureText(parsed.title, 120) &&
+      isSafeFailureText(parsed.detail, 600) &&
+      typeof parsed.retryable === 'boolean'
+    ) {
+      return {
+        code: parsed.code,
+        title: parsed.title,
+        detail: parsed.detail,
+        retryable: parsed.retryable,
+      }
+    }
+  } catch {
+    // A legacy server may send a raw provider error. Never render it.
+  }
+  return UNKNOWN_CHAT_FAILURE
+}
+
+export function chatFailureFromProblem(
+  problem: unknown,
+  status?: number
+): ChatFailure {
+  if (status === 409) {
+    return localChatFailure(
+      'A turn is already running',
+      'This conversation is already processing a message. Wait for it to finish or stop it before retrying.',
+      'turn_already_running'
+    )
+  }
+  const value = problem as { title?: unknown; detail?: unknown } | null
+  if (
+    value &&
+    isSafeFailureText(value.title, 120) &&
+    isSafeFailureText(value.detail, 600)
+  ) {
+    return {
+      code: status ? `http_${status}` : 'chat_request_failed',
+      title: value.title,
+      detail: value.detail,
+      retryable: status == null || status >= 500,
+    }
+  }
+  return UNKNOWN_CHAT_FAILURE
+}
 
 function dropEmptyAssistantTurn(setMessages: SetMessages) {
   setMessages((m) => {
@@ -222,22 +428,87 @@ function dropEmptyAssistantTurn(setMessages: SetMessages) {
   })
 }
 
+function dropOptimisticTurn(setMessages: SetMessages, turnId: string) {
+  setMessages((messages) =>
+    messages.filter((message) => message.client_turn_id !== turnId)
+  )
+}
+
+export function permissionModeIsAuto(permissionModeId: string | null) {
+  return permissionModeId === 'auto' || permissionModeId === 'full-access'
+}
+
+export function permissionModeOptionDisabled(
+  turnActive: boolean,
+  permissionModeId: string
+) {
+  return turnActive && !permissionModeIsAuto(permissionModeId)
+}
+
+export function turnStateNeedsResync(status?: string) {
+  return status === 'running'
+}
+
+export function clearResolvedPermissionParts(
+  messages: ChatMessage[],
+  resolvedPermissionIds: string[]
+) {
+  const resolved = new Set(resolvedPermissionIds)
+  return messages.map((message) => ({
+    ...message,
+    parts: message.parts?.filter(
+      (part) => part.type !== 'permission' || !resolved.has(part.permission.id)
+    ),
+  }))
+}
+
+export function appendLiveUserTurn(
+  messages: ChatMessage[],
+  user: {
+    content: string
+    created_at?: string
+    turn_id?: string
+    attachments?: ChatAttachment[]
+  }
+) {
+  if (
+    user.turn_id &&
+    messages.some((message) => message.client_turn_id === user.turn_id)
+  ) {
+    return messages
+  }
+  const createdAt = user.created_at ?? new Date().toISOString()
+  return [
+    ...messages,
+    {
+      role: 'user',
+      content: user.content,
+      attachments: user.attachments,
+      created_at: createdAt,
+      client_turn_id: user.turn_id,
+    },
+    {
+      role: 'assistant',
+      content: '',
+      created_at: createdAt,
+      client_turn_id: user.turn_id,
+    },
+  ]
+}
+
 /**
- * Apply one wire event (SSE frame or WebSocket frame — both carry the same
- * `(eventName, data)` shape, tee'd from the same point server-side) to the
- * trailing assistant turn. Shared by the sending tab's own fetch-reader loop
- * and the cross-tab `useConversationStream` WS listener, so token/tool/
- * permission rendering can never drift between "I sent this" and "I'm
- * watching this."
+ * Apply one WebSocket event to the trailing assistant turn. Message submission
+ * is a short-lived HTTP command; all live token/tool/permission output has one
+ * transport and therefore cannot be duplicated by an SSE echo.
  */
 function applyWireEvent(
   eventName: string,
   data: string,
   setMessages: SetMessages,
-  setError: SetError
+  setError: SetChatFailure
 ) {
   if (eventName === 'error') {
-    if (data) setError(data)
+    setError(parseChatFailure(data))
     dropEmptyAssistantTurn(setMessages)
     return
   }
@@ -335,7 +606,7 @@ function applyWireEvent(
     }
     return
   }
-  // Plain token text (unnamed SSE frame).
+  // Plain token text.
   if (data) {
     setMessages((m) => {
       const copy = [...m]
@@ -388,12 +659,61 @@ function messageCopyText(m: ChatMessage): string {
  * which is far more useful than several identical "temps"/"temps_write" rows.
  * Falls back to the tool name for other tools or unparsable args.
  */
-function toolLabel(tool: ToolCall): string {
-  if (tool.name === 'temps' || tool.name === 'temps_write') {
+export function toolLabel(tool: ToolCall): string {
+  // MCP clients qualify tool names as `mcp__<server>__<tool>`. The chat wire
+  // persists that provider-native name so it can be inspected later, but the
+  // compact row should describe the operation rather than the transport.
+  const qualifiedNameParts = tool.name.split('__')
+  const baseName =
+    qualifiedNameParts[qualifiedNameParts.length - 1] || tool.name
+
+  if (baseName === 'temps' || baseName === 'temps_write') {
+    try {
+      const args = JSON.parse(tool.arguments) as {
+        command?: unknown
+        commands?: unknown
+      }
+      if (typeof args.command === 'string' && args.command.trim()) {
+        return args.command.trim()
+      }
+      if (Array.isArray(args.commands)) {
+        const commands = args.commands.filter(
+          (command): command is string =>
+            typeof command === 'string' && Boolean(command.trim())
+        )
+        if (commands.length > 0) {
+          return `${commands.length} commands · ${commands
+            .map((command) => command.trim())
+            .join(' → ')}`
+        }
+      }
+    } catch {
+      /* fall through to the tool name */
+    }
+  }
+  // Native harness events (Claude Code today) use the same tool card. Surface
+  // the command directly so a sequence of `Bash` calls is useful at a glance;
+  // the full, redacted arguments remain available when expanded.
+  if (baseName === 'Bash') {
     try {
       const args = JSON.parse(tool.arguments) as { command?: unknown }
       if (typeof args.command === 'string' && args.command.trim()) {
-        return args.command.trim()
+        return `Bash · ${args.command.trim().split('\n')[0]}`
+      }
+    } catch {
+      /* fall through to the tool name */
+    }
+  }
+  // Native filesystem tools otherwise become a wall of indistinguishable
+  // cards. The path is safe to surface here: it is already part of the
+  // redacted native tool event, and it gives the person reviewing the turn a
+  // precise answer to "what did it touch?" without opening every card.
+  if (baseName === 'Read' || baseName === 'Edit' || baseName === 'Write') {
+    try {
+      const args = JSON.parse(tool.arguments) as Record<string, unknown>
+      const path = args.file_path ?? args.path ?? args.target_file
+      if (typeof path === 'string' && path.trim()) {
+        return `${baseName} · ${path.trim()}`
       }
     } catch {
       /* fall through to the tool name */
@@ -441,6 +761,7 @@ function ToolBlock({ value }: { value: string }) {
 function ToolCard({ tool }: { tool: ToolCall }) {
   const [open, setOpen] = useState(false)
   const running = tool.result === undefined
+  const label = toolLabel(tool)
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border bg-muted/40 text-xs">
       <button
@@ -450,15 +771,13 @@ function ToolCard({ tool }: { tool: ToolCall }) {
         aria-expanded={open}
       >
         <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium">
-          {toolLabel(tool)}
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium"
+          title={label}
+        >
+          {label}
         </span>
-        {running && (
-          <Loader2
-            className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground"
-            aria-label="Running"
-          />
-        )}
+        {running && <ActivityIndicator compact label="Running" />}
         {open ? (
           <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         ) : (
@@ -479,6 +798,38 @@ function ToolCard({ tool }: { tool: ToolCall }) {
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** Deterministic native presentations for trusted read operations. Unknown
+ * operations keep the transparent generic tool card instead of guessing. */
+function ReadToolResultCard({ tool }: { tool: ToolCall }) {
+  const projectCollection = projectCollectionFromTool(tool)
+  if (!projectCollection) return <ToolCard tool={tool} />
+
+  return (
+    <div className="min-w-0 overflow-hidden rounded-lg border border-border bg-background text-xs">
+      <GeneratedProjectCollection
+        presentation={projectCollection}
+        framed={false}
+      />
+      <details className="group border-t">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground sm:px-4">
+          <ChevronRight className="size-3.5 transition-transform group-open:rotate-90" />
+          Request details
+        </summary>
+        <div className="min-w-0 space-y-2 border-t px-3 py-2.5 sm:px-4">
+          <div className="min-w-0 space-y-1">
+            <div className="font-medium text-muted-foreground">Arguments</div>
+            <ToolBlock value={tool.arguments} />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <div className="font-medium text-muted-foreground">Result</div>
+            <ToolBlock value={tool.result ?? ''} />
+          </div>
+        </div>
+      </details>
     </div>
   )
 }
@@ -553,41 +904,57 @@ const ACTION_STATUS: Record<string, { label: string; cls: string }> = {
  * API, so a reloaded chat shows executed/rejected instead of a stale prompt.
  */
 function PendingActionCard({
-  projectId,
+  pendingActionBasePath,
   tool,
   onFix,
+  onStatusChange,
 }: {
-  projectId: number
+  pendingActionBasePath: string
   tool: ToolCall
   /** Send a follow-up chat message (used by "Fix with AI" on failure). */
   onFix?: (text: string) => void
+  /** Reconcile a standalone recovery card with its parent-owned snapshot. */
+  onStatusChange?: (status: string) => void
 }) {
   const proposal = parseProposal(tool.result)
+  const committedApplicationProjects =
+    projectCollectionFromApplicationProjectWrite(tool)
   const actionId = proposal?.action_id
   const [status, setStatus] = useState('proposed')
   const [busy, setBusy] = useState<'confirm' | 'reject' | null>(null)
   const [result, setResult] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [createdAt, setCreatedAt] = useState<string | null>(null)
   // The exact request params/body that will be sent, redacted server-side
   // (value/secret/password/token/key → ***). Shown so the user can review what
   // the action will actually do before confirming.
   const [params, setParams] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
+  const [requestOpen, setRequestOpen] = useState(false)
+  const onStatusChangeRef = useRef(onStatusChange)
+
+  useEffect(() => {
+    onStatusChangeRef.current = onStatusChange
+  }, [onStatusChange])
 
   // Reconcile the live status once the action id is known (covers reloads).
   useEffect(() => {
     if (!actionId) return
     let cancelled = false
-    fetch(`/api/projects/${projectId}/ai/pending-actions/${actionId}`, {
+    fetch(`${pendingActionBasePath}/${actionId}`, {
       credentials: 'include',
     })
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (cancelled || !d) return
-        if (typeof d.status === 'string') setStatus(d.status)
+        if (typeof d.status === 'string') {
+          setStatus(d.status)
+          onStatusChangeRef.current?.(d.status)
+        }
         if (d.result != null) setResult(JSON.stringify(d.result))
         if (typeof d.error === 'string') setError(d.error)
         if (d.params != null) setParams(JSON.stringify(d.params))
+        if (typeof d.created_at === 'string') setCreatedAt(d.created_at)
       })
       .catch(() => {
         /* status reconcile is best-effort */
@@ -595,7 +962,31 @@ function PendingActionCard({
     return () => {
       cancelled = true
     }
-  }, [projectId, actionId])
+  }, [pendingActionBasePath, actionId])
+
+  if (committedApplicationProjects) {
+    return (
+      <div className="min-w-0 overflow-hidden rounded-lg border border-green-500/30 bg-green-500/5 text-xs">
+        <GeneratedProjectCollection
+          title="Application projects"
+          presentation={committedApplicationProjects}
+          framed={false}
+        />
+        <details className="group border-t border-green-500/20">
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground sm:px-4">
+            <ChevronRight className="size-3.5 transition-transform group-open:rotate-90" />
+            Operation details
+          </summary>
+          <div className="min-w-0 space-y-2 border-t border-green-500/20 px-3 py-2.5 sm:px-4">
+            <div className="font-medium text-green-600 dark:text-green-400">
+              Project created and attached to the persistent workspace
+            </div>
+            <ToolBlock value={tool.result ?? ''} />
+          </div>
+        </details>
+      </div>
+    )
+  }
 
   // Still streaming the proposal, or not a proposal at all (help/validation
   // text) — fall back to the ordinary tool card.
@@ -608,7 +999,7 @@ function PendingActionCard({
     setError(null)
     try {
       const r = await fetch(
-        `/api/projects/${projectId}/ai/pending-actions/${proposal.action_id}/${kind}`,
+        `${pendingActionBasePath}/${proposal.action_id}/${kind}`,
         {
           method: 'POST',
           credentials: 'include',
@@ -622,9 +1013,13 @@ function PendingActionCard({
             `Could not ${kind} the action.`
         )
       } else if (d) {
-        if (typeof d.status === 'string') setStatus(d.status)
+        if (typeof d.status === 'string') {
+          setStatus(d.status)
+          onStatusChangeRef.current?.(d.status)
+        }
         if (d.result != null) setResult(JSON.stringify(d.result))
         if (typeof d.error === 'string') setError(d.error)
+        if (typeof d.created_at === 'string') setCreatedAt(d.created_at)
       }
     } catch {
       setError(`Could not ${kind} the action.`)
@@ -635,33 +1030,85 @@ function PendingActionCard({
 
   const st = ACTION_STATUS[status] ?? ACTION_STATUS.proposed
   const pending = status === 'proposed'
+  const serviceProposal =
+    proposal.operation === 'create_service'
+      ? serviceProposalViewModel(params)
+      : null
+  const serviceId =
+    proposal.operation === 'create_service' && status === 'executed'
+      ? createdServiceId(result)
+      : null
+  const deploymentProposal =
+    proposal.operation === 'trigger_project_pipeline' ||
+    proposal.operation === 'deploy_application_workspace_project'
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border border-amber-500/30 bg-amber-500/5 text-xs">
-      <div className="flex min-w-0 items-start gap-2 px-2.5 py-2">
-        <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-        <div className="min-w-0 flex-1 space-y-0.5">
-          <div className="flex items-center gap-1.5">
-            <span className="rounded bg-muted px-1 py-0.5 font-mono text-[10px] font-semibold uppercase">
-              {proposal.method}
-            </span>
-            <span className="min-w-0 truncate font-mono text-[11px] font-medium">
-              {proposal.operation}
-            </span>
-          </div>
-          {proposal.summary && (
-            <div className="text-muted-foreground">{proposal.summary}</div>
-          )}
-          <div className={cn('text-[11px] font-medium', st.cls)}>
-            {st.label}
+      {serviceProposal ? (
+        <GeneratedServiceProposal
+          proposal={serviceProposal}
+          summary={proposal.summary}
+          statusLabel={st.label}
+          statusClassName={st.cls}
+          serviceId={serviceId}
+        />
+      ) : deploymentProposal ? (
+        <GeneratedDeploymentCard
+          paramsJson={params}
+          resultJson={result}
+          actionStatus={status}
+          createdAt={createdAt}
+          summary={proposal.summary}
+          statusLabel={st.label}
+          statusClassName={st.cls}
+        />
+      ) : (
+        <div className="flex min-w-0 items-start gap-2 px-2.5 py-2">
+          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <div className="min-w-0 flex-1 space-y-0.5">
+            <div className="flex items-center gap-1.5">
+              <span className="rounded bg-muted px-1 py-0.5 font-mono text-[10px] font-semibold uppercase">
+                {proposal.method}
+              </span>
+              <span className="min-w-0 truncate font-mono text-[11px] font-medium">
+                {proposal.operation}
+              </span>
+            </div>
+            {proposal.summary && (
+              <div className="text-muted-foreground">{proposal.summary}</div>
+            )}
+            <div className={cn('text-[11px] font-medium', st.cls)}>
+              {st.label}
+            </div>
           </div>
         </div>
-      </div>
+      )}
       {params && params !== '{}' && (
         <div className="min-w-0 space-y-1 border-t border-amber-500/20 px-2.5 py-2">
-          <div className="font-medium text-muted-foreground">
-            {pending ? 'Will send' : 'Sent'}
-          </div>
-          <ToolBlock value={params} />
+          {serviceProposal || deploymentProposal ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setRequestOpen((value) => !value)}
+                aria-expanded={requestOpen}
+                className="flex items-center gap-1 font-medium text-muted-foreground hover:text-foreground"
+              >
+                {requestOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" />
+                )}
+                Request details
+              </button>
+              {requestOpen && <ToolBlock value={params} />}
+            </>
+          ) : (
+            <>
+              <div className="font-medium text-muted-foreground">
+                {pending ? 'Will send' : 'Sent'}
+              </div>
+              <ToolBlock value={params} />
+            </>
+          )}
         </div>
       )}
       {pending ? (
@@ -803,11 +1250,11 @@ interface StepState {
  * groups and sequences them.
  */
 function PlanActionCard({
-  projectId,
+  pendingActionBasePath,
   plan,
   onFix,
 }: {
-  projectId: number
+  pendingActionBasePath: string
   plan: PlanProposal
   /** Send a follow-up chat message (used by "Fix with AI" on a failed step). */
   onFix?: (text: string) => void
@@ -824,7 +1271,7 @@ function PlanActionCard({
     let cancelled = false
     void Promise.all(
       plan.steps.map((s) =>
-        fetch(`/api/projects/${projectId}/ai/pending-actions/${s.action_id}`, {
+        fetch(`${pendingActionBasePath}/${s.action_id}`, {
           credentials: 'include',
         })
           .then((r) => (r.ok ? r.json() : null))
@@ -850,7 +1297,7 @@ function PlanActionCard({
     return () => {
       cancelled = true
     }
-  }, [projectId, plan])
+  }, [pendingActionBasePath, plan])
 
   useEffect(() => fetchAll(), [fetchAll])
 
@@ -872,14 +1319,11 @@ function PlanActionCard({
   const act = async (actionId: string, kind: 'confirm' | 'reject') => {
     setBusy(actionId)
     try {
-      const r = await fetch(
-        `/api/projects/${projectId}/ai/pending-actions/${actionId}/${kind}`,
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-        }
-      )
+      const r = await fetch(`${pendingActionBasePath}/${actionId}/${kind}`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+      })
       const d = await r.json().catch(() => null)
       setStates((prev) => ({
         ...prev,
@@ -1062,155 +1506,29 @@ function PlanActionCard({
 
 /** Route a `temps_write` tool part to the plan card or the single-action card. */
 function WriteProposalCard({
-  projectId,
+  pendingActionBasePath,
   tool,
   onFix,
 }: {
-  projectId: number
+  pendingActionBasePath: string
   tool: ToolCall
   onFix?: (text: string) => void
 }) {
   const plan = parsePlanProposal(tool.result)
   if (plan)
-    return <PlanActionCard projectId={projectId} plan={plan} onFix={onFix} />
-  return <PendingActionCard projectId={projectId} tool={tool} onFix={onFix} />
-}
-
-/** A visible, reversible project-level control for Temps write proposals. */
-function WriteActionsEnabler({ projectId }: { projectId: number }) {
-  // null = still loading / unknown.
-  const [enabled, setEnabled] = useState<boolean | null>(null)
-  const [confirmOpen, setConfirmOpen] = useState(false)
-  const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    let cancelled = false
-    getProject({ path: { id: projectId } })
-      .then(({ data }) => {
-        if (!cancelled && data) {
-          setEnabled(data.ai_write_actions_enabled === true)
-        }
-      })
-      .catch(() => {
-        /* leave unknown — just don't show the affordance */
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [projectId])
-
-  const update = async (nextEnabled: boolean) => {
-    setBusy(true)
-    try {
-      const { error } = await updateProjectSettings({
-        path: { project_id: projectId },
-        // Enabling writes also enables chat, because chat is where proposals
-        // are reviewed. Disabling writes must not unexpectedly disable chat.
-        body: {
-          ai_write_actions_enabled: nextEnabled,
-          ...(nextEnabled ? { ai_debug_chat_enabled: true } : {}),
-        },
-      })
-      if (error) throw error
-      setEnabled(nextEnabled)
-      setConfirmOpen(false)
-      toast.success(
-        nextEnabled
-          ? 'AI write proposals enabled for this project'
-          : 'AI write proposals disabled for this project'
-      )
-    } catch {
-      toast.error(
-        `Couldn't ${nextEnabled ? 'enable' : 'disable'} write proposals — you may need project admin permission.`
-      )
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  if (enabled === null) {
     return (
-      <Skeleton
-        className="h-8 w-48 rounded-md"
-        aria-label="Loading AI write status"
+      <PlanActionCard
+        pendingActionBasePath={pendingActionBasePath}
+        plan={plan}
+        onFix={onFix}
       />
     )
-  }
-
   return (
-    <>
-      <button
-        type="button"
-        onClick={() => setConfirmOpen(true)}
-        className={cn(
-          'flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors',
-          enabled
-            ? 'border-green-500/30 bg-green-500/5 text-green-700 hover:bg-green-500/10 dark:text-green-400'
-            : 'border-amber-500/30 bg-amber-500/5 text-amber-700 hover:bg-amber-500/10 dark:text-amber-400'
-        )}
-      >
-        {enabled ? (
-          <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-        ) : (
-          <Shield className="h-3.5 w-3.5 shrink-0" />
-        )}
-        <span className="min-w-0 flex-1">
-          {enabled ? (
-            <>
-              <span className="font-medium">Write proposals enabled.</span>{' '}
-              Every action still requires confirmation.
-            </>
-          ) : (
-            <>
-              Read-only.{' '}
-              <span className="font-medium">Enable write proposals</span> to let
-              the AI suggest changes.
-            </>
-          )}
-        </span>
-      </button>
-      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {enabled
-                ? 'Disable AI write proposals?'
-                : 'Enable AI write proposals?'}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {enabled ? (
-                <>
-                  The assistant will return to read-only access and cannot stage
-                  new changes. Existing proposals remain available for you to
-                  confirm or reject.
-                </>
-              ) : (
-                <>
-                  This lets the assistant <strong>propose</strong> changes to
-                  this project — redeploys, restarts, environment variables,
-                  domains. Nothing runs automatically: every proposal waits for
-                  you to review and <strong>Confirm</strong> it here in chat,
-                  and runs with your own permissions.
-                </>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                void update(!enabled)
-              }}
-              disabled={busy}
-            >
-              {busy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
-              {enabled ? 'Disable write proposals' : 'Enable write proposals'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </>
+    <PendingActionCard
+      pendingActionBasePath={pendingActionBasePath}
+      tool={tool}
+      onFix={onFix}
+    />
   )
 }
 
@@ -1226,7 +1544,27 @@ function WriteActionsEnabler({ projectId }: { projectId: number }) {
  * - `interactive_bridge_status === 'healthy'`: bridge is live, hide the
  *   notice entirely — `PermissionCard`s will render in-line as they arrive.
  */
-function InteractiveToolsNotice({ provider }: { provider: string }) {
+export function applicationHarnessPermissionNotice(
+  provider: string,
+  permissionMode: string | null
+): string | null {
+  if (permissionMode === 'auto' || permissionMode === 'full-access') return null
+  // Claude's print-mode permission prompt is bridged through the turn-scoped
+  // Temps MCP server. Native Write/Edit/Bash prompts therefore arrive as
+  // PermissionCards and resume the same harness turn after the user decides.
+  if (provider === 'claude_cli') return null
+  return 'This harness does not yet expose its native approval prompts inline. Choose Auto to run commands inside the Temps sandbox without per-command approval.'
+}
+
+function InteractiveToolsNotice({
+  provider,
+  contextType,
+  permissionMode,
+}: {
+  provider: string
+  contextType: string
+  permissionMode: string | null
+}) {
   // null = still loading / unknown.
   const [supported, setSupported] = useState<boolean | null>(null)
   // `interactive_bridge_status` from the extended provider status response.
@@ -1236,6 +1574,7 @@ function InteractiveToolsNotice({ provider }: { provider: string }) {
   )
 
   useEffect(() => {
+    if (contextType === 'application') return
     let cancelled = false
     getAiProviderStatus()
       .then(({ data }) => {
@@ -1255,7 +1594,18 @@ function InteractiveToolsNotice({ provider }: { provider: string }) {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [contextType])
+
+  if (contextType === 'application') {
+    const notice = applicationHarnessPermissionNotice(provider, permissionMode)
+    if (!notice) return null
+    return (
+      <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+        <Info className="h-3.5 w-3.5 shrink-0 translate-y-px" />
+        <span className="min-w-0 flex-1">{notice}</span>
+      </div>
+    )
+  }
 
   // Still loading.
   if (supported === null && bridgeStatus === undefined) return null
@@ -1279,7 +1629,12 @@ function InteractiveToolsNotice({ provider }: { provider: string }) {
 }
 
 interface DebugChatPanelProps {
-  projectId: number
+  /** Present for legacy project-attached chat. AI workspace threads are user-owned. */
+  projectId?: number
+  /** Existing user-owned thread selected by the AI workspace. */
+  conversationPublicId?: string
+  /** Use user-rooted routes whose authority comes from the current principal. */
+  userScoped?: boolean
   /** The interaction this chat is attached to, e.g. 'deployment' | 'alert'. */
   contextType: string
   contextId: string | number
@@ -1300,6 +1655,31 @@ interface DebugChatPanelProps {
   emptyHint?: string
   /** Notifies the parent of the active conversation's public id (for reset). */
   onConversationChange?: (publicId: string | null) => void
+  /** Typed live-wire invalidation events consumed by adjacent generated UI. */
+  onLiveEvent?: (eventName: string, data: string) => void
+  /** Re-read the conversation summary after a message/stop command settles. */
+  onConversationStatusInvalidated?: () => void
+}
+
+export function chatApiPaths(userScoped: boolean, projectId?: number) {
+  if (userScoped) {
+    return {
+      conversations: '/api/ai/conversations',
+      pendingActions: '/api/ai/pending-actions',
+    }
+  }
+  if (projectId == null) {
+    throw new Error('A project-scoped chat requires a project id.')
+  }
+  return {
+    conversations: `/api/projects/${projectId}/ai/conversations`,
+    pendingActions: `/api/projects/${projectId}/ai/pending-actions`,
+  }
+}
+
+export function conversationHistoryErrorMessage(status?: number): string {
+  const suffix = status ? ` (HTTP ${status})` : ''
+  return `Couldn’t load this conversation${suffix}. Its messages remain stored in Temps; reconnect and try again.`
 }
 
 function providerDisplayName(provider: string): string {
@@ -1318,18 +1698,134 @@ function providerDisplayName(provider: string): string {
   }
 }
 
+/** The distance from the bottom that still counts as following the transcript. */
+const CHAT_SCROLL_BOTTOM_THRESHOLD_PX = 72
+
+/**
+ * Keep live output pinned only while the reader is already at the bottom.
+ * A user who scrolls up owns the viewport until they explicitly return.
+ */
+export function isChatTranscriptNearBottom(
+  viewport: Pick<HTMLElement, 'scrollHeight' | 'scrollTop' | 'clientHeight'>,
+  threshold = CHAT_SCROLL_BOTTOM_THRESHOLD_PX
+): boolean {
+  return (
+    viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <=
+    threshold
+  )
+}
+
 const proseClasses =
   'prose prose-sm dark:prose-invert max-w-none prose-pre:bg-[#0d1117] prose-pre:text-xs prose-pre:border-0 prose-pre:overflow-x-auto prose-pre:rounded-lg prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
 
-/** Three-dot "assistant is thinking" indicator. */
-function TypingDots() {
+const pixelDelays = [90, 180, 270, 0, 90, 180, 90, 180, 270]
+
+/** Calculate display time from the server-owned turn timestamp, never mount time. */
+export function serverElapsedDeciseconds(
+  startedAt: string | null | undefined,
+  nowMs: number
+): number {
+  if (!startedAt) return 0
+  const startedAtMs = Date.parse(startedAt)
+  if (!Number.isFinite(startedAtMs)) return 0
+  return Math.max(0, Math.floor((nowMs - startedAtMs) / 100))
+}
+
+/**
+ * The chat's working state is intentionally a small, utilitarian instrument:
+ * a pixel wave and a shimmer rather than a full-screen spinner. It works on
+ * either console theme because it only uses semantic foreground tokens.
+ */
+function ActivityIndicator({
+  compact = false,
+  label,
+  startedAt,
+}: {
+  compact?: boolean
+  label: string
+  /** Durable server timestamp for the active turn. */
+  startedAt?: string | null
+}) {
+  const [nowMs, setNowMs] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (compact) return
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 100)
+    return () => window.clearInterval(timer)
+  }, [compact])
+
+  const deciseconds = serverElapsedDeciseconds(startedAt, nowMs)
+  const elapsed = deciseconds / 10
+  const elapsedLabel =
+    elapsed < 60
+      ? `${elapsed.toFixed(1)}s`
+      : `${Math.floor(elapsed / 60)}m ${(elapsed % 60).toFixed(1)}s`
+
   return (
-    <span className="inline-flex items-center gap-1 py-1" aria-label="Thinking">
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/70 [animation-delay:-0.3s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/70 [animation-delay:-0.15s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/70" />
+    <span
+      className={cn(
+        'inline-flex items-center',
+        compact ? 'gap-1.5' : 'gap-2.5 py-1'
+      )}
+      role="status"
+      aria-label={label}
+    >
+      <span
+        aria-hidden
+        className="grid shrink-0 grid-cols-[repeat(3,4px)] gap-[1.5px]"
+      >
+        {pixelDelays.map((delay, index) => (
+          <span
+            key={index}
+            className="ai-activity-pixel h-[4px] w-[4px] rounded-[1px] bg-foreground"
+            style={{ animationDelay: `${delay}ms` }}
+          />
+        ))}
+      </span>
+      {!compact && (
+        <span className="ai-activity-shimmer bg-gradient-to-r from-muted-foreground via-foreground to-muted-foreground bg-[length:200%_100%] bg-clip-text text-[13px] font-medium text-transparent">
+          {label}
+        </span>
+      )}
+      {!compact && (
+        <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+          {elapsedLabel}
+        </span>
+      )}
     </span>
   )
+}
+
+/**
+ * Describe observable work rather than guessing at the model's internal state.
+ * Keep the infrastructure boundary out of the primary status copy. Users care
+ * that Temps is working in their durable project/workspace, not which runtime
+ * container currently hosts that work.
+ */
+export function chatTurnActivityLabel(
+  contextType: string,
+  preparing: boolean
+): string {
+  if (contextType === 'application') {
+    return preparing ? 'Preparing workspace' : 'Working on your project'
+  }
+  if (contextType === 'global') {
+    return preparing ? 'Preparing workspace' : 'Working in your workspace'
+  }
+  return 'Working'
+}
+
+/** Inline server-owned activity state for an assistant turn. */
+function TurnActivity({
+  label,
+  startedAt,
+}: {
+  label: string
+  startedAt?: string | null
+}) {
+  return <ActivityIndicator label={label} startedAt={startedAt} />
 }
 
 /** Open links (including `remark-gfm` autolinked bare URLs) in a new tab, styled
@@ -1368,27 +1864,35 @@ function MarkdownText({ text }: { text: string }) {
 /**
  * The body of an assistant turn: its ordered text/tool/permission segments, so
  * cards render inline where they occurred instead of all hoisted above the
- * prose. Shows the typing indicator only while a trailing turn is streaming
- * with nothing rendered yet.
+ * prose. The activity indicator remains visible for the full server-owned
+ * turn, including while tokens and tool cards stream into the message.
  */
 function AssistantBody({
   message,
   streaming,
-  projectId,
+  activityLabel,
+  turnStartedAt,
+  pendingActionBasePath,
+  conversationBasePath,
   conversationPublicId,
   onFix,
   onPermissionResolved,
 }: {
   message: ChatMessage
   streaming: boolean
-  projectId: number
+  activityLabel: string
+  turnStartedAt?: string | null
+  pendingActionBasePath: string
+  conversationBasePath: string
   conversationPublicId: string | null
   onFix?: (text: string) => void
   onPermissionResolved?: () => void
 }) {
   const parts = assistantParts(message)
   if (parts.length === 0) {
-    return streaming ? <TypingDots /> : null
+    return streaming ? (
+      <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
+    ) : null
   }
   return (
     <>
@@ -1396,21 +1900,21 @@ function AssistantBody({
         part.type === 'tool' ? (
           // A `temps_write` tool is a *proposed* mutation — render the human
           // confirm/reject gate instead of a read-only result card.
-          part.tool.name === 'temps_write' ? (
+          isTempsWriteToolName(part.tool.name) ? (
             <WriteProposalCard
               key={part.tool.id}
-              projectId={projectId}
+              pendingActionBasePath={pendingActionBasePath}
               tool={part.tool}
               onFix={onFix}
             />
           ) : (
-            <ToolCard key={part.tool.id} tool={part.tool} />
+            <ReadToolResultCard key={part.tool.id} tool={part.tool} />
           )
         ) : part.type === 'permission' ? (
           // ADR-038 Phase 2: interactive bridge permission request
           <PermissionCard
             key={`perm-${part.permission.id}`}
-            projectId={projectId}
+            conversationBasePath={conversationBasePath}
             conversationPublicId={conversationPublicId ?? ''}
             permission={part.permission}
             onResolved={onPermissionResolved}
@@ -1419,35 +1923,118 @@ function AssistantBody({
           <MarkdownText key={`text-${idx}`} text={part.text} />
         )
       )}
+      {shouldShowAssistantActivityAfterContent(parts.length, streaming) && (
+        <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
+      )}
     </>
   )
+}
+
+/** Streaming content does not imply completion; only the server terminal state does. */
+export function shouldShowAssistantActivityAfterContent(
+  partCount: number,
+  streaming: boolean
+) {
+  return streaming && partCount > 0
 }
 
 /** Backoff schedule for WS reconnects — bounded, no thundering herd. */
 const WS_RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 15000]
 
+/** A disconnected observer wire must never be represented as model activity. */
+export function shouldShowLiveTurn(
+  streaming: boolean,
+  wsTurnActive: boolean,
+  liveUpdatesUnavailable: boolean
+) {
+  // `streaming` is the short message-submission command. Once accepted, the
+  // persisted/live-wire state takes over until the terminal event arrives.
+  return streaming || (!liveUpdatesUnavailable && wsTurnActive)
+}
+
+/** Restore activity from the persisted server snapshot after a remount. */
+export function hasRunningServerTurn(value: { turn_status?: string } | null) {
+  return value?.turn_status === 'running'
+}
+
+/**
+ * A refreshed observer has persisted history but no optimistic empty assistant
+ * message. Give the authoritative running turn its own trailing activity row
+ * until the first assistant content arrives over the live stream.
+ */
+export function needsTrailingActivityRow(
+  liveTurn: boolean,
+  trailingRole?: ChatMessage['role']
+) {
+  return liveTurn && trailingRole !== 'assistant'
+}
+
+/** Permission polling suppresses only its synthetic user echo, never lifecycle events. */
+export function shouldSuppressPermissionPollEvent(
+  eventName: string,
+  suppressionCount: number
+) {
+  return suppressionCount > 0 && eventName === 'user_message'
+}
+
+/** A server-owned terminal snapshot wins even when optimistic message counts match. */
+export function permissionPollIsTerminal(
+  turnStatus: string | undefined,
+  hasPendingPermission: boolean
+) {
+  return turnStatus !== 'running' && !hasPendingPermission
+}
+
+/** Give resumed live events a concrete assistant target for tokens and tools. */
+export function ensureRunningAssistant(
+  messages: ChatMessage[],
+  running: boolean
+) {
+  if (!running || messages[messages.length - 1]?.role === 'assistant') {
+    return messages
+  }
+  return [
+    ...messages,
+    {
+      role: 'assistant',
+      content: '',
+      created_at: new Date().toISOString(),
+    },
+  ]
+}
+
 /**
  * Keeps a `GET .../conversations/{publicId}/stream` WebSocket open for the
- * panel's full lifetime (not just during an active send, unlike the fetch
- * reader in `send()`), so a second tab/device watching the same conversation
- * sees tokens, tool activity, and permission requests live instead of only on
- * reload.
+ * panel's full lifetime. It is the single real-time transport for the sending
+ * tab and every observer: tokens, tools, permissions, errors, and completion
+ * all arrive here after the message command has been accepted.
  *
- * `suppressRef` is a counter, not a boolean: the tab that is itself sending a
- * message or resolving a permission must ignore its own broadcast echo (it
- * already has that data from its own request), but those two actions can
- * overlap so a simple flag would race. Once `suppressRef.current` returns to
- * 0 this tab is back to being a normal observer.
+ * `suppressRef` is retained only for the permission-resolution history poll,
+ * which deliberately replaces its own synthetic user-message echo with a
+ * fresh authoritative snapshot.
  */
 function useConversationStream(
-  projectId: number,
+  conversationBasePath: string,
   publicId: string | null,
+  turnActiveRef: { current: boolean },
   suppressRef: { current: number },
   setMessages: SetMessages,
-  setError: SetError,
-  setWsTurnActive: React.Dispatch<React.SetStateAction<boolean>>
+  setError: SetChatFailure,
+  setWsTurnActive: React.Dispatch<React.SetStateAction<boolean>>,
+  setTurnStartedAt: React.Dispatch<React.SetStateAction<string | null>>,
+  setLiveUpdatesUnavailable: React.Dispatch<React.SetStateAction<boolean>>,
+  onLiveEvent?: (eventName: string, data: string) => void
 ) {
+  const onLiveEventRef = useRef(onLiveEvent)
+
   useEffect(() => {
+    onLiveEventRef.current = onLiveEvent
+  }, [onLiveEvent])
+
+  useEffect(() => {
+    setWsTurnActive(false)
+    setTurnStartedAt(null)
+    setLiveUpdatesUnavailable(false)
     if (!publicId) return
     let cancelled = false
     let ws: WebSocket | null = null
@@ -1456,38 +2043,95 @@ function useConversationStream(
     // distinguishes the initial connect (history was already loaded by the
     // panel's own init fetch, no need to resync) from a later reconnect
     // (missed whatever happened while disconnected, including possibly a
-    // `turn_complete` — resync and clear any stuck "thinking" state rather
+    // `turn_complete` — resync and clear any stuck activity state rather
     // than trust stale local state).
     let hasConnectedBefore = false
+    let liveEventRevision = 0
+    let resyncRequestRevision = 0
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let fallbackPollTimer: ReturnType<typeof setTimeout> | null = null
+    let activeTurnPollTimer: ReturnType<typeof setInterval> | null = null
 
-    const resync = () => {
-      getConversation({ path: { project_id: projectId, public_id: publicId } })
-        .then(({ data }) => {
-          if (!cancelled && data) setMessages(mapConversationDetail(data))
+    const resync = async () => {
+      const requestedAtRevision = liveEventRevision
+      const requestRevision = ++resyncRequestRevision
+      try {
+        const response = await fetch(`${conversationBasePath}/${publicId}`, {
+          credentials: 'include',
         })
-        .catch(() => {
-          /* best-effort resync — the next event or a manual reload recovers */
-        })
+        const data = response.ok
+          ? ((await response.json()) as ConversationDetailResponse)
+          : null
+        if (!cancelled && data) {
+          const running = hasRunningServerTurn(
+            data as typeof data & { turn_status?: string }
+          )
+          // A snapshot requested before a newer live event is stale by
+          // definition. Never replace text, tools, or approvals that arrived
+          // over the ordered WebSocket while this fetch was in flight.
+          if (
+            requestedAtRevision !== liveEventRevision ||
+            requestRevision !== resyncRequestRevision
+          ) {
+            return running
+          }
+          setMessages((current) =>
+            reconcileLatestHistoryPage(
+              current,
+              ensureRunningAssistant(mapConversationDetail(data), running)
+            )
+          )
+          setWsTurnActive(running)
+          setTurnStartedAt(running ? (data.turn_started_at ?? null) : null)
+          return running
+        }
+      } catch {
+        /* best-effort resync — the next event or poll retries */
+      }
+      return false
+    }
+
+    // The server owns turn and approval state. A WebSocket can appear open
+    // while an intermediary silently drops an individual frame, so socket
+    // health alone is not enough to prove the client is current. Reconcile a
+    // running turn at low frequency even while the socket is connected. This
+    // restores missed approvals and terminal state without polling idle chats;
+    // revision checks above keep a late snapshot from overwriting newer wire
+    // events.
+    activeTurnPollTimer = setInterval(() => {
+      if (turnActiveRef.current) void resync()
+    }, 2000)
+
+    const pollUntilTerminal = (): void => {
+      if (cancelled) return
+      void resync().then((running) => {
+        if (!cancelled && running) {
+          fallbackPollTimer = setTimeout(pollUntilTerminal, 2000)
+        }
+      })
     }
 
     const connect = () => {
       if (cancelled) return
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const socket = new WebSocket(
-        `${wsProtocol}//${window.location.host}/api/projects/${projectId}/ai/conversations/${publicId}/stream`
+        `${wsProtocol}//${window.location.host}${conversationBasePath}/${publicId}/stream`
       )
       ws = socket
       socket.onopen = () => {
         attempt = 0
+        if (fallbackPollTimer) {
+          clearTimeout(fallbackPollTimer)
+          fallbackPollTimer = null
+        }
+        setLiveUpdatesUnavailable(false)
         if (hasConnectedBefore) {
-          setWsTurnActive(false)
-          resync()
+          onLiveEventRef.current?.('resync_required', '')
+          void resync()
         }
         hasConnectedBefore = true
       }
       socket.onmessage = (ev) => {
-        if (suppressRef.current > 0) return
         let frame: { event?: string; data?: string }
         try {
           frame = JSON.parse(ev.data as string) as {
@@ -1499,17 +2143,61 @@ function useConversationStream(
         }
         const eventName = frame.event ?? ''
         const data = frame.data ?? ''
+        liveEventRevision += 1
+        onLiveEventRef.current?.(eventName, data)
+        if (shouldSuppressPermissionPollEvent(eventName, suppressRef.current)) {
+          return
+        }
         if (eventName === 'resync_required') {
           setWsTurnActive(false)
-          resync()
+          void resync()
           return
         }
         if (eventName === 'turn_complete') {
           setWsTurnActive(false)
+          setTurnStartedAt(null)
+          void resync()
+          return
+        }
+        if (eventName === 'turn_state') {
+          try {
+            const state = JSON.parse(data) as {
+              status?: string
+              turn_started_at?: string | null
+            }
+            const running = turnStateNeedsResync(state.status)
+            setWsTurnActive(running)
+            setTurnStartedAt(running ? (state.turn_started_at ?? null) : null)
+            // The initial WS snapshot contains lifecycle state, not the
+            // pending permission payload. Reconcile immediately so a request
+            // emitted before this tab subscribed is still actionable.
+            if (running) void resync()
+          } catch {
+            setWsTurnActive(false)
+            setTurnStartedAt(null)
+          }
+          return
+        }
+        if (eventName === 'runtime_options_updated') {
+          try {
+            const update = JSON.parse(data) as {
+              auto_approved_permission_ids?: string[]
+            }
+            setMessages((messages) =>
+              clearResolvedPermissionParts(
+                messages,
+                update.auto_approved_permission_ids ?? []
+              )
+            )
+          } catch {
+            /* a detail resync below remains authoritative */
+          }
+          void resync()
           return
         }
         if (eventName === 'error') {
           setWsTurnActive(false)
+          setTurnStartedAt(null)
           applyWireEvent(eventName, data, setMessages, setError)
           return
         }
@@ -1519,13 +2207,14 @@ function useConversationStream(
             const u = JSON.parse(data) as {
               content: string
               created_at?: string
+              turn_id?: string
+              attachments?: ChatAttachment[]
             }
-            const now = u.created_at ?? new Date().toISOString()
-            setMessages((m) => [
-              ...m,
-              { role: 'user', content: u.content, created_at: now },
-              { role: 'assistant', content: '', created_at: now },
-            ])
+            // This timestamp is produced by Temps when it persists the user
+            // turn. It keeps already-connected observers on the same clock;
+            // refresh/reconnect uses the exact persisted turn_started_at.
+            setTurnStartedAt(u.created_at ?? null)
+            setMessages((messages) => appendLiveUserTurn(messages, u))
           } catch {
             /* ignore malformed user_message frame */
           }
@@ -1535,14 +2224,25 @@ function useConversationStream(
       }
       socket.onclose = () => {
         if (cancelled) return
-        const delay =
-          WS_RECONNECT_DELAYS_MS[
-            Math.min(attempt, WS_RECONNECT_DELAYS_MS.length - 1)
-          ]
+        // Connectivity does not own the durable turn. Preserve the last
+        // server snapshot so the composer cannot submit a conflicting turn.
+        // A connection still being established is not an error and must not
+        // hide the accepted turn; suppress activity only after retries are
+        // exhausted and the stable unavailable state is visible.
+        if (attempt >= WS_RECONNECT_DELAYS_MS.length) {
+          // Surface one stable, non-blocking state only after bounded retries
+          // instead of flashing an alert per reconnect.
+          setLiveUpdatesUnavailable(true)
+          pollUntilTerminal()
+          return
+        }
+        const delay = WS_RECONNECT_DELAYS_MS[attempt]
         attempt += 1
         reconnectTimer = setTimeout(connect, delay)
       }
       socket.onerror = () => {
+        // The close event owns retry and UI state. Handling both events caused
+        // a disconnect/reconnect render flicker for each failed upgrade.
         socket.close()
       }
     }
@@ -1551,20 +2251,34 @@ function useConversationStream(
     return () => {
       cancelled = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
+      if (fallbackPollTimer) clearTimeout(fallbackPollTimer)
+      if (activeTurnPollTimer) clearInterval(activeTurnPollTimer)
       ws?.close()
     }
-  }, [projectId, publicId, suppressRef, setMessages, setError, setWsTurnActive])
+  }, [
+    conversationBasePath,
+    publicId,
+    turnActiveRef,
+    suppressRef,
+    setMessages,
+    setError,
+    setWsTurnActive,
+    setTurnStartedAt,
+    setLiveUpdatesUnavailable,
+  ])
 }
 
 /**
  * The body of the AI debugging chat attached to any entity (ADR-023). Renders a
  * scrollable message list that fills its parent plus a follow-up composer — no
  * surrounding card, so it can drop into a sidebar/sheet or a page section. The
- * streaming reply is consumed via a manual SSE fetch reader (the generated SDK
- * can't stream); find/create/history go through the generated SDK.
+ * message submission is a short HTTP command and the conversation WebSocket
+ * owns all real-time output; find/create/history use the generated SDK.
  */
 export function DebugChatPanel({
   projectId,
+  conversationPublicId,
+  userScoped = false,
   contextType,
   contextId,
   startPrompt = 'Diagnose this and suggest concrete next steps.',
@@ -1573,18 +2287,25 @@ export function DebugChatPanel({
   lazyCreate = false,
   emptyHint = 'Ask anything about this project.',
   onConversationChange,
+  onLiveEvent,
+  onConversationStatusInvalidated,
 }: DebugChatPanelProps) {
-  const base = `/api/projects/${projectId}/ai/conversations`
+  const paths = chatApiPaths(userScoped, projectId)
+  const base = paths.conversations
+  const pendingActionBasePath = paths.pendingActions
   const ctxId = String(contextId)
   // Per-chat draft key: a half-typed message survives closing the dock,
   // switching chats, and reloads.
-  const draftKey = `temps.ai.draft.${projectId}:${contextType}:${ctxId}`
+  const draftKey = `temps.ai.draft.${userScoped ? 'user' : projectId}:${contextType}:${ctxId}`
   // Current page context (what the user is viewing). Shown as a chip by the
   // input; the user can toggle whether it's attached.
   const { pageContext } = useAiAssistant()
   const [includeContext, setIncludeContext] = useState(true)
-  const [publicId, setPublicId] = useState<string | null>(null)
+  const [publicId, setPublicId] = useState<string | null>(
+    conversationPublicId ?? null
+  )
   const providerPinnedRef = useRef(false)
+  const providerStatusRequestRef = useRef(0)
   const [providerOptions, setProviderOptions] = useState<ChatProviderOption[]>(
     []
   )
@@ -1606,11 +2327,23 @@ export function DebugChatPanel({
   const selectedModelOption = selectedProviderOption?.models.find(
     (model) => model.id === runtimeSelection.modelId
   )
+  // Some providers (OpenRouter especially) advertise hundreds of models —
+  // a plain unsearchable dropdown becomes unusable at that size.
+  const modelOptions: SearchableSelectOption[] = (() => {
+    const provider = selectedProviderOption
+    if (!provider) return []
+    return provider.models.map((model) => ({
+      value: model.id,
+      label: chatModelLabel(provider, model),
+      keywords: model.id,
+    }))
+  })()
   const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [pendingActionSnapshot, setPendingActionSnapshot] = useState<{
-    conversationId: string
-    actions: PendingActionResponse[]
-  } | null>(null)
+  const [pendingAttachments, setPendingAttachments] = useState<
+    ChatAttachment[]
+  >([])
+  const [attachmentUploads, setAttachmentUploads] = useState(0)
+  const attachmentInputRef = useRef<HTMLInputElement>(null)
   const [input, setInput] = useState(() => {
     try {
       return localStorage.getItem(draftKey) ?? ''
@@ -1624,141 +2357,246 @@ export function DebugChatPanel({
   // of flashing the "Start AI diagnosis" empty state while resuming a chat —
   // that empty condition is indistinguishable from the initial mount state.
   const [initializing, setInitializing] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [historyLoadError, setHistoryLoadError] = useState<string | null>(null)
+  const [historyPage, setHistoryPage] = useState<ConversationHistoryPage>({
+    has_more: false,
+    next_before: null,
+  })
+  const [loadingEarlierMessages, setLoadingEarlierMessages] = useState(false)
+  const [earlierMessagesError, setEarlierMessagesError] = useState<
+    string | null
+  >(null)
+  const [historyReloadNonce, setHistoryReloadNonce] = useState(0)
+  const retryConversationHistory = useCallback(() => {
+    setInitializing(true)
+    setHistoryLoadError(null)
+    setHistoryReloadNonce((nonce) => nonce + 1)
+  }, [])
+  const [error, setError] = useState<ChatFailure | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  // Aborts the in-flight streaming request when the user hits Stop (or the panel
-  // unmounts). Dropping the SSE connection also tells the server to stop
-  // generating, so a stopped turn doesn't keep costing tokens.
-  const abortRef = useRef<AbortController | null>(null)
+  const historyPageRequestRef = useRef(false)
+  const prependScrollAnchorRef = useRef<{
+    scrollHeight: number
+    scrollTop: number
+  } | null>(null)
+  const followTranscriptRef = useRef(true)
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const queuedInterruptRef = useRef<string | null>(null)
   const sendAfterInterruptRef = useRef<(text: string) => void>(() => {})
-  // Counts this tab's own in-flight writes to the conversation (an active
-  // send, or a permission being resolved+polled) — see useConversationStream.
+  const submissionInFlightRef = useRef(false)
+  // Counts history-replacing permission resolution polls. Ordinary messages
+  // never suppress the WebSocket because it is their only live transport.
   const wsSuppressRef = useRef(0)
-  // Whether a turn is in flight on ANOTHER tab, per the live wire — an
-  // observer tab has no local `streaming` state to drive the "thinking"
-  // indicator with, since it never called send() itself.
+  // Authoritative running state from the durable snapshot/live wire. This is
+  // not limited to another tab: the sending tab receives the same state.
   const [wsTurnActive, setWsTurnActive] = useState(false)
+  const [turnStartedAt, setTurnStartedAt] = useState<string | null>(null)
+  const [liveUpdatesUnavailable, setLiveUpdatesUnavailable] = useState(false)
+  const turnActive = streaming || wsTurnActive
+  const turnActiveRef = useRef(turnActive)
+  useEffect(() => {
+    turnActiveRef.current = turnActive
+  }, [turnActive])
 
-  // New conversations may choose any provider that is ready on this host.
-  // Once the first message creates the row, `publicId` locks only the provider
-  // harness. Model, reasoning, and permission mode remain turn-level controls.
-  const loadProviderStatus = useCallback(async (forceRefresh = false) => {
-    if (forceRefresh) setProviderRefreshing(true)
-    else setProviderStatusState('loading')
-    try {
-      const statusResult = forceRefresh
-        ? await refreshAiProviderStatus({ throwOnError: true })
-        : await getAiProviderStatus({ throwOnError: true })
-      const status = statusResult.data
-      const options = (status?.available_providers ?? []).map((provider) => {
-        const extended = provider as typeof provider & ChatProviderOption
-        return {
-          id: provider.id,
-          name: provider.name,
-          auth_source: provider.auth_source,
-          models: extended.models ?? [],
-          default_model_id: extended.default_model_id,
-          model_discovery_status: extended.model_discovery_status,
-          model_discovery_error: extended.model_discovery_error,
-          permission_modes: extended.permission_modes ?? [],
-          default_permission_mode_id: extended.default_permission_mode_id,
+  const changePermissionMode = useCallback(
+    async (permissionModeId: string) => {
+      const previousPermissionModeId = runtimeSelection.permissionModeId
+      setRuntimeSelection((selection) => ({
+        ...selection,
+        permissionModeId,
+      }))
+      if (!turnActive || !publicId) return
+
+      try {
+        const response = await fetch(`${base}/${publicId}/permission-mode`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({ permission_mode: permissionModeId }),
+        })
+        const payload = (await response.json().catch(() => ({}))) as {
+          ai_permission_mode?: string
+          title?: string
+          detail?: string
         }
-      })
-      setProviderOptions((current) =>
-        providerPinnedRef.current
-          ? [
-              ...options,
-              ...current.filter(
-                (saved) => !options.some((option) => option.id === saved.id)
-              ),
-            ]
-          : options
-      )
-
-      if (providerPinnedRef.current) {
-        setRuntimeSelection((current) =>
-          reconcileChatRuntimeAfterRefresh(options, current)
+        if (!response.ok) {
+          setRuntimeSelection((selection) => ({
+            ...selection,
+            permissionModeId: previousPermissionModeId,
+          }))
+          setError(chatFailureFromProblem(payload, response.status))
+          return
+        }
+        setRuntimeSelection((selection) => ({
+          ...selection,
+          permissionModeId: payload.ai_permission_mode ?? permissionModeId,
+        }))
+      } catch {
+        setRuntimeSelection((selection) => ({
+          ...selection,
+          permissionModeId: previousPermissionModeId,
+        }))
+        setError(
+          localChatFailure(
+            'Could not change permissions',
+            'Temps could not update the active turn. The existing approval mode is still in effect.',
+            'permission_mode_update_failed'
+          )
         )
       }
+    },
+    [base, publicId, runtimeSelection.permissionModeId, turnActive]
+  )
 
-      const active =
-        status?.active_provider_type === 'agent_cli'
-          ? status.agent_cli_provider_id
-          : 'gateway'
-      if (
-        !providerPinnedRef.current &&
-        active &&
-        options.some((option) => option.id === active)
-      ) {
-        setRuntimeSelection(resolveChatRuntimeSelection(options, active))
-      } else if (!providerPinnedRef.current && options[0]) {
-        setRuntimeSelection(resolveChatRuntimeSelection(options, options[0].id))
+  const loadProviderStatus = useCallback(
+    async (forceRefresh = false, silent = false) => {
+      const requestGeneration = ++providerStatusRequestRef.current
+      if (forceRefresh) setProviderRefreshing(true)
+      else setProviderStatusState('loading')
+      try {
+        const options = usesHarnessCatalog(contextType)
+          ? chatHarnessProviderOptions(
+              (
+                await listAiProviders({
+                  query: {
+                    catalog_only: false,
+                    refresh_models: forceRefresh,
+                  },
+                  throwOnError: true,
+                })
+              ).data.providers
+            )
+          : (
+              (forceRefresh
+                ? await refreshAiProviderStatus({ throwOnError: true })
+                : await getAiProviderStatus({ throwOnError: true })
+              ).data?.available_providers ?? []
+            ).map((provider) => {
+              const extended = provider as typeof provider & ChatProviderOption
+              return {
+                id: provider.id,
+                name: provider.name,
+                auth_source: provider.auth_source,
+                models: extended.models ?? [],
+                default_model_id: extended.default_model_id,
+                model_discovery_status: extended.model_discovery_status,
+                model_discovery_error: extended.model_discovery_error,
+                permission_modes: extended.permission_modes ?? [],
+                default_permission_mode_id: extended.default_permission_mode_id,
+              }
+            })
+        if (requestGeneration !== providerStatusRequestRef.current) return
+        setProviderOptions((current) =>
+          providerPinnedRef.current
+            ? [
+                ...options,
+                ...current.filter(
+                  (saved) => !options.some((option) => option.id === saved.id)
+                ),
+              ]
+            : options
+        )
+
+        if (providerPinnedRef.current) {
+          setRuntimeSelection((current) =>
+            reconcileChatRuntimeAfterRefresh(options, current)
+          )
+        }
+
+        const active = 'gateway'
+        if (
+          !providerPinnedRef.current &&
+          active &&
+          options.some((option) => option.id === active)
+        ) {
+          setRuntimeSelection(resolveChatRuntimeSelection(options, active))
+        } else if (!providerPinnedRef.current && options[0]) {
+          setRuntimeSelection(
+            resolveChatRuntimeSelection(options, options[0].id)
+          )
+        }
+        setProviderStatusState('success')
+      } catch {
+        if (requestGeneration !== providerStatusRequestRef.current) return
+        if (forceRefresh && !silent) {
+          toast.error('Couldn’t refresh provider authentication and models')
+        } else if (!forceRefresh) {
+          setProviderStatusState('error')
+        }
+      } finally {
+        if (requestGeneration === providerStatusRequestRef.current) {
+          setProviderRefreshing(false)
+        }
       }
-      setProviderStatusState('success')
-    } catch {
-      if (forceRefresh) {
-        toast.error('Couldn’t refresh provider authentication and models')
-      } else {
-        setProviderStatusState('error')
-      }
-    } finally {
-      setProviderRefreshing(false)
-    }
-  }, [])
+    },
+    [contextType]
+  )
 
   useEffect(() => {
-    // Defer the async refresh out of the effect's synchronous phase. The
-    // initial state already renders the loading skeleton, so no paint is lost.
+    // First paint uses cached/bootstrap capabilities and never invokes a CLI.
+    // Account-aware names/auth are refreshed silently after the composer is
+    // usable; the explicit refresh button uses the same path with error UI.
     const timer = window.setTimeout(() => void loadProviderStatus(), 0)
-    return () => window.clearTimeout(timer)
-  }, [loadProviderStatus])
+    const refreshTimer = usesHarnessCatalog(contextType)
+      ? window.setTimeout(() => void loadProviderStatus(true, true), 250)
+      : null
+    return () => {
+      window.clearTimeout(timer)
+      if (refreshTimer != null) window.clearTimeout(refreshTimer)
+    }
+  }, [contextType, loadProviderStatus])
 
   useConversationStream(
-    projectId,
+    base,
     publicId,
+    turnActiveRef,
     wsSuppressRef,
     setMessages,
     setError,
-    setWsTurnActive
+    setWsTurnActive,
+    setTurnStartedAt,
+    setLiveUpdatesUnavailable,
+    onLiveEvent
   )
 
-  // Pending actions are durable rows. Linking their proposal receipt back to
-  // an assistant message is deliberately best-effort, so load the rows too:
-  // otherwise a transient persistence failure can leave a real proposal with
-  // no Confirm/Reject UI after a reload.
-  useEffect(() => {
+  const stop = useCallback(() => {
     if (!publicId) return
-    if (streaming) return
-    let cancelled = false
-    listPendingActions({
-      path: { project_id: projectId, public_id: publicId },
+    // Execution is server-owned. Stop is therefore an explicit mutation; a
+    // client disconnect or cancelled HTTP request never owns task lifetime.
+    void fetch(`${base}/${publicId}/stop`, {
+      method: 'POST',
+      credentials: 'include',
     })
-      .then(({ data }) => {
-        if (!cancelled) {
-          setPendingActionSnapshot({
-            conversationId: publicId,
-            actions: data ?? [],
-          })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Could not stop turn (${response.status})`)
+        }
+        setWsTurnActive(false)
+        onConversationStatusInvalidated?.()
+        const queuedInterrupt = queuedInterruptRef.current
+        queuedInterruptRef.current = null
+        if (queuedInterrupt) {
+          window.setTimeout(
+            () => sendAfterInterruptRef.current(queuedInterrupt),
+            0
+          )
         }
       })
-      .catch(() => {
-        // The transcript remains usable; an ordinary API error banner would
-        // obscure the composer. The next completed turn retries this query.
+      .catch((stopError) => {
+        setError(
+          localChatFailure(
+            'Could not stop the running turn',
+            stopError instanceof Error
+              ? stopError.message
+              : 'Temps could not stop the active turn. Check the connection and try again.',
+            'turn_stop_failed'
+          )
+        )
       })
-    return () => {
-      cancelled = true
-    }
-  }, [messages.length, projectId, publicId, streaming])
-
-  const recoveredPendingActions =
-    publicId && pendingActionSnapshot?.conversationId === publicId
-      ? unrepresentedPendingActions(messages, pendingActionSnapshot.actions)
-      : []
-
-  const stop = useCallback(() => {
-    abortRef.current?.abort()
-  }, [])
+  }, [base, onConversationStatusInvalidated, publicId])
 
   const composerRef = useRef<HTMLTextAreaElement>(null)
   const composerDisabled = isChatComposerDisabled(
@@ -1805,9 +2643,6 @@ export function DebugChatPanel({
     return () => observer.disconnect()
   }, [input])
 
-  // Abort any in-flight stream if the panel unmounts mid-generation.
-  useEffect(() => () => abortRef.current?.abort(), [])
-
   // Persist the draft as the user types; clear it once sent (input → '').
   useEffect(() => {
     try {
@@ -1822,28 +2657,103 @@ export function DebugChatPanel({
     async (text: string, conversationId?: string) => {
       let id = conversationId ?? publicId
       const content = text.trim()
+      const attachments = pendingAttachments
       // Need either an existing conversation or permission to create one lazily.
-      if (!content || (!id && !lazyCreate)) return
-      setInput('')
-      setError(null)
-      setStreaming(true)
-      // This tab already gets its own tokens via this request's SSE body — the
-      // WS listener must ignore its own broadcast echo of the same turn, or
-      // every token would render twice.
-      wsSuppressRef.current += 1
-      // Optimistically append the user's turn + an empty assistant turn that the
-      // stream fills in. The empty assistant turn renders a typing indicator
-      // while streaming; on any failure below we drop it again so it can't linger
-      // as a perpetual fake "typing" bubble next to the error message.
-      const now = new Date().toISOString()
-      setMessages((m) => [
-        ...m,
-        { role: 'user', content, created_at: now },
-        { role: 'assistant', content: '', created_at: now },
-      ])
+      if (
+        (!content && attachments.length === 0) ||
+        attachmentUploads > 0 ||
+        (!id && !lazyCreate) ||
+        submissionInFlightRef.current
+      )
+        return
+      submissionInFlightRef.current = true
+      let submissionStarted = false
+      const turnId = crypto.randomUUID()
       try {
+        // Refresh the server-owned lifecycle and message history before making
+        // any optimistic change. This closes the refresh/double-send gap where
+        // a remounted tab believed the thread was idle while the server still
+        // owned a running turn.
+        if (id) {
+          const snapshotResponse = await fetch(`${base}/${id}`, {
+            credentials: 'include',
+            cache: 'no-store',
+          })
+          const snapshotPayload = (await snapshotResponse
+            .json()
+            .catch(() => ({}))) as ConversationDetailResponse & {
+            detail?: string
+          }
+          if (!snapshotResponse.ok) {
+            setError(
+              chatFailureFromProblem(snapshotPayload, snapshotResponse.status)
+            )
+            return
+          }
+          const running = hasRunningServerTurn(snapshotPayload)
+          setMessages((current) =>
+            reconcileLatestHistoryPage(
+              current,
+              ensureRunningAssistant(
+                mapConversationDetail(snapshotPayload),
+                running
+              )
+            )
+          )
+          setWsTurnActive(running)
+          setTurnStartedAt(
+            running ? (snapshotPayload.turn_started_at ?? null) : null
+          )
+          if (running) {
+            setError(
+              localChatFailure(
+                'A turn is already running',
+                'Temps refreshed this thread and found an active server-owned turn. Stop it or wait for it to finish before sending another message.',
+                'turn_in_progress'
+              )
+            )
+            return
+          }
+        }
+
+        setError(null)
+        setTurnStartedAt(null)
+        setStreaming(true)
+        submissionStarted = true
+        // The preflight above established an idle durable snapshot. Render the
+        // accepted command optimistically, then reconcile its WebSocket echo by
+        // turn id; the atomic server claim remains the final concurrency gate.
+        const now = new Date().toISOString()
+        setMessages((m) => [
+          ...m,
+          {
+            role: 'user',
+            content,
+            attachments,
+            created_at: now,
+            client_turn_id: turnId,
+          },
+          {
+            role: 'assistant',
+            content: '',
+            created_at: now,
+            client_turn_id: turnId,
+          },
+        ])
         // Lazy-create the conversation on the first message (new project chat).
         if (!id) {
+          if (userScoped || projectId == null) {
+            setError(
+              localChatFailure(
+                'Thread no longer exists',
+                'This user-owned thread could not be found. Create a new thread and send the message again.',
+                'conversation_not_found',
+                false
+              )
+            )
+            dropOptimisticTurn(setMessages, turnId)
+            return
+          }
           const { data: conv, error: problem } = await createConversation({
             path: { project_id: projectId },
             body: {
@@ -1856,29 +2766,25 @@ export function DebugChatPanel({
             },
           })
           if (!conv) {
-            setError(
-              (problem as { detail?: string } | undefined)?.detail ||
-                'Could not start the chat. Make sure an AI provider is configured.'
-            )
-            dropEmptyAssistantTurn(setMessages)
+            setError(chatFailureFromProblem(problem))
+            dropOptimisticTurn(setMessages, turnId)
             return
           }
           id = conv.public_id
           providerPinnedRef.current = true
           setPublicId(conv.public_id)
         }
-        const controller = new AbortController()
-        abortRef.current = controller
         const res = await fetch(`${base}/${id}/messages`, {
           method: 'POST',
           credentials: 'include',
-          signal: controller.signal,
           headers: {
             'Content-Type': 'application/json',
-            Accept: 'text/event-stream',
+            Accept: 'application/json',
           },
           body: JSON.stringify({
             content,
+            attachments: attachments.map(({ id, name }) => ({ id, name })),
+            turn_id: turnId,
             ai_model: runtimeSelection.modelId,
             ai_thinking_level: runtimeSelection.thinkingOptionId,
             ai_permission_mode: runtimeSelection.permissionModeId,
@@ -1889,63 +2795,76 @@ export function DebugChatPanel({
               includeContext && pageContext ? pageContext.value : undefined,
           }),
         })
-        if (!res.ok || !res.body) {
-          const problem = await res.json().catch(() => ({}))
-          setError(problem.detail || 'The AI request failed.')
-          dropEmptyAssistantTurn(setMessages)
+        const responsePayload = (await res.json().catch(() => ({}))) as {
+          detail?: string
+          turn_started_at?: string
+        }
+        onConversationStatusInvalidated?.()
+        if (!res.ok) {
+          const problem = responsePayload
+          if (res.status === 409) {
+            // Another tab may have won the atomic claim after our preflight.
+            // Immediately replace optimism with the authoritative snapshot.
+            const latest = await fetch(`${base}/${id}`, {
+              credentials: 'include',
+              cache: 'no-store',
+            })
+              .then(async (response) =>
+                response.ok
+                  ? ((await response.json()) as ConversationDetailResponse)
+                  : null
+              )
+              .catch(() => null)
+            if (latest) {
+              const running = hasRunningServerTurn(latest)
+              setMessages((current) =>
+                reconcileLatestHistoryPage(
+                  current,
+                  ensureRunningAssistant(mapConversationDetail(latest), running)
+                )
+              )
+              setWsTurnActive(running)
+              setTurnStartedAt(
+                running ? (latest.turn_started_at ?? null) : null
+              )
+            } else {
+              setWsTurnActive(true)
+              dropOptimisticTurn(setMessages, turnId)
+            }
+            setError(chatFailureFromProblem(problem, res.status))
+          } else {
+            setError(chatFailureFromProblem(problem, res.status))
+            dropOptimisticTurn(setMessages, turnId)
+          }
           return
         }
-        const reader = res.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-        for (;;) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          let boundary
-          while ((boundary = buffer.indexOf('\n\n')) >= 0) {
-            const rawEvent = buffer.slice(0, boundary)
-            buffer = buffer.slice(boundary + 2)
-            let eventName = ''
-            const dataParts: string[] = []
-            for (const line of rawEvent.split('\n')) {
-              if (line.startsWith('event:')) {
-                eventName = line.slice(6).trim()
-              } else if (line.startsWith('data:')) {
-                dataParts.push(line.slice(5).replace(/^ /, ''))
-              }
-            }
-            const chunk = dataParts.join('\n')
-            applyWireEvent(eventName, chunk, setMessages, setError)
-          }
+        setInput('')
+        setPendingAttachments([])
+        if (typeof responsePayload.turn_started_at === 'string') {
+          setTurnStartedAt(responsePayload.turn_started_at)
         }
-      } catch (e) {
-        // A user-initiated Stop (AbortController) is not an error — just keep
-        // whatever streamed so far and drop the turn only if nothing arrived.
-        if (e instanceof DOMException && e.name === 'AbortError') {
-          dropEmptyAssistantTurn(setMessages)
-        } else {
-          setError('Connection error while talking to the AI.')
-          dropEmptyAssistantTurn(setMessages)
-        }
-      } finally {
-        abortRef.current = null
-        setStreaming(false)
-        wsSuppressRef.current = Math.max(0, wsSuppressRef.current - 1)
-        const queuedInterrupt = queuedInterruptRef.current
-        queuedInterruptRef.current = null
-        if (queuedInterrupt) {
-          window.setTimeout(
-            () => sendAfterInterruptRef.current(queuedInterrupt),
-            0
+        setWsTurnActive(true)
+      } catch {
+        setError(
+          localChatFailure(
+            'Could not reach Temps',
+            submissionStarted
+              ? 'The message could not be submitted because the browser lost its connection to Temps. Reconnect and try again.'
+              : 'Temps could not refresh the server-owned thread state, so the message was not sent. Reconnect and try again.',
+            'chat_connection_failed'
           )
-        }
+        )
+        if (submissionStarted) dropOptimisticTurn(setMessages, turnId)
+      } finally {
+        if (submissionStarted) setStreaming(false)
+        submissionInFlightRef.current = false
       }
     },
     [
       base,
       publicId,
       lazyCreate,
+      userScoped,
       projectId,
       contextType,
       ctxId,
@@ -1955,12 +2874,21 @@ export function DebugChatPanel({
       runtimeSelection.modelId,
       runtimeSelection.thinkingOptionId,
       runtimeSelection.permissionModeId,
+      pendingAttachments,
+      attachmentUploads,
+      onConversationStatusInvalidated,
     ]
   )
 
-  sendAfterInterruptRef.current = (text) => void send(text)
+  useEffect(() => {
+    sendAfterInterruptRef.current = (text) => void send(text)
+  }, [send])
   const submitComposer = useCallback(() => {
-    const action = chatComposerSubmitAction(input, streaming)
+    if (!input.trim() && pendingAttachments.length > 0 && !turnActive) {
+      void send('')
+      return
+    }
+    const action = chatComposerSubmitAction(input, turnActive)
     if (action === 'none') return
     if (action === 'interrupt-and-send') {
       queuedInterruptRef.current = input.trim()
@@ -1969,9 +2897,98 @@ export function DebugChatPanel({
       return
     }
     void send(input)
-  }, [input, streaming, send, stop])
+  }, [input, pendingAttachments.length, turnActive, send, stop])
+
+  const uploadAttachments = useCallback(
+    async (files: FileList | null) => {
+      if (!files || !publicId || !userScoped) return
+      const available = Math.max(0, 8 - pendingAttachments.length)
+      const selected = Array.from(files).slice(0, available)
+      if (selected.length === 0) {
+        setError(
+          localChatFailure(
+            'Attachment limit reached',
+            'A message may include at most 8 files.',
+            'attachment_limit'
+          )
+        )
+        return
+      }
+      setAttachmentUploads((count) => count + selected.length)
+      setError(null)
+      await Promise.all(
+        selected.map(async (file) => {
+          if (file.size > 20 * 1024 * 1024) {
+            setError(
+              localChatFailure(
+                'File is too large',
+                `${file.name} exceeds the 20 MB attachment limit.`,
+                'attachment_too_large'
+              )
+            )
+            return
+          }
+          const form = new FormData()
+          form.append('file', file)
+          try {
+            const response = await fetch(`${base}/${publicId}/attachments`, {
+              method: 'POST',
+              credentials: 'include',
+              body: form,
+            })
+            const payload = (await response.json().catch(() => ({}))) as
+              (ChatAttachment & { detail?: string }) | { detail?: string }
+            if (!response.ok || !('id' in payload)) {
+              throw new Error(
+                payload.detail ?? `Could not upload ${file.name}.`
+              )
+            }
+            const attachment: ChatAttachment = {
+              ...payload,
+              preview_url: payload.is_image
+                ? URL.createObjectURL(file)
+                : undefined,
+            }
+            setPendingAttachments((current) => [...current, attachment])
+          } catch (cause) {
+            setError(
+              localChatFailure(
+                'Could not attach file',
+                cause instanceof Error
+                  ? cause.message
+                  : `Could not upload ${file.name}.`,
+                'attachment_upload_failed'
+              )
+            )
+          }
+        })
+      )
+      setAttachmentUploads((count) => Math.max(0, count - selected.length))
+      if (attachmentInputRef.current) attachmentInputRef.current.value = ''
+    },
+    [base, pendingAttachments.length, publicId, userScoped]
+  )
+
+  const removePendingAttachment = useCallback((id: string) => {
+    setPendingAttachments((current) => {
+      const removed = current.find((attachment) => attachment.id === id)
+      if (removed?.preview_url) URL.revokeObjectURL(removed.preview_url)
+      return current.filter((attachment) => attachment.id !== id)
+    })
+  }, [])
 
   const start = useCallback(async () => {
+    if (userScoped || projectId == null) {
+      setError(
+        localChatFailure(
+          'Thread must be created from an application',
+          'Create this user-owned thread from the application workspace, then send the message again.',
+          'invalid_thread_scope',
+          false
+        )
+      )
+      return
+    }
     setStarting(true)
     setError(null)
     try {
@@ -1987,10 +3004,7 @@ export function DebugChatPanel({
         },
       })
       if (!conv) {
-        setError(
-          (problem as { detail?: string } | undefined)?.detail ||
-            'Could not start the chat. Make sure an AI provider is configured.'
-        )
+        setError(chatFailureFromProblem(problem))
         return
       }
       const extended = conv as typeof conv & {
@@ -2008,14 +3022,23 @@ export function DebugChatPanel({
       setPublicId(conv.public_id)
       providerPinnedRef.current = true
       setMessages([])
+      setHistoryPage({ has_more: false, next_before: null })
+      setEarlierMessagesError(null)
       void send(startPrompt, conv.public_id)
     } catch {
-      setError('Could not start the chat.')
+      setError(
+        localChatFailure(
+          'Could not start the chat',
+          'Temps could not create the conversation. Check the connection and configured AI harness, then retry.',
+          'conversation_create_failed'
+        )
+      )
     } finally {
       setStarting(false)
     }
   }, [
     projectId,
+    userScoped,
     contextType,
     ctxId,
     startPrompt,
@@ -2039,17 +3062,29 @@ export function DebugChatPanel({
   // Initialise exactly once per mount: load the existing conversation for this
   // context, or auto-start a fresh one. The panel is re-keyed per context by its
   // parent, so a context switch is a remount — hence run-once is correct.
-  const initialised = useRef(false)
   useEffect(() => {
-    if (initialised.current) return
-    initialised.current = true
     let ignore = false
     ;(async () => {
       try {
-        const { data: conv } = await findConversation({
-          path: { project_id: projectId },
-          query: { context_type: contextType, context_id: ctxId },
-        })
+        let initialDetail: ConversationDetailResponse | null = null
+        let conv: ConversationResponse | null = null
+        if (userScoped) {
+          if (!conversationPublicId) return
+          const response = await fetch(`${base}/${conversationPublicId}`, {
+            credentials: 'include',
+          })
+          if (!response.ok) {
+            throw new Error(conversationHistoryErrorMessage(response.status))
+          }
+          initialDetail = (await response.json()) as PaginatedConversationDetail
+          conv = initialDetail
+        } else if (projectId != null) {
+          const result = await findConversation({
+            path: { project_id: projectId },
+            query: { context_type: contextType, context_id: ctxId },
+          })
+          conv = result.data ?? null
+        }
         if (ignore) return
         if (!conv) {
           if (autoStart) void startRef.current()
@@ -2112,14 +3147,38 @@ export function DebugChatPanel({
           return next
         })
         setPublicId(conv.public_id)
-        const { data: detail } = await getConversation({
-          path: { project_id: projectId, public_id: conv.public_id },
-        }).catch(() => ({ data: null }))
+        const detail =
+          initialDetail ??
+          (projectId != null
+            ? (
+                await getConversation({
+                  path: { project_id: projectId, public_id: conv.public_id },
+                  throwOnError: true,
+                })
+              ).data
+            : null)
         if (!ignore && detail) {
-          setMessages(mapConversationDetail(detail))
+          const running = hasRunningServerTurn(
+            detail as typeof detail & { turn_status?: string }
+          )
+          setMessages(
+            ensureRunningAssistant(mapConversationDetail(detail), running)
+          )
+          setHistoryPage(
+            conversationHistoryPage(detail as PaginatedConversationDetail)
+          )
+          setWsTurnActive(running)
+          setTurnStartedAt(running ? (detail.turn_started_at ?? null) : null)
         }
-      } catch {
-        /* best-effort: leave the panel in its empty state */
+      } catch (cause) {
+        if (!ignore) {
+          setHistoryLoadError(
+            cause instanceof Error &&
+              cause.message.startsWith('Couldn’t load this conversation')
+              ? cause.message
+              : conversationHistoryErrorMessage()
+          )
+        }
       } finally {
         if (!ignore) setInitializing(false)
       }
@@ -2128,13 +3187,108 @@ export function DebugChatPanel({
       ignore = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyReloadNonce])
+
+  const loadEarlierMessages = useCallback(async () => {
+    const before = historyPage.next_before
+    if (
+      !publicId ||
+      !historyPage.has_more ||
+      !before ||
+      historyPageRequestRef.current
+    ) {
+      return
+    }
+
+    historyPageRequestRef.current = true
+    setLoadingEarlierMessages(true)
+    setEarlierMessagesError(null)
+    const viewport = scrollRef.current
+    prependScrollAnchorRef.current = viewport
+      ? {
+          scrollHeight: viewport.scrollHeight,
+          scrollTop: viewport.scrollTop,
+        }
+      : null
+
+    try {
+      const response = await fetch(
+        `${base}/${publicId}?before=${encodeURIComponent(before)}&limit=50`,
+        {
+          credentials: 'include',
+          cache: 'no-store',
+        }
+      )
+      const detail = (await response
+        .json()
+        .catch(() => ({}))) as PaginatedConversationDetail & {
+        detail?: string
+      }
+      if (!response.ok) {
+        throw new Error(
+          detail.detail ??
+            `Couldn’t load earlier messages (HTTP ${response.status}).`
+        )
+      }
+
+      const olderMessages = mapConversationDetail({
+        ...detail,
+        pending_permission: null,
+      })
+      setMessages((current) => prependHistoryPage(current, olderMessages))
+      setHistoryPage(conversationHistoryPage(detail))
+    } catch (cause) {
+      prependScrollAnchorRef.current = null
+      setEarlierMessagesError(
+        cause instanceof Error
+          ? cause.message
+          : 'Couldn’t load earlier messages. Scroll up to retry.'
+      )
+    } finally {
+      historyPageRequestRef.current = false
+      setLoadingEarlierMessages(false)
+    }
+  }, [base, historyPage, publicId])
+
+  const handleTranscriptScroll = useCallback(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    if (shouldLoadEarlierMessages(viewport.scrollTop, historyPage.has_more)) {
+      followTranscriptRef.current = false
+      setShowJumpToLatest(true)
+      void loadEarlierMessages()
+      return
+    }
+    const nearBottom = isChatTranscriptNearBottom(viewport)
+    followTranscriptRef.current = nearBottom
+    setShowJumpToLatest(!nearBottom)
+  }, [historyPage.has_more, loadEarlierMessages])
+
+  const scrollTranscriptToBottom = useCallback(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    followTranscriptRef.current = true
+    setShowJumpToLatest(false)
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
   }, [])
 
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+  useLayoutEffect(() => {
+    const anchor = prependScrollAnchorRef.current
+    if (!anchor) return
+    prependScrollAnchorRef.current = null
+    const viewport = scrollRef.current
+    if (!viewport) return
+    viewport.scrollTop = restoredHistoryScrollTop(anchor, viewport.scrollHeight)
   }, [messages])
 
-  // Fallback for when the SSE connection that was open when a question was
+  useLayoutEffect(() => {
+    if (!followTranscriptRef.current) return
+    const viewport = scrollRef.current
+    if (!viewport) return
+    viewport.scrollTo({ top: viewport.scrollHeight })
+  }, [messages])
+
+  // Fallback for when the WebSocket connection that was open when a question was
   // asked has died by the time the user answers it (backgrounded tab, network
   // blip, server restart). `resolvePermission` still delivers the answer to
   // the model and the reply still gets persisted — this just polls history
@@ -2161,30 +3315,53 @@ export function DebugChatPanel({
         return
       }
       attempt += 1
-      const { data: detail } = await getConversation({
-        path: { project_id: projectId, public_id: publicId },
-      }).catch(() => ({ data: null }))
+      const detail = await fetch(`${base}/${publicId}`, {
+        credentials: 'include',
+      })
+        .then(async (response) =>
+          response.ok
+            ? ((await response.json()) as ConversationDetailResponse)
+            : null
+        )
+        .catch(() => null)
       if (cancelled || !detail) {
         release()
         return
       }
-      const serverMessageCount = detail.messages?.length ?? 0
       const hasPendingPermission = Boolean(detail.pending_permission)
-      let caughtUp = false
-      setMessages((m) => {
-        if (serverMessageCount <= m.length && !hasPendingPermission) return m
-        caughtUp = true
-        return mapConversationDetail(detail)
-      })
-      if (!caughtUp) setTimeout(poll, 2000)
-      else release()
+      const running = hasRunningServerTurn(detail)
+      const terminal = permissionPollIsTerminal(
+        detail.turn_status,
+        hasPendingPermission
+      )
+      if (terminal) {
+        setMessages((current) =>
+          reconcileLatestHistoryPage(current, mapConversationDetail(detail))
+        )
+        setWsTurnActive(false)
+        setTurnStartedAt(null)
+        release()
+        return
+      }
+      setMessages((current) =>
+        reconcileLatestHistoryPage(
+          current,
+          ensureRunningAssistant(mapConversationDetail(detail), running)
+        )
+      )
+      setWsTurnActive(running)
+      setTurnStartedAt(running ? (detail.turn_started_at ?? null) : null)
+      // A non-terminal snapshot is only an intermediate recovery point. Keep
+      // polling until the server owns a terminal state; otherwise an optimistic
+      // assistant placeholder can make equal message counts look "caught up".
+      setTimeout(poll, hasPendingPermission ? 2000 : 500)
     }
     void poll()
     return () => {
       cancelled = true
       release()
     }
-  }, [projectId, publicId])
+  }, [base, publicId])
 
   // Report the active conversation id upward (lets the dock reset it).
   useEffect(() => {
@@ -2192,159 +3369,297 @@ export function DebugChatPanel({
   }, [publicId, onConversationChange])
 
   const visible = messages.filter((m) => m.role !== 'system')
-  const busy = streaming || starting
+  const busy = turnActive || starting
   // A turn in flight either from this tab's own send() or observed live from
-  // another tab over the WS — both need the "thinking" indicator to show.
-  const liveTurn = streaming || wsTurnActive
-  // Show a standalone "thinking" row only before the optimistic assistant turn
+  // another tab over the WS — both need the activity indicator to show.
+  const liveTurn = shouldShowLiveTurn(
+    streaming,
+    wsTurnActive,
+    liveUpdatesUnavailable
+  )
+  // Show a standalone activity row only before the optimistic assistant turn
   // exists (i.e. while the conversation is being created).
   const showBootRow = visible.length === 0 && busy
+  const showTrailingActivityRow =
+    !showBootRow &&
+    needsTrailingActivityRow(liveTurn, visible[visible.length - 1]?.role)
+  const activityLabel = chatTurnActivityLabel(contextType, streaming)
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
-      <div
-        ref={scrollRef}
-        className="flex-1 min-h-0 space-y-4 overflow-y-auto pr-1"
-      >
-        {/* Until the run-once init fetch resolves we can't tell "no chat yet"
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={scrollRef}
+          onScroll={handleTranscriptScroll}
+          className="h-full space-y-4 overflow-y-auto pr-1"
+        >
+          {loadingEarlierMessages && (
+            <div
+              className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground"
+              role="status"
+            >
+              <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+              Loading earlier messages…
+            </div>
+          )}
+
+          {earlierMessagesError && historyPage.has_more && (
+            <div
+              className="flex items-center justify-center gap-2 py-2 text-xs text-destructive"
+              role="alert"
+            >
+              <span>{earlierMessagesError}</span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2"
+                onClick={() => void loadEarlierMessages()}
+              >
+                Retry
+              </Button>
+            </div>
+          )}
+
+          {/* Until the run-once init fetch resolves we can't tell "no chat yet"
             (show the start button) apart from "resuming an existing chat"
             (about to load history) — both look like the empty mount state. Show
             a skeleton meanwhile so resuming doesn't flash "Start AI diagnosis". */}
-        {initializing && visible.length === 0 && !busy && (
-          <div className="space-y-4">
-            <div className="flex items-start gap-2.5">
-              <Skeleton className="h-7 w-7 shrink-0 rounded-full" />
-              <Skeleton className="h-16 flex-1 rounded-2xl rounded-tl-sm" />
+          {initializing && visible.length === 0 && !busy && (
+            <div className="space-y-4">
+              <div className="flex items-start gap-2.5">
+                <Skeleton className="h-7 w-7 shrink-0 rounded-full" />
+                <Skeleton className="h-16 flex-1 rounded-2xl rounded-tl-sm" />
+              </div>
+              <div className="flex justify-end">
+                <Skeleton className="h-9 w-2/3 rounded-2xl rounded-tr-sm" />
+              </div>
             </div>
-            <div className="flex justify-end">
-              <Skeleton className="h-9 w-2/3 rounded-2xl rounded-tr-sm" />
-            </div>
-          </div>
-        )}
+          )}
 
-        {!initializing &&
-          visible.length === 0 &&
-          !busy &&
-          !publicId &&
-          (lazyCreate ? (
-            // Free-form chat (e.g. a project chat): nothing to auto-diagnose, so
-            // invite the user to type — the first message creates the chat.
-            <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
-              <Sparkles className="h-6 w-6 text-muted-foreground" />
-              <p className="max-w-xs text-sm text-muted-foreground">
-                {emptyHint}
+          {!initializing && historyLoadError && visible.length === 0 && (
+            <div
+              className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center"
+              role="alert"
+            >
+              <Info className="h-6 w-6 text-destructive" />
+              <p className="max-w-md text-sm text-muted-foreground">
+                {historyLoadError}
               </p>
-            </div>
-          ) : (
-            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-              <Sparkles className="h-6 w-6 text-muted-foreground" />
               <Button
-                onClick={() => void start()}
-                disabled={starting || providerOptions.length === 0}
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={retryConversationHistory}
               >
-                {starting ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Sparkles className="h-4 w-4" />
-                )}
-                <span className="ml-2">Start AI diagnosis</span>
+                <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                Retry conversation
               </Button>
             </div>
-          ))}
+          )}
 
-        {showBootRow && (
-          <div className="flex items-start">
-            <div className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5 text-sm text-muted-foreground">
-              <TypingDots />
-              Reading logs and analyzing the failure…
+          {!initializing &&
+            !historyLoadError &&
+            visible.length === 0 &&
+            !busy &&
+            !publicId &&
+            (lazyCreate ? (
+              // Free-form chat (e.g. a project chat): nothing to auto-diagnose, so
+              // invite the user to type — the first message creates the chat.
+              <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+                <Sparkles className="h-6 w-6 text-muted-foreground" />
+                <p className="max-w-xs text-sm text-muted-foreground">
+                  {emptyHint}
+                </p>
+              </div>
+            ) : (
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+                <Sparkles className="h-6 w-6 text-muted-foreground" />
+                <Button
+                  onClick={() => void start()}
+                  disabled={starting || providerOptions.length === 0}
+                >
+                  {starting ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-4 w-4" />
+                  )}
+                  <span className="ml-2">Start AI diagnosis</span>
+                </Button>
+              </div>
+            ))}
+
+          {showBootRow && (
+            <div className="flex items-start">
+              <div className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5 text-sm text-muted-foreground">
+                <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
+                Reading logs and analyzing the failure…
+              </div>
             </div>
+          )}
+
+          {visible.map((m, i) => {
+            const isTrailing = i === visible.length - 1
+            // A completed assistant turn with nothing extracted (e.g. the CLI's
+            // only action was a tool call CLI-chat can't bridge — ADR-038)
+            // renders as truly nothing, not an empty styled bubble: the padded,
+            // rounded `bg-muted` wrapper below has no way to look "empty" once
+            // it exists, so skip the whole message instead of leaving a blank
+            // gray bar in the transcript that reads as an answer with no text.
+            if (
+              m.role === 'assistant' &&
+              assistantParts(m).length === 0 &&
+              !(liveTurn && isTrailing)
+            ) {
+              return null
+            }
+            return m.role === 'user' ? (
+              <div
+                key={
+                  m.server_cursor ??
+                  (m.client_turn_id
+                    ? `${m.client_turn_id}:${m.role}`
+                    : undefined) ??
+                  `${m.created_at ?? 'message'}-${i}`
+                }
+                className="group flex flex-col items-end gap-0.5"
+              >
+                <div className="flex max-w-[85%] flex-col gap-2 rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2.5 text-sm text-primary-foreground">
+                  <ChatAttachments
+                    attachments={m.attachments ?? []}
+                    contentBase={
+                      userScoped && publicId
+                        ? `${base}/${publicId}/attachments`
+                        : undefined
+                    }
+                  />
+                  {m.content && (
+                    <div className="whitespace-pre-wrap">{m.content}</div>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 px-1">
+                  {m.created_at && (
+                    <TimeAgo
+                      date={m.created_at}
+                      className="text-[10px] text-muted-foreground"
+                    />
+                  )}
+                  <MessageCopyButton text={messageCopyText(m)} />
+                </div>
+              </div>
+            ) : (
+              <div
+                key={
+                  m.server_cursor ??
+                  (m.client_turn_id
+                    ? `${m.client_turn_id}:${m.role}`
+                    : undefined) ??
+                  `${m.created_at ?? 'message'}-${i}`
+                }
+                className="group flex items-start"
+              >
+                <div className="min-w-0 flex-1 space-y-1">
+                  <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
+                    <AssistantBody
+                      message={m}
+                      streaming={liveTurn && isTrailing}
+                      activityLabel={activityLabel}
+                      turnStartedAt={turnStartedAt}
+                      pendingActionBasePath={pendingActionBasePath}
+                      conversationBasePath={base}
+                      conversationPublicId={publicId}
+                      onFix={(text) => void send(text)}
+                      onPermissionResolved={pollForReply}
+                    />
+                  </div>
+                  {assistantParts(m).length > 0 && (
+                    <div className="flex items-center gap-1 px-1">
+                      {m.created_at && (
+                        <TimeAgo
+                          date={m.created_at}
+                          className="text-[10px] text-muted-foreground"
+                        />
+                      )}
+                      <MessageCopyButton text={messageCopyText(m)} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+
+          {showTrailingActivityRow && (
+            <div className="flex items-start">
+              <div className="rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5 text-sm text-muted-foreground">
+                <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {showJumpToLatest && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              className="pointer-events-auto h-8 gap-1.5 rounded-full px-3 shadow-md dark:shadow-none"
+              onClick={scrollTranscriptToBottom}
+            >
+              <ArrowDown className="size-4 shrink-0" aria-hidden="true" />
+              Jump to latest
+            </Button>
           </div>
         )}
-
-        {visible.map((m, i) => {
-          const isTrailing = i === visible.length - 1
-          // A completed assistant turn with nothing extracted (e.g. the CLI's
-          // only action was a tool call CLI-chat can't bridge — ADR-038)
-          // renders as truly nothing, not an empty styled bubble: the padded,
-          // rounded `bg-muted` wrapper below has no way to look "empty" once
-          // it exists, so skip the whole message instead of leaving a blank
-          // gray bar in the transcript that reads as an answer with no text.
-          if (
-            m.role === 'assistant' &&
-            assistantParts(m).length === 0 &&
-            !(liveTurn && isTrailing)
-          ) {
-            return null
-          }
-          return m.role === 'user' ? (
-            <div key={i} className="group flex flex-col items-end gap-0.5">
-              <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2.5 text-sm text-primary-foreground">
-                {m.content}
-              </div>
-              <div className="flex items-center gap-1 px-1">
-                {m.created_at && (
-                  <TimeAgo
-                    date={m.created_at}
-                    className="text-[10px] text-muted-foreground"
-                  />
-                )}
-                <MessageCopyButton text={messageCopyText(m)} />
-              </div>
-            </div>
-          ) : (
-            <div key={i} className="group flex items-start">
-              <div className="min-w-0 flex-1 space-y-1">
-                <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
-                  <AssistantBody
-                    message={m}
-                    streaming={liveTurn && isTrailing}
-                    projectId={projectId}
-                    conversationPublicId={publicId}
-                    onFix={(text) => void send(text)}
-                    onPermissionResolved={pollForReply}
-                  />
-                </div>
-                {assistantParts(m).length > 0 && (
-                  <div className="flex items-center gap-1 px-1">
-                    {m.created_at && (
-                      <TimeAgo
-                        date={m.created_at}
-                        className="text-[10px] text-muted-foreground"
-                      />
-                    )}
-                    <MessageCopyButton text={messageCopyText(m)} />
-                  </div>
-                )}
-              </div>
-            </div>
-          )
-        })}
-
-        {recoveredPendingActions.map((action) => (
-          <div key={action.public_id} className="flex items-start">
-            <div className="min-w-0 flex-1 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
-              <PendingActionCard
-                projectId={projectId}
-                tool={{
-                  id: `pending-${action.public_id}`,
-                  name: 'temps_write',
-                  arguments: '',
-                  result: JSON.stringify({
-                    status: 'proposed',
-                    action_id: action.public_id,
-                    operation: action.operation_id,
-                    method: action.method,
-                    summary: action.summary,
-                  }),
-                }}
-                onFix={(text) => void send(text)}
-              />
-            </div>
-          </div>
-        ))}
       </div>
 
-      {error && <p className="text-sm text-destructive">{error}</p>}
+      {liveUpdatesUnavailable && (
+        <div
+          className="flex items-center gap-2 rounded-md border border-muted-foreground/20 bg-muted/50 px-3 py-2 text-xs text-muted-foreground"
+          role="status"
+        >
+          <Info className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            Live updates are unavailable. Completed replies will appear here.
+          </span>
+        </div>
+      )}
+
+      {historyLoadError && visible.length > 0 && (
+        <div
+          className="flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          role="alert"
+        >
+          <span>{historyLoadError}</span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7"
+            onClick={retryConversationHistory}
+          >
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {error && (
+        <div
+          className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5"
+          role="alert"
+          data-error-code={error.code}
+        >
+          <Info className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <div className="min-w-0 space-y-0.5">
+            <p className="text-sm font-medium text-destructive">
+              {error.title}
+            </p>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {error.detail}
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Page-context chip: tells the user what page context is attached, and
           lets them toggle whether it's sent with the next message. */}
@@ -2373,9 +3688,11 @@ export function DebugChatPanel({
         </button>
       )}
 
-      <InteractiveToolsNotice provider={selectedProvider} />
-      <WriteActionsEnabler projectId={projectId} />
-
+      <InteractiveToolsNotice
+        provider={selectedProvider}
+        contextType={contextType}
+        permissionMode={runtimeSelection.permissionModeId}
+      />
       {providerStatusState === 'loading' && providerOptions.length === 0 && (
         <div
           className="flex items-center gap-2 text-xs text-muted-foreground"
@@ -2424,7 +3741,26 @@ export function DebugChatPanel({
           </div>
         )}
 
-      <div className="shrink-0 overflow-hidden rounded-lg border border-input bg-background transition-[border-color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20">
+      <div className="shrink-0 overflow-hidden rounded-2xl border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20">
+        {(pendingAttachments.length > 0 || attachmentUploads > 0) && (
+          <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
+            <ChatAttachments
+              attachments={pendingAttachments}
+              onRemove={removePendingAttachment}
+              contentBase={
+                userScoped && publicId
+                  ? `${base}/${publicId}/attachments`
+                  : undefined
+              }
+            />
+            {attachmentUploads > 0 && (
+              <div className="flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-xs text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" />
+                Uploading {attachmentUploads}
+              </div>
+            )}
+          </div>
+        )}
         <Textarea
           ref={composerRef}
           autoFocus
@@ -2441,8 +3777,36 @@ export function DebugChatPanel({
             }
           }}
         />
-        <div className="flex items-center justify-between gap-2 border-t px-2 py-1.5">
-          <div className="flex min-w-0 flex-wrap items-center gap-0.5">
+        <div className="flex items-center justify-between gap-2 border-t px-2 py-1.5 sm:px-3 sm:py-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
+            <input
+              ref={attachmentInputRef}
+              type="file"
+              multiple
+              className="sr-only"
+              onChange={(event) => void uploadAttachments(event.target.files)}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0 rounded-full"
+              disabled={
+                !userScoped ||
+                !publicId ||
+                attachmentUploads > 0 ||
+                pendingAttachments.length >= 8
+              }
+              onClick={() => attachmentInputRef.current?.click()}
+              aria-label="Attach files or images"
+              title={
+                !publicId
+                  ? 'Create the workspace thread before attaching files'
+                  : 'Attach files or images (20 MB each)'
+              }
+            >
+              <Paperclip className="size-3.5" />
+            </Button>
             {providerStatusState === 'loading' ? (
               <div
                 className="flex h-8 items-center gap-2 px-2"
@@ -2465,13 +3829,13 @@ export function DebugChatPanel({
                   }
                   disabled={
                     Boolean(publicId) ||
-                    streaming ||
+                    turnActive ||
                     starting ||
                     providerOptions.length === 0
                   }
                 >
                   <SelectTrigger
-                    className="h-8 w-auto max-w-64 border-0 bg-transparent px-2 text-xs shadow-none"
+                    className="h-8 w-auto max-w-64 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
                     title={
                       publicId
                         ? 'Provider is fixed when a conversation is created'
@@ -2480,21 +3844,29 @@ export function DebugChatPanel({
                   >
                     {publicId ? (
                       <Lock className="mr-1 h-3 w-3 shrink-0" />
-                    ) : (
-                      <Bot className="mr-1 h-3.5 w-3.5 shrink-0" />
+                    ) : null}
+                    {selectedProvider && (
+                      <AiHarnessLogo
+                        providerId={selectedProvider}
+                        size={20}
+                        className="mr-1"
+                      />
                     )}
-                    <SelectValue
-                      placeholder={
-                        providerOptions.length === 0
+                    <SelectValue>
+                      {selectedProviderOption
+                        ? chatProviderLabel(selectedProviderOption)
+                        : providerOptions.length === 0
                           ? 'No provider configured'
-                          : 'Select provider'
-                      }
-                    />
+                          : 'Select provider'}
+                    </SelectValue>
                   </SelectTrigger>
                   <SelectContent>
                     {providerOptions.map((provider) => (
                       <SelectItem key={provider.id} value={provider.id}>
-                        {chatProviderLabel(provider)}
+                        <span className="flex items-center gap-2">
+                          <AiHarnessLogo providerId={provider.id} size={22} />
+                          <span>{chatProviderLabel(provider)}</span>
+                        </span>
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -2508,13 +3880,23 @@ export function DebugChatPanel({
                       size="sm"
                       className="h-8 px-1 text-xs"
                     >
-                      <a href="/ai-gateway">Configure an AI provider</a>
+                      <a
+                        href={
+                          contextType === 'application'
+                            ? '/agent-sandbox/providers'
+                            : '/ai-gateway'
+                        }
+                      >
+                        {contextType === 'application'
+                          ? 'Configure a harness'
+                          : 'Configure an AI provider'}
+                      </a>
                     </Button>
                   )}
 
                 {selectedProviderOption &&
                   selectedProviderOption.models.length > 0 && (
-                    <Select
+                    <SearchableSelect
                       value={runtimeSelection.modelId ?? undefined}
                       onValueChange={(modelId) =>
                         setRuntimeSelection(
@@ -2529,28 +3911,23 @@ export function DebugChatPanel({
                           )
                         )
                       }
-                      disabled={streaming || starting}
-                    >
-                      <SelectTrigger
-                        className="h-8 w-auto max-w-56 border-0 bg-transparent px-2 text-xs shadow-none"
-                        title="Choose the model for the next turn"
-                      >
-                        <Sparkles className="mr-1 h-3.5 w-3.5 shrink-0" />
-                        <SelectValue placeholder="Model" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {selectedProviderOption.models.map((model) => (
-                          <SelectItem key={model.id} value={model.id}>
-                            {model.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      options={modelOptions}
+                      placeholder="Model"
+                      searchPlaceholder="Search models..."
+                      emptyText="No matching models."
+                      searchMode="contains"
+                      disabled={turnActive || starting}
+                      icon={<Sparkles className="mr-1 h-3.5 w-3.5 shrink-0" />}
+                      title="Choose the model for the next turn"
+                      className="h-8 w-auto max-w-56 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                    />
                   )}
 
                 {selectedModelOption &&
-                  (selectedModelOption.tool_thinking_options ??
-                    selectedModelOption.thinking_options).length > 0 && (
+                  (
+                    selectedModelOption.tool_thinking_options ??
+                    selectedModelOption.thinking_options
+                  ).length > 0 && (
                     <Select
                       value={runtimeSelection.thinkingOptionId ?? undefined}
                       onValueChange={(thinkingOptionId) =>
@@ -2559,30 +3936,29 @@ export function DebugChatPanel({
                           thinkingOptionId,
                         }))
                       }
-                      disabled={streaming || starting}
+                      disabled={turnActive || starting}
                     >
                       <SelectTrigger
-                        className="h-8 w-auto max-w-40 border-0 bg-transparent px-2 text-xs shadow-none"
+                        className="h-8 w-auto max-w-40 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
                         title={
                           publicId
                             ? 'Choose the reasoning level for the next turn'
                             : 'Choose how much reasoning the model should use'
                         }
                       >
+                        <Brain
+                          className="mr-1 size-4 shrink-0"
+                          aria-hidden="true"
+                        />
                         <SelectValue placeholder="Thinking" />
                       </SelectTrigger>
                       <SelectContent>
-                        {(selectedModelOption.tool_thinking_options ??
+                        {(
+                          selectedModelOption.tool_thinking_options ??
                           selectedModelOption.thinking_options
                         ).map((option) => (
                           <SelectItem key={option.id} value={option.id}>
-                            <span className="flex items-center gap-2">
-                              <Brain
-                                className="h-4 w-4 shrink-0"
-                                aria-hidden="true"
-                              />
-                              <span>{option.name}</span>
-                            </span>
+                            {chatThinkingItemContent(option)}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -2594,24 +3970,38 @@ export function DebugChatPanel({
                     <Select
                       value={runtimeSelection.permissionModeId ?? undefined}
                       onValueChange={(permissionModeId) =>
-                        setRuntimeSelection((selection) => ({
-                          ...selection,
-                          permissionModeId,
-                        }))
+                        void changePermissionMode(permissionModeId)
                       }
-                      disabled={streaming || starting}
+                      disabled={
+                        starting ||
+                        (turnActive &&
+                          permissionModeIsAuto(
+                            runtimeSelection.permissionModeId
+                          ))
+                      }
                     >
                       <SelectTrigger
-                        className="h-8 w-auto max-w-48 border-0 bg-transparent px-2 text-xs shadow-none"
-                        title="Choose the permission mode for the next turn"
+                        className="h-8 w-auto max-w-48 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                        title={
+                          turnActive
+                            ? 'Switch this running sandbox turn to Auto'
+                            : 'Choose the permission mode for the next turn'
+                        }
                       >
                         <Shield className="mr-1 h-3.5 w-3.5 shrink-0" />
                         <SelectValue placeholder="Permissions" />
                       </SelectTrigger>
                       <SelectContent>
                         {selectedProviderOption.permission_modes.map((mode) => (
-                          <SelectItem key={mode.id} value={mode.id}>
-                            {mode.name}
+                          <SelectItem
+                            key={mode.id}
+                            value={mode.id}
+                            disabled={permissionModeOptionDisabled(
+                              turnActive,
+                              mode.id
+                            )}
+                          >
+                            {chatPermissionLabel(mode)}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -2623,7 +4013,7 @@ export function DebugChatPanel({
                   variant="ghost"
                   size="icon"
                   className="h-8 w-8 shrink-0"
-                  disabled={providerRefreshing || streaming || starting}
+                  disabled={providerRefreshing || turnActive || starting}
                   onClick={() => void loadProviderStatus(true)}
                   aria-label="Refresh provider authentication and models"
                   title="Refresh provider authentication and models"
@@ -2638,12 +4028,13 @@ export function DebugChatPanel({
               </>
             )}
           </div>
-          {streaming && !input.trim() ? (
+          {turnActive && !input.trim() ? (
             <Button
               type="button"
               onClick={stop}
               size="icon"
               variant="secondary"
+              className="rounded-full"
               title="Stop generating"
               aria-label="Stop generating"
             >
@@ -2653,11 +4044,13 @@ export function DebugChatPanel({
             <Button
               onClick={submitComposer}
               disabled={
-                !input.trim() ||
+                (!input.trim() && pendingAttachments.length === 0) ||
+                attachmentUploads > 0 ||
                 (!publicId && !lazyCreate) ||
                 (!publicId && providerOptions.length === 0)
               }
               size="icon"
+              className="rounded-full"
               aria-label={
                 streaming ? 'Interrupt and send message' : 'Send message'
               }

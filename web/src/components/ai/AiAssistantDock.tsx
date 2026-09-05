@@ -8,7 +8,6 @@ import {
   getProjects,
   listAllConversations,
   renameConversation,
-  updateProjectSettings,
 } from '@/api/client'
 import {
   AlertDialog,
@@ -52,7 +51,6 @@ import {
   Sparkles,
   Trash2,
   X,
-  Zap,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
@@ -61,6 +59,7 @@ import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import {
   conversationListNeedsRefresh,
   createProjectChat,
+  hasProjectScope,
   resolvePageChat,
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
@@ -76,6 +75,8 @@ interface ActiveChat {
   startPrompt?: string
   autoStart: boolean
 }
+
+type ProjectConversation = GlobalConversationResponse & { project_id: number }
 
 const CONTEXT_META: Record<string, { label: string; Icon: typeof GitBranch }> =
   {
@@ -294,9 +295,7 @@ export function DockBody({
   useEffect(() => {
     saveActiveChat(active)
   }, [active])
-  const [conversations, setConversations] = useState<
-    GlobalConversationResponse[]
-  >([])
+  const [conversations, setConversations] = useState<ProjectConversation[]>([])
   const [loadingList, setLoadingList] = useState(false)
   // Set once the first list fetch settles (success or failure) — distinct
   // from `loadingList` (which starts `false` before the fetch is even
@@ -325,7 +324,12 @@ export function DockBody({
   const loadList = useCallback(() => {
     setLoadingList(true)
     listAllConversations()
-      .then(({ data }) => setConversations(data ?? []))
+      // The classic assistant only operates through legacy project routes.
+      // User-owned application/global chats live in the AI workspace and must
+      // not be coerced back into a fabricated project scope here.
+      .then(({ data }) =>
+        setConversations((data ?? []).filter(hasProjectScope))
+      )
       .catch(() => setConversations([]))
       .finally(() => {
         setLoadingList(false)
@@ -362,7 +366,7 @@ export function DockBody({
     }
   }, [initialContext, loadList])
 
-  const openConversation = useCallback((c: GlobalConversationResponse) => {
+  const openConversation = useCallback((c: ProjectConversation) => {
     // The list already knows this id. Setting it immediately avoids an
     // intermediate render where URL synchronization can mistake a resolved
     // conversation for an unsaved draft.
@@ -499,7 +503,7 @@ export function DockBody({
     }
   }
 
-  const startRename = (c: GlobalConversationResponse) => {
+  const startRename = (c: ProjectConversation) => {
     setRenameValue(c.title ?? '')
     setPendingRename({ projectId: c.project_id, publicId: c.public_id })
   }
@@ -914,13 +918,13 @@ function ConversationList({
   onDelete,
 }: {
   loading: boolean
-  conversations: GlobalConversationResponse[]
+  conversations: ProjectConversation[]
   /** Public id of the chat currently open, highlighted in list-detail layouts. */
   activeId?: string | null
-  onOpen: (c: GlobalConversationResponse) => void
-  onOpenSource: (c: GlobalConversationResponse) => void
-  onRename: (c: GlobalConversationResponse) => void
-  onDelete: (c: GlobalConversationResponse) => void
+  onOpen: (c: ProjectConversation) => void
+  onOpenSource: (c: ProjectConversation) => void
+  onRename: (c: ProjectConversation) => void
+  onDelete: (c: ProjectConversation) => void
 }) {
   if (loading) {
     return (
@@ -1046,9 +1050,6 @@ function ProjectPicker({
   const [projects, setProjects] = useState<ProjectResponse[]>([])
   const [loading, setLoading] = useState(true)
   const [q, setQ] = useState('')
-  // Project id currently being enabled+opened, so its row shows a spinner and
-  // can't be double-clicked.
-  const [enablingId, setEnablingId] = useState<number | null>(null)
   // True when more projects exist than the single page we fetched, so the
   // client-side search can't reach all of them — surfaced, never silent.
   const [truncated, setTruncated] = useState(false)
@@ -1072,40 +1073,7 @@ function ProjectPicker({
     }
   }, [])
 
-  // Open an already-enabled project's chat, or enable the read-only chat inline
-  // then open it. Enabling flips only `ai_debug_chat_enabled` (read-only, safe);
-  // it never touches write actions. A 403 means the user lacks settings
-  // permission — surfaced as a toast rather than a silent no-op.
-  const pick = useCallback(
-    async (p: ProjectResponse) => {
-      if (p.ai_debug_chat_enabled === true) {
-        onSelect(p)
-        return
-      }
-      setEnablingId(p.id)
-      try {
-        const { error } = await updateProjectSettings({
-          path: { project_id: p.id },
-          body: { ai_debug_chat_enabled: true },
-        })
-        if (error) throw error
-        setProjects((prev) =>
-          prev.map((x) =>
-            x.id === p.id ? { ...x, ai_debug_chat_enabled: true } : x
-          )
-        )
-        toast.success(`AI chat enabled for ${p.name}`)
-        onSelect({ ...p, ai_debug_chat_enabled: true })
-      } catch {
-        toast.error(
-          "Couldn't enable AI chat — you may need project admin permission."
-        )
-      } finally {
-        setEnablingId(null)
-      }
-    },
-    [onSelect]
-  )
+  const pick = useCallback((p: ProjectResponse) => onSelect(p), [onSelect])
 
   const needle = q.trim().toLowerCase()
   const filtered = needle
@@ -1150,13 +1118,7 @@ function ProjectPicker({
               key={p.id}
               type="button"
               onClick={() => pick(p)}
-              disabled={enablingId === p.id}
-              title={
-                p.ai_debug_chat_enabled === true
-                  ? undefined
-                  : 'AI chat is off for this project — click to enable it and start'
-              }
-              className="group flex w-full items-center gap-3 rounded-md border border-transparent px-2 py-2.5 text-left transition-colors hover:border-border hover:bg-accent disabled:opacity-60"
+              className="group flex w-full items-center gap-3 rounded-md border border-transparent px-2 py-2.5 text-left transition-colors hover:border-border hover:bg-accent"
             >
               <ProjectAvatar
                 name={p.name}
@@ -1171,16 +1133,7 @@ function ProjectPicker({
                   </div>
                 )}
               </div>
-              {enablingId === p.id ? (
-                <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
-              ) : p.ai_debug_chat_enabled === true ? (
-                <Plus className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-              ) : (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
-                  <Zap className="h-3 w-3" />
-                  Enable
-                </span>
-              )}
+              <Plus className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
             </button>
           ))}
           {truncated && (

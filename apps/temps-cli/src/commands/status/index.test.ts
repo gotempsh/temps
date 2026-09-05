@@ -14,7 +14,6 @@ function makeEnv(overrides: Partial<EnvironmentResponse> = {}): EnvironmentRespo
     is_preview: false,
     project_id: 1,
     created_at: 0,
-    ai_write_actions_enabled: false,
     ...overrides,
   } as EnvironmentResponse
 }

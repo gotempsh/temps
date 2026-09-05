@@ -107,6 +107,7 @@ impl TempsPlugin for AiChatPlugin {
                     db.clone(),
                     audit_service.clone(),
                 )),
+                Arc::new(crate::GlobalChatProvider),
                 Arc::new(ProjectChatProvider::new(db.clone())),
                 // ADR-024: generic API meta-tools (search_api, describe_api, call_api).
                 // Uses the sentinel context_type "__api_tools__" — never selected as a
@@ -123,20 +124,49 @@ impl TempsPlugin for AiChatPlugin {
                 Arc::new(RepoToolsProvider::new(db.clone(), git)),
             ];
 
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let application_workspaces = Arc::new(crate::ApplicationWorkspaceService::new(
+                config_service.data_dir(),
+            ));
+            context.register_service(application_workspaces.clone());
+            let applications = Arc::new(crate::ApplicationService::new(db.clone()));
+            context.register_service(applications.clone());
+
             // Optional: operator-tuned chat limits (turn timeout). Absent in
             // minimal wirings, where the compiled defaults apply.
             let config_service = context.get_service::<temps_config::ConfigService>();
             let mut service = ConversationService::new(db.clone(), ai, providers)
-                .with_write_support(write_handle, pending_actions.clone());
+                .with_write_support(write_handle, pending_actions.clone(), audit_service.clone())
+                .with_application_workspaces(application_workspaces.clone())
+                .with_application_service(applications.clone());
+            if let Some(sandboxes) = context.get_service::<temps_sandbox::SandboxService>() {
+                service = service.with_application_sandboxes(sandboxes);
+            } else {
+                tracing::warn!(
+                    "SandboxService is unavailable; application harness turns will fail closed"
+                );
+            }
             if let Some(cfg) = &config_service {
                 service = service.with_config(cfg.clone());
+            }
+
+            match service.recover_interrupted_turns().await {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(
+                    count,
+                    "marked AI turns from the previous server process as interrupted"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "failed to recover persisted AI turn state: {error}"
+                    )))
+                }
             }
 
             let service = Arc::new(service);
             context.register_service(service.clone());
 
-            let applications = Arc::new(crate::ApplicationService::new(db.clone()));
-            context.register_service(applications.clone());
+            let project_service = context.require_service::<temps_projects::ProjectService>();
 
             let app_state = Arc::new(AppState {
                 service,
@@ -144,6 +174,12 @@ impl TempsPlugin for AiChatPlugin {
                 audit_service,
                 pending_actions,
                 applications,
+                project_service,
+                application_workspaces,
+                application_sandboxes: context.get_service::<temps_sandbox::SandboxService>(),
+                sandbox_snapshots: context
+                    .get_service::<temps_sandbox::services::SnapshotService>(),
+                source_drop_deployer: context.get_service::<dyn temps_core::SourceDropDeployer>(),
                 project_access_checker: None,
             });
             context.register_plugin_state("ai_chat", app_state);
@@ -162,9 +198,22 @@ impl TempsPlugin for AiChatPlugin {
             audit_service: old.audit_service.clone(),
             pending_actions: old.pending_actions.clone(),
             applications: old.applications.clone(),
+            project_service: old.project_service.clone(),
+            application_workspaces: old.application_workspaces.clone(),
+            application_sandboxes: old.application_sandboxes.clone(),
+            sandbox_snapshots: old.sandbox_snapshots.clone(),
+            // Route assembly runs after every plugin has registered services.
+            // Resolve again here so initialization order cannot freeze Drop
+            // support as unavailable for the lifetime of the chat plugin.
+            source_drop_deployer: context
+                .get_service::<dyn temps_core::SourceDropDeployer>()
+                .or_else(|| old.source_drop_deployer.clone()),
             project_access_checker,
         });
-        let router = handlers::configure_routes().with_state(app_state);
+        let model_relay = context.require_service::<temps_ai_agent_cli::SandboxModelRelayService>();
+        let router = handlers::configure_routes()
+            .with_state(app_state)
+            .merge(temps_ai_agent_cli::sandbox_model_relay_routes().with_state(model_relay));
         Some(PluginRoutes::new(router))
     }
 

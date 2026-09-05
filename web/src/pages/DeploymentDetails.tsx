@@ -1414,7 +1414,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         )}
 
         {/* Deployment Pipeline — failed stages expose a "Debug with AI" sidebar
-            (ADR-023), gated on the project's ai_debug_chat_enabled toggle */}
+          (ADR-023), gated by the user's project access */}
         <DeploymentStages project={project} deployment={deployment} />
 
         {/* Captured logs from previous containers (survive teardown) */}

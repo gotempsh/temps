@@ -432,12 +432,10 @@ impl RedisService {
             }))
             .await?;
 
-        if !containers.is_empty() {
+        if let Some(existing_container) = super::exact_named_container(&containers, &container_name)
+        {
             // Check if we need to recreate with a new image
-            let existing_image = containers
-                .first()
-                .and_then(|c| c.image.as_deref())
-                .unwrap_or("");
+            let existing_image = existing_container.image.as_deref().unwrap_or("");
 
             if existing_image == config.docker_image {
                 info!(
@@ -2268,7 +2266,8 @@ impl ExternalService for RedisService {
             }))
             .await?;
 
-        if containers.is_empty() {
+        let existing_container = super::exact_named_container(&containers, &container_name);
+        if existing_container.is_none() {
             let mut config =
                 existing_config.ok_or_else(|| anyhow::anyhow!("Redis configuration not found"))?;
             if config.container_name.is_some() {
@@ -2283,9 +2282,12 @@ impl ExternalService for RedisService {
                 .await?;
             *self.config.write().await = Some(config);
         } else {
+            let container_id = existing_container
+                .and_then(|container| container.id.as_deref())
+                .unwrap_or(&container_name);
             self.docker
                 .start_container(
-                    &container_name,
+                    container_id,
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
                 .await
@@ -2326,7 +2328,7 @@ impl ExternalService for RedisService {
             }))
             .await?;
 
-        if !containers.is_empty() {
+        if super::exact_named_container(&containers, &container_name).is_some() {
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
@@ -2359,7 +2361,7 @@ impl ExternalService for RedisService {
             }))
             .await?;
 
-        if !containers.is_empty() {
+        if super::exact_named_container(&containers, &container_name).is_some() {
             // Stop container first if running
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
