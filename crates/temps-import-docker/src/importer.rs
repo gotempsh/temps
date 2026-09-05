@@ -650,6 +650,7 @@ impl WorkloadImporter for DockerImporter {
 
         let create_project_request = temps_projects::services::types::CreateProjectRequest {
             name: context.project_name.clone(),
+            expected_slug: None,
             repo_name: context.repo_name.clone(),
             repo_owner: context.repo_owner.clone(),
             directory: context.directory.clone(),
@@ -677,6 +678,10 @@ impl WorkloadImporter for DockerImporter {
             git_url: None,
             git_provider_connection_id: context.git_provider_connection_id,
             exposed_port: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
         };

@@ -27,6 +27,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { KeyboardShortcut } from '@/components/ui/keyboard-shortcut'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import {
+  historicalImageRuntime,
+  serviceTemplateDeployOverrides,
+} from '@/lib/template-runtime-defaults'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -249,19 +253,22 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
-  // Resolve the prebuilt image ref for a docker_image project: prefer the
-  // selected deployment's image, else the most recent deployment that has one.
+  // A historical redeploy preserves that deployment's image. A new deployment
+  // uses the project's saved service-template image before falling back to the
+  // latest deployment (for projects created before runtime persistence).
   const resolveImageRef = useCallback((): string | undefined => {
     const deployments = deploymentsData?.deployments ?? []
     if (selectedDeployment != null) {
       const sel = deployments.find((d) => d.id === selectedDeployment)
       if (sel?.metadata?.externalImageRef) return sel.metadata.externalImageRef
     }
+    const savedImage = serviceTemplateDeployOverrides(project).image_ref
+    if (savedImage) return savedImage
     return (
       deployments.find((d) => d.metadata?.externalImageRef)?.metadata
         ?.externalImageRef ?? undefined
     )
-  }, [deploymentsData?.deployments, selectedDeployment])
+  }, [deploymentsData?.deployments, project, selectedDeployment])
 
   const imageRef = resolveImageRef()
 
@@ -309,6 +316,12 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   }) => {
     // docker_image projects re-pull the given image; git projects run the pipeline.
     if (project.source_type === 'docker_image') {
+      const selected = deploymentsData?.deployments.find(
+        (deployment) => deployment.id === selectedDeployment
+      )
+      const savedRuntime = selected
+        ? historicalImageRuntime(selected.metadata)
+        : serviceTemplateDeployOverrides(project)
       const ref = editedImageRef?.trim() || resolveImageRef()
       if (!ref) {
         toast.error('No image reference found for this project')
@@ -316,7 +329,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       }
       await redeployImage.mutateAsync({
         path: { project_id: project.id, environment_id: environmentId },
-        body: { image_ref: ref },
+        body: { ...savedRuntime, image_ref: ref },
       })
       return
     }
@@ -423,7 +436,10 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     try {
       await deployImageMut.mutateAsync({
         path: { project_id: project.id, environment_id: parseInt(imageEnv) },
-        body: { image_ref: ref },
+        body: {
+          ...serviceTemplateDeployOverrides(project),
+          image_ref: ref,
+        },
       })
       toast.success('Image deployment started')
       setImageDialogOpen(false)

@@ -199,9 +199,9 @@ impl AuditOperation for EnvironmentDeletedAudit {
 }
 
 /// Emitted when an existing environment variable is converted into a
-/// write-only secret. The transition is one-way and permanently removes the
-/// value from every read path, so it gets its own audit event rather than
-/// being folded into a generic "variable updated" record.
+/// secret. The transition is one-way and permanently removes the value from
+/// list responses, so it gets its own audit event rather than being folded
+/// into a generic "variable updated" record.
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvironmentVariablePromotedToSecretAudit {
     pub context: AuditContext,

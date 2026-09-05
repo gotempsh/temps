@@ -11,6 +11,11 @@ use utoipa::ToSchema;
 pub enum StatusPageError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+    #[error("failed to construct the status-monitor HTTP client: {source}")]
+    HttpClientBuild {
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("Not found")]
     NotFound,
     #[error("Validation error: {0}")]

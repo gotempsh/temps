@@ -5,10 +5,7 @@ export interface DropEnvironmentVariable {
   id: string
   key: string
   value: string
-  /**
-   * Write-only: temps stores the value encrypted and never returns the
-   * plaintext again, so it can be replaced but never read back.
-   */
+  /** Adds stricter masking and permission-checked, audited reveals. */
   isSecret: boolean
 }
 
@@ -26,10 +23,9 @@ export function validateDropEnvironmentVariables(
       return `${key} is not a valid environment variable key`
     }
     if (seen.has(key)) return `${key} is defined more than once`
-    // A secret is write-only once saved, so an empty one could never be
-    // filled in afterwards. The server rejects it too.
+    // Empty secrets are unusable credentials. The server rejects them too.
     if (variable.isSecret && !variable.value) {
-      return `${key} is marked as a secret but has no value — secrets cannot be filled in later`
+      return `${key} is marked as a secret but has no value`
     }
     seen.add(key)
   }

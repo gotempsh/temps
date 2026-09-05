@@ -1352,6 +1352,7 @@ mod tests {
             check_path: None,
             check_interval_seconds: 60,
             is_active: true,
+            is_managed: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

@@ -11,6 +11,7 @@ Browse deployment templates
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
+- `validate` - Validate a Temps-native template YAML file or directory offline
 
 ### `templates list` (alias: `ls`)
 
@@ -21,4 +22,14 @@ List available templates
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
-| `--type <type>` | Filter by project type (server, static) | - | No |
+| `--kind <kind>` | Filter by template gallery (starter, service) | - | No |
+
+### `templates validate`
+
+Validate a Temps-native template YAML file or directory offline
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |

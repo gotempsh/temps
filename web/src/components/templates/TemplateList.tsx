@@ -13,19 +13,31 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { Search, Star, Loader2, LayoutGrid, List } from 'lucide-react'
+import { Skeleton } from '@/components/ui/skeleton'
+import {
+  AlertCircle,
+  Search,
+  Star,
+  LayoutGrid,
+  List,
+  RefreshCw,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface TemplateListProps {
   onTemplateSelect: (template: TemplateResponse) => void
   selectedTemplate?: TemplateResponse | null
   showFeaturedFirst?: boolean
+  kind?: 'starter' | 'service'
+  showTagFilter?: boolean
 }
 
 export function TemplateList({
   onTemplateSelect,
   selectedTemplate,
   showFeaturedFirst = true,
+  kind = 'starter',
+  showTagFilter = true,
 }: TemplateListProps) {
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
@@ -33,11 +45,17 @@ export function TemplateList({
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid')
 
   // Fetch templates
-  const { data: templatesData, isLoading: isLoadingTemplates } = useQuery({
+  const {
+    data: templatesData,
+    isLoading: isLoadingTemplates,
+    isError: isTemplatesError,
+    refetch: refetchTemplates,
+  } = useQuery({
     ...listProjectTemplatesOptions({
       query: {
         featured: showFeaturedOnly ? true : undefined,
         tag: selectedTag || undefined,
+        kind,
       },
     }),
   })
@@ -46,17 +64,18 @@ export function TemplateList({
   const { data: tagsData } = useQuery({
     ...listProjectTemplateTagsOptions(),
   })
+  const templates = templatesData?.templates
 
   // Filter and sort templates
   const filteredTemplates = useMemo(() => {
-    if (!templatesData?.templates) return []
+    if (!templates) return []
 
-    let templates = [...templatesData.templates]
+    let matchingTemplates = [...templates]
 
     // Filter by search query
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase()
-      templates = templates.filter(
+      matchingTemplates = matchingTemplates.filter(
         (t) =>
           t.name.toLowerCase().includes(query) ||
           t.description?.toLowerCase().includes(query) ||
@@ -67,20 +86,40 @@ export function TemplateList({
 
     // Sort: featured first, then alphabetically
     if (showFeaturedFirst) {
-      templates.sort((a, b) => {
+      matchingTemplates.sort((a, b) => {
         if (a.is_featured && !b.is_featured) return -1
         if (!a.is_featured && b.is_featured) return 1
         return a.name.localeCompare(b.name)
       })
     }
 
-    return templates
-  }, [templatesData?.templates, searchQuery, showFeaturedFirst])
+    return matchingTemplates
+  }, [templates, searchQuery, showFeaturedFirst])
 
   if (isLoadingTemplates) {
     return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      <div className="grid gap-4 md:grid-cols-2" aria-label="Loading templates">
+        {[0, 1, 2, 3].map((item) => (
+          <Skeleton key={item} className="h-52 rounded-xl" />
+        ))}
+      </div>
+    )
+  }
+
+  if (isTemplatesError) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-6 py-12 text-center">
+        <AlertCircle className="size-6 text-amber-600 dark:text-amber-400" />
+        <div>
+          <p className="font-medium">Could not load the template catalog</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Check the server connection and try again.
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => refetchTemplates()}>
+          <RefreshCw className="mr-1.5 size-3.5" />
+          Retry
+        </Button>
       </div>
     )
   }
@@ -104,7 +143,9 @@ export function TemplateList({
             size="sm"
             onClick={() => setShowFeaturedOnly(!showFeaturedOnly)}
           >
-            <Star className={cn('h-4 w-4 mr-1', showFeaturedOnly && 'fill-current')} />
+            <Star
+              className={cn('h-4 w-4 mr-1', showFeaturedOnly && 'fill-current')}
+            />
             Featured
           </Button>
           <div className="flex items-center border rounded-md">
@@ -113,6 +154,7 @@ export function TemplateList({
               size="sm"
               className="rounded-r-none"
               onClick={() => setViewMode('grid')}
+              aria-label="Show templates as a grid"
             >
               <LayoutGrid className="h-4 w-4" />
             </Button>
@@ -121,6 +163,7 @@ export function TemplateList({
               size="sm"
               className="rounded-l-none"
               onClick={() => setViewMode('list')}
+              aria-label="Show templates as a list"
             >
               <List className="h-4 w-4" />
             </Button>
@@ -129,7 +172,7 @@ export function TemplateList({
       </div>
 
       {/* Tags */}
-      {tagsData?.tags && tagsData.tags.length > 0 && (
+      {showTagFilter && tagsData?.tags && tagsData.tags.length > 0 && (
         <ScrollArea className="w-full whitespace-nowrap">
           <div className="flex gap-2 pb-2">
             <Badge
@@ -158,9 +201,7 @@ export function TemplateList({
         <div className="text-center py-12 text-muted-foreground">
           <p>No templates found</p>
           {searchQuery && (
-            <p className="text-sm mt-1">
-              Try adjusting your search or filters
-            </p>
+            <p className="text-sm mt-1">Try adjusting your search or filters</p>
           )}
         </div>
       ) : (
@@ -185,7 +226,8 @@ export function TemplateList({
 
       {/* Template count */}
       <div className="text-xs text-muted-foreground text-center pt-2">
-        {filteredTemplates.length} of {templatesData?.total ?? 0} templates
+        {filteredTemplates.length} of {templatesData?.total ?? 0}{' '}
+        {kind === 'service' ? 'services' : 'templates'}
       </div>
     </div>
   )

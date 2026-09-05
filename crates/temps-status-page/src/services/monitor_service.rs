@@ -205,6 +205,7 @@ impl MonitorService {
         let existing = status_monitors::Entity::find()
             .filter(status_monitors::Column::ProjectId.eq(project_id))
             .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+            .filter(status_monitors::Column::IsManaged.eq(true))
             .one(self.db.as_ref())
             .await?;
 
@@ -221,12 +222,32 @@ impl MonitorService {
             monitor_type: Set("web".to_string()),
             check_interval_seconds: Set(60), // Check every minute
             is_active: Set(true),
+            is_managed: Set(true),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
         };
 
-        let result = monitor.insert(self.db.as_ref()).await?;
+        let result = match monitor.insert(self.db.as_ref()).await {
+            Ok(monitor) => monitor,
+            Err(insert_error) => {
+                // Environment creation events are at-least-once and can race.
+                // The partial unique index is authoritative; if another worker
+                // won, return that managed monitor instead of surfacing a false
+                // deployment error.
+                if let Some(existing) = status_monitors::Entity::find()
+                    .filter(status_monitors::Column::ProjectId.eq(project_id))
+                    .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+                    .filter(status_monitors::Column::IsManaged.eq(true))
+                    .one(self.db.as_ref())
+                    .await?
+                {
+                    existing
+                } else {
+                    return Err(StatusPageError::Database(insert_error));
+                }
+            }
+        };
 
         tracing::info!(
             "Created automatic monitor for environment {} in project {}",
@@ -277,6 +298,7 @@ impl MonitorService {
             check_path: Set(request.check_path),
             check_interval_seconds: Set(request.check_interval_seconds.unwrap_or(60)),
             is_active: Set(true),
+            is_managed: Set(false),
             ..Default::default()
         };
 
@@ -467,24 +489,28 @@ impl MonitorService {
         Ok(result)
     }
 
-    /// Update the check_path for all monitors of an environment
-    pub async fn update_check_path_for_environment(
+    /// Set or clear the deployment-discovered path on Temps' managed monitor.
+    /// User-created monitors retain their independently configured endpoints.
+    pub async fn update_managed_check_path_for_environment(
         &self,
         project_id: i32,
         environment_id: i32,
-        check_path: &str,
+        check_path: Option<&str>,
     ) -> Result<(), StatusPageError> {
-        validate_check_path(check_path)?;
+        if let Some(check_path) = check_path {
+            validate_check_path(check_path)?;
+        }
 
         let monitors = status_monitors::Entity::find()
             .filter(status_monitors::Column::ProjectId.eq(project_id))
             .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+            .filter(status_monitors::Column::IsManaged.eq(true))
             .all(self.db.as_ref())
             .await?;
 
         for monitor in monitors {
             let mut active: status_monitors::ActiveModel = monitor.into();
-            active.check_path = Set(Some(check_path.to_string()));
+            active.check_path = Set(check_path.map(str::to_string));
             active.update(self.db.as_ref()).await?;
         }
 
@@ -1073,7 +1099,7 @@ impl MonitorService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{environments, projects, upstream_config::UpstreamList};
 
@@ -1154,6 +1180,161 @@ mod tests {
         assert_eq!(monitor.environment_id, Some(environment.id));
         assert_eq!(monitor.check_interval_seconds, 60);
         assert!(monitor.is_active);
+    }
+
+    #[tokio::test]
+    async fn deployment_health_path_only_updates_and_clears_the_managed_monitor() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+        let managed = service
+            .ensure_monitor_for_environment(project.id, environment.id, &environment.name)
+            .await
+            .unwrap();
+        let custom = service
+            .create_monitor(
+                project.id,
+                CreateMonitorRequest {
+                    name: "Custom readiness endpoint".to_string(),
+                    monitor_type: "web".to_string(),
+                    environment_id: environment.id,
+                    check_interval_seconds: Some(60),
+                    check_path: Some("/api/ready".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        service
+            .update_managed_check_path_for_environment(project.id, environment.id, Some("/docs"))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_monitor(managed.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/docs")
+        );
+        assert_eq!(
+            service
+                .get_monitor(custom.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/api/ready")
+        );
+
+        service
+            .update_managed_check_path_for_environment(project.id, environment.id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.get_monitor(managed.id).await.unwrap().check_path,
+            None
+        );
+        assert_eq!(
+            service
+                .get_monitor(custom.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/api/ready")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_monitor_does_not_claim_a_user_monitor_with_the_default_name() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+        let user_monitor = service
+            .create_monitor(
+                project.id,
+                CreateMonitorRequest {
+                    name: format!("{} Monitor", environment.name),
+                    monitor_type: "web".to_string(),
+                    environment_id: environment.id,
+                    check_interval_seconds: Some(60),
+                    check_path: Some("/user-health".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let managed_monitor = service
+            .ensure_monitor_for_environment(project.id, environment.id, &environment.name)
+            .await
+            .unwrap();
+
+        assert_ne!(managed_monitor.id, user_monitor.id);
+        service
+            .update_managed_check_path_for_environment(
+                project.id,
+                environment.id,
+                Some("/deployed-health"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_monitor(user_monitor.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/user-health")
+        );
+        assert_eq!(
+            service
+                .get_monitor(managed_monitor.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/deployed-health")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_environment_events_create_one_managed_monitor() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+
+        let (first, second) = tokio::join!(
+            service.ensure_monitor_for_environment(project.id, environment.id, &environment.name),
+            service.ensure_monitor_for_environment(project.id, environment.id, &environment.name)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.id, second.id);
+        let managed_count = status_monitors::Entity::find()
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment.id)))
+            .filter(status_monitors::Column::IsManaged.eq(true))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(managed_count, 1);
     }
 
     #[tokio::test]

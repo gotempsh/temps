@@ -32,6 +32,7 @@ import {
   GitSettings,
 } from '@/components/project/settings/GitSettings'
 import { BuildDeploySettings } from '@/components/project/settings/BuildDeploySettings'
+import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
@@ -245,15 +246,18 @@ export function ProjectDetail() {
     if (!project) return
 
     if (project.source_type === 'docker_image') {
+      const savedRuntime = serviceTemplateDeployOverrides(project)
       const imageRef =
-        editedImageRef?.trim() || lastDeployment?.metadata?.externalImageRef
+        editedImageRef?.trim() ||
+        savedRuntime.image_ref ||
+        lastDeployment?.metadata?.externalImageRef
       if (!imageRef) {
         toast.error('No image reference found for this project')
         return
       }
       await deployImage.mutateAsync({
         path: { project_id: project.id, environment_id: environmentId },
-        body: { image_ref: imageRef },
+        body: { ...savedRuntime, image_ref: imageRef },
       })
     } else {
       await createDeployment.mutateAsync({
@@ -403,7 +407,10 @@ export function ProjectDetail() {
           onConfirm={handleHeaderDeployment}
           mode="new"
           defaultBranch={project.main_branch}
-          imageRef={lastDeployment?.metadata?.externalImageRef}
+          imageRef={
+            serviceTemplateDeployOverrides(project).image_ref ??
+            lastDeployment?.metadata?.externalImageRef
+          }
           isLoading={createDeployment.isPending || deployImage.isPending}
         />
         <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">

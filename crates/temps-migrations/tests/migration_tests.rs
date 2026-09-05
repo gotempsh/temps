@@ -3,7 +3,11 @@
 
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 use sea_orm_migration::MigratorTrait;
-use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{
+    core::{ContainerPort, WaitFor},
+    runners::AsyncRunner,
+    GenericImage, ImageExt,
+};
 
 use temps_migrations::Migrator;
 
@@ -87,6 +91,375 @@ async fn project_secret_preview_default(db: &DatabaseConnection) -> anyhow::Resu
         .await?
         .expect("secrets.include_in_preview metadata exists");
     Ok(row.try_get("", "column_default")?)
+}
+
+async fn managed_monitor_schema_state(db: &DatabaseConnection) -> anyhow::Result<(bool, bool)> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' \
+                    AND table_name = 'status_monitors' \
+                    AND column_name = 'is_managed') AS has_column, \
+                to_regclass('idx_status_monitors_managed_environment') IS NOT NULL AS has_index"
+                .to_string(),
+        ))
+        .await?
+        .expect("schema-state query returns one row");
+    Ok((
+        row.try_get("", "has_column")?,
+        row.try_get("", "has_index")?,
+    ))
+}
+
+async fn service_project_identity_schema_state(
+    db: &DatabaseConnection,
+) -> anyhow::Result<(bool, bool)> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' \
+                    AND table_name = 'projects' \
+                    AND column_name = 'project_type') AS has_project_type, \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' \
+                    AND table_name = 'projects' \
+                    AND column_name = 'service_template') AS has_service_template"
+                .to_string(),
+        ))
+        .await?
+        .expect("schema-state query returns one row");
+    Ok((
+        row.try_get("", "has_project_type")?,
+        row.try_get("", "has_service_template")?,
+    ))
+}
+
+#[tokio::test]
+async fn test_service_project_identity_migration_defaults_down_and_reup() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping service-project identity migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping service-project identity migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260903_000001_add_service_project_identity";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (false, false)
+    );
+
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, template_slug) \
+         VALUES \
+         ('Keycloak', '', '', '.', 'main', 'dockerfile', now(), now(), 'keycloak-test', 'keycloak'), \
+         ('Static', '', '', '.', 'main', 'static', now(), now(), 'static-test', NULL), \
+         ('Vite', '', '', '.', 'main', 'vite', now(), now(), 'vite-test', NULL), \
+         ('Nixpacks static', '', '', '.', 'main', 'nixpacks', now(), now(), 'nixpacks-static-test', NULL), \
+         ('Server', '', '', '.', 'main', 'nodejs', now(), now(), 'server-test', NULL)",
+    )
+    .await?;
+    db.execute_unprepared(
+        "UPDATE projects SET preset_config = '{\"preset\":\"nixpacks\",\"providers\":[\"static\"]}'::jsonb \
+         WHERE slug = 'nixpacks-static-test'",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (true, true)
+    );
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT slug, project_type FROM projects \
+            WHERE slug IN ('keycloak-test', 'nixpacks-static-test', 'static-test', 'server-test', 'vite-test') ORDER BY slug"
+                .to_string(),
+        ))
+        .await?;
+    let project_types = rows
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String>("", "slug")?,
+                row.try_get::<String>("", "project_type")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+    assert_eq!(
+        project_types,
+        vec![
+            ("keycloak-test".to_string(), "server".to_string()),
+            ("nixpacks-static-test".to_string(), "static".to_string()),
+            ("server-test".to_string(), "server".to_string()),
+            ("static-test".to_string(), "static".to_string()),
+            ("vite-test".to_string(), "static".to_string()),
+        ]
+    );
+
+    let service_without_release = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type) \
+             VALUES ('Invalid service', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                     'invalid-service', 'service')",
+        )
+        .await;
+    assert!(
+        service_without_release.is_err(),
+        "a service project must persist its exact template release"
+    );
+
+    for (slug_column, case) in [("NULL", "null"), ("'   '", "blank")] {
+        let statement = format!(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type, service_template, template_slug) \
+             VALUES ('Invalid service identity', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                     'invalid-service-{case}', 'service', '{{}}'::jsonb, {slug_column})"
+        );
+        assert!(
+            db.execute_unprepared(&statement).await.is_err(),
+            "a service project with a {case} template slug must be rejected"
+        );
+    }
+
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type, service_template, template_slug) \
+         VALUES ('Valid service', '', '', '.', 'main', 'dockerfile', now(), now(), \
+                 'valid-service', 'service', '{}'::jsonb, 'keycloak')",
+    )
+    .await?;
+
+    let server_with_release = db
+        .execute_unprepared(
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug, project_type, service_template) \
+             VALUES ('Invalid server', '', '', '.', 'main', 'nodejs', now(), now(), \
+                     'invalid-server', 'server', '{}'::jsonb)",
+        )
+        .await;
+    assert!(
+        server_with_release.is_err(),
+        "a regular project cannot carry service-template identity"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (false, false)
+    );
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        service_project_identity_schema_state(&db).await?,
+        (true, true)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping managed-monitor migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping managed-monitor migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260831_000002_add_managed_status_monitors";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-test', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'monitor-test')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-test-production', 'monitor.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-test'",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', 60, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-test-production'",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, created_at, updated_at) \
+         SELECT project_id, id, 'Custom readiness', 'web', 60, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-test-production'",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT name, is_managed FROM status_monitors ORDER BY name".to_string(),
+        ))
+        .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].try_get::<String>("", "name")?, "Custom readiness");
+    assert!(!rows[0].try_get::<bool>("", "is_managed")?);
+    assert_eq!(rows[1].try_get::<String>("", "name")?, "production Monitor");
+    assert!(
+        !rows[1].try_get::<bool>("", "is_managed")?,
+        "an ordinary user-editable name is not durable ownership provenance"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
+
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'Temps managed', 'web', 60, true, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-test-production'",
+    )
+    .await?;
+
+    let duplicate = db
+        .execute_unprepared(
+            "INSERT INTO status_monitors \
+             (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+             SELECT project_id, id, 'Duplicate managed', 'web', 60, true, true, now(), now() FROM environments \
+             WHERE subdomain = 'monitor-test-production'",
+        )
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "only one managed monitor is allowed per environment"
+    );
+
+    db.execute_unprepared("DELETE FROM status_monitors WHERE name = 'Temps managed'")
+        .await?;
+    db.execute_unprepared(
+        "UPDATE status_monitors SET is_managed = TRUE WHERE name = 'production Monitor'",
+    )
+    .await?;
+    assert_eq!(
+        db.query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS count FROM status_monitors WHERE is_managed = TRUE".to_string(),
+        ))
+        .await?
+        .expect("managed monitor count row")
+        .try_get::<i64>("", "count")?,
+        1,
+        "simulate the ownership inferred by the previously shipped migration"
+    );
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
+    let corrected = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("default-named user monitor remains present");
+    assert!(
+        !corrected.try_get::<bool>("", "is_managed")?,
+        "the forward corrective migration must demote ownership inferred by the shipped migration"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("default-named user monitor remains present after rollback");
+    assert!(
+        restored.try_get::<bool>("", "is_managed")?,
+        "rolling back the corrective migration must restore the captured ownership state"
+    );
+
+    Migrator::up(&db, Some(1)).await?;
+    let corrected_again = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("default-named user monitor remains present after reapplying correction");
+    assert!(!corrected_again.try_get::<bool>("", "is_managed")?);
+    Ok(())
 }
 
 #[tokio::test]
@@ -2891,19 +3264,18 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(schema.try_get::<bool>("", "service_creator_fk")?);
 
     // Exercise the creator-ownership migration's reversal and re-application
-    // so upgrades retain an emergency rollback. Targeted by name rather than
-    // assuming it is the last registered migration — hardcoding `Some(1)`
-    // here broke the moment a later migration was registered after it, for a
-    // reason that had nothing to do with whatever added that later one.
-    let target = "m20260830_000001_add_external_service_creator";
-    let all_migrations = Migrator::migrations();
-    let target_position = all_migrations
+    // so upgrades retain an emergency rollback. Later migrations must be
+    // rolled back first; derive that count from the registry instead of
+    // assuming creator ownership remains the latest migration forever.
+    let creator_migration = "m20260830_000001_add_external_service_creator";
+    let migrations = Migrator::migrations();
+    let creator_position = migrations
         .iter()
-        .position(|migration| migration.name() == target)
-        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
-    let steps_from_target_to_head = (all_migrations.len() - target_position) as u32;
-
-    Migrator::down(&db, Some(steps_from_target_to_head)).await?;
+        .position(|migration| migration.name() == creator_migration)
+        .unwrap_or_else(|| panic!("migration {creator_migration} not found in Migrator"));
+    let rollback_count = u32::try_from(migrations.len() - creator_position)
+        .expect("migration count must fit into u32");
+    Migrator::down(&db, Some(rollback_count)).await?;
     let creator_column_after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -2916,7 +3288,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
         .expect("creator column rollback query");
     assert!(!creator_column_after_down.try_get::<bool>("", "present")?);
 
-    Migrator::up(&db, Some(steps_from_target_to_head)).await?;
+    Migrator::up(&db, Some(rollback_count)).await?;
     let creator_column_after_reapply = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,

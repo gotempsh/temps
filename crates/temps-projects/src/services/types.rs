@@ -23,6 +23,10 @@ pub struct EnvVarWithEnvironments {
     pub project_id: i32,
     pub key: String,
     pub value: String,
+    /// Internal presence bit used by upgrade validation. Secret list values
+    /// are masked, so callers must never infer this from the serialized value.
+    #[serde(skip)]
+    pub has_value: bool,
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
     pub environments: Vec<EnvVarEnvironment>,
@@ -46,6 +50,13 @@ pub struct Project {
     pub directory: String,
     pub main_branch: String,
     pub preset: Option<String>,
+    /// Bundled template provenance persisted on the project row.
+    pub template_slug: Option<String>,
+    /// Logo captured in the applied service-template release. This remains
+    /// stable even when the live catalog changes.
+    pub service_template_image_url: Option<String>,
+    /// Exact applied service-template version.
+    pub service_template_version: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     pub preset_config: Option<serde_json::Value>,
     pub created_at: UtcDateTime,
@@ -192,8 +203,8 @@ pub struct ProjectSettingsUpdate {
 pub struct CreateProjectEnvVar {
     pub key: String,
     pub value: String,
-    /// When true the value is write-only: it is encrypted at rest and the API
-    /// never returns the plaintext again.
+    /// When true the value is encrypted at rest and masked in list responses.
+    /// Plaintext access requires the audited reveal endpoint.
     pub is_secret: bool,
 }
 
@@ -247,6 +258,7 @@ impl CreateProjectEnvVar {
 #[derive(Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
+    pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
@@ -267,37 +279,21 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub exposed_port: Option<i32>,
+    /// Optional curated-template resource profile. Generic callers leave
+    /// these unset and receive the platform defaults.
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
     /// Source type for deployments (git, docker_image, or static_files)
     #[serde(default)]
     pub source_type: SourceType,
     /// Bounded template provenance: a reviewed bundled slug or the fixed
-    /// `custom` marker. Internal only; normal project-creation paths leave it
-    /// unset and operator-defined slugs are never persisted here.
+    /// `custom` marker. Internal only; operator-defined slugs are never
+    /// persisted here.
     #[serde(default)]
     pub template_slug: Option<String>,
 }
-
-#[derive(Deserialize)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateGithubRepoRequest {
-    pub name: String,
-    pub private: bool,
-    #[serde(rename = "auto_init")]
-    pub auto_init: bool,
-}
-
-// Types are defined directly in this file for simplicity
 
 #[derive(Error, Debug)]
 pub enum ProjectError {
@@ -309,9 +305,6 @@ pub enum ProjectError {
 
     #[error("Git provider connection {connection_id} not found or not accessible")]
     GitProviderConnectionNotFound { connection_id: i32 },
-
-    #[error("Template not found")]
-    TemplateNotFound,
 
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },

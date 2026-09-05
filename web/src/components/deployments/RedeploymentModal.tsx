@@ -534,8 +534,6 @@ export function RedeploymentModal({
           </DialogTitle>
         </DialogHeader>
 
-        {/* Image-deploy view (docker_image projects): re-pull the prebuilt
-            image; no branch/commit/tag. */}
         {isImageDeploy ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">

@@ -4,7 +4,7 @@
 /**
  * Frontend-side default-value generators for template environment variables.
  *
- * Templates can declare `default_generator` per env var (see `temps-core/templates.yaml`).
+ * Templates can declare `default_generator` per env var (see `temps-core/templates/`).
  * The Configurator uses this to (a) auto-fill empty values once the user has typed a
  * repository name and (b) render a "Generate" button on the value field.
  */
@@ -34,29 +34,23 @@ export type GeneratorContext = {
 }
 
 /**
- * Generates a hex string of the requested byte length using the Web Crypto API.
- * Falls back to `Math.random` only when crypto is unavailable (very old browsers).
+ * Generates a hex string with Web Crypto. Secret generation fails closed when
+ * the browser cannot provide a cryptographically secure random source.
  */
-function randomHex(byteLength: number): string {
+function randomHex(byteLength: number): string | null {
   const buf = new Uint8Array(byteLength)
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(buf)
-  } else {
-    for (let i = 0; i < byteLength; i++) buf[i] = Math.floor(Math.random() * 256)
-  }
+  if (typeof crypto === 'undefined' || !crypto.getRandomValues) return null
+  crypto.getRandomValues(buf)
   return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 /**
  * Generates a base64-url-safe random string of the requested byte length.
  */
-function randomBase64(byteLength: number): string {
+function randomBase64(byteLength: number): string | null {
   const buf = new Uint8Array(byteLength)
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(buf)
-  } else {
-    for (let i = 0; i < byteLength; i++) buf[i] = Math.floor(Math.random() * 256)
-  }
+  if (typeof crypto === 'undefined' || !crypto.getRandomValues) return null
+  crypto.getRandomValues(buf)
   let binary = ''
   for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i])
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -78,7 +72,9 @@ function isLocalHost(host: string): boolean {
  * Parses `external_url` into its scheme, hostname, and (optional) port.
  * Returns `null` for empty / malformed input.
  */
-function parseExternalUrl(externalUrl?: string | null): DeploymentUrlBase | null {
+function parseExternalUrl(
+  externalUrl?: string | null
+): DeploymentUrlBase | null {
   const trimmed = externalUrl?.trim()
   if (!trimmed) return null
   try {
@@ -212,6 +208,8 @@ export function runGenerator(
  * name. Used to decide whether to re-run the generator when the repo or the
  * resolved deployment-URL base changes.
  */
-export function generatorDependsOnRepoName(generator: string | null | undefined): boolean {
+export function generatorDependsOnRepoName(
+  generator: string | null | undefined
+): boolean {
   return generator === 'app_url'
 }

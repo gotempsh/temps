@@ -128,6 +128,12 @@ pub struct DeploymentMetadata {
     /// priority over any `.temps.yaml` `health.path` value. Always starts with '/'.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check_path: Option<String>,
+
+    /// Command passed to a prebuilt image entrypoint. Stored in deployment
+    /// metadata so redeploy, rollback, and node failover reproduce the exact
+    /// workload rather than falling back to the image default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]

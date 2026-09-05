@@ -5995,6 +5995,13 @@
       "ComposePublicPort": {
         "description": "A port that should be exposed publicly through the proxy for a compose service.",
         "properties": {
+          "healthCheckPath": {
+            "description": "Optional user override for the public health probe. When absent, Temps\nuses the path discovered from this service's Compose healthcheck.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "port": {
             "description": "Container port to expose (e.g. 8123)",
             "format": "int32",
@@ -7792,7 +7799,7 @@
             "type": "array"
           },
           "target_all_services": {
-            "description": "When `true` (default), the schedule backs up every external service\non the host — including databases created in the future. When\n`false`, the schedule backs up only the services explicitly attached\nvia `POST /backups/schedules/{id}/services`. Omit to use the default.",
+            "description": "When `true` (default), the schedule backs up every external service\non the host — including databases created in the future. When\n`false`, the schedule backs up only the services supplied in\n`service_ids` (or later attached through the schedule-services API).\nOmit to use the default.",
             "type": [
               "boolean",
               "null"
@@ -8219,7 +8226,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "When true the variable is treated as write-only: never returned in\nplaintext from the API, masked in the UI, and updates that omit the\nvalue preserve the existing ciphertext. The flag is one-way — secret\nvars cannot be demoted back to regular vars.",
+            "description": "When true the variable is masked in list responses and can only be\nviewed through the permission-checked, audited per-variable reveal\nendpoint. Updates that omit the value preserve the existing ciphertext.\nThe flag is one-way — secret vars cannot be demoted to regular vars.",
             "type": "boolean"
           },
           "key": {
@@ -8963,6 +8970,32 @@
             "description": "Enable automatic deployment on push (defaults to true). Only honoured in\nfork mode; public-repo deploys cannot receive push webhooks.",
             "type": "boolean"
           },
+          "command": {
+            "description": "Optional image entrypoint arguments. An empty list explicitly uses the\nimage's own default command instead of the template command.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cpu_limit": {
+            "description": "CPU limit override in microcores. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpu_request": {
+            "description": "CPU request override in microcores (1_000_000 = one CPU core).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "environment_variables": {
             "description": "Environment variables to set (key-value pairs)",
             "items": {
@@ -8970,8 +9003,46 @@
             },
             "type": "array"
           },
+          "exposed_port": {
+            "description": "Public container port override.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "git_provider_connection_id": {
             "description": "Git provider connection ID. When omitted, the project deploys directly\nfrom the template's public source repository instead of forking it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "health_check_path": {
+            "description": "Relative HTTP health-check path override.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Optional prebuilt-image override. Curated template values remain the\ndefault when this is omitted. Accepted only for image templates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "description": "Memory limit override in MiB. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_request": {
+            "description": "Memory request override in MiB.",
             "format": "int32",
             "type": [
               "integer",
@@ -9022,6 +9093,20 @@
       "CreateProjectFromTemplateResponse": {
         "description": "Response after creating a project from template",
         "properties": {
+          "deployment_error": {
+            "description": "Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_queued": {
+            "description": "Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "message": {
             "description": "Message with additional info",
             "type": "string"
@@ -9091,8 +9176,15 @@
               "null"
             ]
           },
+          "expected_slug": {
+            "description": "Exact slug returned by service-template preflight. Normal project creation omits it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "exposed_port": {
-            "description": "Port exposed by the container (fallback when image has no EXPOSE directive)\n\nPriority order for port resolution:\n1. Image EXPOSE directive (auto-detected from built image)\n2. Environment-level exposed_port (overrides this value per environment)\n3. This project-level exposed_port (fallback)\n4. Default: 3000\n\nOnly set this if your image doesn't use EXPOSE directive.",
+            "description": "Explicit port exposed by the container.\n\nPriority order for port resolution:\n1. Environment-level exposed_port (explicit override)\n2. This project-level exposed_port (explicit override)\n3. Image EXPOSE directive (auto-detected from built image)\n4. Default: 3000\n\nSet this when the desired application port differs from the image's\nfirst EXPOSE directive (for example, an image exposing HTTP and HTTPS).",
             "example": 8080,
             "format": "int32",
             "type": [
@@ -10427,6 +10519,16 @@
             "description": "Claim an image already present in the platform host's Docker daemon.\nTemps retags it into a generated project-owned namespace and records\nits immutable image ID. Never set this for a registry image.",
             "type": "boolean"
           },
+          "command": {
+            "description": "Optional container command override. Each entry is passed directly as\none argv element; no shell parsing or interpolation is performed.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "external_image_id": {
             "description": "External image ID (if already registered). If provided without image_ref,\nthe image reference will be fetched from the registered external image.",
             "format": "int32",
@@ -11130,6 +11232,16 @@
             "description": "Docker builder used (e.g., \"nixpacks\", \"dockerfile\")",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "command": {
+            "description": "Command passed to a prebuilt image entrypoint. Stored in deployment\nmetadata so redeploy, rollback, and node failover reproduce the exact\nworkload rather than falling back to the image default.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },
@@ -13041,6 +13153,13 @@
               "$ref": "#/components/schemas/ComposePublicPort"
             },
             "type": "array"
+          },
+          "relaxedCapabilityServices": {
+            "description": "Services granted the limited startup capability profile after explicit approval.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -13143,6 +13262,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "imageRuntime": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageRuntimeConfig",
+                "description": "Durable runtime selected for a curated single-container image template."
+              }
             ]
           },
           "variant": {
@@ -14674,7 +14804,7 @@
         "description": "Input for environment variable",
         "properties": {
           "is_secret": {
-            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
             "type": "boolean"
           },
           "name": {
@@ -14743,6 +14873,55 @@
         ],
         "type": "object"
       },
+      "EnvVarTemplate": {
+        "description": "Environment variable template definition",
+        "properties": {
+          "default": {
+            "description": "Default value if not provided by user",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_generator": {
+            "description": "Frontend-side generator for the default value. Recognised values:\n`app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),\n`random_hex_32` (32-byte hex). Unknown values are ignored client-side.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Description of what this variable is used for",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "example": {
+            "description": "Example value for documentation",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Name of the environment variable",
+            "type": "string"
+          },
+          "required": {
+            "description": "Whether this variable is required",
+            "type": "boolean"
+          },
+          "secret": {
+            "description": "Explicit sensitivity classification for credentials whose names do not\nmatch the conservative built-in heuristic.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "EnvVarTemplateResponse": {
         "description": "Environment variable template response",
         "properties": {
@@ -14781,11 +14960,16 @@
           "required": {
             "description": "Whether this variable is required",
             "type": "boolean"
+          },
+          "secret": {
+            "description": "Whether values must use the protected secret reveal path.",
+            "type": "boolean"
           }
         },
         "required": [
           "name",
-          "required"
+          "required",
+          "secret"
         ],
         "type": "object"
       },
@@ -15056,7 +15240,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "Whether the variable is a write-only secret. Secrets always have\n`value: None` in responses.",
+            "description": "Whether the variable is a secret. Secrets always have `value: None` in\nlist responses.",
             "type": "boolean"
           },
           "key": {
@@ -15067,7 +15251,7 @@
             "type": "integer"
           },
           "value": {
-            "description": "Plaintext value for non-secret vars (or `\"***\"` mask for list responses).\n`None` for secret vars — secrets are write-only.",
+            "description": "Plaintext value for non-secret vars (or `\"***\"` mask for list responses).\n`None` for secret vars; use the audited per-variable reveal endpoint.",
             "type": [
               "string",
               "null"
@@ -19139,6 +19323,30 @@
         ],
         "type": "object"
       },
+      "GitRef": {
+        "description": "Git repository reference (supports any git provider: GitHub, GitLab, Bitbucket, etc.)",
+        "properties": {
+          "path": {
+            "description": "Path within the repository (for monorepos)\nAlso accepts \"subfolder\" as an alias in YAML/JSON",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ref": {
+            "description": "Git reference (branch, tag, or commit)",
+            "type": "string"
+          },
+          "url": {
+            "description": "Git repository URL (e.g., \"https://github.com/owner/repo.git\" or \"https://gitlab.com/owner/repo.git\")",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
       "GitRefResponse": {
         "description": "Git repository reference response",
         "properties": {
@@ -20210,6 +20418,34 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "ImageRuntimeConfig": {
+        "description": "Editable runtime settings for a single-container image template.\n\nMulti-container service templates will use a separate container collection;\nkeeping this shape explicitly singular prevents silently applying one image\nor command to an unrelated sidecar.",
+        "properties": {
+          "command": {
+            "description": "`None` explicitly means \"use the image's default command\". Keep the\nserialized `null` when a runtime snapshot exists so clients can\ndistinguish that choice from an omitted runtime setting.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "healthCheckPath": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "imageRef": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "imageRef"
+        ],
         "type": "object"
       },
       "ImportCredentials": {
@@ -22532,6 +22768,17 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateKind",
+                "description": "Filter by gallery (`starter` or `service`)."
+              }
             ]
           },
           "tag": {
@@ -29559,7 +29806,7 @@
         "description": "Documentation-only schema for a project-creation environment variable.\n\nThe wire format is deserialized by [`CreateProjectEnvVar`], which also\naccepts the legacy `[\"KEY\", \"value\"]` tuple form. This struct exists so the\nOpenAPI spec (and the generated clients) describe the preferred object form\nwith its `is_secret` flag.",
         "properties": {
           "is_secret": {
-            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
             "type": "boolean"
           },
           "key": {
@@ -29918,7 +30165,15 @@
             ]
           },
           "preset_config": {
-            "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PresetConfigSchema",
+                "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+              }
+            ]
           },
           "preview_envs_idle_timeout_seconds": {
             "description": "Idle timeout (seconds) for on-demand preview environments.",
@@ -29934,6 +30189,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "project_type": {
+            "description": "Product lifecycle classification. `service` projects are tied to a\npersisted, versioned template release; this is independent from the\ndeployment transport in `source_type`.",
+            "type": "string"
+          },
           "repo_name": {
             "type": [
               "string",
@@ -29946,12 +30205,33 @@
               "null"
             ]
           },
+          "service_template_image_url": {
+            "description": "Logo from the immutable service-template release applied to this\nproject. Clients should prefer it over a deployed site's favicon.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_template_version": {
+            "description": "Exact service-template version currently applied to the project.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "slug": {
             "type": "string"
           },
           "source_type": {
             "$ref": "#/components/schemas/SourceType",
             "description": "Source type for deployments (git, docker_image, or static_files)"
+          },
+          "template_slug": {
+            "description": "Bundled template slug that created this project. Clients use this to\npresent template-specific runtime configuration instead of generic\nsource-build controls.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
             "format": "int64",
@@ -29968,6 +30248,7 @@
           "name",
           "directory",
           "main_branch",
+          "project_type",
           "created_at",
           "updated_at",
           "is_public_repo",
@@ -30128,6 +30409,166 @@
           "total_page_views",
           "bounce_rate",
           "engagement_rate"
+        ],
+        "type": "object"
+      },
+      "ProjectTemplate": {
+        "description": "A curated project template",
+        "properties": {
+          "command": {
+            "description": "Optional command passed to the container image. This is needed for\nproduction images whose default command is intentionally a development\nmode (for example Keycloak).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Short description",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env_vars": {
+            "description": "Environment variables template",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
+            },
+            "type": "array"
+          },
+          "exposed_port": {
+            "description": "Container port the prebuilt image listens on (used for routing when\ndeploying from `image`). Falls back to the image's EXPOSE / 3000 default.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "features": {
+            "description": "Feature highlights",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "git": {
+            "$ref": "#/components/schemas/GitRef",
+            "description": "Git repository reference (supports any git provider). Always present as\nthe source-of-truth / build fallback, even for image-based templates."
+          },
+          "health_check_path": {
+            "description": "HTTP health-check path probed after the container starts (image deploys\ncan't read `.temps.yaml`). Must start with '/'. Defaults to \"/\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Prebuilt Docker image reference (e.g. \"ghcr.io/org/app:latest\"). When set,\nthe one-click deploy pulls and runs this image directly (source_type\ndocker_image) instead of building from `git` — instant, no BuildKit. When\nabsent, the template builds from source.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image_url": {
+            "description": "URL to template image/icon",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_featured": {
+            "description": "Whether the template is featured/promoted",
+            "type": "boolean"
+          },
+          "is_public": {
+            "description": "Whether the template is publicly visible",
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TemplateKind",
+            "description": "Gallery this template belongs to. Older configurations default to a\nsource-code starter, preserving their existing behaviour."
+          },
+          "managed_service_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Environment aliases populated from a linked managed service. The outer\nkey is the Temps service type and each inner entry maps an application\nvariable to a variable supplied by that service.\n\nExample: `postgres.KC_DB_USERNAME: POSTGRES_USER`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "description": "Display name",
+            "type": "string"
+          },
+          "preset": {
+            "description": "Framework/preset to use (e.g., \"nextjs\", \"fastapi\", \"dockerfile\")",
+            "type": "string"
+          },
+          "preset_config": {
+            "description": "Preset-specific configuration"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Minimum/safe runtime resources for this application. These values are\nvalidated against operator-configured tenant ceilings before creation."
+              }
+            ]
+          },
+          "screenshot_url": {
+            "description": "URL to a full screenshot/banner preview of the deployed template (e.g.\n`/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the\ntemplate card; optional — templates without one show no banner.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "services": {
+            "description": "Required external services (e.g., [\"postgres\", \"redis\"])",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "slug": {
+            "description": "Unique identifier for the template (used in URLs)",
+            "type": "string"
+          },
+          "sort_order": {
+            "description": "Sort order for display (lower = first)",
+            "format": "int32",
+            "type": "integer"
+          },
+          "tags": {
+            "description": "Tags/categories for filtering",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "description": "Version of this template release. Service projects pin this value and\nthe complete resolved definition so catalog updates are always an\nexplicit, reviewable upgrade rather than a silent runtime mutation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "name",
+          "git",
+          "preset"
         ],
         "type": "object"
       },
@@ -31449,6 +31890,13 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "health_check_path": {
+            "description": "HTTP path declared by a loopback Compose healthcheck, if unambiguous.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "image": {
             "type": [
@@ -36941,6 +37389,136 @@
         ],
         "type": "object"
       },
+      "ServiceTemplateChangeKind": {
+        "enum": [
+          "added",
+          "removed",
+          "changed"
+        ],
+        "type": "string"
+      },
+      "ServiceTemplateInstance": {
+        "description": "Immutable template release attached to a service project.\n\nThe resolved definition is deliberately stored with the project. The live\ncatalog is only needed to discover a newer release; deployments, edits and\nrollbacks continue to work if the catalog later changes or disappears.",
+        "properties": {
+          "schema_version": {
+            "description": "Catalog schema used to deserialize `template`.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "Stable service family identifier.",
+            "type": "string"
+          },
+          "template": {
+            "$ref": "#/components/schemas/ProjectTemplate",
+            "description": "Exact resolved release from which this project was created/upgraded."
+          },
+          "version": {
+            "description": "Applied template release.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "slug",
+          "version",
+          "template"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateInstanceResponse": {
+        "properties": {
+          "applied": {
+            "$ref": "#/components/schemas/ServiceTemplateInstance"
+          },
+          "catalog_drift": {
+            "description": "The catalog definition changed without a version bump. Applying it is\nintentionally blocked because mutable releases make upgrades and\nrollbacks non-reproducible.",
+            "type": "boolean"
+          },
+          "catalog_error": {
+            "description": "User-safe explanation when the active catalog could not provide this\nservice family. The applied snapshot remains authoritative and editable.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTemplateUpgradeChange"
+            },
+            "type": "array"
+          },
+          "latest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceTemplateInstance",
+                "description": "Latest release for the same service family. Absent when the catalog no\nlonger carries the template; the applied snapshot is still usable."
+              }
+            ]
+          },
+          "missing_services": {
+            "description": "Managed service families that must be linked before this release can be\napplied. Existing links are never removed automatically.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "required_configuration": {
+            "description": "Required target inputs that are not currently configured and cannot be\nfilled from a template default or generator.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
+            },
+            "type": "array"
+          },
+          "upgrade_available": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project_id",
+          "applied",
+          "upgrade_available",
+          "catalog_drift",
+          "changes",
+          "required_configuration",
+          "missing_services"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateUpgradeChange": {
+        "description": "One reviewable change between the project's applied service release and\nthe current catalog release. Values contain public template metadata only;\nproject environment values and secrets never enter this response.",
+        "properties": {
+          "current": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ServiceTemplateChangeKind"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "field",
+          "kind"
+        ],
+        "type": "object"
+      },
       "ServiceTypeInfo": {
         "properties": {
           "parameters": {
@@ -40971,9 +41549,61 @@
         ],
         "type": "string"
       },
+      "TemplateKind": {
+        "description": "Where a template is presented in the project creation flow.",
+        "enum": [
+          "starter",
+          "service"
+        ],
+        "type": "string"
+      },
+      "TemplateResources": {
+        "description": "Resource profile required by a curated template. CPU values use the same\nmicrocore unit as project deployment configuration; memory values are MiB.",
+        "properties": {
+          "cpu_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpu_request": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_request": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "TemplateResponse": {
         "description": "Response type for a single template",
         "properties": {
+          "command": {
+            "description": "Optional command passed to the image entrypoint.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "description": {
             "description": "Short description",
             "type": [
@@ -41032,6 +41662,26 @@
             "description": "Whether the template is featured/promoted",
             "type": "boolean"
           },
+          "kind": {
+            "$ref": "#/components/schemas/TemplateKind",
+            "description": "Gallery this template belongs to."
+          },
+          "managed_service_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Managed-service environment aliases used at deployment time.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "name": {
             "description": "Display name",
             "type": "string"
@@ -41039,6 +41689,17 @@
           "preset": {
             "description": "Framework/preset to use",
             "type": "string"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Curated CPU/memory profile applied when the project is created."
+              }
+            ]
           },
           "screenshot_url": {
             "description": "URL to a wide screenshot/banner preview of the deployed template.\nAbsent for templates that don't have one captured yet.",
@@ -41064,18 +41725,25 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "version": {
+            "description": "Immutable release identifier for service templates.",
+            "type": "string"
           }
         },
         "required": [
           "slug",
           "name",
+          "version",
+          "kind",
           "git",
           "preset",
           "tags",
           "features",
           "services",
           "env_vars",
-          "is_featured"
+          "is_featured",
+          "managed_service_bindings"
         ],
         "type": "object"
       },
@@ -45186,6 +45854,64 @@
         },
         "type": "object"
       },
+      "UpdateServiceTemplateRuntimeRequest": {
+        "description": "Complete replacement for the editable runtime of a single-container\nservice-template project. Runtime and resource fields are written to the\nsame project row in one transaction.",
+        "properties": {
+          "command": {
+            "description": "Empty means use the image's own default command.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cpuLimit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpuRequest": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exposedPort": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "healthCheckPath": {
+            "type": "string"
+          },
+          "imageRef": {
+            "type": "string"
+          },
+          "memoryLimit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memoryRequest": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "imageRef",
+          "healthCheckPath"
+        ],
+        "type": "object"
+      },
       "UpdateSessionDurationRequest": {
         "properties": {
           "duration": {
@@ -45511,6 +46237,25 @@
         },
         "required": [
           "image"
+        ],
+        "type": "object"
+      },
+      "UpgradeServiceTemplateRequest": {
+        "properties": {
+          "environment_variables": {
+            "description": "Values for inputs introduced by the target release. Existing project\nvalues are preserved and cannot be overwritten through this endpoint.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarInput"
+            },
+            "type": "array"
+          },
+          "target_version": {
+            "description": "Optimistic target selected from the preview. The server rejects a stale\ntarget if the catalog changes between preview and apply.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_version"
         ],
         "type": "object"
       },
@@ -77837,6 +78582,9 @@
           "400": {
             "description": "Invalid input"
           },
+          "409": {
+            "description": "Expected project slug is already in use"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -91849,6 +92597,180 @@
         ]
       }
     },
+    "/projects/{project_id}/service-runtime": {
+      "patch": {
+        "operationId": "update_service_template_runtime",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceTemplateRuntimeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Service runtime updated successfully"
+          },
+          "400": {
+            "description": "Invalid service runtime"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/service-template": {
+      "get": {
+        "operationId": "get_project_service_template",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceTemplateInstanceResponse"
+                }
+              }
+            },
+            "description": "Applied service release and upgrade preview"
+          },
+          "400": {
+            "description": "Project is not a service"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Atomically replace a service-template project's image runtime and resource\nprofile. This endpoint is deliberately separate from generic project\nsettings because these fields form one deployable configuration.",
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/service-template/upgrade": {
+      "post": {
+        "operationId": "upgrade_project_service_template",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeServiceTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Service template upgraded"
+          },
+          "400": {
+            "description": "Invalid or stale upgrade"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project or template not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/settings": {
       "post": {
         "operationId": "update_project_settings",
@@ -99567,6 +100489,15 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter by gallery: starter or service",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TemplateKind"
             }
           }
         ],

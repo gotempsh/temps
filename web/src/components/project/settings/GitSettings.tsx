@@ -186,6 +186,7 @@ function GitSettingsInline({
   // ---------------- Live API data ----------------
   const isPublicRepo = project.is_public_repo
   const isUploadedSource = project.source_type === 'uploaded_source'
+  const isLocalSource = isUploadedSource
   const sections = projectSettingsSections(view, project.source_type)
   const publicProvider = publicRepositoryProvider(project?.git_url)
   const publicRepository = parsePublicRepositoryUrl(project?.git_url)
@@ -373,7 +374,7 @@ function GitSettingsInline({
       overrides.preset === 'nixpacks' && overrides.preset_config === undefined
         ? presetConfigForSelection('nixpacks', presetCfg)
         : (overrides.preset_config ?? presetCfg ?? undefined)
-    if (project.source_type === 'uploaded_source') {
+    if (isLocalSource) {
       await updateProjectSettings.mutateAsync({
         body: {
           preset: selectedPreset,
@@ -1687,6 +1688,7 @@ function PublicPortsInline({
     service: string
     port: number
     published?: number
+    healthCheckPath?: string
   }
   const cfg: any = (project.preset_config as any) || {}
   const ports: PublicRoute[] = cfg.publicPorts || cfg.public_ports || []
@@ -1711,6 +1713,10 @@ function PublicPortsInline({
     persistedServices,
     parseComposeOverridePorts(cfg.composeOverride || cfg.compose_override)
   )
+  const detectedHealthPath = (serviceName: string) =>
+    (cfg.composeServices || cfg.compose_services || []).find(
+      (service: any) => service.name === serviceName
+    )?.healthCheckPath
   const serviceNames = Array.from(
     new Set([
       ...(cfg.composeServices || cfg.compose_services || []).map(
@@ -1826,6 +1832,7 @@ function PublicPortsInline({
                           service: nextService,
                           port: suggestedMapping?.target ?? row.port,
                           published: suggestedMapping?.published,
+                          healthCheckPath: undefined,
                         }
                         update(next)
                       }}
@@ -1940,6 +1947,39 @@ function PublicPortsInline({
                     a known container port manually.
                   </p>
                 )}
+                <div className="mt-3 max-w-md space-y-1.5">
+                  <Label
+                    htmlFor={`compose-health-path-${i}`}
+                    className="text-sm text-muted-foreground"
+                  >
+                    Health path {i === 0 ? '(public uptime)' : ''}
+                  </Label>
+                  <Input
+                    id={`compose-health-path-${i}`}
+                    value={
+                      row.healthCheckPath ??
+                      detectedHealthPath(row.service) ??
+                      ''
+                    }
+                    placeholder="/"
+                    className="font-mono"
+                    onChange={(event) => {
+                      const next = [...draft]
+                      next[i] = {
+                        ...next[i],
+                        healthCheckPath: event.target.value || undefined,
+                      }
+                      update(next)
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {row.healthCheckPath
+                      ? 'Custom override. Clear it to use the Compose healthcheck.'
+                      : detectedHealthPath(row.service)
+                        ? `Detected from this service’s Compose healthcheck.`
+                        : 'Defaults to / when the Compose service has no HTTP healthcheck.'}
+                  </p>
+                </div>
               </div>
             )
           })}
@@ -1978,6 +2018,7 @@ function PublicPortsInline({
                       service: route.service,
                       port: mapping?.target ?? route.port,
                       published: mapping?.published ?? route.published,
+                      healthCheckPath: route.healthCheckPath,
                     }
                   })
                 await saveGitField({
@@ -2251,8 +2292,8 @@ function ExcludedServicesInline({
 
       {services.length === 0 ? (
         <p className="text-xs text-muted-foreground italic py-2">
-          No services detected yet — captured automatically after your next
-          deploy, or click “Sync from repository” to check {composePath} now.
+          No services detected yet —{' '}
+          {`captured automatically after your next deploy, or sync ${composePath} now.`}
         </p>
       ) : (
         <TooltipProvider>

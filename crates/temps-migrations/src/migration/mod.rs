@@ -214,9 +214,12 @@ mod m20260830_000001_create_traefik_discovered_routes;
 // the certificates migration below. Preserve that upgrade history.
 mod m20260831_000001_create_analytics_ingest_keys;
 mod m20260831_000001_create_traefik_route_certificates;
+mod m20260831_000002_add_managed_status_monitors;
 mod m20260831_000002_backfill_acme_verification_method;
 mod m20260902_000001_backup_safety_and_provenance;
+mod m20260903_000001_add_service_project_identity;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
+mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 
 pub struct Migrator;
 
@@ -477,6 +480,9 @@ impl MigratorTrait for Migrator {
             Box::new(
                 m20260903_000001_add_vulnerability_scanning_enabled_to_projects::Migration,
             ),
+            Box::new(m20260831_000002_add_managed_status_monitors::Migration),
+            Box::new(m20260903_000001_add_service_project_identity::Migration),
+            Box::new(m20260904_000001_reset_ambiguous_managed_status_monitors::Migration),
         ]
     }
 }
@@ -487,7 +493,7 @@ mod registry_tests {
     use std::collections::HashSet;
 
     #[test]
-    fn migration_names_are_unique_and_same_stamp_upgrade_history_stays_main_first() {
+    fn migration_names_are_unique_and_upgrade_history_stays_stable() {
         let names = Migrator::migrations()
             .into_iter()
             .map(|migration| migration.name().to_string())
@@ -511,6 +517,18 @@ mod registry_tests {
             (
                 "m20260815_000001_add_facet_attr_columns_to_otel_spans",
                 "m20260815_000001_default_preview_inclusion_off",
+            ),
+            (
+                "m20260830_000001_add_external_service_creator",
+                "m20260831_000002_add_managed_status_monitors",
+            ),
+            (
+                "m20260831_000002_add_managed_status_monitors",
+                "m20260903_000001_add_service_project_identity",
+            ),
+            (
+                "m20260903_000001_add_service_project_identity",
+                "m20260904_000001_reset_ambiguous_managed_status_monitors",
             ),
         ] {
             let shipped_position = names

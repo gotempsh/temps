@@ -7,7 +7,9 @@
 //! These schemas are used in the API and validated when creating/updating projects.
 
 use serde::{Deserialize, Serialize};
-use temps_entities::preset::{ComposePublicPort, DockerfileVariant, NixpacksProvider};
+use temps_entities::preset::{
+    ComposePublicPort, DockerfileVariant, ImageRuntimeConfig, NixpacksProvider,
+};
 
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
@@ -34,6 +36,10 @@ pub struct DockerfilePresetConfig {
     #[cfg_attr(feature = "openapi", schema(example = "./api"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_context: Option<String>,
+
+    /// Durable runtime selected for a curated single-container image template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_runtime: Option<ImageRuntimeConfig>,
 }
 
 /// Configuration for Docker Compose deployments.
@@ -52,6 +58,10 @@ pub struct DockerComposePresetConfig {
     /// Compose service ports that should be publicly routed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_ports: Vec<ComposePublicPort>,
+
+    /// Services granted the limited startup capability profile after explicit approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxed_capability_services: Vec<String>,
 }
 
 /// Configuration for Nixpacks preset
@@ -146,6 +156,7 @@ mod tests {
             variant: None,
             dockerfile_path: Some("docker/Dockerfile".to_string()),
             build_context: Some("./api".to_string()),
+            image_runtime: None,
         };
 
         let json = serde_json::to_value(&config).unwrap();
@@ -177,12 +188,14 @@ mod tests {
                 port: 3000,
                 ..Default::default()
             }],
+            relaxed_capability_services: vec!["database".to_string()],
         };
 
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["composePath"], "deploy/compose.yml");
         assert_eq!(json["publicPorts"][0]["service"], "web");
         assert_eq!(json["publicPorts"][0]["port"], 3000);
+        assert_eq!(json["relaxedCapabilityServices"][0], "database");
     }
 
     #[test]
@@ -206,6 +219,7 @@ mod tests {
             variant: None,
             dockerfile_path: Some("Dockerfile.prod".to_string()),
             build_context: None,
+            image_runtime: None,
         });
 
         let json = serde_json::to_value(&dockerfile_config).unwrap();

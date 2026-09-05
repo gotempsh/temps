@@ -876,6 +876,43 @@ impl DeploymentService {
         }
     }
 
+    fn resource_usage_from_snapshot(
+        snapshot: &temps_entities::deployment_config::DeploymentConfigSnapshot,
+    ) -> crate::jobs::ResourceUsage {
+        crate::jobs::ResourceUsage {
+            cpu_limit: snapshot.cpu_limit.map(|value| format!("{value}u")),
+            memory_limit: snapshot.memory_limit.map(|value| format!("{value}Mi")),
+            cpu_request: snapshot.cpu_request.map(|value| format!("{value}u")),
+            memory_request: snapshot.memory_request.map(|value| format!("{value}Mi")),
+        }
+    }
+
+    fn rollback_snapshot_port_and_replicas(
+        snapshot: &temps_entities::deployment_config::DeploymentConfigSnapshot,
+        deployment_id: i32,
+    ) -> Result<(Option<u16>, u32), DeploymentError> {
+        let port = snapshot
+            .exposed_port
+            .map(u16::try_from)
+            .transpose()
+            .map_err(|error| {
+                DeploymentError::InvalidDeploymentState(format!(
+                    "Target deployment {deployment_id} has invalid exposed port {:?}: {error}",
+                    snapshot.exposed_port
+                ))
+            })?;
+        let replicas = u32::try_from(snapshot.replicas)
+            .ok()
+            .filter(|replicas| *replicas > 0)
+            .ok_or_else(|| {
+                DeploymentError::InvalidDeploymentState(format!(
+                    "Target deployment {deployment_id} has invalid replica count {}",
+                    snapshot.replicas
+                ))
+            })?;
+        Ok((port, replicas))
+    }
+
     pub fn new(
         db: Arc<temps_database::DbConnection>,
         log_service: Arc<temps_logs::LogService>,
@@ -1024,20 +1061,22 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
 
-        let deployment_id = environment
-            .current_deployment_id
-            .ok_or_else(|| DeploymentError::NotFound("No active deployment found".to_string()))?;
-
-        // Verify the container belongs to this deployment and pick up its node placement.
+        // Resolve any still-live container in this environment, including a
+        // failed Compose candidate retained for debugging. Do not constrain
+        // this to `current_deployment_id`: failed candidates are deliberately
+        // never promoted, but their logs remain an authenticated project
+        // debugging surface until retry/delete cleanup.
         let container = deployment_containers::Entity::find()
-            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment.id))
             .filter(deployment_containers::Column::ContainerId.eq(&container_id))
             .filter(deployment_containers::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
                 DeploymentError::NotFound(format!(
-                    "Container {} not found in deployment",
+                    "Container {} not found in environment",
                     container_id
                 ))
             })?;
@@ -1882,6 +1921,7 @@ impl DeploymentService {
         target_environment_id: Option<i32>,
         image_ref: String,
         health_check_path: Option<String>,
+        command: Option<Vec<String>>,
     ) -> Result<(), DeploymentError> {
         if image_ref.is_empty() {
             return Err(DeploymentError::InvalidInput(
@@ -1901,6 +1941,7 @@ impl DeploymentService {
                     target_environment_id,
                     image_ref,
                     health_check_path,
+                    command,
                 },
             ))
             .await
@@ -1948,7 +1989,19 @@ impl DeploymentService {
             .and_then(|m| m.external_image_ref.clone())
         {
             return self
-                .trigger_image_deployment(project_id, Some(environment_id), image_ref, None)
+                .trigger_image_deployment(
+                    project_id,
+                    Some(environment_id),
+                    image_ref,
+                    deploy
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.health_check_path.clone()),
+                    deploy
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.command.clone()),
+                )
                 .await;
         }
 
@@ -2157,9 +2210,19 @@ impl DeploymentService {
 
         let rollback_asset_origin =
             deployment_asset_origin(self.db.as_ref(), &target_deployment).await?;
+        let rollback_health_check_path = target_deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.health_check_path.clone());
+        let rollback_command = target_deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.command.clone());
         let rollback_metadata = DeploymentMetadata {
             is_rollback: true,
             rolled_back_from_id: Some(deployment_id),
+            health_check_path: rollback_health_check_path.clone(),
+            command: rollback_command.clone(),
             ..Default::default()
         };
 
@@ -2384,8 +2447,31 @@ impl DeploymentService {
 
             // Step 1: Execute DeployImageJob with external image
             // Use the NEW rollback slug as the container name (not the old deployment's slug)
-            let configured_port =
-                super::port_resolver::configured_port_override(&environment, &project);
+            let (configured_port, rollback_replicas, rollback_resources) =
+                if let Some(snapshot) = target_deployment.deployment_config.as_ref() {
+                    let (port, replicas) =
+                        Self::rollback_snapshot_port_and_replicas(snapshot, deployment_id)?;
+                    (port, replicas, Self::resource_usage_from_snapshot(snapshot))
+                } else {
+                    (
+                        super::port_resolver::configured_port_override(&environment, &project),
+                        environment
+                            .deployment_config
+                            .as_ref()
+                            .map(|config| config.replicas as u32)
+                            .or_else(|| {
+                                project
+                                    .deployment_config
+                                    .as_ref()
+                                    .map(|config| config.replicas as u32)
+                            })
+                            .unwrap_or(1),
+                        Self::resolve_resource_usage(
+                            environment.deployment_config.as_ref(),
+                            project.deployment_config.as_ref(),
+                        ),
+                    )
+                };
             let exposed_port = configured_port.map(u32::from).unwrap_or(3000);
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
@@ -2396,23 +2482,14 @@ impl DeploymentService {
                 })
                 .service_name(rollback_slug.clone())
                 .health_check_path(None)
-                .replicas(
-                    environment
-                        .deployment_config
-                        .as_ref()
-                        .map(|c| c.replicas as u32)
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .map(|c| c.replicas as u32)
-                        })
-                        .unwrap_or(1),
-                )
+                .health_check_path_override(rollback_health_check_path)
+                .command(rollback_command)
+                .replicas(rollback_replicas)
                 .port(exposed_port)
                 .configured_port(configured_port)
                 .log_id(deploy_log_id.clone())
-                .log_service(self.log_service.clone());
+                .log_service(self.log_service.clone())
+                .failed_container_retention(self.db.clone(), rollback_deployment_id);
 
             // Apply container log rotation settings from config
             if let Ok(settings) = self.config_service.get_settings().await {
@@ -2430,10 +2507,7 @@ impl DeploymentService {
             // would inherit `ResourceUsage::default()` (now all-None) and silently
             // drop a configured limit — or, before the default was fixed, cap an
             // unconfigured environment.
-            deploy_builder = deploy_builder.resources(Self::resolve_resource_usage(
-                environment.deployment_config.as_ref(),
-                project.deployment_config.as_ref(),
-            ));
+            deploy_builder = deploy_builder.resources(rollback_resources);
 
             // Resolve the environment's env vars exactly as a normal deploy does,
             // so the rolled-back container boots with the full set (user vars,
@@ -2827,6 +2901,14 @@ impl DeploymentService {
             // Reuse build info from source
             builder: source.metadata.as_ref().and_then(|m| m.builder.clone()),
             image_size_bytes: source.metadata.as_ref().and_then(|m| m.image_size_bytes),
+            health_check_path: source
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.health_check_path.clone()),
+            command: source
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.command.clone()),
             ..Default::default()
         };
 
@@ -3063,6 +3145,18 @@ impl DeploymentService {
                 })
                 .service_name(promote_slug.clone())
                 .health_check_path(None)
+                .health_check_path_override(
+                    promoted_deployment
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.health_check_path.clone()),
+                )
+                .command(
+                    promoted_deployment
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.command.clone()),
+                )
                 .replicas(
                     target_env
                         .deployment_config
@@ -3079,7 +3173,8 @@ impl DeploymentService {
                 .port(exposed_port)
                 .configured_port(configured_port)
                 .log_id(deploy_log_id.clone())
-                .log_service(self.log_service.clone());
+                .log_service(self.log_service.clone())
+                .failed_container_retention(self.db.clone(), promoted_id);
 
             // Apply container log rotation settings from config
             if let Ok(settings) = self.config_service.get_settings().await {
@@ -4342,11 +4437,18 @@ impl DeploymentService {
         // (cancel_running_deployments) paths, since those fire automatically
         // on every push / restart and would swamp the funnel signal with
         // non-user-initiated noise.
+        let template_provenance = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|project| project.template_slug);
         self.telemetry().report(
             temps_core::telemetry::TelemetryEvent::new(
                 temps_core::telemetry::TelemetryEventKind::DeployCancelled,
             )
-            .with("trigger", "user"),
+            .with("trigger", "user")
+            .with_template_provenance(template_provenance.as_deref()),
         );
 
         info!(
@@ -5556,6 +5658,10 @@ mod tests {
         // We need to provide the database URL that the test database is using
         let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
         let proxy_address = spawn_test_readiness_proxy();
+        let readiness_host_port = proxy_address
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .expect("read test readiness proxy port");
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
                 proxy_address,
@@ -5659,12 +5765,12 @@ mod tests {
 
         // Create mock deployer with all required methods
         let mut deployer = MockContainerDeployer::new();
-        deployer.expect_deploy_container().returning(|_| {
+        deployer.expect_deploy_container().returning(move |_| {
             Ok(temps_deployer::DeployResult {
                 container_id: "test-container".to_string(),
                 container_name: "test-container".to_string(),
                 container_port: 3000,
-                host_port: 3000,
+                host_port: readiness_host_port,
                 status: temps_deployer::ContainerStatus::Running,
             })
         });
@@ -6252,6 +6358,15 @@ mod tests {
 
         // Setup test data
         let (_project, mut environment, target_deployment) = setup_test_data(&db).await?;
+        let expected_command = vec!["start".to_string(), "--optimized".to_string()];
+        let expected_health_check_path = "/realms/master".to_string();
+        let mut active_target: deployments::ActiveModel = target_deployment.into();
+        active_target.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            command: Some(expected_command.clone()),
+            health_check_path: Some(expected_health_check_path.clone()),
+            ..Default::default()
+        }));
+        let target_deployment = active_target.update(db.as_ref()).await?;
         setup_test_environment_variables(&db, target_deployment.project_id, environment.id).await?;
 
         // Create container for target deployment (required for rollback)
@@ -6325,6 +6440,11 @@ mod tests {
         let metadata = rollback_dep.metadata.unwrap();
         assert!(metadata.is_rollback);
         assert_eq!(metadata.rolled_back_from_id, Some(target_deployment.id));
+        assert_eq!(metadata.command, Some(expected_command));
+        assert_eq!(
+            metadata.health_check_path.as_deref(),
+            Some(expected_health_check_path.as_str())
+        );
 
         // Verify environment was updated to point to the NEW rollback deployment
         let updated_environment = environments::Entity::find_by_id(environment.id)
@@ -6332,6 +6452,62 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(updated_environment.current_deployment_id, Some(result.id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_promote_deployment_preserves_image_runtime(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (project, _source_environment, source) = setup_test_data(&db).await?;
+        let expected_command = vec!["start".to_string(), "--optimized".to_string()];
+        let expected_health_check_path = "/realms/master".to_string();
+        let mut active_source: deployments::ActiveModel = source.into();
+        active_source.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            command: Some(expected_command.clone()),
+            health_check_path: Some(expected_health_check_path.clone()),
+            ..Default::default()
+        }));
+        let source = active_source.update(db.as_ref()).await?;
+
+        let now = Utc::now();
+        let target_environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Promotion Target".to_string()),
+            slug: Set("promotion-target".to_string()),
+            host: Set("promotion-target.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            current_deployment_id: Set(None),
+            subdomain: Set("promotion-target.example.com".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
+
+        let promoted = deployment_service
+            .promote_deployment(project.id, source.id, target_environment.id)
+            .await?;
+
+        let promoted_model = deployments::Entity::find_by_id(promoted.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("promoted deployment was not persisted")?;
+        let metadata = promoted_model
+            .metadata
+            .ok_or("promoted deployment metadata was not persisted")?;
+        assert_eq!(metadata.command, Some(expected_command));
+        assert_eq!(
+            metadata.health_check_path.as_deref(),
+            Some(expected_health_check_path.as_str())
+        );
 
         Ok(())
     }
@@ -7107,6 +7283,74 @@ mod tests {
             }
             _ => panic!("Expected NotFound error"),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_failed_compose_container_passes_log_ownership_lookup(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = setup_test_data(&db).await?;
+
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(current_deployment.id));
+        active_environment.update(db.as_ref()).await?;
+
+        let failed_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("failed-compose-candidate".to_string()),
+            state: Set("failed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("retained-failed-container".to_string()),
+            container_name: Set("temps-retained-app-1".to_string()),
+            container_port: Set(80),
+            image_name: Set(Some("nginx:alpine".to_string())),
+            status: Set(Some("retained:running".to_string())),
+            service_name: Set(Some("app".to_string())),
+            created_at: Set(Utc::now()),
+            deployed_at: Set(Utc::now()),
+            ready_at: Set(None),
+            deleted_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        let result = deployment_service
+            .get_container_logs_by_id(
+                project.id,
+                environment.id,
+                "retained-failed-container".to_string(),
+                ContainerLogParams {
+                    start_date: None,
+                    end_date: None,
+                    tail: Some("10".to_string()),
+                    timestamps: false,
+                    follow: false,
+                },
+            )
+            .await;
+
+        assert!(
+            !matches!(result, Err(DeploymentError::NotFound(_))),
+            "a live retained container must pass project/environment ownership lookup even when another deployment is current"
+        );
 
         Ok(())
     }
@@ -8323,6 +8567,52 @@ mod tests {
         assert_eq!(still_none.memory_limit, None);
     }
 
+    #[test]
+    fn rollback_runtime_uses_target_deployment_snapshot() {
+        let snapshot = temps_entities::deployment_config::DeploymentConfigSnapshot {
+            exposed_port: Some(8080),
+            replicas: 3,
+            cpu_request: Some(500_000),
+            cpu_limit: Some(1_000_000),
+            memory_request: Some(512),
+            memory_limit: Some(1_536),
+            ..Default::default()
+        };
+
+        let (port, replicas) =
+            DeploymentService::rollback_snapshot_port_and_replicas(&snapshot, 42)
+                .expect("valid deployment snapshot");
+        let resources = DeploymentService::resource_usage_from_snapshot(&snapshot);
+
+        assert_eq!(port, Some(8080));
+        assert_eq!(replicas, 3);
+        assert_eq!(resources.cpu_request.as_deref(), Some("500000u"));
+        assert_eq!(resources.cpu_limit.as_deref(), Some("1000000u"));
+        assert_eq!(resources.memory_request.as_deref(), Some("512Mi"));
+        assert_eq!(resources.memory_limit.as_deref(), Some("1536Mi"));
+    }
+
+    #[test]
+    fn rollback_rejects_invalid_target_snapshot_runtime() {
+        let invalid_port = temps_entities::deployment_config::DeploymentConfigSnapshot {
+            exposed_port: Some(70_000),
+            ..Default::default()
+        };
+        assert!(matches!(
+            DeploymentService::rollback_snapshot_port_and_replicas(&invalid_port, 42),
+            Err(DeploymentError::InvalidDeploymentState(_))
+        ));
+
+        let invalid_replicas = temps_entities::deployment_config::DeploymentConfigSnapshot {
+            replicas: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            DeploymentService::rollback_snapshot_port_and_replicas(&invalid_replicas, 42),
+            Err(DeploymentError::InvalidDeploymentState(_))
+        ));
+    }
+
     /// `stop_environment_containers` (pre-rollback cleanup) has the same
     /// deleted-before-stopped ordering requirement as
     /// `WorkflowExecutionService::teardown_previous_deployment`. Uses
@@ -8439,7 +8729,7 @@ mod tests {
         let deployment_service = create_deployment_service_for_test(db);
 
         let result = deployment_service
-            .trigger_image_deployment(1, None, String::new(), None)
+            .trigger_image_deployment(1, None, String::new(), None, None)
             .await;
 
         assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
@@ -8461,6 +8751,7 @@ mod tests {
                 Some(7),
                 "ghcr.io/org/app:latest".to_string(),
                 Some("/healthz".to_string()),
+                Some(vec!["serve".to_string()]),
             )
             .await?;
 
@@ -8479,6 +8770,7 @@ mod tests {
         assert_eq!(job.target_environment_id, Some(7));
         assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
         assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
+        assert_eq!(job.command, Some(vec!["serve".to_string()]));
         Ok(())
     }
 

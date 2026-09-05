@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { buildCustomDomainUpdateBody } from './index.js'
+import { buildCustomDomainUpdateBody, customDomainTimestamp } from './index.js'
+
+test('custom domain timestamps are interpreted as epoch milliseconds', () => {
+  expect(customDomainTimestamp(1_796_278_035_000).toISOString()).toBe('2026-12-03T06:07:15.000Z')
+})
 
 describe('buildCustomDomainUpdateBody', () => {
   test('produces an empty body when no options are provided', () => {

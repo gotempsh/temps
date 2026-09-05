@@ -8,13 +8,13 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
-use temps_core::{EncryptionService, SecretsManagerResolver};
+use temps_core::{canonical_managed_service_type, EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use super::env_resolver::merge_environment_variable_layers;
+use super::env_resolver::merge_managed_service_environment;
 use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
 
 #[derive(Debug, Error)]
@@ -379,7 +379,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        use std::collections::HashMap;
+        use std::collections::{BTreeMap, HashMap};
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
@@ -448,7 +448,8 @@ impl WorkflowPlanner {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
-        let mut linked_service_vars = HashMap::new();
+        let mut linked_service_vars: BTreeMap<String, Vec<HashMap<String, String>>> =
+            BTreeMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -457,6 +458,18 @@ impl WorkflowPlanner {
                 project_service.service_id, project.id, environment.id
             );
 
+            let service = match self
+                .external_service_manager
+                .get_service(project_service.service_id)
+                .await
+            {
+                Ok(service) => service,
+                Err(error) => {
+                    failed_services.push((project_service.service_id, error.to_string()));
+                    continue;
+                }
+            };
+            let service_type = canonical_managed_service_type(&service.service_type);
             match self
                 .external_service_manager
                 .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
@@ -473,7 +486,10 @@ impl WorkflowPlanner {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    linked_service_vars.extend(service_env_vars);
+                    linked_service_vars
+                        .entry(service_type)
+                        .or_default()
+                        .push(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails
@@ -507,13 +523,18 @@ impl WorkflowPlanner {
             return Err(anyhow::anyhow!(error_message));
         }
 
-        // Linked-service variables are defaults. Explicit project variables
-        // express user intent and therefore take precedence on collisions.
-        merge_environment_variable_layers(
+        // Apply reviewed native-template aliases (for example Keycloak's
+        // KC_DB_* contract) before explicit project values take precedence.
+        // This is the normal deployment path; rollback and promotion use the
+        // same shared merge in DeploymentEnvResolver.
+        merge_managed_service_environment(
             &mut env_vars_map,
             linked_service_vars,
             explicit_project_vars,
-        );
+            project.service_template.as_ref(),
+            project.id,
+            environment.id,
+        )?;
 
         // 2b. Secrets-manager bindings (EE only — strict no-op when resolver is absent).
         //
@@ -2195,7 +2216,6 @@ impl WorkflowPlanner {
 
         // Check if git info is available
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
-
         // Job 1: prepare either the uploaded archive or the Git checkout.
         if let Some(archive_path) = source_bundle_path {
             jobs.push(JobDefinition {
@@ -2236,7 +2256,7 @@ impl WorkflowPlanner {
         }
 
         // Get compose path from preset config
-        let compose_path = project
+        let current_compose_path = project
             .preset_config
             .as_ref()
             .and_then(|pc| {
@@ -2247,7 +2267,6 @@ impl WorkflowPlanner {
                 }
             })
             .unwrap_or_else(|| "docker-compose.yml".to_string());
-
         // Job 2: Deploy Compose Stack (no build step)
         let deploy_dependencies = if deployment
             .metadata
@@ -2263,7 +2282,7 @@ impl WorkflowPlanner {
         };
 
         let mut compose_job_config = serde_json::json!({
-            "compose_path": compose_path,
+            "compose_path": current_compose_path,
             "project_id": project.id,
             "environment_id": environment.id,
             "directory": project.directory,
@@ -3430,6 +3449,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uploaded_source_compose_uses_bundle_and_project_location(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping uploaded Compose planner test: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+
+        let mut project_update: projects::ActiveModel = project.into();
+        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
+        project_update.repo_owner = Set(String::new());
+        project_update.repo_name = Set(String::new());
+        project_update.git_provider_connection_id = Set(None);
+        project_update.directory = Set("saved-root".to_string());
+        project_update.preset_config =
+            Set(Some(temps_entities::preset::PresetConfig::DockerCompose(
+                temps_entities::preset::DockerComposeConfig {
+                    compose_path: Some("stack/compose.yaml".to_string()),
+                    ..Default::default()
+                },
+            )));
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.into();
+        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        }));
+        let deployment = deployment_update.update(db.as_ref()).await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let prepare = jobs
+            .iter()
+            .find(|job| job.job_id == "prepare_source_bundle")
+            .expect("uploaded Compose must prepare its source archive");
+        assert_eq!(prepare.job_type, "PrepareSourceBundleJob");
+        assert_eq!(prepare.dependencies, None);
+        assert_eq!(
+            prepare
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("archive_path"))
+                .and_then(serde_json::Value::as_str),
+            Some("source-bundles/fixture.zip")
+        );
+
+        let compose = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("uploaded Compose must deploy the prepared stack");
+        assert_eq!(compose.job_type, "DeployComposeJob");
+        assert_eq!(
+            compose.dependencies,
+            Some(serde_json::json!(["prepare_source_bundle"]))
+        );
+        let compose_config = compose
+            .job_config
+            .as_ref()
+            .expect("Compose job must include configuration");
+        assert_eq!(
+            compose_config
+                .get("compose_path")
+                .and_then(serde_json::Value::as_str),
+            Some("stack/compose.yaml")
+        );
+        assert_eq!(
+            compose_config
+                .get("directory")
+                .and_then(serde_json::Value::as_str),
+            Some("saved-root")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compose_cache_namespace_is_sealed_build_only_and_tenant_proof(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use temps_entities::{env_var_environments, env_vars};
@@ -3527,73 +3636,6 @@ mod tests {
         assert!(!runtime_env
             .values()
             .any(|value| value == &expected_namespace));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn uploaded_compose_uses_prepared_archive_as_its_repository(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-            && !tokio::process::Command::new("docker")
-                .arg("info")
-                .output()
-                .await
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-        {
-            eprintln!("Docker unavailable; skipping uploaded Compose planner test");
-            return Ok(());
-        }
-
-        let test_db = TestDatabase::with_migrations().await?;
-        let db = test_db.connection_arc();
-        let planner = WorkflowPlanner::new(
-            db.clone(),
-            Arc::new(LogService::new(std::env::temp_dir())),
-            create_test_external_service_manager(db.clone()),
-            create_test_config_service(db.clone()),
-            create_test_dsn_service(db.clone()),
-            create_test_encryption_service(),
-        );
-        let (project, _environment, deployment) =
-            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
-
-        let mut project_update: projects::ActiveModel = project.into();
-        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
-        project_update.repo_owner = Set(String::new());
-        project_update.repo_name = Set(String::new());
-        project_update.update(db.as_ref()).await?;
-
-        let mut deployment_update: deployments::ActiveModel = deployment.into();
-        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
-            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
-            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
-            ..Default::default()
-        }));
-        let deployment = deployment_update.update(db.as_ref()).await?;
-
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
-        let prepare = jobs
-            .iter()
-            .find(|job| job.job_id == "prepare_source_bundle")
-            .expect("uploaded Compose must prepare its source archive");
-        assert_eq!(
-            prepare
-                .job_config
-                .as_ref()
-                .and_then(|config| config.get("archive_path"))
-                .and_then(serde_json::Value::as_str),
-            Some("source-bundles/fixture.zip")
-        );
-        let compose = jobs
-            .iter()
-            .find(|job| job.job_id == "deploy_compose")
-            .expect("uploaded Compose must deploy the stack");
-        assert_eq!(
-            compose.dependencies,
-            Some(serde_json::json!(["prepare_source_bundle"]))
-        );
 
         Ok(())
     }

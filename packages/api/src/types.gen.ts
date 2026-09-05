@@ -41,13 +41,24 @@ export type ActiveVisitor = {
   visitor_id?: string | null;
 };
 
+export type ActiveVisitorCountResponse = {
+  active_visitors: number;
+  window_minutes: number;
+};
+
+/**
+ * Query parameters for active visitors endpoint
+ */
 export type ActiveVisitorsQuery = {
   deployment_id?: number | null;
   environment_id?: number | null;
+  project_id: number;
+  window_minutes?: number | null;
 };
 
 export type ActiveVisitorsResponse = {
-  active_visitors: number;
+  count: number;
+  visitors: Array<ActiveVisitor>;
   window_minutes: number;
 };
 
@@ -209,6 +220,11 @@ export type AddEnvironmentDomainRequest = {
 };
 
 export type AddEventsRequest = {
+  /**
+   * Client-generated id, stable across retries of the same batch. When
+   * present the append is idempotent; omitted, delivery is at-least-once.
+   */
+  batchId?: string | null;
   events: string;
 };
 
@@ -231,6 +247,11 @@ export type AddManagedDomainApiRequest = {
    * Opt in to reconciling generated hostnames into this domain's DNS zone.
    */
   sync_generated_records?: boolean;
+};
+
+export type AddProviderModelRequest = {
+  display_name?: string | null;
+  model_id: string;
 };
 
 export type AdminGateResponse = {
@@ -698,6 +719,24 @@ export type AiChatLimitsSettings = {
 };
 
 /**
+ * Mirrors `temps_agents::ai_cli::AiCliStatus` with utoipa `ToSchema` added.
+ * `AiCliStatus` itself does not derive `ToSchema`, so this local projection is
+ * used for OpenAPI generation only — the fields are identical.
+ */
+export type AiCliStatusDto = {
+  auth_method?: string | null;
+  authenticated: boolean;
+  installed: boolean;
+  provider: string;
+  /**
+   * Instructions for the operator when not installed or not authenticated.
+   */
+  setup_hint?: string | null;
+  subscription_type?: string | null;
+  version?: string | null;
+};
+
+/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -725,6 +764,18 @@ export type AiDataAccessResponse = {
   service_id: number;
 };
 
+export type AiModelOptionDto = {
+  default_thinking_option_id?: string | null;
+  id: string;
+  name: string;
+  thinking_options: Array<AiSelectOptionDto>;
+  /**
+   * Model-specific reasoning options valid while project-chat function
+   * tools are attached. Omitted when the normal options also apply.
+   */
+  tool_thinking_options?: Array<AiSelectOptionDto> | null;
+};
+
 /**
  * Response wrapping the AI page breakdown rows.
  */
@@ -750,6 +801,67 @@ export type AiPageBreakdownRow = {
 };
 
 /**
+ * Current AI provider routing preference and availability for this instance.
+ *
+ * The `configured` field drives the UI onboarding state: when `false` the UI
+ * must show _exactly what is missing_ (`reason`) and _where to fix it_
+ * (`setup_path`), not hide the feature.
+ */
+export type AiProviderStatusResponse = {
+  /**
+   * Active preference: `"gateway"` (BYOK) or `"agent_cli"` (subscription).
+   */
+  active_provider_type: string;
+  /**
+   * Catalog id of the active agent CLI provider, or `null` when
+   * `active_provider_type` is `"gateway"`.
+   */
+  agent_cli_provider_id?: string | null;
+  agent_cli_status?: null | AiCliStatusDto;
+  /**
+   * Providers a chat user may choose for a new conversation. Authentication
+   * source is descriptive metadata only and never contains credentials.
+   */
+  available_providers: Array<AvailableAiProviderDto>;
+  /**
+   * Whether the active provider is ready to serve requests.
+   */
+  configured: boolean;
+  /**
+   * Whether at least one active BYOK provider key exists.
+   */
+  gateway_available: boolean;
+  /**
+   * Health of normalized mid-turn user interactions, or `null` when the
+   * active adapter does not advertise them. Kept for API compatibility.
+   */
+  interactive_bridge_status?: string | null;
+  /**
+   * Human-readable explanation of why `configured` is `false`.
+   */
+  reason?: string | null;
+  /**
+   * Console path the operator should visit to fix the missing configuration.
+   */
+  setup_path?: string | null;
+  /**
+   * Instance-wide defaults inherited by all server-authored AI summaries.
+   */
+  summary_preference: AiSummaryPreferenceDto;
+  /**
+   * Whether the active adapter's normalized realtime contract exposes tool
+   * events. Kept under the legacy field name for API compatibility.
+   */
+  supports_interactive_tools: boolean;
+};
+
+export type AiSelectOptionDto = {
+  description?: string | null;
+  id: string;
+  name: string;
+};
+
+/**
  * Response wrapping the AI status breakdown rows.
  */
 export type AiStatusBreakdownResponse = {
@@ -768,6 +880,22 @@ export type AiStatusBreakdownRow = {
    * Status class label.
    */
   status_class: string;
+};
+
+export type AiSummaryPreferenceDto = {
+  /**
+   * `null` uses the selected provider's default model.
+   */
+  model?: string | null;
+  /**
+   * Normalized provider route (`gateway_key:{id}`, `claude_cli`, etc.).
+   * `null` inherits the active instance provider.
+   */
+  provider_id?: string | null;
+  /**
+   * `null` uses the selected model's default reasoning depth.
+   */
+  thinking_level?: string | null;
 };
 
 /**
@@ -810,13 +938,24 @@ export type AlarmResponse = {
    * Arbitrary JSON metadata attached by the alarm source.
    */
   metadata?: unknown;
-  project_id: number;
+  /**
+   * `None` for host/control-plane-wide alarms with no associated project.
+   */
+  project_id?: number | null;
   /**
    * ISO-8601 UTC timestamp when the alarm was resolved, if any.
    */
   resolved_at?: string | null;
   service_id?: number | null;
   severity: string;
+  /**
+   * ISO-8601 UTC timestamp this alarm (and future re-fires of the same
+   * type/scope) are muted until, if currently silenced. Not cleared when
+   * the silence expires — check against the current time, or compare to
+   * `fired_at` on a *new* alarm of the same scope to know a silence has
+   * lapsed.
+   */
+  silenced_until?: string | null;
   status: string;
   title: string;
   /**
@@ -867,6 +1006,51 @@ export type AllocEntry = {
    */
   node_id: string;
   underlay_address: string;
+};
+
+/**
+ * An analytics ingest key as returned by the admin API.
+ *
+ * `public_key` is present in full on every response — see the module docs.
+ */
+export type AnalyticsIngestKey = {
+  /**
+   * Exact origins (`scheme://host[:port]`) permitted to use this key from a
+   * browser. `None` or `[]` means any origin. This is a browser-enforced
+   * convenience control, not authentication — a non-browser client ignores
+   * `Origin` entirely.
+   */
+  allowed_origins?: Array<string> | null;
+  created_at: string;
+  created_by_user_id?: number | null;
+  /**
+   * `None` means the key is scoped to the whole project. An
+   * environment-scoped key additionally attributes ingested data to that
+   * environment's current deployment, when it has one.
+   */
+  environment_id?: number | null;
+  event_count: number;
+  id: number;
+  is_active: boolean;
+  last_used_at?: string | null;
+  /**
+   * Operator-facing label.
+   */
+  name: string;
+  project_id: number;
+  /**
+   * The ingest key itself, `pa_` + 64 hex characters.
+   *
+   * **Not a secret.** It is designed to ship in client-side JavaScript and
+   * is returned unmasked so operators can copy it. See the module docs.
+   */
+  public_key: string;
+  /**
+   * `None` or `<= 0` means unlimited.
+   */
+  rate_limit_per_minute?: number | null;
+  revoked_at?: string | null;
+  updated_at: string;
 };
 
 export type AnalyticsSessionEventsResponse = {
@@ -984,6 +1168,42 @@ export type AnomalyPreviewResponse = {
   sufficient: boolean;
 };
 
+/**
+ * A single caller entry in the top-callers breakdown.
+ */
+export type ApiCallerEntry = {
+  /**
+   * Caller IP address as recorded in proxy_logs.client_ip.
+   */
+  client_ip: string;
+  /**
+   * Error rate for this caller (0.0–1.0).
+   */
+  error_rate: number;
+  /**
+   * Timestamp of the most recent request from this IP in the period.
+   */
+  last_seen: string;
+  /**
+   * Total request count from this IP in the period.
+   */
+  request_count: number;
+};
+
+/**
+ * Top callers (by IP) ranked by request count for a given project + time window.
+ */
+export type ApiCallersResponse = {
+  /**
+   * Top callers, ordered by request_count descending.
+   */
+  callers: Array<ApiCallerEntry>;
+  /**
+   * Total distinct client IPs seen in the period (before the limit).
+   */
+  total_callers: number;
+};
+
 export type ApiKeyListResponse = {
   api_keys: Array<ApiKeyResponse>;
   total: number;
@@ -999,6 +1219,167 @@ export type ApiKeyResponse = {
   name: string;
   permissions?: Array<string> | null;
   role_type: string;
+};
+
+/**
+ * A single route entry in the top-routes breakdown.
+ *
+ * Routes are grouped by raw `(method, path)` — no template normalization.
+ * See the module-level note on path cardinality.
+ */
+export type ApiRouteEntry = {
+  /**
+   * Mean response time in milliseconds for this route.
+   */
+  avg_latency_ms?: number | null;
+  /**
+   * Error rate for this route (0.0–1.0): requests with status >= 400.
+   */
+  error_rate: number;
+  /**
+   * HTTP method (e.g. "GET", "POST").
+   */
+  method: string;
+  /**
+   * Raw request path (e.g. "/api/users/123"). High-cardinality paths with
+   * dynamic IDs will appear as separate rows until path normalization is
+   * implemented.
+   */
+  path: string;
+  /**
+   * Total request count for this route in the period.
+   */
+  request_count: number;
+};
+
+/**
+ * Top routes by request count for a given project + time window.
+ */
+export type ApiRoutesResponse = {
+  /**
+   * Top routes, ordered by request_count descending.
+   */
+  routes: Array<ApiRouteEntry>;
+  /**
+   * Total distinct (method, path) pairs in the period (before the limit).
+   */
+  total_routes: number;
+};
+
+/**
+ * A single time bucket in the API request timeseries.
+ */
+export type ApiTimeseriesPoint = {
+  /**
+   * Mean response time in milliseconds. Null when no rows with a recorded
+   * response_time_ms exist in the bucket.
+   */
+  avg_latency_ms?: number | null;
+  /**
+   * Number of requests with status >= 400.
+   */
+  error_count: number;
+  /**
+   * Error rate: error_count / request_count (0.0–1.0). Zero when
+   * request_count == 0.
+   */
+  error_rate: number;
+  /**
+   * p95 response time in milliseconds. Null when insufficient data.
+   */
+  p95_latency_ms?: number | null;
+  /**
+   * p99 response time in milliseconds. Null when insufficient data.
+   */
+  p99_latency_ms?: number | null;
+  /**
+   * Total request count in this bucket.
+   */
+  request_count: number;
+  /**
+   * Bucket start timestamp (ISO 8601 with Z suffix).
+   */
+  timestamp: string;
+};
+
+/**
+ * Timeseries of API request volume, error rate, and latency percentiles.
+ */
+export type ApiTimeseriesResponse = {
+  /**
+   * Bucket interval used for time series (e.g. "1 hour", "6 hours", "1 day").
+   */
+  bucket_interval: string;
+  /**
+   * Overall mean response time in milliseconds over the full period.
+   */
+  overall_avg_latency_ms?: number | null;
+  /**
+   * Overall error rate over the full period (0.0–1.0).
+   */
+  overall_error_rate: number;
+  /**
+   * Time-bucketed data points ordered ascending by timestamp.
+   */
+  points: Array<ApiTimeseriesPoint>;
+  /**
+   * Aggregate error count (status >= 400) over the full period.
+   */
+  total_errors: number;
+  /**
+   * Aggregate request count over the full period.
+   */
+  total_requests: number;
+};
+
+/**
+ * Structured AI summary of API traffic for a given project + time window.
+ *
+ * Derives `JsonSchema` so `complete_typed` can request this shape from the
+ * configured AI provider. All fields are intentionally short — the prompt
+ * feeds aggregated stats (not raw log lines) to keep token usage bounded.
+ *
+ * When AI is not configured or the project has not opted in, the summary
+ * endpoint returns `null` for this field rather than an error.
+ */
+export type ApiTrafficSummary = {
+  /**
+   * Anomalies or concerns worth investigating (0–3 items). Empty when
+   * traffic appears normal.
+   */
+  anomalies: Array<string>;
+  /**
+   * Bullet-point findings (2–4 items). Each finding is a single sentence.
+   */
+  findings: Array<string>;
+  /**
+   * One-sentence headline describing the traffic pattern.
+   */
+  headline: string;
+  /**
+   * Optional single actionable recommendation.
+   */
+  recommendation?: string | null;
+};
+
+/**
+ * Response from the AI traffic summary endpoint.
+ */
+export type ApiTrafficSummaryResponse = {
+  /**
+   * Whether this response was served from the backend AI-result cache.
+   */
+  cached: boolean;
+  /**
+   * Whether the project has `ai_api_traffic_summary_enabled = true`.
+   */
+  enabled: boolean;
+  summary?: null | ApiTrafficSummary;
+  /**
+   * Why the summary is null when `summary` is None and `enabled` is true:
+   * either AI is not configured or the call failed/timed out.
+   */
+  unavailable_reason?: string | null;
 };
 
 /**
@@ -1030,6 +1411,32 @@ export type AppSettings = {
    */
   cluster_dns?: ClusterDnsSettings;
   /**
+   * Per-upstream concurrent-connection cap applied by the proxy to
+   * customer app traffic. `0` (the default) is unlimited. See issue #646.
+   */
+  connection_limits?: ConnectionLimitSettings;
+  /**
+   * Whether plain-HTTP requests to the console host (`external_url`) are
+   * redirected to HTTPS. Same tri-state contract as an environment's
+   * `force_https`:
+   *
+   * - `None` (default) — inherit the per-host heuristic: redirect only once
+   * the console hostname has actually completed TLS provisioning. An
+   * HTTP-only install, and an install whose TLS is terminated upstream,
+   * are both left alone.
+   * - `Some(true)` — always redirect. For operators who terminate TLS at
+   * Temps but have not provisioned the cert through Temps.
+   * - `Some(false)` — never redirect, even once a certificate exists.
+   *
+   * Deliberately operator-set rather than inferred. Temps cannot tell
+   * "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+   * arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+   * trustworthy from an arbitrary peer — so inferring `true` from an
+   * `https://` `external_url` would 301 a CDN-fronted console into an
+   * infinite redirect loop with no way out but the global kill switch.
+   */
+  console_force_https?: boolean | null;
+  /**
    * Binary version tag (e.g. "v0.1.0") of the *console* process
    * (`temps serve`, role=all or role=console) that last started. Written
    * on console startup; read by the standalone `temps proxy` to detect
@@ -1055,6 +1462,13 @@ export type AppSettings = {
   edge_target?: string | null;
   external_url?: string | null;
   /**
+   * Retention policy for locally-built deployment images. Modeled as a
+   * settings row (not an env var) per CLAUDE.md so an operator can change
+   * the system-wide default at runtime without restarting the binary.
+   * Individual projects override it via `projects.image_retention_hours`.
+   */
+  image_retention?: ImageRetentionSettings;
+  /**
    * Skip TLS certificate verification on outbound HTTP clients built by the
    * server (deployer, agent, remote service client). Strictly opt-in for
    * operators running self-signed control plane / worker certs on a trusted
@@ -1072,6 +1486,11 @@ export type AppSettings = {
    */
   internal_url?: string | null;
   letsencrypt?: LetsEncryptSettings;
+  /**
+   * MCP server settings (ADR-039). Off by default — enable via the Settings
+   * UI to expose the MCP endpoint to the Temps CLI wizard.
+   */
+  mcp_server?: McpServerSettings;
   /**
    * Metrics observability settings. Controls the MetricsStore backend,
    * scrape interval, and tiered retention windows.
@@ -1092,6 +1511,13 @@ export type AppSettings = {
   preview_domain?: string;
   preview_gateway?: PreviewGatewaySettings;
   rate_limiting?: RateLimitSettings;
+  /**
+   * Upstream request/connection timeouts applied by the proxy to customer
+   * app traffic. Provides a global hard ceiling plus global defaults for
+   * regular HTTP, SSE, and WebSocket traffic; projects and environments
+   * may set a shorter value but never exceed the ceiling here.
+   */
+  request_timeouts?: RequestTimeoutSettings;
   /**
    * When `true`, any user holding the `Admin` role must have MFA enrolled
    * (`users.mfa_enabled = true`) to complete a **password** login. Users
@@ -1116,6 +1542,12 @@ export type AppSettings = {
    * from appearing on installs that were already configured via the CLI.
    */
   setup_complete?: boolean;
+  /**
+   * Ceilings the operator places on what a *tenant* may configure for
+   * their own project/environment. Entirely unenforced by default, so an
+   * upgrade never changes what an existing config means.
+   */
+  tenant_resource_ceilings?: TenantResourceCeilings;
 };
 
 /**
@@ -1139,6 +1571,17 @@ export type AppSettingsResponse = {
    * through as-is so the settings UI can read and toggle the flag.
    */
   cluster_dns: ClusterDnsSettings;
+  /**
+   * Per-upstream concurrent-connection cap applied by the proxy to
+   * customer app traffic. No sensitive content. See issue #646.
+   */
+  connection_limits: ConnectionLimitSettings;
+  /**
+   * Whether plain-HTTP requests to the console host are redirected to HTTPS.
+   * `None` inherits the per-host certificate heuristic; `Some(b)` is an
+   * explicit operator override. No sensitive content.
+   */
+  console_force_https?: boolean | null;
   container_logs: ContainerLogSettings;
   disk_space_alert: DiskSpaceAlertSettings;
   dns_provider: DnsProviderSettingsMasked;
@@ -1165,9 +1608,19 @@ export type AppSettingsResponse = {
    */
   effective_observability_store: MetricsStoreKind;
   external_url?: string | null;
+  /**
+   * Deployment-image retention policy. No sensitive content, passed through
+   * as-is so the settings UI can show and edit the system-wide default.
+   */
+  image_retention: ImageRetentionSettings;
   insecure_tls: boolean;
   internal_url?: string | null;
   letsencrypt: LetsEncryptSettings;
+  /**
+   * MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
+   * content — passed through as-is so the settings UI can show and edit it.
+   */
+  mcp_server: McpServerSettings;
   /**
    * Number of enabled, running services the MetricsScraper currently
    * includes. Used for the lightweight storage estimate in the UI.
@@ -1185,7 +1638,20 @@ export type AppSettingsResponse = {
   observability_retention: ObservabilityRetentionSettings;
   preview_domain: string;
   preview_gateway: PreviewGatewaySettingsMasked;
+  /**
+   * Port the main Pingora proxy listens on (parsed from `--address`), the
+   * same value `ConfigService::proxy_port()` feeds into
+   * `compute_deployment_url`/`compute_environment_url` when `external_url`
+   * is unset. The console uses this to preview a project's real
+   * `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
+   */
+  proxy_port: number;
   rate_limiting: RateLimitSettings;
+  /**
+   * Upstream request/connection timeouts (hard ceiling + defaults) applied
+   * by the proxy to customer app traffic. No sensitive content.
+   */
+  request_timeouts: RequestTimeoutSettings;
   /**
    * When enabled, Admin-role accounts without MFA enrolled are rejected
    * at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
@@ -1205,6 +1671,12 @@ export type AppSettingsResponse = {
    * wizard checks this field on load and skips itself when true.
    */
   setup_complete: boolean;
+  /**
+   * Upper bounds a project/environment override may not exceed. No
+   * sensitive content — this is operator policy the settings UI edits
+   * directly. Unenforced by default.
+   */
+  tenant_resource_ceilings: TenantResourceCeilings;
 };
 
 /**
@@ -1452,6 +1924,26 @@ export type AutofixerRunResponse = {
 export type AutofixerRunWithLogsResponse = {
   logs: Array<AgentRunLogResponse>;
   run: AutofixerRunResponse;
+};
+
+export type AvailableAiProviderDto = {
+  /**
+   * `configured_key` for the gateway or `host_environment` for an ambient
+   * CLI login discovered in the Temps process environment.
+   */
+  auth_source: string;
+  default_model_id?: string | null;
+  default_permission_mode_id?: string | null;
+  id: string;
+  model_discovery_error?: string | null;
+  /**
+   * `ready` when the model list was loaded, `unavailable` when the provider
+   * can still run with its own default but live discovery failed.
+   */
+  model_discovery_status: string;
+  models: Array<AiModelOptionDto>;
+  name: string;
+  permission_modes: Array<AiSelectOptionDto>;
 };
 
 /**
@@ -2254,6 +2746,26 @@ export type ClusterDnsSettings = {
 };
 
 /**
+ * Response from `GET /api/cluster/dns/status`.
+ */
+export type ClusterDnsStatusResponse = {
+  /**
+   * Whether cluster DNS is currently enabled cluster-wide
+   * (`AppSettings.cluster_dns.enabled`). When `false`, every node's
+   * per-node values below are expected to show `dns_resolver_running:
+   * Some(false)` (or `None` if a node has never reported).
+   */
+  cluster_dns_enabled: boolean;
+  nodes: Array<NodeDnsStatusEntry>;
+  /**
+   * Total `*.temps.local` records currently registered across the whole
+   * cluster (`service_endpoints` row count), independent of any single
+   * node's resolver health.
+   */
+  total_record_count: number;
+};
+
+/**
  * Response body for `GET /external-services/{id}/cluster-health`.
  */
 export type ClusterHealthReportResponse = {
@@ -2431,17 +2943,121 @@ export type CommitListResponse = {
 export type Comparator = "gt" | "gte" | "lt" | "lte";
 
 /**
+ * A Docker Compose service port mapping, reduced to the information the UI
+ * needs to build a public route without confusing host and container ports.
+ */
+export type ComposePortMapping = {
+  /**
+   * Transport protocol. Compose defaults to TCP.
+   */
+  protocol?: string;
+  /**
+   * Optional port published on the Docker host by Compose.
+   */
+  published?: number | null;
+  /**
+   * Port inside the service container. Temps routes traffic to this port.
+   */
+  target: number;
+};
+
+export type ComposePreviewRequest = {
+  branch?: string | null;
+  composeOverride?: string | null;
+  excludedServices?: Array<string>;
+  path: string;
+};
+
+export type ComposePreviewResponse = {
+  disabledServices: Array<string>;
+  /**
+   * Effective user-controlled Compose YAML with sensitive values redacted.
+   */
+  effectiveCompose: string;
+  enabledServices: Array<string>;
+  path: string;
+  redactedValues: number;
+  repositoryId: number;
+};
+
+/**
  * A port that should be exposed publicly through the proxy for a compose service.
  */
 export type ComposePublicPort = {
+  /**
+   * Optional user override for the public health probe. When absent, Temps
+   * uses the path discovered from this service's Compose healthcheck.
+   */
+  healthCheckPath?: string | null;
   /**
    * Container port to expose (e.g. 8123)
    */
   port: number;
   /**
+   * Optional port published on the Docker host by Compose. The proxy uses
+   * this port when Temps runs on the host or reaches a remote node.
+   */
+  published?: number | null;
+  /**
    * Compose service name (e.g. "web", "clickhouse")
    */
   service: string;
+};
+
+/**
+ * The specific well-known service family a compose service's image matches,
+ * when it matches one Temps can deploy as a managed `external_services` row
+ * instead. Drives the "deploy this as a Temps-managed service" recommendation
+ * in `GitSettings.tsx` and the deploy-log message — kept separate from
+ * `ComposeServiceSnapshot::looks_like_database` (which stays a plain bool)
+ * because that field only gates the unrelated "may need elevated Linux
+ * capabilities" warning, and S3/MinIO images need this classification
+ * without tripping that warning.
+ */
+export type ComposeServiceFamily =
+  "postgres" | "mariadb" | "mongodb" | "redis" | "s3";
+
+export type ComposeServicePreviewResponse = {
+  dependsOn: Array<string>;
+  detectedServiceType?: null | ComposeServiceFamily;
+  /**
+   * Environment variable names declared by this service. Values are
+   * intentionally omitted.
+   */
+  environmentVariables: Array<string>;
+  image?: string | null;
+  /**
+   * True when the image looks like a well-known database engine
+   * (Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw
+   * compose service never becomes a Temps-managed `external_services` row,
+   * so it never gets backup/restore. Informational only.
+   */
+  looksLikeDatabase: boolean;
+  name: string;
+  /**
+   * Ports declared by Compose. Route `target`, not `published`: the latter
+   * is only the optional host-side Docker port.
+   */
+  ports: Array<ComposePortMapping>;
+};
+
+/**
+ * Per-upstream concurrent-connection limiting. Protects the proxy's own
+ * connection/file-descriptor budget from a single slow or malicious
+ * customer upstream — independent of the request/idle timeouts in
+ * `RequestTimeoutSettings`, which bound how long a connection may stay
+ * open, not how many may exist at once. See issue #646.
+ */
+export type ConnectionLimitSettings = {
+  /**
+   * Default max concurrent in-flight requests to a single
+   * project/environment's upstream, used when the project/environment
+   * hasn't set its own `max_concurrent_connections` override. `0` (the
+   * default) means unlimited — matches the "opt-in, never breaks an
+   * existing app on upgrade" philosophy already established for
+   * `RequestTimeoutSettings`.
+   */
+  default_max_concurrent_connections?: number;
 };
 
 export type ConnectionListQuery = {
@@ -2464,7 +3080,8 @@ export type ConnectionResponse = {
   consecutive_health_failures: number;
   created_at: string;
   /**
-   * Whether this connection can make authenticated provider requests. This exposes capability only; credential values are never serialized.
+   * Whether this connection can make authenticated provider requests.
+   * This exposes capability only; credential values are never serialized.
    */
   has_authenticated_credentials: boolean;
   /**
@@ -2624,6 +3241,39 @@ export type ContainerDetailResponse = {
 
 export type ContainerEnvironmentVariableValueResponse = {
   value: string;
+};
+
+/**
+ * One container that has ever run for an environment — current or replaced
+ * by a later redeploy. `id` is the internal row ID to pass as the
+ * `container_id` path segment when calling the metrics/history endpoint for
+ * this specific container generation (its docker `container_id` also works
+ * since the history handler now resolves either).
+ */
+export type ContainerHistoryEntry = {
+  container_id: string;
+  container_name: string;
+  deleted_at?: string | null;
+  deployed_at: string;
+  deployment_id: number;
+  finished_at?: string | null;
+  id: number;
+  /**
+   * True if this row is the environment's currently-active container
+   * (deleted_at is null) — false for containers replaced by a later
+   * redeploy.
+   */
+  is_current: boolean;
+  service_name?: string | null;
+};
+
+export type ContainerHistoryListResponse = {
+  containers: Array<ContainerHistoryEntry>;
+  /**
+   * Total number of container rows matching the filter, before `limit`
+   * was applied — lets the client show "20 of 627".
+   */
+  total_count: number;
 };
 
 export type ContainerInfoResponse = {
@@ -2988,9 +3638,14 @@ export type ConversationDetailResponse = ConversationResponse & {
    * Turns oldest-first. The `system` seed message is omitted (internal).
    */
   messages: Array<MessageResponse>;
+  pending_permission?: null | PermissionRequest;
 };
 
 export type ConversationResponse = {
+  ai_model: string;
+  ai_permission_mode: string;
+  ai_provider: string;
+  ai_thinking_level?: string | null;
   context_id: string;
   context_type: string;
   created_at: string;
@@ -3109,6 +3764,16 @@ export type CostAnalysis = {
   usage_source: UsageSource;
 };
 
+export type CreatableServiceTypeRoute =
+  | "mariadb"
+  | "mongodb"
+  | "postgres"
+  | "redis"
+  | "s3"
+  | "kv"
+  | "blob"
+  | "rustfs";
+
 export type CreateAlertRuleRequest = {
   /**
    * Minimum minutes between notifications for same rule+group
@@ -3136,6 +3801,32 @@ export type CreateAlertRuleRequest = {
    * Trigger type: new_issue, regression, frequency, new_user, user_count, status_change
    */
   trigger_type: string;
+};
+
+/**
+ * Request body for minting a new ingest key.
+ */
+export type CreateAnalyticsIngestKeyRequest = {
+  /**
+   * Exact origins permitted to use this key from a browser. Omit or send an
+   * empty array to allow any origin.
+   */
+  allowed_origins?: Array<string> | null;
+  /**
+   * Scope the key to a single environment. Recommended: it lets Temps
+   * attribute ingested data to that environment's current deployment.
+   * Omit for a project-wide key.
+   */
+  environment_id?: number | null;
+  /**
+   * Operator-facing label. Defaults to "Default ingest key".
+   */
+  name?: string | null;
+  /**
+   * Requests per minute for this key. Omit for the 600/min default; send a
+   * non-positive value for unlimited.
+   */
+  rate_limit_per_minute?: number | null;
 };
 
 export type CreateApiKeyRequest = {
@@ -3181,12 +3872,19 @@ export type CreateBackupScheduleRequest = {
    */
   s3_source_id?: number | null;
   schedule_expression: string;
+  /**
+   * External services to target when `target_all_services` is `false`.
+   * The schedule and these memberships are created atomically, so an
+   * enabled schedule can never be observed without its requested targets.
+   */
+  service_ids?: Array<number>;
   tags: Array<string>;
   /**
    * When `true` (default), the schedule backs up every external service
    * on the host — including databases created in the future. When
-   * `false`, the schedule backs up only the services explicitly attached
-   * via `POST /backups/schedules/{id}/services`. Omit to use the default.
+   * `false`, the schedule backs up only the services supplied in
+   * `service_ids` (or later attached through the schedule-services API).
+   * Omit to use the default.
    */
   target_all_services?: boolean | null;
 };
@@ -3209,6 +3907,14 @@ export type CreateCloudflareProviderRequest = {
 };
 
 export type CreateConversationRequest = {
+  ai_model?: string | null;
+  ai_permission_mode?: string | null;
+  /**
+   * Provider pinned to this conversation. Omitted requests use the current
+   * instance preference.
+   */
+  ai_provider?: string | null;
+  ai_thinking_level?: string | null;
   /**
    * The entity id (ints stringified).
    */
@@ -3341,14 +4047,14 @@ export type CreateEnvironmentRequest = {
 export type CreateEnvironmentVariableRequest = {
   environment_ids: Array<number>;
   /**
-   * Include this environment variable in preview environments (default: true)
+   * Include this environment variable in preview environments (default: false)
    */
   include_in_preview?: boolean;
   /**
-   * When true the variable is treated as write-only: never returned in
-   * plaintext from the API, masked in the UI, and updates that omit the
-   * value preserve the existing ciphertext. The flag is one-way — secret
-   * vars cannot be demoted back to regular vars.
+   * When true the variable is masked in list responses and can only be
+   * viewed through the permission-checked, audited per-variable reveal
+   * endpoint. Updates that omit the value preserve the existing ciphertext.
+   * The flag is one-way — secret vars cannot be demoted to regular vars.
    */
   is_secret?: boolean;
   key: string;
@@ -3368,12 +4074,23 @@ export type CreateExternalServiceRequest = {
   parameters: {
     [key: string]: unknown;
   };
-  service_type: ServiceTypeRoute;
+  service_type: CreatableServiceTypeRoute;
   /**
    * Service topology: "standalone" (default) or "cluster" (HA multi-member).
    */
   topology?: string;
   version?: string | null;
+};
+
+/**
+ * Request body for registering a new facet.
+ */
+export type CreateFacetRequest = {
+  /**
+   * The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).
+   * Must be non-empty, ≤200 characters, and not already registered.
+   */
+  attribute_key: string;
 };
 
 export type CreateFlagRequest = {
@@ -3505,7 +4222,8 @@ export type CreateIpAccessControlRequest = {
    */
   action: string;
   /**
-   * IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
+   * IPv4 or IPv6 address, in CIDR notation for ranges (e.g., "192.168.1.1",
+   * "10.0.0.0/24", "2001:db8::1", or "2001:db8::/32")
    */
   ip_address: string;
   /**
@@ -3584,6 +4302,14 @@ export type CreateNotificationEmailProviderRequest = {
   config: EmailConfig;
   enabled?: boolean | null;
   name: string;
+};
+
+export type CreateNotificationRouteRequest = {
+  enabled?: boolean | null;
+  max_severity: string;
+  min_severity: string;
+  name: string;
+  provider_ids: Array<number>;
 };
 
 export type CreateOidcProviderRequest = {
@@ -3693,14 +4419,48 @@ export type CreateProjectFromTemplateRequest = {
    */
   automatic_deploy?: boolean;
   /**
+   * Optional image entrypoint arguments. An empty list explicitly uses the
+   * image's own default command instead of the template command.
+   */
+  command?: Array<string> | null;
+  /**
+   * CPU limit override in microcores. Zero means uncapped.
+   */
+  cpu_limit?: number | null;
+  /**
+   * CPU request override in microcores (1_000_000 = one CPU core).
+   */
+  cpu_request?: number | null;
+  /**
    * Environment variables to set (key-value pairs)
    */
   environment_variables?: Array<EnvVarInput>;
+  /**
+   * Public container port override.
+   */
+  exposed_port?: number | null;
   /**
    * Git provider connection ID. When omitted, the project deploys directly
    * from the template's public source repository instead of forking it.
    */
   git_provider_connection_id?: number | null;
+  /**
+   * Relative HTTP health-check path override.
+   */
+  health_check_path?: string | null;
+  /**
+   * Optional prebuilt-image override. Curated template values remain the
+   * default when this is omitted. Accepted only for image templates.
+   */
+  image?: string | null;
+  /**
+   * Memory limit override in MiB. Zero means uncapped.
+   */
+  memory_limit?: number | null;
+  /**
+   * Memory request override in MiB.
+   */
+  memory_request?: number | null;
   /**
    * Whether to make the repository private (defaults to true)
    */
@@ -3733,6 +4493,14 @@ export type CreateProjectFromTemplateRequest = {
  */
 export type CreateProjectFromTemplateResponse = {
   /**
+   * Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.
+   */
+  deployment_error?: string | null;
+  /**
+   * Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.
+   */
+  deployment_queued?: boolean | null;
+  /**
    * Message with additional info
    */
   message: string;
@@ -3763,17 +4531,29 @@ export type CreateProjectRequest = {
   build_command?: string | null;
   custom_domain?: string | null;
   directory: string;
-  environment_variables?: Array<[string, string]> | null;
   /**
-   * Port exposed by the container (fallback when image has no EXPOSE directive)
+   * Environment variables to seed the default (production) environment with.
+   *
+   * Accepts objects — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+   * — or the legacy two-element form `["API_KEY", "sk-..."]`, which implies
+   * `is_secret: false`.
+   */
+  environment_variables?: Array<ProjectEnvVarInput> | null;
+  /**
+   * Exact slug returned by service-template preflight. Normal project creation omits it.
+   */
+  expected_slug?: string | null;
+  /**
+   * Explicit port exposed by the container.
    *
    * Priority order for port resolution:
-   * 1. Image EXPOSE directive (auto-detected from built image)
-   * 2. Environment-level exposed_port (overrides this value per environment)
-   * 3. This project-level exposed_port (fallback)
+   * 1. Environment-level exposed_port (explicit override)
+   * 2. This project-level exposed_port (explicit override)
+   * 3. Image EXPOSE directive (auto-detected from built image)
    * 4. Default: 3000
    *
-   * Only set this if your image doesn't use EXPOSE directive.
+   * Set this when the desired application port differs from the image's
+   * first EXPOSE directive (for example, an image exposing HTTP and HTTPS).
    */
   exposed_port?: number | null;
   git_provider_connection_id?: number | null;
@@ -3810,14 +4590,24 @@ export type CreateProjectRequest = {
  * Request to create a new project secret.
  *
  * Project secrets are mounted into the container as files under
- * `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+ * `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+ * variables, so they do not appear in `docker inspect`.
  * Values are always encrypted at rest and never returned in plaintext from
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */
 export type CreateProjectSecretRequest = {
+  /**
+   * Docker Compose services allowed to read this secret, by compose
+   * service name. Empty (the default) delivers it to every service in the
+   * stack, which is how secrets behaved before scoping existed.
+   *
+   * Ignored by non-Compose presets: those deploy a single container, which
+   * always receives every secret in scope for its environment.
+   */
+  compose_services?: Array<string>;
   environment_ids?: Array<number>;
   /**
-   * Include this secret in preview environments.
+   * Include this secret in preview environments (default: false).
    */
   include_in_preview?: boolean;
   /**
@@ -3862,6 +4652,11 @@ export type CreateRouteRequest = {
 
 export type CreateS3SourceRequest = {
   access_key_id: string;
+  /**
+   * Managed RustFS/S3 service that supplies this destination. When set,
+   * schedules using this source can never target that service itself.
+   */
+  backing_service_id?: number | null;
   bucket_name: string;
   bucket_path: string;
   /**
@@ -3904,6 +4699,17 @@ export type CreateSandboxBody = {
   env?: {
     [key: string]: string;
   };
+  /**
+   * Create the sandbox from a snapshot (ADR-037).
+   *
+   * Mutually exclusive with `image`: if both are set the request fails
+   * with 400. When set, the sandbox is created with the snapshotted
+   * filesystem rather than a base image, giving users a reproducible
+   * starting point.
+   *
+   * The snapshot must be in `ready` status and belong to the calling user.
+   */
+  from_snapshot?: string | null;
   /**
    * Docker image override. `null` uses the platform default.
    */
@@ -3973,6 +4779,16 @@ export type CreateSlackProviderRequest = {
   config: SlackConfig;
   enabled?: boolean | null;
   name: string;
+};
+
+/**
+ * Request body for `POST /v1/sandboxes/{id}/snapshots`.
+ */
+export type CreateSnapshotBody = {
+  /**
+   * Optional human-readable label for the snapshot.
+   */
+  label?: string | null;
 };
 
 export type CreateTeamMemberRequest = {
@@ -4350,6 +5166,17 @@ export type DeleteResponse = {
 
 export type DeployFromImageRequest = {
   /**
+   * Claim an image already present in the platform host's Docker daemon.
+   * Temps retags it into a generated project-owned namespace and records
+   * its immutable image ID. Never set this for a registry image.
+   */
+  claim_local?: boolean;
+  /**
+   * Optional container command override. Each entry is passed directly as
+   * one argv element; no shell parsing or interpolation is performed.
+   */
+  command?: Array<string> | null;
+  /**
    * External image ID (if already registered). If provided without image_ref,
    * the image reference will be fetched from the registered external image.
    */
@@ -4382,8 +5209,8 @@ export type DeployFromImageUploadQuery = {
    */
   health_check_path?: string | null;
   /**
-   * Tag to apply to the imported image (e.g., "myapp:v1.0")
-   * If not provided, a unique tag will be generated
+   * Deprecated display hint retained for wire compatibility. Temps always
+   * generates the actual project-scoped internal image reference.
    */
   tag?: string | null;
 };
@@ -4480,6 +5307,18 @@ export type DeploymentConfig = {
    */
   idleTimeoutSeconds?: number;
   /**
+   * Override for the proxy's cap on concurrent in-flight requests to this
+   * project/environment's upstream, independent of the timeout overrides
+   * above. `None` = inherit the global
+   * `connection_limits.default_max_concurrent_connections`. `Some(0)`
+   * explicitly forces "unlimited" for this project/environment, overriding
+   * a nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —
+   * there is no global ceiling clamp here (unlike the timeout settings):
+   * an operator who has explicitly set a per-project value has made a
+   * deliberate choice and the platform should respect it.
+   */
+  maxConcurrentConnections?: number | null;
+  /**
    * Memory limit in megabytes. Three-state semantics:
    * - `None`     → inherit the parent layer (env inherits project, project
    * inherits the seeded default); used by the settings UI's "Use default".
@@ -4512,11 +5351,30 @@ export type DeploymentConfig = {
    * Defaults to 1 replica
    */
   replicas?: number;
+  /**
+   * Override for the proxy's upstream timeout on regular (non-streaming)
+   * HTTP requests to this project/environment, in seconds.
+   * `None` = inherit the global `request_timeouts.default_http_timeout_seconds`
+   * (which itself defaults to "no timeout"). `Some(0)` explicitly forces
+   * "no timeout" for this project/environment, overriding a nonzero
+   * global default. `Some(n)` for `n > 0` sets an explicit timeout,
+   * always clamped to the global hard ceiling
+   * (`request_timeouts.max_request_timeout_seconds`) at resolution time.
+   */
+  requestTimeoutSeconds?: number | null;
   security?: null | SecurityConfig;
   /**
    * Enable session recording for analytics
    */
   sessionRecordingEnabled?: boolean;
+  /**
+   * Override for the proxy's idle timeout on Server-Sent Events streams to
+   * this project/environment, in seconds. `None` = inherit the global
+   * `request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`
+   * explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+   * the global hard ceiling at resolution time.
+   */
+  sseIdleTimeoutSeconds?: number | null;
   /**
    * Label selector for node-based scheduling. Replicas are only deployed to
    * nodes whose labels match the selector.
@@ -4542,6 +5400,14 @@ export type DeploymentConfig = {
    * Requests return 503 if exceeded. Default: 30.
    */
   wakeTimeoutSeconds?: number;
+  /**
+   * Override for the proxy's idle timeout on WebSocket connections to this
+   * project/environment, in seconds. `None` = inherit the global
+   * `request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`
+   * explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+   * the global hard ceiling at resolution time.
+   */
+  websocketIdleTimeoutSeconds?: number | null;
 };
 
 /**
@@ -4746,6 +5612,12 @@ export type DeploymentMetadata = {
    * Docker builder used (e.g., "nixpacks", "dockerfile")
    */
   builder?: string | null;
+  /**
+   * Command passed to a prebuilt image entrypoint. Stored in deployment
+   * metadata so redeploy, rollback, and node failover reproduce the exact
+   * workload rather than falling back to the image default.
+   */
+  command?: Array<string> | null;
   /**
    * Deployment duration in milliseconds
    */
@@ -5505,6 +6377,36 @@ export type DnsRecordStatusResponse =
   "unknown" | "verified" | "pending" | "failed";
 
 /**
+ * Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
+ * `temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
+ * declared separately rather than shared: the agent and control-plane
+ * crates don't depend on each other (the agent avoids pulling in
+ * `temps-deployments`' sea-orm dependency tree), matching the existing
+ * `WirePeerListResponse` pattern in `temps-agent::network_sync`.
+ */
+export type DnsResolverHeartbeat = {
+  consecutive_sync_failures?: number;
+  /**
+   * Most recent resolver-related error: a sync tick failure, or (when the
+   * resolver never started at all) the startup error itself.
+   */
+  last_sync_error?: string | null;
+  last_sync_success_at?: string | null;
+  record_count?: number;
+  /**
+   * `false` when cluster DNS is disabled on the control plane, the
+   * resolver failed to start, or it was shut down. `true` only while a
+   * resolver handle currently exists and cluster DNS is enabled.
+   */
+  running?: boolean;
+  /**
+   * `false` means the resolver's sync or DNS server task crashed. Only
+   * meaningful when `running`.
+   */
+  tasks_alive?: boolean;
+};
+
+/**
  * A DNS zone (domain managed by the provider)
  */
 export type DnsZone = {
@@ -5548,6 +6450,10 @@ export type DockerComposePresetConfig = {
    * Compose service ports that should be publicly routed.
    */
   publicPorts?: Array<ComposePublicPort>;
+  /**
+   * Services granted the limited startup capability profile after explicit approval.
+   */
+  relaxedCapabilityServices?: Array<string>;
 };
 
 export type DockerRegistrySettings = {
@@ -5586,6 +6492,7 @@ export type DockerfilePresetConfig = {
    * If not specified, defaults to "Dockerfile" in the build context
    */
   dockerfilePath?: string | null;
+  imageRuntime?: null | ImageRuntimeConfig;
   variant?: null | DockerfileVariant;
 };
 
@@ -5705,7 +6612,8 @@ export type DrainStatusResponse = {
    */
   can_remove: boolean;
   /**
-   * Whether the drain is complete (all containers migrated)
+   * Whether the source node is empty and safe to remove. Replacement
+   * deployments may still be converging asynchronously on other nodes.
    */
   drain_complete: boolean;
   message: string;
@@ -5750,8 +6658,17 @@ export type DropOffPoint = {
 };
 
 export type DropPresetCandidate = {
+  composePath?: string | null;
   confidence: string;
   directory: string;
+  /**
+   * Repository-root-relative path to the Dockerfile, when it does not
+   * live directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`
+   * rolled up to a `directory` of `"."`). `None` for a Dockerfile located
+   * directly at `{directory}/Dockerfile` and for every non-Dockerfile
+   * preset.
+   */
+  dockerfilePath?: string | null;
   isStatic: boolean;
   label: string;
   preset: string;
@@ -5869,16 +6786,16 @@ export type EmailStatsResponse = {
    */
   captured: number;
   /**
-   * Provider transport completed without a definitive delivery result; never retried automatically
+   * Emails whose provider accepted/rejected outcome could not be determined
    */
   delivery_unknown: number;
   failed: number;
   queued: number;
-  sent: number;
   /**
-   * Emails currently protected by a delivery lease
+   * Emails currently owned by an active provider delivery attempt
    */
   sending: number;
+  sent: number;
   total: number;
 };
 
@@ -6180,9 +7097,50 @@ export type EntityResponse = {
 };
 
 /**
+ * A single environment variable parsed from a detected env-example file
+ */
+export type EnvExampleVariable = {
+  /**
+   * Placeholder/default value as written in the file (may be empty)
+   */
+  default_value: string;
+  /**
+   * Description derived from a `# comment` immediately preceding the
+   * variable in the file, if any
+   */
+  description?: string | null;
+  /**
+   * Variable name (e.g. "DATABASE_URL")
+   */
+  key: string;
+};
+
+export type EnvExampleVariableResponse = {
+  /**
+   * Placeholder/default value as written in the file (may be empty)
+   */
+  defaultValue: string;
+  /**
+   * Description derived from a `# comment` immediately preceding the
+   * variable in the file, if any
+   */
+  description?: string | null;
+  /**
+   * Variable name (e.g. "DATABASE_URL")
+   */
+  key: string;
+};
+
+/**
  * Input for environment variable
  */
 export type EnvVarInput = {
+  /**
+   * Mark the variable as a secret. Secret values are encrypted at rest,
+   * masked in list responses, and revealable only through an audited,
+   * permission-checked endpoint. Defaults to `false`.
+   */
+  is_secret?: boolean;
   /**
    * Variable name
    */
@@ -6214,6 +7172,43 @@ export type EnvVarResponse = {
 };
 
 /**
+ * Environment variable template definition
+ */
+export type EnvVarTemplate = {
+  /**
+   * Default value if not provided by user
+   */
+  default?: string | null;
+  /**
+   * Frontend-side generator for the default value. Recognised values:
+   * `app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),
+   * `random_hex_32` (32-byte hex). Unknown values are ignored client-side.
+   */
+  default_generator?: string | null;
+  /**
+   * Description of what this variable is used for
+   */
+  description?: string | null;
+  /**
+   * Example value for documentation
+   */
+  example?: string | null;
+  /**
+   * Name of the environment variable
+   */
+  name: string;
+  /**
+   * Whether this variable is required
+   */
+  required?: boolean;
+  /**
+   * Explicit sensitivity classification for credentials whose names do not
+   * match the conservative built-in heuristic.
+   */
+  secret?: boolean;
+};
+
+/**
  * Environment variable template response
  */
 export type EnvVarTemplateResponse = {
@@ -6242,6 +7237,10 @@ export type EnvVarTemplateResponse = {
    * Whether this variable is required
    */
   required: boolean;
+  /**
+   * Whether values must use the protected secret reveal path.
+   */
+  secret: boolean;
 };
 
 /**
@@ -6380,15 +7379,15 @@ export type EnvironmentVariableResponse = {
    */
   include_in_preview: boolean;
   /**
-   * Whether the variable is a write-only secret. Secrets always have
-   * `value: None` in responses.
+   * Whether the variable is a secret. Secrets always have `value: None` in
+   * list responses.
    */
   is_secret: boolean;
   key: string;
   updated_at: number;
   /**
    * Plaintext value for non-secret vars (or `"***"` mask for list responses).
-   * `None` for secret vars — secrets are write-only.
+   * `None` for secret vars; use the audited per-variable reveal endpoint.
    */
   value?: string | null;
 };
@@ -6431,12 +7430,30 @@ export type ErrorEventResponse = {
   timestamp: string;
 };
 
+export type ErrorGroupDeploymentResponse = {
+  branch?: string | null;
+  commit_hash?: string | null;
+  commit_message?: string | null;
+  id: number;
+};
+
 export type ErrorGroupResponse = {
+  /**
+   * Count of distinct affected visitors/users within the requested time window.
+   * Present only when `start_date` and `end_date` were supplied on the list request.
+   */
+  affected_users?: number | null;
   assigned_to?: string | null;
   created_at: string;
+  deployment?: null | ErrorGroupDeploymentResponse;
   deployment_id?: number | null;
   environment_id?: number | null;
   error_type: string;
+  /**
+   * Count of error events within the requested time window.
+   * Present only when `start_date` and `end_date` were supplied on the list request.
+   */
+  events_in_range?: number | null;
   first_seen: string;
   id: number;
   last_seen: string;
@@ -6486,6 +7503,12 @@ export type ErrorTimeSeriesQuery = {
    */
   bucket?: string;
   end_time: string;
+  /**
+   * Filter chart data to a specific environment.
+   * Always AND-combined with project_id — an environment from a different project
+   * returns zero-filled buckets rather than cross-project data.
+   */
+  environment_id?: number | null;
   start_time: string;
 };
 
@@ -6734,6 +7757,14 @@ export type EventMetricsPayload = {
    * Cumulative Layout Shift (score)
    */
   cls?: number | null;
+  /**
+   * The tracked site's own domain, computed client-side by the SDK's
+   * `resolveDomain()` and sent as a sibling of `event_data` (not nested
+   * inside it). Used on the keyed ingest path (ADR-040 §3) to attribute
+   * self-referrals/channels correctly: there, `Host` names the Temps
+   * server rather than the customer's site, so it can't be used for that.
+   */
+  domain?: string | null;
   event_data: unknown;
   event_name: string;
   /**
@@ -6763,11 +7794,23 @@ export type EventMetricsPayload = {
   screen_height?: number | null;
   screen_width?: number | null;
   /**
+   * Client-generated session id fallback (see `visitor_id`).
+   */
+  session_id?: string | null;
+  /**
    * Time to First Byte (milliseconds)
    */
   ttfb?: number | null;
   viewport_height?: number | null;
   viewport_width?: number | null;
+  /**
+   * Client-generated visitor id, used only when the request carries no
+   * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+   * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+   * Accepts the SDK's `visitorId` key too, since the shared SDK helper that
+   * generates this value sends camelCase for every ingest endpoint.
+   */
+  visitor_id?: string | null;
 };
 
 /**
@@ -6941,17 +7984,12 @@ export type EventVisitorsResponse = {
 };
 
 export type EventsCountQuery = {
-  /**
-   * Aggregation level: events (raw count), sessions (unique sessions), or visitors (unique visitors)
-   */
-  aggregation_level?: AggregationLevel;
-  /**
-   * Only return custom events, excluding system events like page_view, page_leave, heartbeat (default: true)
-   */
+  breakdown?: null | EventBreakdown;
   custom_events_only?: boolean | null;
   end_date: string;
   environment_id?: number | null;
   limit?: number | null;
+  project_id: number;
   start_date: string;
 };
 
@@ -7141,6 +8179,11 @@ export type ExternalServiceBackupResponse = {
   metadata: unknown;
   s3_location: string;
   service_id: number;
+  /**
+   * Immutable provenance retained when the source service is deleted.
+   */
+  service_name_snapshot?: string | null;
+  service_type_snapshot?: string | null;
   size_bytes?: number | null;
   started_at: string;
   state: string;
@@ -7209,6 +8252,78 @@ export type ExternalServiceSummary = {
    * Service type string (e.g. "postgres", "redis", "mongodb").
    */
   service_type: string;
+};
+
+/**
+ * Which storage engine a facet was created against. A deployment only ever
+ * runs one backend at a time (see `plugin.rs`'s storage selection), but
+ * stamping it on each row keeps the status fields unambiguous.
+ */
+export type FacetBackendKind = "clickhouse" | "timescaledb";
+
+/**
+ * Public representation of a registered span attribute facet.
+ */
+export type FacetInfo = {
+  /**
+   * The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.
+   */
+  attribute_key: string;
+  backend: FacetBackendKind;
+  created_at: string;
+  /**
+   * Populated when `status = failed`, explaining why.
+   */
+  error_message?: string | null;
+  /**
+   * Rows backfilled so far. Only meaningful for the `timescaledb` backend
+   * — the `clickhouse` backend's mutation doesn't expose a row count
+   * until it's done, so this stays 0 there even while running.
+   */
+  rows_backfilled: number;
+  /**
+   * The slot column index 1..=20 (`facet_attr_N`).
+   */
+  slot: number;
+  status: FacetStatus;
+};
+
+/**
+ * Backfill/delete-clear lifecycle for a facet. See the module docs for how
+ * the poller advances a facet through these states.
+ */
+export type FacetStatus =
+  "pending" | "running" | "completed" | "failed" | "deleting";
+
+/**
+ * Response body for facet list.
+ */
+export type FacetsResponse = {
+  data: Array<FacetInfo>;
+};
+
+export type FailureReportPreviewResponse = {
+  error_message?: string | null;
+  failed_job_type: string;
+  github_issue_body: string;
+  github_issue_title: string;
+  /**
+   * Redacted, editable draft of the failure trace. Shown in a textarea the
+   * user can edit before sending — nothing is sent without their review.
+   */
+  redacted_log: string;
+  /**
+   * Whether "send to Temps" should be offered. False when the operator
+   * opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
+   */
+  reporting_enabled: boolean;
+};
+
+export type FeatureMaturity = {
+  docs_path: string;
+  key: string;
+  maturity: Maturity;
+  reason: string;
 };
 
 export type FieldResponse = {
@@ -7455,8 +8570,8 @@ export type GatewayStatus = {
    */
   host_port?: number | null;
   /**
-   * Image reference the container was created with (e.g.
-   * `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+   * Image reference the container was created with (e.g. an immutable
+   * `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
    */
   image?: string | null;
   /**
@@ -8051,6 +9166,25 @@ export type GitPushEvent = {
 };
 
 /**
+ * Git repository reference (supports any git provider: GitHub, GitLab, Bitbucket, etc.)
+ */
+export type GitRef = {
+  /**
+   * Path within the repository (for monorepos)
+   * Also accepts "subfolder" as an alias in YAML/JSON
+   */
+  path?: string | null;
+  /**
+   * Git reference (branch, tag, or commit)
+   */
+  ref?: string;
+  /**
+   * Git repository URL (e.g., "https://github.com/owner/repo.git" or "https://gitlab.com/owner/repo.git")
+   */
+  url: string;
+};
+
+/**
  * Git repository reference response
  */
 export type GitRefResponse = {
@@ -8102,6 +9236,10 @@ export type GitSourcePlan = {
  * link back to the source.
  */
 export type GlobalConversationResponse = {
+  ai_model: string;
+  ai_permission_mode: string;
+  ai_provider: string;
+  ai_thinking_level?: string | null;
   context_id: string;
   context_type: string;
   created_at: string;
@@ -8227,6 +9365,10 @@ export type HasMetricsResponse = {
   has_metrics: boolean;
 };
 
+export type HasTracesResponse = {
+  has_traces: boolean;
+};
+
 /**
  * Health check configuration
  */
@@ -8315,6 +9457,7 @@ export type HeartbeatApiRequest = {
    * Each entry has `container_id` and `container_name` of temps-managed containers.
    */
   containers?: Array<ContainerInventoryItem> | null;
+  dns_resolver?: null | DnsResolverHeartbeat;
   /**
    * Updated node labels for scheduling (allows runtime label changes).
    */
@@ -8459,6 +9602,46 @@ export type HttpChallengeDebugResponse = {
    * The ACME validation URL (internal to ACME protocol)
    */
   validation_url?: string | null;
+};
+
+/**
+ * System-wide retention policy for locally-built deployment images.
+ *
+ * The nightly cleanup removes a Temps-built image only once *every*
+ * deployment that references it is older than the owning project's retention
+ * window. Deleting an image makes rollback/promotion to that deployment
+ * impossible, so the default is deliberately generous: it is a rollback
+ * window, not a cache TTL.
+ */
+export type ImageRetentionSettings = {
+  /**
+   * Default hours to keep a built deployment image when the owning project
+   * has no `image_retention_hours` override. Valid range 1..=8760.
+   */
+  default_hours?: number;
+  /**
+   * Whether the nightly pass removes expired deployment images at all.
+   * Disabling it keeps every built image forever (the pre-0.1 behaviour).
+   */
+  enabled?: boolean;
+};
+
+/**
+ * Editable runtime settings for a single-container image template.
+ *
+ * Multi-container service templates will use a separate container collection;
+ * keeping this shape explicitly singular prevents silently applying one image
+ * or command to an unrelated sidecar.
+ */
+export type ImageRuntimeConfig = {
+  /**
+   * `None` explicitly means "use the image's default command". Keep the
+   * serialized `null` when a runtime snapshot exists so clients can
+   * distinguish that choice from an omitted runtime setting.
+   */
+  command?: Array<string> | null;
+  healthCheckPath?: string | null;
+  imageRef: string;
 };
 
 /**
@@ -8754,6 +9937,76 @@ export type ImportStatusResponse = {
   warnings: Array<string>;
 };
 
+/**
+ * Request body for Path B: import from Traefik's `acme.json`.
+ *
+ * `Debug` is hand-written: `acme_json` contains Traefik's private keys and
+ * must never appear in logs. Only the host list, renewal method, dry-run flag,
+ * and byte length are logged.
+ */
+export type ImportTraefikAcmeJsonRequest = {
+  /**
+   * Required when `renewal_method` is `"dns-01"` and no auto-manage zone
+   * covers the host.
+   */
+  acknowledge_manual_dns_renewal?: boolean;
+  /**
+   * Raw contents of the Traefik `acme.json` file (uploaded by the CLI or
+   * pasted in the console). **Never** a server-side file path.
+   * Redacted in `Debug` output — the field holds private key material.
+   */
+  acme_json: string;
+  /**
+   * `true` → full parse and validation, no writes. The identical per-host
+   * verdicts are returned, giving the operator a preview before committing.
+   */
+  dry_run?: boolean;
+  /**
+   * Hosts to import. Only hosts that appear in the document's certificates
+   * (by X.509 SAN, not JSON `domain.main`) are accepted.
+   */
+  hosts: Array<string>;
+  /**
+   * `"http-01"` or `"dns-01"`. Stored as `verification_method` so the
+   * renewal scheduler knows how to renew.
+   */
+  renewal_method: string;
+};
+
+/**
+ * Response body for the Path B import endpoint.
+ */
+export type ImportTraefikAcmeJsonResponse = {
+  dry_run: boolean;
+  failed: number;
+  succeeded: number;
+  total_requested: number;
+  verdicts: Array<ImportedHostVerdict>;
+};
+
+/**
+ * Per-host result from a Path B import.
+ */
+export type ImportedHostVerdict = {
+  /**
+   * Human-readable failure reason when `success` is `false`.
+   */
+  error?: string | null;
+  host: string;
+  /**
+   * ISO 8601 expiry of the imported certificate.
+   */
+  not_after?: string | null;
+  /**
+   * DNS SANs carried in the imported certificate.
+   */
+  sans: Array<string>;
+  /**
+   * Whether the cert was written (or would be written on `dry_run: false`).
+   */
+  success: boolean;
+};
+
 export type IncidentBucket = {
   active_incidents: number;
   avg_resolution_time_minutes?: number | null;
@@ -8821,6 +10074,47 @@ export type IncrResponse = {
    * New value after increment
    */
   value: number;
+};
+
+/**
+ * One aggregated ingest-failure group: "this signal failed this way N times".
+ *
+ * The pipeline-stats counters say *how many* records were dropped;
+ * this says *why*. Rows are grouped by `(signal_type, error_class)` rather
+ * than stored per-event, so a sustained outage collapses into one row with a
+ * rising `count` instead of flooding the table.
+ *
+ * `sample_message` is one representative backend error string, kept for the
+ * detail a class name cannot carry (the failing column, the refused address).
+ * It is a sample, not a guarantee: which occurrence it came from is
+ * unspecified.
+ */
+export type IngestErrorSummary = {
+  /**
+   * How many times this `(signal_type, error_class)` pair has failed.
+   */
+  count: number;
+  /**
+   * Stable, low-cardinality failure class — see `OtelError::error_class`.
+   */
+  error_class: string;
+  first_seen: string;
+  last_seen: string;
+  /**
+   * A representative backend error message for this group.
+   */
+  sample_message: string;
+  /**
+   * Which signal was being written: `metrics`, `spans`, or `logs`.
+   */
+  signal_type: string;
+};
+
+export type IngestErrorsResponse = {
+  /**
+   * Failure groups, most recently seen first.
+   */
+  errors: Array<IngestErrorSummary>;
 };
 
 export type InitAuthResponse = {
@@ -9142,6 +10436,23 @@ export type KvStatusResponse = {
   version?: string | null;
 };
 
+export type LatestDeploymentMediaResponse = {
+  /**
+   * Latest deployment media keyed by project ID. Projects with no
+   * deployments are omitted.
+   */
+  projects: {
+    [key: string]: LatestDeploymentMediaResponseItem;
+  };
+};
+
+export type LatestDeploymentMediaResponseItem = {
+  latest_attempt_status: string;
+  project_id: number;
+  screenshot_location?: string | null;
+  url?: string | null;
+};
+
 export type LemonSqueezyConfig = {
   product_allowlist?: Array<string>;
   variant_allowlist?: Array<string>;
@@ -9267,6 +10578,11 @@ export type ListDeploymentTokensQuery = {
   page_size?: number | null;
 };
 
+export type ListDiscoveredRoutesQuery = {
+  page?: number | null;
+  page_size?: number | null;
+};
+
 export type ListDomainsResponse = {
   domains: Array<DomainResponse>;
   page: number;
@@ -9333,6 +10649,16 @@ export type ListPresetsResponse = {
   total: number;
 };
 
+/**
+ * Paginated renewal-attempt history for one domain, newest first.
+ */
+export type ListRenewalAttemptsResponse = {
+  attempts: Array<RenewalAttemptResponse>;
+  page: number;
+  page_size: number;
+  total: number;
+};
+
 export type ListRunsResponse = {
   items: Array<AgentRunResponse>;
   page: number;
@@ -9367,6 +10693,16 @@ export type ListSkillsResponse = {
 };
 
 /**
+ * Paginated list of snapshots.
+ */
+export type ListSnapshotsResponse = {
+  page: number;
+  page_size: number;
+  snapshots: Array<SnapshotResponse>;
+  total: number;
+};
+
+/**
  * Response for listing tags
  */
 export type ListTagsResponse = {
@@ -9388,6 +10724,7 @@ export type ListTemplatesQuery = {
    * Only return featured templates
    */
   featured?: boolean | null;
+  kind?: null | TemplateKind;
   /**
    * Filter templates by tag
    */
@@ -9598,6 +10935,21 @@ export type ManagedDomainResponse = {
   zone_id?: string | null;
 };
 
+export type ManagedEnvironmentVariable = {
+  description: string;
+  is_secret: boolean;
+  /**
+   * Whether a user-defined value is intentionally allowed to replace the
+   * generated default. When false, the deployment pipeline wins.
+   */
+  is_user_overridable: boolean;
+  name: string;
+  source: ManagedEnvironmentVariableSource;
+};
+
+export type ManagedEnvironmentVariableSource =
+  "error_tracking" | "open_telemetry" | "temps";
+
 /**
  * A manual action the user must perform outside of the automated migration
  */
@@ -9622,6 +10974,8 @@ export type ManualAction = {
 export type ManualActionTiming =
   "before-migration" | "after-migration" | "within-hours";
 
+export type Maturity = "stable" | "beta" | "experimental";
+
 export type McpDefinitionResponse = {
   config: {
     [key: string]: unknown;
@@ -9633,6 +10987,26 @@ export type McpDefinitionResponse = {
   project_id?: number | null;
   slug: string;
   updated_at: string;
+};
+
+/**
+ * MCP server settings (ADR-039).
+ *
+ * The MCP endpoint lets AI tools (e.g. the Temps CLI wizard) interact with
+ * this Temps instance through the Model Context Protocol.  Disabled by
+ * default so new installs do not expose the endpoint until the operator
+ * explicitly opts in.
+ *
+ * `bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the
+ * safe-off behaviour is automatic for new installs and legacy settings rows.
+ */
+export type McpServerSettings = {
+  /**
+   * Master switch. When `false` (default), `GET /mcp/tools` returns `404`
+   * and all other MCP endpoints return `404` too.  Set to `true` via the
+   * Settings UI to activate the MCP server.
+   */
+  enabled?: boolean;
 };
 
 export type MessageContent = string | Array<ContentPart>;
@@ -9808,6 +11182,10 @@ export type MetricsQuery = {
  */
 export type MetricsRangeQuery = {
   /**
+   * Explicit window end (ISO 8601). Must be paired with `start_time`.
+   */
+  end_time?: string | null;
+  /**
    * Metric name, e.g. `"pg.connections_active"`.
    */
   metric: string;
@@ -9818,8 +11196,13 @@ export type MetricsRangeQuery = {
   percentile?: number | null;
   /**
    * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+   * Ignored when `start_time` and `end_time` are both set.
    */
   range?: string;
+  /**
+   * Explicit window start (ISO 8601). Must be paired with `end_time`.
+   */
+  start_time?: string | null;
 };
 
 /**
@@ -10443,6 +11826,38 @@ export type NodeCostInfo = {
   region?: string | null;
 };
 
+/**
+ * Per-node DNS resolver health, as last reported by that node's heartbeat.
+ * Part of `GET /api/cluster/dns/status`.
+ */
+export type NodeDnsStatusEntry = {
+  dns_resolver_consecutive_failures: number;
+  dns_resolver_last_error?: string | null;
+  dns_resolver_last_sync_at?: string | null;
+  dns_resolver_record_count?: number | null;
+  /**
+   * `None` = never reported (older agent, or a single-host node that
+   * never allocates a `compute_cidr` and so never touches cluster DNS).
+   */
+  dns_resolver_running?: boolean | null;
+  dns_resolver_tasks_alive?: boolean | null;
+  node_id: number;
+  node_name: string;
+  /**
+   * The node's own status field (`active`, `offline`, `draining`, …) —
+   * included so an operator can tell "resolver down" apart from "node
+   * down" at a glance, without a second request.
+   */
+  node_status: string;
+  /**
+   * Computed from `dns_resolver_last_sync_at` against "now" server-side —
+   * a raw timestamp makes an operator do the subtraction themselves for
+   * every node; a staleness age is what actually answers "is this
+   * healthy right now". `None` when `dns_resolver_last_sync_at` is `None`.
+   */
+  seconds_since_last_sync?: number | null;
+};
+
 export type NodeInfoResponse = {
   address: string;
   /**
@@ -10503,6 +11918,24 @@ export type NotificationProviderResponse = {
   name: string;
   provider_type: string;
   updated_at: number;
+};
+
+export type NotificationRoute = {
+  created_at: number;
+  enabled: boolean;
+  id: number;
+  max_severity: string;
+  min_severity: string;
+  name: string;
+  provider_ids: Array<number>;
+  updated_at: number;
+};
+
+export type NotificationRoutePage = {
+  items: Array<NotificationRoute>;
+  page: number;
+  page_size: number;
+  total: number;
 };
 
 /**
@@ -11718,6 +13151,32 @@ export type PerformanceMetricsResponse = {
 };
 
 /**
+ * The user's decision for a pending permission request.  Serialized as a tagged
+ * JSON object and sent in the resolve endpoint body.  `DenyTool`/`RejectPlan`
+ * carry an optional human-readable reason that is forwarded to the CLI's
+ * `control_response` (never stored).
+ */
+export type PermissionDecision =
+  | {
+      type: "allow_tool";
+    }
+  | {
+      reason?: string | null;
+      type: "deny_tool";
+    }
+  | {
+      answers: unknown;
+      type: "answer_question";
+    }
+  | {
+      type: "approve_plan";
+    }
+  | {
+      feedback?: string | null;
+      type: "reject_plan";
+    };
+
+/**
  * Information about a single permission
  */
 export type PermissionInfo = {
@@ -11733,6 +13192,68 @@ export type PermissionInfo = {
    * The permission identifier (e.g., "projects:read")
    */
   name: string;
+};
+
+/**
+ * Kind of permission the Claude CLI is requesting via `--permission-prompt-tool stdio`
+ * (ADR-038 Phase 2). Used to drive the correct UI card (`ToolApproval` → allow/deny
+ * buttons; `Question` → answer form; `PlanApproval` → approve/reject-with-feedback).
+ */
+export type PermissionKind = "tool_approval" | "question" | "plan_approval";
+
+/**
+ * A permission request emitted by `run_interactive` when the Claude CLI blocks
+ * on a `control_request` frame.  Passed to the UI via an SSE event so the user
+ * can respond before the subprocess continues.
+ */
+export type PermissionRequest = {
+  /**
+   * The CLI's own `request_id` (UUID); used as the key in the pending-permission
+   * registry and as `{permission_id}` in the resolve endpoint.
+   */
+  id: string;
+  /**
+   * Raw `request.input` from the CLI — passed through to the UI verbatim so
+   * each milestone's card can render the relevant fields without requiring the
+   * service layer to know about tool-specific schemas.
+   */
+  input: unknown;
+  /**
+   * What kind of interaction is required.
+   */
+  kind: PermissionKind;
+  /**
+   * The tool name from `request.tool_name` (e.g. `"Bash"`, `"AskUserQuestion"`).
+   */
+  tool_name: string;
+};
+
+/**
+ * Payload for the `permission_requested` SSE event (ADR-038 Phase 2).
+ * The active provider turn is paused waiting for the user to approve or deny
+ * a tool/question/plan. Resolve via
+ * `POST .../permissions/{id}/resolve`.
+ */
+export type PermissionRequestedEvent = {
+  /**
+   * The CLI's `request_id` — also the `{permission_id}` in the resolve URL.
+   */
+  id: string;
+  /**
+   * Raw `input` from the CLI request. Passed through verbatim so each
+   * milestone's card can render tool-specific fields without the service
+   * layer needing to know about their schemas.
+   */
+  input: unknown;
+  /**
+   * What kind of interaction is required: `"tool_approval"`, `"question"`,
+   * or `"plan_approval"`.
+   */
+  kind: PermissionKind;
+  /**
+   * Tool name from the CLI request (e.g. `"Bash"`, `"AskUserQuestion"`).
+   */
+  tool_name: string;
 };
 
 export type PgUpgradeLogResponse = {
@@ -11760,7 +13281,75 @@ export type PgUpgradeResponse = {
 };
 
 /**
+ * One `(timestamp, value)` sample in a pipeline series.
+ */
+export type PipelineHistoryPoint = {
+  /**
+   * ISO 8601 timestamp with `Z` suffix (bucket start).
+   */
+  time: string;
+  /**
+   * Bucket value — the mean per-sample delta, see [`PipelineSeries`].
+   */
+  value: number;
+};
+
+/**
+ * Time-series history for every counter the pipeline-stats sampler publishes.
+ */
+export type PipelineHistoryResponse = {
+  /**
+   * Resolved window end (ISO 8601, `Z`).
+   */
+  end_time: string;
+  /**
+   * Interval the sampler writes at, in seconds. The client needs this to
+   * label values honestly: a bucket is the *mean delta per sample*, so
+   * "events per `sample_interval_seconds`", not a bucket total.
+   */
+  sample_interval_seconds: number;
+  /**
+   * One entry per sampled counter, always the full set in a stable order —
+   * a counter with no data yet is present with an empty `points`, never
+   * omitted, so the client can render an empty chart instead of dropping
+   * the panel.
+   */
+  series: Array<PipelineSeries>;
+  /**
+   * Resolved window start (ISO 8601, `Z`).
+   */
+  start_time: string;
+  /**
+   * Bucket width actually used, in seconds. Server-derived from the window
+   * so a caller cannot request 1-minute buckets over 7 days.
+   */
+  step_seconds: number;
+};
+
+/**
+ * One charted counter over the requested window.
+ */
+export type PipelineSeries = {
+  /**
+   * Metric name, e.g. `otel.spans_dropped`.
+   */
+  name: string;
+  /**
+   * Buckets in ascending time order. Empty when the window predates the
+   * first sample (a freshly started server has no history yet).
+   */
+  points: Array<PipelineHistoryPoint>;
+};
+
+/**
  * Internal pipeline statistics for self-observability.
+ *
+ * All fields are cumulative process-lifetime counters. Every one of them is
+ * also sampled every 60 seconds by the plugin's stats sampler and written to
+ * the unified metrics store as a **delta** counter named `otel.<field>`
+ * (`SourceKind::Node`, node_id 0) — see `pipeline_stat_deltas` in
+ * `plugin.rs`. Adding a field here means adding it there too, otherwise the
+ * new counter is only ever visible through the API response.
  */
 export type PipelineStats = {
   ingest_errors: number;
@@ -11771,6 +13360,27 @@ export type PipelineStats = {
   metrics_dropped: number;
   metrics_received: number;
   metrics_stored: number;
+  /**
+   * Cumulative count of ingest requests rejected because the per-project
+   * storage quota was exceeded (→ HTTP 413). Written to the metrics store
+   * as `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.
+   */
+  quota_exceeded_requests: number;
+  /**
+   * Cumulative count of ingest requests rejected because the per-project
+   * rate limit was exceeded (→ HTTP 429). Written to the metrics store as
+   * `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
+   */
+  rate_limited_requests: number;
+  /**
+   * Cumulative count of best-effort relay batches rejected because the
+   * bounded relay handoff was saturated or closed.
+   */
+  relay_dropped_batches: number;
+  /**
+   * Cumulative signal-item count contained in rejected relay batches.
+   */
+  relay_dropped_items: number;
   spans_dropped: number;
   spans_received: number;
   spans_stored: number;
@@ -11810,7 +13420,7 @@ export type PlanMetadata = {
 export type PlanSourceBackup = {
   created_at?: string | null;
   /**
-   * "walg", "pg_dump", "unknown".
+   * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
    */
   format: string;
   /**
@@ -11861,9 +13471,31 @@ export type PlatformInfo = {
 };
 
 /**
+ * What a plugin is allowed to do with the platform API over the channel.
+ *
+ * Coarse on purpose. Fine-grained authorization already exists in the
+ * permission system and is enforced per request against the acting user;
+ * this exists so an operator installing a binary can see at a glance
+ * whether it intends to *write* at all, without reading its source.
+ */
+export type PluginCapability = "api_read" | "api_write";
+
+/**
  * The complete plugin manifest — the handshake contract.
  */
 export type PluginManifest = {
+  /**
+   * What this plugin may do with the platform's own API over the channel.
+   *
+   * Empty by default, and empty means read-only channel queries and
+   * nothing else: a plugin that never asks cannot deploy, cannot create
+   * projects, and cannot provision databases. Declaring a capability is
+   * not by itself permission to act — every call still runs the real
+   * handler's `permission_guard!` as the user the plugin is acting for,
+   * so a capability can only ever narrow what that user could already do
+   * through the console.
+   */
+  capabilities?: Array<PluginCapability>;
   /**
    * Short description of what the plugin does
    */
@@ -11891,6 +13523,20 @@ export type PluginManifest = {
    */
   health_path?: string;
   /**
+   * Suppress the console's own header strip above this plugin's UI.
+   *
+   * The console normally renders the plugin's icon, display name and
+   * version above the iframe. For a plugin whose UI is a full working
+   * surface with its own header, that is a second title bar competing
+   * for the same vertical space — and vertical space is exactly what a
+   * dense full-page layout has none of. Opt out and the frame gets the
+   * full height.
+   *
+   * The nav entry still names the plugin, so nothing becomes
+   * unidentifiable by setting this.
+   */
+  hide_header?: boolean;
+  /**
    * Unique plugin identifier (kebab-case, e.g., "backup-manager")
    */
   name: string;
@@ -11899,9 +13545,35 @@ export type PluginManifest = {
    */
   nav?: Array<NavEntry>;
   /**
+   * Routes this plugin authenticates itself, which the platform's proxy
+   * therefore does not gate.
+   *
+   * Every other proxied route requires an authenticated caller before it
+   * reaches the plugin. That is right for anything a signed-in user
+   * drives, and wrong for the endpoints a plugin exposes to clients that
+   * hold no platform session — an agent in a sandbox presenting a
+   * capability token, a share link opened by someone with no account.
+   * This is the external-plugin counterpart of the in-process
+   * `configure_public_routes`.
+   *
+   * Paths are relative to the plugin's mount point and match by prefix,
+   * so `/webhooks/incoming` covers everything beneath it. A listed route is
+   * reachable by anyone who can reach the instance: it **must** check its
+   * own credential. Listing a route that does not is an open door.
+   */
+  public_paths?: Array<string>;
+  /**
    * Whether the plugin needs database access
    */
   requires_db?: boolean;
+  /**
+   * Whether the plugin may read the platform's host data root.
+   *
+   * This is a highly privileged capability: the directory can contain
+   * encryption keys and instance-owned state. It is independent of direct
+   * database access and defaults to `false`.
+   */
+  requires_host_data_access?: boolean;
   ui?: null | UiManifest;
   /**
    * SemVer version string
@@ -11986,6 +13658,13 @@ export type PresetInfo = {
    */
   compose_files?: Array<string> | null;
   /**
+   * Repository-root-relative path to the Dockerfile, when it does not
+   * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+   * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+   * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+   */
+  dockerfile_path?: string | null;
+  /**
    * Default exposed port for this preset
    */
   exposed_port?: number | null;
@@ -12056,12 +13735,29 @@ export type PreviewGatewaySettings = {
    */
   auto_upgrade?: boolean;
   /**
+   * Docker container name for this instance's gateway.
+   *
+   * A single Temps install owns the whole host, so the default is fine and
+   * operators never need to touch this. It exists for the case where
+   * several Temps instances share one Docker daemon — most obviously a
+   * development machine with multiple checkouts running at once.
+   *
+   * Without it those instances silently fight: the `shared_secret` is
+   * per-database, so each generates a different one, but they all
+   * reconcile the *same* container name. Each start-up sees the other's
+   * container as drifted, recreates it with its own secret, and every
+   * other instance's previews start failing with "missing or invalid
+   * X-Temps-Preview-Token". Giving each instance its own container name
+   * (and `host_port`) makes them independent.
+   */
+  container_name?: string;
+  /**
    * Host port to publish the gateway on (always bound to 127.0.0.1).
    * Pingora forwards `ws-*` traffic to this port after authenticating.
    */
   host_port?: number;
   /**
-   * Docker image reference for the gateway. Pinned per Temps release.
+   * Docker image reference for the gateway. Pinned by digest per Temps release.
    * Operators can override this to test a custom build.
    */
   image?: string;
@@ -12238,7 +13934,32 @@ export type ProjectDashboardAnalytics = {
 };
 
 /**
- * Health summary for a single project (last 1 hour)
+ * Documentation-only schema for a project-creation environment variable.
+ *
+ * The wire format is deserialized by [`CreateProjectEnvVar`], which also
+ * accepts the legacy `["KEY", "value"]` tuple form. This struct exists so the
+ * OpenAPI spec (and the generated clients) describe the preferred object form
+ * with its `is_secret` flag.
+ */
+export type ProjectEnvVarInput = {
+  /**
+   * Mark the variable as a secret. Secret values are encrypted at rest,
+   * masked in list responses, and revealable only through an audited,
+   * permission-checked endpoint. Defaults to `false`.
+   */
+  is_secret?: boolean;
+  /**
+   * Variable name, e.g. `DATABASE_URL`
+   */
+  key: string;
+  /**
+   * Variable value
+   */
+  value: string;
+};
+
+/**
+ * Health summary for a single project over the requested time range.
  */
 export type ProjectHealthSummary = {
   /**
@@ -12249,6 +13970,10 @@ export type ProjectHealthSummary = {
    * Error rate as a percentage (0-100)
    */
   error_rate: number;
+  /**
+   * Hourly request counts ordered by bucket start.
+   */
+  hourly_requests: Array<ProjectHourlyRequestCount>;
   project_id: number;
   /**
    * Health status: "healthy", "degraded", "down", "unknown"
@@ -12262,6 +13987,17 @@ export type ProjectHealthSummary = {
    * Total requests in the period
    */
   total_requests: number;
+};
+
+/**
+ * One hourly request-count point in a project health summary.
+ */
+export type ProjectHourlyRequestCount = {
+  /**
+   * Start of the UTC hour in RFC 3339 format.
+   */
+  bucket: string;
+  request_count: number;
 };
 
 export type ProjectInfo = {
@@ -12286,6 +14022,13 @@ export type ProjectPresetResponse = {
    * Compose file paths found in the repository (only for docker-compose preset)
    */
   composeFiles?: Array<string> | null;
+  /**
+   * Repository-root-relative path to the Dockerfile, when it does not
+   * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+   * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+   * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+   */
+  dockerfilePath?: string | null;
   /**
    * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
    */
@@ -12326,6 +14069,10 @@ export type ProjectResponse = {
    */
   ai_alert_summaries_enabled?: boolean | null;
   /**
+   * Opt-in to AI summarization of API traffic analytics (NULL/false = off).
+   */
+  ai_api_traffic_summary_enabled?: boolean | null;
+  /**
    * Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
    */
   ai_debug_chat_enabled?: boolean | null;
@@ -12333,6 +14080,14 @@ export type ProjectResponse = {
    * Opt-in to AI propose-then-confirm write capability (false = off).
    */
   ai_write_actions_enabled: boolean;
+  /**
+   * Whether this project also accepts deployments from a source other than
+   * `source_type` — chiefly, whether a Git-backed project will take an
+   * uploaded source archive (`drop`). `null` or `false` means only the
+   * configured `source_type` (plus Docker images and static bundles, which
+   * every project accepts) may be deployed.
+   */
+  allow_alternate_sources?: boolean | null;
   /**
    * Attack mode - when enabled, requires CAPTCHA verification for all project environments
    */
@@ -12366,6 +14121,17 @@ export type ProjectResponse = {
   error_source_root?: string | null;
   git_provider_connection_id?: number | null;
   /**
+   * Git provider behind `git_provider_connection_id`: `github`,
+   * `github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when
+   * the project has no connection (public repository, Docker image or
+   * uploaded source).
+   *
+   * Clients must use this rather than guessing the host from `git_url`: a
+   * self-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and
+   * a connected project may have no clone URL stored at all.
+   */
+  git_provider_type?: string | null;
+  /**
    * Git clone URL for the repository (used for public repos without a provider connection)
    */
   git_url?: string | null;
@@ -12376,14 +14142,21 @@ export type ProjectResponse = {
    */
   gitlab_webhook_id?: number | null;
   id: number;
+  /**
+   * Hours to retain built Docker images before nightly cleanup. Null = use the
+   * system-wide default from settings.
+   */
+  image_retention_hours?: number | null;
+  /**
+   * Authoritative repository visibility. A missing connection alone does
+   * not imply that an incompletely configured repository is public.
+   */
+  is_public_repo: boolean;
   last_deployment?: number | null;
   main_branch: string;
   name: string;
   preset?: string | null;
-  /**
-   * Preset-specific configuration (Dockerfile path, build context, etc.)
-   */
-  preset_config?: unknown;
+  preset_config?: null | PresetConfigSchema;
   /**
    * Idle timeout (seconds) for on-demand preview environments.
    */
@@ -12397,14 +14170,40 @@ export type ProjectResponse = {
    * Wake timeout (seconds) for on-demand preview environments.
    */
   preview_envs_wake_timeout_seconds: number;
+  /**
+   * Product lifecycle classification. `service` projects are tied to a
+   * persisted, versioned template release; this is independent from the
+   * deployment transport in `source_type`.
+   */
+  project_type: string;
   repo_name?: string | null;
   repo_owner?: string | null;
+  /**
+   * Logo from the immutable service-template release applied to this
+   * project. Clients should prefer it over a deployed site's favicon.
+   */
+  service_template_image_url?: string | null;
+  /**
+   * Exact service-template version currently applied to the project.
+   */
+  service_template_version?: string | null;
   slug: string;
   /**
    * Source type for deployments (git, docker_image, or static_files)
    */
   source_type: SourceType;
+  /**
+   * Bundled template slug that created this project. Clients use this to
+   * present template-specific runtime configuration instead of generic
+   * source-build controls.
+   */
+  template_slug?: string | null;
   updated_at: number;
+  /**
+   * Opt-in Trivy vulnerability scanning of this project's deployed Docker
+   * images. Off by default — project owners explicitly enable it.
+   */
+  vulnerability_scanning_enabled: boolean;
 };
 
 export type ProjectSecretEnvironmentInfo = {
@@ -12419,6 +14218,11 @@ export type ProjectSecretEnvironmentInfo = {
  * must read it from the mounted file inside the container.
  */
 export type ProjectSecretResponse = {
+  /**
+   * Compose services this secret is restricted to. Empty means every
+   * service in the stack.
+   */
+  compose_services: Array<string>;
   created_at: number;
   environments: Array<ProjectSecretEnvironmentInfo>;
   id: number;
@@ -12446,6 +14250,122 @@ export type ProjectStatsBreakdown = {
   total_page_views: number;
   total_visits: number;
   unique_visitors: number;
+};
+
+/**
+ * A curated project template
+ */
+export type ProjectTemplate = {
+  /**
+   * Optional command passed to the container image. This is needed for
+   * production images whose default command is intentionally a development
+   * mode (for example Keycloak).
+   */
+  command?: Array<string> | null;
+  /**
+   * Short description
+   */
+  description?: string | null;
+  /**
+   * Environment variables template
+   */
+  env_vars?: Array<EnvVarTemplate>;
+  /**
+   * Container port the prebuilt image listens on (used for routing when
+   * deploying from `image`). Falls back to the image's EXPOSE / 3000 default.
+   */
+  exposed_port?: number | null;
+  /**
+   * Feature highlights
+   */
+  features?: Array<string>;
+  /**
+   * Git repository reference (supports any git provider). Always present as
+   * the source-of-truth / build fallback, even for image-based templates.
+   */
+  git: GitRef;
+  /**
+   * HTTP health-check path probed after the container starts (image deploys
+   * can't read `.temps.yaml`). Must start with '/'. Defaults to "/".
+   */
+  health_check_path?: string | null;
+  /**
+   * Prebuilt Docker image reference (e.g. "ghcr.io/org/app:latest"). When set,
+   * the one-click deploy pulls and runs this image directly (source_type
+   * docker_image) instead of building from `git` — instant, no BuildKit. When
+   * absent, the template builds from source.
+   */
+  image?: string | null;
+  /**
+   * URL to template image/icon
+   */
+  image_url?: string | null;
+  /**
+   * Whether the template is featured/promoted
+   */
+  is_featured?: boolean;
+  /**
+   * Whether the template is publicly visible
+   */
+  is_public?: boolean;
+  /**
+   * Gallery this template belongs to. Older configurations default to a
+   * source-code starter, preserving their existing behaviour.
+   */
+  kind?: TemplateKind;
+  /**
+   * Environment aliases populated from a linked managed service. The outer
+   * key is the Temps service type and each inner entry maps an application
+   * variable to a variable supplied by that service.
+   *
+   * Example: `postgres.KC_DB_USERNAME: POSTGRES_USER`.
+   */
+  managed_service_bindings?: {
+    [key: string]: {
+      [key: string]: string;
+    };
+  };
+  /**
+   * Display name
+   */
+  name: string;
+  /**
+   * Framework/preset to use (e.g., "nextjs", "fastapi", "dockerfile")
+   */
+  preset: string;
+  /**
+   * Preset-specific configuration
+   */
+  preset_config?: unknown;
+  resources?: null | TemplateResources;
+  /**
+   * URL to a full screenshot/banner preview of the deployed template (e.g.
+   * `/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the
+   * template card; optional — templates without one show no banner.
+   */
+  screenshot_url?: string | null;
+  /**
+   * Required external services (e.g., ["postgres", "redis"])
+   */
+  services?: Array<string>;
+  /**
+   * Unique identifier for the template (used in URLs)
+   */
+  slug: string;
+  /**
+   * Sort order for display (lower = first)
+   */
+  sort_order?: number;
+  /**
+   * Tags/categories for filtering
+   */
+  tags?: Array<string>;
+  /**
+   * Version of this template release. Service projects pin this value and
+   * the complete resolved definition so catalog updates are always an
+   * explicit, reviewable upgrade rather than a silent runtime mutation.
+   */
+  version?: string;
 };
 
 /**
@@ -12674,6 +14594,35 @@ export type ProviderCatalogDto = {
    * that as "Use provider default".
    */
   default_model?: string | null;
+  /**
+   * Explains why `host_authenticated` is false (not installed vs.
+   * installed-but-not-authenticated), or `None` when it's true.
+   */
+  host_auth_hint?: string | null;
+  /**
+   * Authentication mechanism reported by the CLI running in the Temps
+   * process environment (for example `chatgpt_subscription` or
+   * `host_auth_store`). Never contains credential material.
+   */
+  host_auth_method?: string | null;
+  /**
+   * True when the CLI is installed AND authenticated on **this host** —
+   * the machine running the Temps server process. This is a completely
+   * different signal from `credential_saved`: that field is about a
+   * credential seeded into a *sandboxed autofixer container*, while this
+   * one is what actually gates whether the AI Gateway can route requests
+   * to this provider (ADR-037's `AgentCliAiService` uses only the host's
+   * ambient CLI session — ordering `claude setup-token`/`codex login` on
+   * this machine — and never reads the sandbox credential at all). A
+   * provider can show `credential_saved: true` and `host_authenticated:
+   * false` at the same time; only the latter means chat/gateway routing
+   * will actually work.
+   */
+  host_authenticated: boolean;
+  /**
+   * Installed CLI version used as part of the model-cache identity.
+   */
+  host_version?: string | null;
   id: string;
   install_command: string;
   /**
@@ -12692,11 +14641,19 @@ export type ProviderCatalogDto = {
    */
   max_turns_fix?: number | null;
   /**
+   * `live`, `cache`, `stale_cache`, or `bootstrap`.
+   */
+  model_source: string;
+  /**
    * Model ids this provider accepts, in display order. The first entry is
    * the recommended default. Empty when the provider doesn't expose model
    * selection (e.g. OpenCode), which the UI uses to hide the dropdown.
    */
   models: Array<string>;
+  /**
+   * Time of the last successful account-aware CLI model discovery.
+   */
+  models_refreshed_at?: string | null;
   name: string;
   /**
    * True when this provider's CLI supports enforcing a turn cap. False
@@ -12755,6 +14712,11 @@ export type ProviderDescriptor = {
   recommended_events: Array<string>;
 };
 
+export type ProviderDetailResponse = {
+  key: ProviderKeyResponse;
+  models: Array<ProviderModelResponse>;
+};
+
 export type ProviderKeyResponse = {
   /**
    * Masked API key (only last 4 chars visible)
@@ -12779,6 +14741,19 @@ export type ProviderMetadata = {
   display_name: string;
   icon_url: string;
   service_type: ServiceTypeRoute;
+};
+
+export type ProviderModelResponse = {
+  display_name: string;
+  id: number;
+  is_available: boolean;
+  is_enabled: boolean;
+  last_seen_at?: string | null;
+  model_id: string;
+  owned_by?: string | null;
+  provider_key_id: number;
+  source: string;
+  updated_at: string;
 };
 
 export type ProviderResponse = {
@@ -12813,6 +14788,11 @@ export type ProvisionResponse =
       type: "pending";
     });
 
+export type ProxyLogAccessResponse = {
+  allowed: boolean;
+  reason?: string | null;
+};
+
 /**
  * Response model for proxy logs
  */
@@ -12838,9 +14818,29 @@ export type ProxyLogResponse = {
   project_id?: number | null;
   query_string?: string | null;
   referrer?: string | null;
+  /**
+   * Inbound request headers, credential values already replaced with
+   * `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+   * predates header capture or was written by a path that doesn't record
+   * them; an empty map means "captured, but no headers", which is different
+   * and worth being able to tell apart.
+   *
+   * A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+   * typed and the UI gets a stable alphabetical ordering for free.
+   */
+  request_headers?: {
+    [key: string]: string;
+  } | null;
   request_id: string;
   request_size_bytes?: number | null;
   request_source: string;
+  /**
+   * Upstream response headers, redacted on the same terms as
+   * [`Self::request_headers`].
+   */
+  response_headers?: {
+    [key: string]: string;
+  } | null;
   response_size_bytes?: number | null;
   response_time_ms?: number | null;
   routing_status: string;
@@ -12861,6 +14861,87 @@ export type ProxyLogsPaginatedResponse = {
   page_size: number;
   total: number;
   total_pages: number;
+};
+
+export type PublicComposePreviewRequest = {
+  branch?: string | null;
+  composeOverride?: string | null;
+  excludedServices?: Array<string>;
+  path: string;
+};
+
+export type PublicComposePreviewResponse = {
+  branch: string;
+  disabledServices: Array<string>;
+  /**
+   * Effective user-controlled Compose YAML with sensitive values redacted.
+   */
+  effectiveCompose: string;
+  enabledServices: Array<string>;
+  path: string;
+  redactedValues: number;
+};
+
+/**
+ * A single service parsed from a compose file's `services:` map
+ */
+export type PublicComposeServicePreview = {
+  depends_on: Array<string>;
+  detected_service_type?: null | ComposeServiceFamily;
+  /**
+   * Environment variable names declared by this service. Values are
+   * intentionally omitted.
+   */
+  environment_variables: Array<string>;
+  /**
+   * HTTP path declared by a loopback Compose healthcheck, if unambiguous.
+   */
+  health_check_path?: string | null;
+  image?: string | null;
+  /**
+   * True when the image looks like a well-known database engine
+   * (Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw
+   * compose service never becomes a Temps-managed `external_services` row,
+   * so it never gets backup/restore. Informational only.
+   */
+  looks_like_database: boolean;
+  name: string;
+  /**
+   * Ports declared by Compose. `target` is the container port Temps can
+   * route to; `published` is only the optional Docker host port.
+   */
+  ports: Array<ComposePortMapping>;
+};
+
+/**
+ * Response for compose-file service preview
+ */
+export type PublicComposeServicesResponse = {
+  /**
+   * Branch the file was read from
+   */
+  branch: string;
+  path: string;
+  services: Array<PublicComposeServicePreview>;
+};
+
+/**
+ * Response for env-example detection
+ */
+export type PublicEnvExampleResponse = {
+  /**
+   * Branch the file was read from
+   */
+  branch: string;
+  /**
+   * Path of the detected env-example file (e.g. ".env.example"), `null`
+   * if the repository has none
+   */
+  path?: string | null;
+  /**
+   * Parsed variables (empty if no env-example file was found)
+   */
+  variables: Array<EnvExampleVariable>;
 };
 
 /**
@@ -13091,6 +15172,11 @@ export type ReadRowsQuery = {
    * Sort order (asc/desc)
    */
   sort_order?: string | null;
+};
+
+export type ReassignCustomDomainRequest = {
+  target_environment_id: number;
+  target_project_id: number;
 };
 
 /**
@@ -13464,6 +15550,48 @@ export type RenameConversationRequest = {
   title: string;
 };
 
+/**
+ * One row of the standard (non-on-demand) renewal-attempt audit log, backing
+ * the domain detail page's renewal timeline.
+ */
+export type RenewalAttemptResponse = {
+  /**
+   * When the attempt was recorded (epoch millis).
+   */
+  created_at: number;
+  error?: string | null;
+  error_type?: string | null;
+  id: number;
+  /**
+   * `"success"` | `"failed"`.
+   */
+  outcome: string;
+  /**
+   * `"request_challenge"` | `"complete_challenge"`.
+   */
+  stage: string;
+  /**
+   * `"http-01"` | `"dns-01"`.
+   */
+  verification_method: string;
+};
+
+export type RepositoryComposeServicesResponse = {
+  path: string;
+  repositoryId: number;
+  services: Array<ComposeServicePreviewResponse>;
+};
+
+export type RepositoryEnvExampleResponse = {
+  /**
+   * Path of the detected env-example file (e.g. ".env.example"), `null`
+   * if the repository has none
+   */
+  path?: string | null;
+  repositoryId: number;
+  variables: Array<EnvExampleVariableResponse>;
+};
+
 export type RepositoryListQuery = {
   direction?: string | null;
   language?: string | null;
@@ -13527,6 +15655,22 @@ export type RepositorySyncStartedResponse = {
   syncing: boolean;
 };
 
+/**
+ * Request body for Path A: operator-triggered ACME issuance.
+ */
+export type RequestDiscoveredRouteCertRequest = {
+  /**
+   * Must be `true` when `challenge_type` is `"dns-01"` and no verified
+   * `auto_manage` zone covers this host. Lets the operator confirm they
+   * know renewal will require manual DNS updates.
+   */
+  acknowledge_manual_dns_renewal?: boolean;
+  /**
+   * `"http-01"` or `"dns-01"`. Required — no silent default.
+   */
+  challenge_type: string;
+};
+
 export type RequestRow = {
   client_ip?: string | null;
   country?: string | null;
@@ -13553,6 +15697,54 @@ export type RequestRow = {
   trace_id?: string | null;
   ts: string;
   user_agent?: string | null;
+};
+
+/**
+ * Upstream request/connection timeouts for customer app traffic.
+ *
+ * By default, no timeout is applied to customer app traffic at all — an
+ * existing app that happens to have a slow endpoint, a long-polling
+ * request, or an unusually long response must keep working exactly as it
+ * did before this setting existed. Timeouts here are opt-in: an operator
+ * can set a global default, and/or a project/environment can set its own
+ * override (`DeploymentConfig::request_timeout_seconds` /
+ * `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until
+ * one of those is explicitly configured, the proxy holds the connection
+ * open indefinitely (bounded only by TCP/OS-level limits).
+ *
+ * `default_*_timeout_seconds` of `0` means "no timeout" — this is the
+ * out-of-the-box value for all three. `max_request_timeout_seconds` is a
+ * hard ceiling that only comes into play once a timeout is actually
+ * configured (globally or per project/environment): whatever value is
+ * resolved is always clamped to it, so lowering the ceiling here takes
+ * effect immediately without needing every environment row re-saved. It
+ * never *creates* a timeout for traffic that has none.
+ */
+export type RequestTimeoutSettings = {
+  /**
+   * Default timeout for regular (non-streaming) HTTP requests, in
+   * seconds. Used when a project/environment hasn't set
+   * `request_timeout_seconds`. `0` (the default) means no timeout.
+   */
+  default_http_timeout_seconds?: number;
+  /**
+   * Default idle timeout for Server-Sent Events streams, in seconds. Used
+   * when a project/environment hasn't set `sse_idle_timeout_seconds`. `0`
+   * (the default) means no timeout.
+   */
+  default_sse_idle_timeout_seconds?: number;
+  /**
+   * Default idle timeout for WebSocket connections, in seconds. Used when
+   * a project/environment hasn't set `websocket_idle_timeout_seconds`.
+   * `0` (the default) means no timeout.
+   */
+  default_websocket_idle_timeout_seconds?: number;
+  /**
+   * Hard ceiling, in seconds, applied once a timeout is configured (via a
+   * global default above or a project/environment override). Has no
+   * effect on traffic with no timeout configured at all.
+   */
+  max_request_timeout_seconds?: number;
 };
 
 export type RequiredPasswordChangeRequest = {
@@ -13600,6 +15792,13 @@ export type ResizeSandboxBody = {
    * New root disk size in MB. Grow-only; must exceed the current size.
    */
   disk_size_mb: number;
+};
+
+/**
+ * Body for the `POST .../permissions/{permission_id}/resolve` endpoint.
+ */
+export type ResolvePermissionRequest = {
+  decision: PermissionDecision;
 };
 
 /**
@@ -13836,7 +16035,7 @@ export type RestorePlan = {
   steps: Array<string>;
   /**
    * How the restore will be performed: "walg_restore", "pg_dump_restore",
-   * or "unsupported".
+   * "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
    */
   strategy: string;
   /**
@@ -14107,6 +16306,22 @@ export type RunExternalServiceBackupRequest = {
    * ID of the S3 source to store the backup. If omitted, the current default S3 source is used.
    */
   s3_source_id?: number | null;
+};
+
+/**
+ * Live connection variables for a service in one environment.
+ *
+ * Every value is plaintext — this is the response of the audited issuance
+ * endpoint, not of the masked bulk read. Callers must treat it as a
+ * credential: do not log it, do not cache it, do not put it in an error.
+ */
+export type RuntimeCredentialsResponse = {
+  /**
+   * Connection variables, e.g. `POSTGRES_URL`, `POSTGRES_PASSWORD`.
+   */
+  variables: {
+    [key: string]: string;
+  };
 };
 
 /**
@@ -14742,6 +16957,17 @@ export type SelfUpdateAttempt = {
    */
   from_version: string;
   /**
+   * Number of database migrations that were successfully applied during
+   * this attempt. Set at completion (success or migration failure). `None`
+   * if migrations were never reached (pre-swap failure).
+   */
+  migrations_applied?: number | null;
+  /**
+   * Total number of database migrations that were planned. Set at the same
+   * time as `migrations_applied`. `None` if migrations were never reached.
+   */
+  migrations_total?: number | null;
+  /**
    * Where the replaced binary was kept, so a bad release can be reverted by
    * hand (`mv <path> <binary>`). Set once the swap completes.
    */
@@ -14781,6 +17007,7 @@ export type SelfUpdatePhase =
   | "downloading"
   | "verifying"
   | "installing"
+  | "migrating"
   | "restarting"
   | "pending_restart"
   | "failed";
@@ -14893,7 +17120,27 @@ export type SendEmailResponseBody = {
   status: string;
 };
 
+export type SendFailureReportRequest = {
+  /**
+   * The report text as reviewed (and possibly edited) by the user.
+   */
+  report_text: string;
+};
+
 export type SendMessageRequest = {
+  /**
+   * Optional next-turn model. The provider harness remains pinned, but its
+   * advertised models may be changed between turns.
+   */
+  ai_model?: string | null;
+  /**
+   * Optional next-turn permission mode for the pinned provider harness.
+   */
+  ai_permission_mode?: string | null;
+  /**
+   * Optional next-turn thinking level.
+   */
+  ai_thinking_level?: string | null;
   content: string;
   /**
    * Optional, client-supplied description of the page/entity the user is
@@ -15041,6 +17288,12 @@ export type ServiceAlertRuleResponse = {
   id: number;
   metric_name: string;
   name: string;
+  /**
+   * Node the rule is scoped to. `0` is the synthetic control-plane node
+   * (see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`
+   * rules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.
+   */
+  node_id?: number | null;
   service_id?: number | null;
   severity: string;
   silenced_until?: string | null;
@@ -15366,6 +17619,75 @@ export type ServiceStatsReport = {
   topology: string;
 };
 
+export type ServiceTemplateChangeKind = "added" | "removed" | "changed";
+
+/**
+ * Immutable template release attached to a service project.
+ *
+ * The resolved definition is deliberately stored with the project. The live
+ * catalog is only needed to discover a newer release; deployments, edits and
+ * rollbacks continue to work if the catalog later changes or disappears.
+ */
+export type ServiceTemplateInstance = {
+  /**
+   * Catalog schema used to deserialize `template`.
+   */
+  schema_version: string;
+  /**
+   * Stable service family identifier.
+   */
+  slug: string;
+  /**
+   * Exact resolved release from which this project was created/upgraded.
+   */
+  template: ProjectTemplate;
+  /**
+   * Applied template release.
+   */
+  version: string;
+};
+
+export type ServiceTemplateInstanceResponse = {
+  applied: ServiceTemplateInstance;
+  /**
+   * The catalog definition changed without a version bump. Applying it is
+   * intentionally blocked because mutable releases make upgrades and
+   * rollbacks non-reproducible.
+   */
+  catalog_drift: boolean;
+  /**
+   * User-safe explanation when the active catalog could not provide this
+   * service family. The applied snapshot remains authoritative and editable.
+   */
+  catalog_error?: string | null;
+  changes: Array<ServiceTemplateUpgradeChange>;
+  latest?: null | ServiceTemplateInstance;
+  /**
+   * Managed service families that must be linked before this release can be
+   * applied. Existing links are never removed automatically.
+   */
+  missing_services: Array<string>;
+  project_id: number;
+  /**
+   * Required target inputs that are not currently configured and cannot be
+   * filled from a template default or generator.
+   */
+  required_configuration: Array<EnvVarTemplate>;
+  upgrade_available: boolean;
+};
+
+/**
+ * One reviewable change between the project's applied service release and
+ * the current catalog release. Values contain public template metadata only;
+ * project environment values and secrets never enter this response.
+ */
+export type ServiceTemplateUpgradeChange = {
+  current?: string | null;
+  field: string;
+  kind: ServiceTemplateChangeKind;
+  target?: string | null;
+};
+
 export type ServiceTypeInfo = {
   parameters: Array<ServiceParameter>;
   service_type: ServiceTypeRoute;
@@ -15422,13 +17744,12 @@ export type SessionDetailsQuery = {
 };
 
 export type SessionEvent = {
-  event_data?: unknown;
-  event_name?: string | null;
-  event_type?: string | null;
+  event_data: unknown;
+  event_name: string;
   id: number;
-  page_title?: string | null;
-  page_url?: string | null;
-  timestamp: string;
+  occurred_at: string;
+  request_path: string;
+  request_query?: string | null;
 };
 
 export type SessionEventDto = {
@@ -15440,8 +17761,13 @@ export type SessionEventDto = {
 };
 
 export type SessionEventsQuery = {
+  end_date?: string | null;
   environment_id?: number | null;
+  limit?: number | null;
+  offset?: number | null;
   project_id: number;
+  sort_order?: string | null;
+  start_date?: string | null;
 };
 
 export type SessionEventsResponse = {
@@ -15472,6 +17798,11 @@ export type SessionLogsResponse = {
 };
 
 export type SessionReplayEventsRequest = {
+  /**
+   * Client-generated id, stable across retries of the same batch. When
+   * present the append is idempotent; omitted, delivery is at-least-once.
+   */
+  batchId?: string | null;
   events: string;
   sessionId: string;
 };
@@ -15503,6 +17834,13 @@ export type SessionReplayInitRequest = {
   userAgent?: string | null;
   viewportHeight?: number | null;
   viewportWidth?: number | null;
+  /**
+   * Client-generated visitor id, used only when the request carries no
+   * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+   * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+   * The SDK already sends this today via `getSessionMetadata()`.
+   */
+  visitorId?: string | null;
 };
 
 export type SessionReplayInitResponse = {
@@ -15574,6 +17912,23 @@ export type SessionSummary = {
   requests_count: number;
   session_id: number;
   started_at: string;
+};
+
+/**
+ * Opt a project in or out of accepting deployments from a source other than
+ * its configured `source_type`.
+ *
+ * Unlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a
+ * Git project keeps its repository, branch, webhook auto-deploy and
+ * rollback-rebuild behaviour and merely gains the ability to also be deployed
+ * from an uploaded source archive.
+ */
+export type SetAlternateSourcesRequest = {
+  /**
+   * `true` to also accept uploaded source archives, `false` to restrict the
+   * project to its configured source again.
+   */
+  allow_alternate_sources: boolean;
 };
 
 export type SetFlagEnvironmentRequest = {
@@ -15729,6 +18084,14 @@ export type SetupDnsResponse = {
   total_records: number;
 };
 
+export type SetupMfaRequest = {
+  /**
+   * Required to enroll MFA on an account that has a password set.
+   * Omit (or leave empty) for SSO-only accounts with no local password.
+   */
+  current_password?: string | null;
+};
+
 /**
  * A sibling project that shares the same `trace_id` and has opted in to
  * cross-project trace sharing (`cross_project_trace_sharing = TRUE`).
@@ -15744,6 +18107,17 @@ export type SiblingRef = {
    * URL slug used to link into the sibling project's single-project trace view.
    */
   project_slug: string;
+};
+
+/**
+ * Request body for `POST .../alarms/{alarm_id}/silence`.
+ */
+export type SilenceAlarmRequest = {
+  /**
+   * How long to mute this alarm (and future re-fires of the same
+   * type/scope) for, in hours. Must be between 1 and 168 (7 days).
+   */
+  duration_hours: number;
 };
 
 export type SkillDefinitionResponse = {
@@ -15907,9 +18281,10 @@ export type SmartFilter =
   | {
       type: "custom_data";
       /**
-       * Match custom event_data by JSON path
+       * Match custom event properties by JSON path
        * Format: {"path": "user.plan", "value": "premium"}
-       * This will match events where event_data->'user'->>'plan' = 'premium'
+       * This will match events where props->'user'->>'plan' = 'premium',
+       * falling back to the legacy `event_data` column when `props` is NULL
        */
       value: {
         path: string;
@@ -16019,6 +18394,22 @@ export type SmtpResult = {
    * Whether the mailbox is disabled
    */
   is_disabled: boolean;
+};
+
+/**
+ * Single snapshot as returned by the API.
+ */
+export type SnapshotResponse = {
+  backend: string;
+  content_digest: string;
+  created_at: string;
+  id: string;
+  image_ref?: string | null;
+  label?: string | null;
+  project_id?: number | null;
+  size_bytes: number;
+  status: string;
+  updated_at: string;
 };
 
 export type SourceArchiveUpload = {
@@ -16370,6 +18761,10 @@ export type SpeedMetricsPayload = {
    */
   screenWidth?: number | null;
   /**
+   * Client-generated session id fallback (see `visitor_id`).
+   */
+  sessionId?: string | null;
+  /**
    * Time to First Byte (milliseconds)
    */
   ttfb?: number | null;
@@ -16381,6 +18776,12 @@ export type SpeedMetricsPayload = {
    * Viewport width in pixels
    */
   viewportWidth?: number | null;
+  /**
+   * Client-generated visitor id, used only when the request carries no
+   * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+   * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+   */
+  visitorId?: string | null;
 };
 
 /**
@@ -16586,6 +18987,11 @@ export type StatsFilters = {
   device_type?: string | null;
   environment_id?: number | null;
   /**
+   * Exclude Temps status-monitor traffic, including legacy rows written
+   * before monitor requests received their own `request_source` value.
+   */
+  exclude_synthetic?: boolean;
+  /**
    * When true, only count requests that matched a project (project_id IS NOT NULL).
    * Used by the health dashboard so totals match the per-project cards.
    */
@@ -16724,6 +19130,72 @@ export type StorageQuota = {
   total_bytes: number;
   traces_bytes: number;
   usage_pct: number;
+};
+
+/**
+ * Storage summary returned by `GET /v1/sandbox-snapshots/storage-summary`.
+ */
+export type StorageSummary = {
+  /**
+   * Available bytes on the snapshots filesystem, or `null` when the
+   * platform check is not yet implemented (deferred — see `available_disk_space()`).
+   * API consumers MUST treat `null` as "unknown" rather than "zero bytes
+   * available". A `Some(0)` would incorrectly block snapshot creation.
+   */
+  available_disk_bytes?: number | null;
+  /**
+   * Per-user quota in bytes.
+   */
+  quota_bytes: number;
+  /**
+   * Number of `ready` snapshots.
+   */
+  snapshot_count: number;
+  /**
+   * Total bytes used by all `ready` snapshots for this user.
+   */
+  total_bytes: number;
+};
+
+export type StreamStructuredOutputRequest = {
+  /**
+   * Optional screen-owned cache identity. Prompt and schema hashes are also
+   * included automatically, preventing stale output when input data changes.
+   */
+  cache_key?: string | null;
+  /**
+   * Backend cache lifetime in seconds (default 60, clamped to 1-300).
+   */
+  cache_ttl_seconds?: number | null;
+  /**
+   * Optional enabled model id for the selected key.
+   */
+  model?: string | null;
+  /**
+   * The complete, already-authorized context and instructions for the model.
+   */
+  prompt: string;
+  /**
+   * Optional configured gateway key. Omit to use the active gateway key.
+   * Host subscription CLIs are intentionally not accepted here.
+   */
+  provider_key_id?: number | null;
+  /**
+   * Stable product use-case identifier, for example `api_traffic.summary`.
+   */
+  purpose: string;
+  /**
+   * Bypass any matching backend cache entry and replace it with this result.
+   */
+  refresh?: boolean;
+  /**
+   * JSON Schema describing the required response object.
+   */
+  schema: unknown;
+  /**
+   * Optional normalized reasoning depth advertised for the selected model.
+   */
+  thinking_level?: string | null;
 };
 
 export type StripeConfig = {
@@ -16918,9 +19390,29 @@ export type TeamResponse = {
 export type TeamRole = "owner" | "admin" | "deployer" | "viewer";
 
 /**
+ * Where a template is presented in the project creation flow.
+ */
+export type TemplateKind = "starter" | "service";
+
+/**
+ * Resource profile required by a curated template. CPU values use the same
+ * microcore unit as project deployment configuration; memory values are MiB.
+ */
+export type TemplateResources = {
+  cpu_limit?: number | null;
+  cpu_request?: number | null;
+  memory_limit?: number | null;
+  memory_request?: number | null;
+};
+
+/**
  * Response type for a single template
  */
 export type TemplateResponse = {
+  /**
+   * Optional command passed to the image entrypoint.
+   */
+  command?: Array<string> | null;
   /**
    * Short description
    */
@@ -16959,6 +19451,18 @@ export type TemplateResponse = {
    */
   is_featured: boolean;
   /**
+   * Gallery this template belongs to.
+   */
+  kind: TemplateKind;
+  /**
+   * Managed-service environment aliases used at deployment time.
+   */
+  managed_service_bindings: {
+    [key: string]: {
+      [key: string]: string;
+    };
+  };
+  /**
    * Display name
    */
   name: string;
@@ -16966,6 +19470,7 @@ export type TemplateResponse = {
    * Framework/preset to use
    */
   preset: string;
+  resources?: null | TemplateResources;
   /**
    * URL to a wide screenshot/banner preview of the deployed template.
    * Absent for templates that don't have one captured yet.
@@ -16983,6 +19488,63 @@ export type TemplateResponse = {
    * Tags/categories for filtering
    */
   tags: Array<string>;
+  /**
+   * Immutable release identifier for service templates.
+   */
+  version: string;
+};
+
+/**
+ * Ceilings on the resource overrides a *tenant* may set for their own
+ * project or environment.
+ *
+ * The knobs these bound (`memory_limit`, `max_concurrent_connections`, the
+ * request/idle timeouts) are deliberately uncapped-by-sentinel: `0` means
+ * "unlimited". That is the right default for a single-team self-hosted
+ * install, where the person editing a project *is* the operator. It is the
+ * wrong default on a shared host, where it lets one project opt out of the
+ * operator's protection and take the node — or the shared proxy's connection
+ * budget — down with it.
+ *
+ * Every ceiling here is therefore **off by default**, and turning one on is
+ * what makes the corresponding tenant override enforceable. A caller holding
+ * `Permission::SettingsWrite` (operators: `Admin`/`PlatformAdmin`, never
+ * `Role::User`) may still exceed them — the ceiling constrains tenants, not
+ * the operator who set it.
+ *
+ * Violations are **rejected, not clamped**: silently rewriting a value the
+ * user asked for leaves them debugging a limit they believe they removed,
+ * and self-hosted operators have no support channel to ask.
+ */
+export type TenantResourceCeilings = {
+  /**
+   * Whether a project/environment may set a request, SSE or WebSocket
+   * timeout of `0` ("no timeout"). `true` (the default) preserves current
+   * behaviour.
+   *
+   * Nonzero tenant timeouts need no ceiling here: they are already clamped
+   * to [`RequestTimeoutSettings::ceiling`] at resolution time. `0` escapes
+   * that clamp by construction — it means "no timeout is configured", so
+   * there is nothing to clamp — which is precisely the hole this closes.
+   */
+  allow_unlimited_request_timeouts?: boolean;
+  /**
+   * Largest `max_concurrent_connections` a project/environment may set.
+   * `0` (the default) leaves it unenforced.
+   *
+   * As with memory, a project value of `0` means unlimited and is refused
+   * whenever this ceiling is set.
+   */
+  max_concurrent_connections?: number;
+  /**
+   * Largest `memory_limit` (MB) a project/environment may set for its
+   * containers. `0` (the default) leaves it unenforced.
+   *
+   * A project value of `0` means "no cgroup limit at all", so it is
+   * refused whenever this ceiling is set — that is the case that OOMs the
+   * host, not merely a large number.
+   */
+  max_memory_limit_mb?: number;
 };
 
 /**
@@ -17070,6 +19632,22 @@ export type TimeBucketStats = {
    * Number of errors (status >= 400)
    */
   error_count: number;
+  /**
+   * Number of requests in this bucket that recorded a latency value.
+   */
+  latency_count: number;
+  /**
+   * p50 response time in milliseconds (0 when the bucket has no timings)
+   */
+  p50_response_time_ms: number;
+  /**
+   * p95 response time in milliseconds (0 when the bucket has no timings)
+   */
+  p95_response_time_ms: number;
+  /**
+   * p99 response time in milliseconds (0 when the bucket has no timings)
+   */
+  p99_response_time_ms: number;
   /**
    * Total number of requests in this bucket
    */
@@ -17329,6 +19907,360 @@ export type TrackingEventResponse = {
   user_agent?: string | null;
 };
 
+/**
+ * Paginated discovered routes, plus the hosts that were found and rejected.
+ */
+export type TraefikDiscoveredRouteListResponse = {
+  /**
+   * Labelled containers found by the last reconciliation that were NOT
+   * adopted (host owned by a Temps route, or claimed by another container).
+   * These have no row of their own — without surfacing them here the
+   * operator sees nothing at all for a container they labelled.
+   */
+  conflicts: Array<TraefikDiscoveryConflictResponse>;
+  /**
+   * `false` when the watcher isn't running, so a client can explain an
+   * empty list as "discovery is off" rather than "nothing was found".
+   */
+  discovery_running: boolean;
+  page: number;
+  page_size: number;
+  routes: Array<TraefikDiscoveredRouteResponse>;
+  total: number;
+};
+
+/**
+ * One row of `traefik_discovered_routes`, annotated for an operator.
+ */
+export type TraefikDiscoveredRouteResponse = {
+  /**
+   * Whether this route is currently served by the proxy.
+   */
+  active: boolean;
+  /**
+   * Other labelled containers that claim this host and lost the collision.
+   * Non-empty means someone's container is silently not being routed.
+   */
+  contested_by: Array<string>;
+  created_at: string;
+  enabled: boolean;
+  host: string;
+  id: number;
+  /**
+   * Why it isn't, when `active` is false.
+   */
+  inactive_reason?: string | null;
+  last_seen_at: string;
+  network: string;
+  router_name: string;
+  target_container_id: string;
+  target_container_name: string;
+  /**
+   * Host-published port, used on baremetal installs where the proxy cannot
+   * resolve container names.
+   */
+  target_host_port?: number | null;
+  target_port: number;
+  tls: boolean;
+  tls_certificate?: null | TraefikRouteTlsBlock;
+  updated_at: string;
+};
+
+/**
+ * A labelled container that was found but deliberately **not** adopted.
+ */
+export type TraefikDiscoveryConflictResponse = {
+  container_id: string;
+  container_name: string;
+  /**
+   * Human-readable explanation of the conflict.
+   */
+  detail: string;
+  host: string;
+  /**
+   * Machine-readable discriminator: `owned_by_temps_route` or
+   * `claimed_by_another_container`.
+   */
+  reason: string;
+  /**
+   * Traefik router name the host came from.
+   */
+  router_name: string;
+  /**
+   * Container that holds the host instead, when the conflict is between two
+   * discovered containers.
+   */
+  winner_container_name?: string | null;
+};
+
+/**
+ * How an operator turns discovery on. Always returned, including when
+ * discovery is already running, so the console/CLI can render the exact
+ * invocation instead of sending the reader to the docs.
+ */
+export type TraefikDiscoverySetupResponse = {
+  /**
+   * Environment variable that opts this installation in.
+   */
+  enable_env_var: string;
+  /**
+   * A concrete, copy-pasteable example of enabling it.
+   */
+  example: string;
+  /**
+   * Environment variable overriding the watched Docker network.
+   */
+  network_env_var: string;
+  /**
+   * These are read once at process start: changing them needs a restart.
+   */
+  requires_restart: boolean;
+};
+
+/**
+ * Capability + status of Traefik label discovery on this instance.
+ */
+export type TraefikDiscoveryStatusResponse = {
+  /**
+   * `true` only when the watcher is actually running in this process.
+   * `false` means "not turned on here", never "not supported" — the setup
+   * block below always says how to turn it on.
+   */
+  configured: boolean;
+  /**
+   * Rows currently in `traefik_discovered_routes` (all networks).
+   */
+  discovered_route_count: number;
+  /**
+   * Whether `TEMPS_TRAEFIK_DISCOVERY_ENABLED` resolved to true. Can be
+   * `true` while `configured` is `false` (e.g. Docker unreachable).
+   */
+  enabled: boolean;
+  /**
+   * Of those, how many are enabled and therefore in the live route table.
+   */
+  enabled_route_count: number;
+  last_reconciliation?: null | TraefikReconciliationResponse;
+  /**
+   * Docker network being watched, or the one that *would* be watched.
+   */
+  network: string;
+  /**
+   * Interval of the full reconciliation safety net.
+   */
+  poll_interval_seconds: number;
+  /**
+   * Why discovery isn't active, when `configured` is false.
+   */
+  reason?: string | null;
+  setup: TraefikDiscoverySetupResponse;
+};
+
+/**
+ * Summary of the most recent reconciliation pass.
+ */
+export type TraefikReconciliationResponse = {
+  completed_at: string;
+  conflicts: Array<TraefikDiscoveryConflictResponse>;
+  containers_scanned: number;
+  network: string;
+  routes_removed: number;
+  routes_unchanged: number;
+  routes_upserted: number;
+  /**
+   * Containers skipped because Temps deployed them (they already have a
+   * route and must never re-derive one from labels they control).
+   */
+  skipped_temps_managed: number;
+};
+
+/**
+ * TLS state for a single discovered route (ADR-041 §3/§4).
+ *
+ * Absent when no `traefik_route_certificates` row exists for this host.
+ * Never `null` on a host where `cert_authorized = true`.
+ */
+export type TraefikRouteTlsBlock = {
+  authorized_at: string;
+  /**
+   * Container ID that was authorized. Used for drift comparison.
+   */
+  authorized_container_id?: string | null;
+  authorized_container_name?: string | null;
+  /**
+   * The operator has explicitly authorized TLS for this host.
+   */
+  cert_authorized: boolean;
+  /**
+   * `true` when the currently-serving container differs from the one
+   * that was authorized. Requires operator acknowledgment.
+   */
+  container_drift: boolean;
+  /**
+   * When drift was first detected.
+   */
+  container_drift_detected_at: string;
+  /**
+   * Name of the container that currently holds the host (for the drift UI).
+   */
+  current_container_name?: string | null;
+  /**
+   * Days until expiry.
+   */
+  days_remaining?: number | null;
+  imported_at: string;
+  /**
+   * ISO 8601 expiry time of the current certificate, if one exists.
+   */
+  not_after?: string | null;
+  /**
+   * `"http-01"` or `"dns-01"`.
+   */
+  renewal_method?: string | null;
+  /**
+   * `true` when the proxy is currently loading a cert for this host.
+   */
+  serving: boolean;
+  /**
+   * `"acme"` or `"imported"`.
+   */
+  source?: string | null;
+  /**
+   * Certificate status as reported by the `domains` row, e.g. `"active"`.
+   */
+  status?: string | null;
+};
+
+export type TrafficAggregationRequest = {
+  /**
+   * Zero to four grouping dimensions. Zero returns one overall rollup;
+   * multiple dimensions form a tuple.
+   */
+  dimensions: Array<TrafficDimension>;
+  end_time: string;
+  environment_id?: number | null;
+  filters?: Array<TrafficFilter>;
+  /**
+   * Include Temps status-monitor requests. They are excluded by default.
+   */
+  include_synthetic?: boolean;
+  /**
+   * Aggregates to calculate. Unrequested response fields remain null.
+   */
+  metrics: Array<TrafficMetric>;
+  /**
+   * Ordered sort keys. Multiple keys provide stable pagination when the
+   * primary metric ties. Every field must be requested/grouped.
+   */
+  order_by?: Array<TrafficOrderBy>;
+  page?: number;
+  page_size?: number;
+  start_time: string;
+};
+
+export type TrafficAggregationResponse = {
+  dimensions: Array<TrafficDimension>;
+  metrics: Array<TrafficMetric>;
+  page: number;
+  page_size: number;
+  rows: Array<TrafficAggregationRow>;
+  synthetic_excluded: boolean;
+  total_groups: number;
+  total_pages: number;
+};
+
+export type TrafficAggregationRow = {
+  dimensions: Array<TrafficDimensionValue>;
+  metrics: TrafficMetricValues;
+};
+
+export type TrafficDimension =
+  | "client_ip"
+  | "method"
+  | "path"
+  | "host"
+  | "status_code"
+  | "status_class"
+  | "environment_id"
+  | "deployment_id"
+  | "request_source"
+  | "is_bot"
+  | "browser"
+  | "operating_system"
+  | "device_type"
+  | "cache_status";
+
+export type TrafficDimensionValue = {
+  dimension: TrafficDimension;
+  /**
+   * Dimensions are serialized as display-safe strings across both storage
+   * backends. Null database values remain null rather than becoming empty.
+   */
+  value?: string | null;
+};
+
+export type TrafficFilter = {
+  dimension: TrafficDimension;
+  operator: TrafficFilterOperator;
+  /**
+   * One value for scalar operators; one or more values for `in`.
+   */
+  values: Array<string>;
+};
+
+export type TrafficFilterOperator =
+  "eq" | "not_eq" | "contains" | "starts_with" | "in";
+
+export type TrafficMetric =
+  | "requests"
+  | "errors"
+  | "error_rate"
+  | "latency_avg"
+  | "latency_min"
+  | "latency_max"
+  | "latency_p50"
+  | "latency_p95"
+  | "latency_p99"
+  | "unique_ips"
+  | "unique_paths"
+  | "bot_requests"
+  | "robots_txt_requests"
+  | "last_seen";
+
+export type TrafficMetricValues = {
+  bot_requests?: number | null;
+  error_rate?: number | null;
+  errors?: number | null;
+  last_seen?: string | null;
+  latency_avg_ms?: number | null;
+  latency_max_ms?: number | null;
+  latency_min_ms?: number | null;
+  latency_p50_ms?: number | null;
+  latency_p95_ms?: number | null;
+  latency_p99_ms?: number | null;
+  requests?: number | null;
+  robots_txt_requests?: number | null;
+  unique_ips?: number | null;
+  unique_paths?: number | null;
+};
+
+export type TrafficOrderBy = {
+  direction: TrafficSortDirection;
+  field: TrafficOrderField;
+};
+
+export type TrafficOrderField =
+  | {
+      field: TrafficDimension;
+      kind: "dimension";
+    }
+  | {
+      field: TrafficMetric;
+      kind: "metric";
+    };
+
+export type TrafficSortDirection = "asc" | "desc";
+
 export type TriggerAgentRequest = {
   trigger_source_id?: number | null;
   trigger_source_type?: string | null;
@@ -17587,6 +20519,15 @@ export type UpdateAiProviderResponse = {
   provider_id: string;
 };
 
+/**
+ * Replace the instance-wide defaults inherited by every AI summary.
+ */
+export type UpdateAiSummaryPreferenceRequest = {
+  model?: string | null;
+  provider_id?: string | null;
+  thinking_level?: string | null;
+};
+
 export type UpdateAlertRuleRequest = {
   cooldown_minutes?: number | null;
   enabled?: boolean | null;
@@ -17596,6 +20537,30 @@ export type UpdateAlertRuleRequest = {
   notification_priority?: string | null;
   trigger_config?: unknown;
   trigger_type?: string | null;
+};
+
+/**
+ * Request body for a partial update.
+ *
+ * `allowed_origins` and `rate_limit_per_minute` use the three-state
+ * double-`Option` encoding: field absent = leave unchanged, explicit `null` =
+ * clear, value = set. Plain `Option<Option<T>>` alone cannot express this
+ * because serde collapses an explicit JSON `null` into the outer `None`.
+ */
+export type UpdateAnalyticsIngestKeyRequest = {
+  /**
+   * Absent = unchanged, `null` = clear (any origin allowed), array = replace.
+   */
+  allowed_origins?: Array<string> | null;
+  /**
+   * New operator-facing label. Absent leaves it unchanged. The column is
+   * `NOT NULL`, so there is no "clear" state — send a new label instead.
+   */
+  name?: string | null;
+  /**
+   * Absent = unchanged, `null` = clear (unlimited), value = replace.
+   */
+  rate_limit_per_minute?: number | null;
 };
 
 export type UpdateApiKeyRequest = {
@@ -17649,6 +20614,12 @@ export type UpdateBackupScheduleRequest = {
    */
   schedule_expression?: string | null;
   /**
+   * Replace the explicit external-service selection atomically with the
+   * schedule update. Only meaningful when `target_all_services` resolves
+   * to `false`; an empty list explicitly clears the selection.
+   */
+  service_ids?: Array<number> | null;
+  /**
    * Replace the full tag list. Skipped when `None`.
    */
   tags?: Array<string> | null;
@@ -17665,7 +20636,7 @@ export type UpdateBackupScheduleRequest = {
  */
 export type UpdateBlobRequest = {
   /**
-   * Docker image to use (e.g., "rustfs/rustfs:1.0.0-alpha.98")
+   * Docker image to use (e.g., "rustfs/rustfs:1.0.0-rc.5")
    */
   docker_image?: string | null;
 };
@@ -17726,6 +20697,11 @@ export type UpdateCapabilityResponse = {
    */
   channel_is_pinned: boolean;
   /**
+   * Name of the migration currently running. `Some` while `phase` is
+   * `migrating` and a migration step is in flight.
+   */
+  current_migration_name?: string | null;
+  /**
    * Version tag of the running binary. Always present — the version page
    * needs it whether or not an update exists.
    */
@@ -17735,6 +20711,15 @@ export type UpdateCapabilityResponse = {
    * The equivalent command to run by hand. Always present.
    */
   manual_command: string;
+  /**
+   * Number of migrations applied so far. `Some` while `phase` is `migrating`.
+   */
+  migrations_applied?: number | null;
+  /**
+   * Total migrations to be applied. `Some` once the migrate child has
+   * reported its first `started` event.
+   */
+  migrations_total?: number | null;
   /**
    * Phase of an in-flight attempt: `idle` when none is running.
    */
@@ -17798,12 +20783,41 @@ export type UpdateDeploymentConfigRequest = {
    */
   crossArchitectureBuilds?: boolean | null;
   exposedPort?: number | null;
+  /**
+   * Project-level default cap on concurrent in-flight requests to a
+   * single environment's upstream (0 = unlimited). Environments may
+   * override this. Absent leaves the current value unchanged. See
+   * issue #646.
+   */
+  maxConcurrentConnections?: number | null;
   memoryLimit?: number | null;
   memoryRequest?: number | null;
   performanceMetricsEnabled?: boolean | null;
   replicas?: number | null;
+  /**
+   * Project-level default timeout for regular (non-streaming) HTTP
+   * requests, in seconds (0 = no timeout, or 1-86400). Environments may
+   * override this; always clamped to the operator's global hard ceiling
+   * regardless of what's set here. Absent leaves the current value
+   * unchanged.
+   */
+  requestTimeoutSeconds?: number | null;
   security?: null | SecurityConfig;
   sessionRecordingEnabled?: boolean | null;
+  /**
+   * Project-level default idle timeout for Server-Sent Events streams, in
+   * seconds (0 = no timeout, or 1-86400). Environments may override this;
+   * always clamped to the operator's global hard ceiling. Absent leaves
+   * the current value unchanged.
+   */
+  sseIdleTimeoutSeconds?: number | null;
+  /**
+   * Project-level default idle timeout for WebSocket connections, in
+   * seconds (0 = no timeout, or 1-86400). Environments may override this;
+   * always clamped to the operator's global hard ceiling. Absent leaves
+   * the current value unchanged.
+   */
+  websocketIdleTimeoutSeconds?: number | null;
 };
 
 export type UpdateDeploymentTokenRequest = {
@@ -17920,6 +20934,13 @@ export type UpdateEnvironmentSettingsRequest = {
    */
   idle_timeout_seconds?: number | null;
   /**
+   * Override the proxy's cap on concurrent in-flight requests to this
+   * environment's upstream (0 = unlimited). Absent leaves the current
+   * value unchanged. Send JSON `null` to clear the override (inherit
+   * the project/global default). See issue #646.
+   */
+  max_concurrent_connections?: number | null;
+  /**
    * Maximum (limit) memory in MB. Send JSON `null` to clear → "no limit".
    * Absent leaves the current value unchanged.
    */
@@ -17951,25 +20972,49 @@ export type UpdateEnvironmentSettingsRequest = {
    */
   protected?: boolean | null;
   replicas?: number | null;
+  /**
+   * Override the proxy's timeout for regular (non-streaming) HTTP requests
+   * to this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
+   * operator's global hard ceiling regardless of what's set here.
+   * Absent leaves the current value unchanged. Send JSON `null` to clear
+   * the override (inherit the project/global default).
+   */
+  request_timeout_seconds?: number | null;
   security?: null | SecurityConfig;
   /**
    * Enable/disable session recording
    */
   session_recording_enabled?: boolean | null;
   /**
+   * Override the proxy's idle timeout for Server-Sent Events streams to
+   * this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
+   * operator's global hard ceiling. Absent leaves the current value
+   * unchanged. Send JSON `null` to clear the override.
+   */
+  sse_idle_timeout_seconds?: number | null;
+  /**
    * Label selector for node-based scheduling (overrides project-level setting).
+   * Send an empty object to clear the environment-level override.
    * Same key with array value -> OR, different keys -> AND.
    * Example: `{"region": ["us", "asia"], "gpu": "true"}`
    */
   target_labels?: unknown;
   /**
-   * Optional list of node IDs to deploy to (overrides project-level setting)
+   * Optional list of node IDs to deploy to (overrides project-level setting).
+   * Send an empty list to clear the environment-level override.
    */
   target_nodes?: Array<number> | null;
   /**
    * Max seconds to wait for containers to start on wake (5-120). Default: 30.
    */
   wake_timeout_seconds?: number | null;
+  /**
+   * Override the proxy's idle timeout for WebSocket connections to this
+   * environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the operator's
+   * global hard ceiling. Absent leaves the current value unchanged. Send
+   * JSON `null` to clear the override.
+   */
+  websocket_idle_timeout_seconds?: number | null;
 };
 
 /**
@@ -18009,6 +21054,12 @@ export type UpdateEnvironmentVariableRequest = {
 };
 
 export type UpdateErrorGroupRequest = {
+  /**
+   * Assignee (email by convention).
+   * - `Some("user@example.com")` — sets the assignee.
+   * - `Some("")` (empty string) — clears the current assignment (sets to null).
+   * - `null` / field omitted — leaves the existing value unchanged.
+   */
   assigned_to?: string | null;
   status: string;
 };
@@ -18176,6 +21227,14 @@ export type UpdateNotificationEmailProviderRequest = {
   name?: string | null;
 };
 
+export type UpdateNotificationRouteRequest = {
+  enabled?: boolean | null;
+  max_severity?: string | null;
+  min_severity?: string | null;
+  name?: string | null;
+  provider_ids?: Array<number> | null;
+};
+
 export type UpdateOidcProviderRequest = {
   client_id?: string | null;
   client_secret?: string | null;
@@ -18201,6 +21260,15 @@ export type UpdatePreferencesRequest = {
  * ciphertext.
  */
 export type UpdateProjectSecretRequest = {
+  /**
+   * Docker Compose services allowed to read this secret, by compose
+   * service name. Empty (the default) delivers it to every service in the
+   * stack, which is how secrets behaved before scoping existed.
+   *
+   * Ignored by non-Compose presets: those deploy a single container, which
+   * always receives every secret in scope for its environment.
+   */
+  compose_services?: Array<string>;
   environment_ids?: Array<number>;
   include_in_preview?: boolean;
   /**
@@ -18214,6 +21282,10 @@ export type UpdateProjectSettingsRequest = {
    * Opt in to AI summarization of metric alert notifications (ADR-021).
    */
   ai_alert_summaries_enabled?: boolean | null;
+  /**
+   * Opt in to AI summarization of API traffic analytics.
+   */
+  ai_api_traffic_summary_enabled?: boolean | null;
   /**
    * Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).
    */
@@ -18249,7 +21321,23 @@ export type UpdateProjectSettingsRequest = {
    */
   error_source_root?: string | null;
   git_provider_connection_id?: number | null;
+  /**
+   * How long (hours) to retain built Docker images before nightly cleanup removes them.
+   * Set to null to use the system default. Valid range: 1–8760.
+   *
+   * Omitting the key leaves the current value unchanged; sending an explicit
+   * `null` clears the per-project override. `skip_serializing_if` keeps the
+   * round-trip honest — re-serializing a request that omitted the key must
+   * not emit `"image_retention_hours": null`, which would mean "reset".
+   */
+  image_retention_hours?: number | null;
   main_branch?: string | null;
+  /**
+   * Human-facing project display name. Unlike `slug` this is not part of any
+   * URL and is not required to be unique. Changing it also changes the
+   * `OTEL_SERVICE_NAME` injected into subsequent deployments.
+   */
+  name?: string | null;
   preset?: string | null;
   preset_config?: null | PresetConfigSchema;
   /**
@@ -18267,6 +21355,11 @@ export type UpdateProjectSettingsRequest = {
   repo_name?: string | null;
   repo_owner?: string | null;
   slug?: string | null;
+  /**
+   * Opt in to Trivy vulnerability scanning of this project's deployed Docker
+   * images (post-deployment scan + daily rescans). Off by default.
+   */
+  vulnerability_scanning_enabled?: boolean | null;
 };
 
 /**
@@ -18324,6 +21417,29 @@ export type UpdateProviderKeyRequest = {
   default_model?: string | null;
   display_name?: string | null;
   is_active?: boolean | null;
+};
+
+export type UpdateProviderModelRequest = {
+  is_enabled: boolean;
+};
+
+/**
+ * Request body for `PUT /api/ai/provider-preference`.
+ */
+export type UpdateProviderPreferenceRequest = {
+  /**
+   * Required when `provider_type` is `"agent_cli"`.
+   */
+  agent_cli_provider_id?: string | null;
+  /**
+   * Deprecated compatibility field. Adapter realtime behavior is derived
+   * from its capability contract and cannot be toggled independently.
+   */
+  interactive_bridge_enabled?: boolean | null;
+  /**
+   * `"gateway"` or `"agent_cli"`.
+   */
+  provider_type: string;
 };
 
 export type UpdateProviderRequest = {
@@ -18391,6 +21507,25 @@ export type UpdateSelfRequest = {
   name?: string | null;
 };
 
+/**
+ * Complete replacement for the editable runtime of a single-container
+ * service-template project. Runtime and resource fields are written to the
+ * same project row in one transaction.
+ */
+export type UpdateServiceTemplateRuntimeRequest = {
+  /**
+   * Empty means use the image's own default command.
+   */
+  command?: Array<string>;
+  cpuLimit?: number | null;
+  cpuRequest?: number | null;
+  exposedPort?: number | null;
+  healthCheckPath: string;
+  imageRef: string;
+  memoryLimit?: number | null;
+  memoryRequest?: number | null;
+};
+
 export type UpdateSessionDurationRequest = {
   duration: number;
 };
@@ -18423,6 +21558,16 @@ export type UpdateSpeedMetricsPayload = {
    * Interaction to Next Paint (milliseconds)
    */
   inp?: number | null;
+  /**
+   * Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+   */
+  sessionId?: string | null;
+  /**
+   * Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+   * Required to identify the right row on the keyed path, where there is
+   * no Temps-issued cookie to fall back on.
+   */
+  visitorId?: string | null;
 };
 
 /**
@@ -18479,6 +21624,17 @@ export type UpdateTokenResponse = {
   message: string;
 };
 
+/**
+ * Body of `PATCH /traefik-discovery/routes/{host}/enabled`.
+ */
+export type UpdateTraefikRouteEnabledRequest = {
+  /**
+   * `false` suppresses the route without touching the container's labels;
+   * the row stays visible so the operator can see what was found.
+   */
+  enabled: boolean;
+};
+
 export type UpdateUserRequest = {
   email?: string | null;
   name?: string | null;
@@ -18520,9 +21676,23 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
   /**
    * Image reference to pull and run (e.g.
-   * `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+   * an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+   * Empty resets to default.
    */
   image: string;
+};
+
+export type UpgradeServiceTemplateRequest = {
+  /**
+   * Values for inputs introduced by the target release. Existing project
+   * values are preserved and cannot be overwritten through this endpoint.
+   */
+  environment_variables?: Array<EnvVarInput>;
+  /**
+   * Optimistic target selected from the preview. The server rejects a stale
+   * target if the catalog changes between preview and apply.
+   */
+  target_version: string;
 };
 
 export type UpsertAgentRequest = {
@@ -19770,8 +22940,19 @@ export type UploadReleaseFileResponse =
 
 export type RecordEventMetricsData = {
   body: EventMetricsPayload;
+  headers?: {
+    /**
+     * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+     */
+    "x-temps-analytics-key"?: string | null;
+  };
   path?: never;
-  query?: never;
+  query?: {
+    /**
+     * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+     */
+    temps_key?: string;
+  };
   url: "/_temps/event";
 };
 
@@ -19796,10 +22977,68 @@ export type RecordEventMetricsResponses = {
 export type RecordEventMetricsResponse =
   RecordEventMetricsResponses[keyof RecordEventMetricsResponses];
 
-export type AddSessionReplayEventsData = {
-  body: SessionReplayEventsRequest;
+export type IngestTunneledEnvelopeData = {
+  /**
+   * Sentry envelope as binary data
+   */
+  body: string;
   path?: never;
   query?: never;
+  url: "/_temps/sentry/envelope";
+};
+
+export type IngestTunneledEnvelopeErrors = {
+  /**
+   * Bad request
+   */
+  400: unknown;
+  /**
+   * Origin/Referer does not match the resolved host
+   */
+  403: unknown;
+  /**
+   * Unknown host
+   */
+  404: unknown;
+  /**
+   * Request body too large (exceeds 2 MiB)
+   */
+  413: unknown;
+  /**
+   * Rate limit exceeded
+   */
+  429: unknown;
+};
+
+export type IngestTunneledEnvelopeResponses = {
+  /**
+   * Envelope ingested
+   */
+  200: unknown;
+  /**
+   * Host resolved to a route with no attributable project (sandbox/orphan)
+   */
+  204: void;
+};
+
+export type IngestTunneledEnvelopeResponse =
+  IngestTunneledEnvelopeResponses[keyof IngestTunneledEnvelopeResponses];
+
+export type AddSessionReplayEventsData = {
+  body: SessionReplayEventsRequest;
+  headers?: {
+    /**
+     * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+     */
+    "x-temps-analytics-key"?: string | null;
+  };
+  path?: never;
+  query?: {
+    /**
+     * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+     */
+    temps_key?: string;
+  };
   url: "/_temps/session-replay/events";
 };
 
@@ -19833,8 +23072,19 @@ export type AddSessionReplayEventsResponse =
 
 export type InitSessionReplayData = {
   body: SessionReplayInitRequest;
+  headers?: {
+    /**
+     * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+     */
+    "x-temps-analytics-key"?: string | null;
+  };
   path?: never;
-  query?: never;
+  query?: {
+    /**
+     * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+     */
+    temps_key?: string;
+  };
   url: "/_temps/session-replay/init";
 };
 
@@ -19864,8 +23114,19 @@ export type InitSessionReplayResponse =
 
 export type RecordSpeedMetricsData = {
   body: SpeedMetricsPayload;
+  headers?: {
+    /**
+     * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+     */
+    "x-temps-analytics-key"?: string | null;
+  };
   path?: never;
-  query?: never;
+  query?: {
+    /**
+     * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+     */
+    temps_key?: string;
+  };
   url: "/_temps/speed";
 };
 
@@ -19899,8 +23160,19 @@ export type RecordSpeedMetricsResponse =
 
 export type UpdateSpeedMetricsData = {
   body: UpdateSpeedMetricsPayload;
+  headers?: {
+    /**
+     * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+     */
+    "x-temps-analytics-key"?: string | null;
+  };
   path?: never;
-  query?: never;
+  query?: {
+    /**
+     * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+     */
+    temps_key?: string;
+  };
   url: "/_temps/speed/update";
 };
 
@@ -20265,6 +23537,115 @@ export type GetPricingResponses = {
 
 export type GetPricingResponse = GetPricingResponses[keyof GetPricingResponses];
 
+export type UpdateAiProviderPreferenceData = {
+  body: UpdateProviderPreferenceRequest;
+  path?: never;
+  query?: never;
+  url: "/ai/provider-preference";
+};
+
+export type UpdateAiProviderPreferenceErrors = {
+  /**
+   * Validation error
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type UpdateAiProviderPreferenceError =
+  UpdateAiProviderPreferenceErrors[keyof UpdateAiProviderPreferenceErrors];
+
+export type UpdateAiProviderPreferenceResponses = {
+  /**
+   * Updated provider preference and availability
+   */
+  200: AiProviderStatusResponse;
+};
+
+export type UpdateAiProviderPreferenceResponse =
+  UpdateAiProviderPreferenceResponses[keyof UpdateAiProviderPreferenceResponses];
+
+export type GetAiProviderStatusData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/ai/provider-status";
+};
+
+export type GetAiProviderStatusErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type GetAiProviderStatusError =
+  GetAiProviderStatusErrors[keyof GetAiProviderStatusErrors];
+
+export type GetAiProviderStatusResponses = {
+  /**
+   * Current provider preference and availability
+   */
+  200: AiProviderStatusResponse;
+};
+
+export type GetAiProviderStatusResponse =
+  GetAiProviderStatusResponses[keyof GetAiProviderStatusResponses];
+
+export type RefreshAiProviderStatusData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/ai/provider-status/refresh";
+};
+
+export type RefreshAiProviderStatusErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Provider refresh failed
+   */
+  500: ProblemDetails;
+};
+
+export type RefreshAiProviderStatusError =
+  RefreshAiProviderStatusErrors[keyof RefreshAiProviderStatusErrors];
+
+export type RefreshAiProviderStatusResponses = {
+  /**
+   * Fresh provider authentication and model capability snapshot
+   */
+  200: AiProviderStatusResponse;
+};
+
+export type RefreshAiProviderStatusResponse =
+  RefreshAiProviderStatusResponses[keyof RefreshAiProviderStatusResponses];
+
 export type ListProviderKeysData = {
   body?: never;
   path?: never;
@@ -20403,6 +23784,32 @@ export type DeleteProviderKeyResponses = {
 export type DeleteProviderKeyResponse =
   DeleteProviderKeyResponses[keyof DeleteProviderKeyResponses];
 
+export type GetProviderKeyData = {
+  body?: never;
+  path: {
+    /**
+     * Provider key ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/ai/providers/{id}";
+};
+
+export type GetProviderKeyErrors = {
+  404: ProblemDetails;
+};
+
+export type GetProviderKeyError =
+  GetProviderKeyErrors[keyof GetProviderKeyErrors];
+
+export type GetProviderKeyResponses = {
+  200: ProviderDetailResponse;
+};
+
+export type GetProviderKeyResponse =
+  GetProviderKeyResponses[keyof GetProviderKeyResponses];
+
 export type UpdateProviderKeyData = {
   body: UpdateProviderKeyRequest;
   path: {
@@ -20444,6 +23851,106 @@ export type UpdateProviderKeyResponses = {
 export type UpdateProviderKeyResponse =
   UpdateProviderKeyResponses[keyof UpdateProviderKeyResponses];
 
+export type AddProviderModelData = {
+  body: AddProviderModelRequest;
+  path: {
+    /**
+     * Provider key ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/ai/providers/{id}/models";
+};
+
+export type AddProviderModelErrors = {
+  400: ProblemDetails;
+};
+
+export type AddProviderModelError =
+  AddProviderModelErrors[keyof AddProviderModelErrors];
+
+export type AddProviderModelResponses = {
+  201: ProviderModelResponse;
+};
+
+export type AddProviderModelResponse =
+  AddProviderModelResponses[keyof AddProviderModelResponses];
+
+export type RefreshProviderModelsData = {
+  body?: never;
+  path: {
+    /**
+     * Provider key ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/ai/providers/{id}/models/refresh";
+};
+
+export type RefreshProviderModelsErrors = {
+  404: ProblemDetails;
+};
+
+export type RefreshProviderModelsError =
+  RefreshProviderModelsErrors[keyof RefreshProviderModelsErrors];
+
+export type RefreshProviderModelsResponses = {
+  200: Array<ProviderModelResponse>;
+};
+
+export type RefreshProviderModelsResponse =
+  RefreshProviderModelsResponses[keyof RefreshProviderModelsResponses];
+
+export type DeleteProviderModelData = {
+  body?: never;
+  path: {
+    id: number;
+    model_row_id: number;
+  };
+  query?: never;
+  url: "/ai/providers/{id}/models/{model_row_id}";
+};
+
+export type DeleteProviderModelErrors = {
+  400: ProblemDetails;
+};
+
+export type DeleteProviderModelError =
+  DeleteProviderModelErrors[keyof DeleteProviderModelErrors];
+
+export type DeleteProviderModelResponses = {
+  204: void;
+};
+
+export type DeleteProviderModelResponse =
+  DeleteProviderModelResponses[keyof DeleteProviderModelResponses];
+
+export type UpdateProviderModelData = {
+  body: UpdateProviderModelRequest;
+  path: {
+    id: number;
+    model_row_id: number;
+  };
+  query?: never;
+  url: "/ai/providers/{id}/models/{model_row_id}";
+};
+
+export type UpdateProviderModelErrors = {
+  404: ProblemDetails;
+};
+
+export type UpdateProviderModelError =
+  UpdateProviderModelErrors[keyof UpdateProviderModelErrors];
+
+export type UpdateProviderModelResponses = {
+  200: ProviderModelResponse;
+};
+
+export type UpdateProviderModelResponse =
+  UpdateProviderModelResponses[keyof UpdateProviderModelResponses];
+
 export type TestProviderKeyByIdData = {
   body?: never;
   path: {
@@ -20480,6 +23987,41 @@ export type TestProviderKeyByIdResponses = {
 
 export type TestProviderKeyByIdResponse =
   TestProviderKeyByIdResponses[keyof TestProviderKeyByIdResponses];
+
+export type UpdateAiSummaryPreferenceData = {
+  body: UpdateAiSummaryPreferenceRequest;
+  path?: never;
+  query?: never;
+  url: "/ai/summary-preference";
+};
+
+export type UpdateAiSummaryPreferenceErrors = {
+  /**
+   * Unsupported provider, model, or thinking level
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+};
+
+export type UpdateAiSummaryPreferenceError =
+  UpdateAiSummaryPreferenceErrors[keyof UpdateAiSummaryPreferenceErrors];
+
+export type UpdateAiSummaryPreferenceResponses = {
+  /**
+   * Updated summary routing defaults
+   */
+  200: AiProviderStatusResponse;
+};
+
+export type UpdateAiSummaryPreferenceResponse =
+  UpdateAiSummaryPreferenceResponses[keyof UpdateAiSummaryPreferenceResponses];
 
 export type GetUsageByProviderData = {
   body?: never;
@@ -23295,6 +26837,10 @@ export type ListBackupAlertsErrors = {
    */
   401: ProblemDetails;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Internal server error
    */
   500: ProblemDetails;
@@ -23384,6 +26930,14 @@ export type RunExternalServiceBackupErrors = {
    */
   400: ProblemDetails;
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * External service or S3 source not found
    */
   404: ProblemDetails;
@@ -23432,6 +26986,10 @@ export type ListExternalServiceBackupsErrors = {
    * Unauthorized
    */
   401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * Internal server error
    */
@@ -23508,6 +27066,10 @@ export type ListS3SourcesErrors = {
    */
   401: ProblemDetails;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Internal server error
    */
   500: ProblemDetails;
@@ -23541,6 +27103,10 @@ export type CreateS3SourceErrors = {
    * Unauthorized
    */
   401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * Internal server error
    */
@@ -23577,6 +27143,10 @@ export type TestS3ConnectionPreviewErrors = {
    */
   401: ProblemDetails;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Internal server error
    */
   500: ProblemDetails;
@@ -23605,6 +27175,14 @@ export type DeleteS3SourceData = {
 };
 
 export type DeleteS3SourceErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * S3 source not found
    */
@@ -23639,6 +27217,14 @@ export type GetS3SourceData = {
 
 export type GetS3SourceErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * S3 source not found
    */
   404: ProblemDetails;
@@ -23670,6 +27256,14 @@ export type UpdateS3SourceData = {
 };
 
 export type UpdateS3SourceErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * S3 source not found
    */
@@ -23715,6 +27309,10 @@ export type ListSourceBackupsErrors = {
    */
   401: ProblemDetails;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * S3 source not found
    */
   404: unknown;
@@ -23751,6 +27349,14 @@ export type RunBackupForSourceErrors = {
    * Invalid request
    */
   400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * S3 source not found
    */
@@ -23789,6 +27395,10 @@ export type SetDefaultS3SourceErrors = {
    */
   401: ProblemDetails;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * S3 source not found
    */
   404: ProblemDetails;
@@ -23825,6 +27435,10 @@ export type TestS3SourceConnectionErrors = {
    * Unauthorized
    */
   401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * S3 source not found
    */
@@ -23939,6 +27553,10 @@ export type ListBackupSchedulesErrors = {
    */
   401: ProblemDetails;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Internal server error
    */
   500: ProblemDetails;
@@ -23970,6 +27588,10 @@ export type CreateBackupScheduleErrors = {
    */
   401: ProblemDetails;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Internal server error
    */
   500: ProblemDetails;
@@ -23998,6 +27620,14 @@ export type DeleteBackupScheduleData = {
 };
 
 export type DeleteBackupScheduleErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * Backup schedule not found
    */
@@ -24032,6 +27662,14 @@ export type GetBackupScheduleData = {
 
 export type GetBackupScheduleErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Backup schedule not found
    */
   404: unknown;
@@ -24040,6 +27678,9 @@ export type GetBackupScheduleErrors = {
    */
   500: unknown;
 };
+
+export type GetBackupScheduleError =
+  GetBackupScheduleErrors[keyof GetBackupScheduleErrors];
 
 export type GetBackupScheduleResponses = {
   /**
@@ -24069,6 +27710,10 @@ export type UpdateBackupScheduleErrors = {
    * Unauthorized
    */
   401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * Schedule not found
    */
@@ -24103,6 +27748,14 @@ export type ListBackupsForScheduleData = {
 
 export type ListBackupsForScheduleErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Backup schedule not found
    */
   404: unknown;
@@ -24111,6 +27764,9 @@ export type ListBackupsForScheduleErrors = {
    */
   500: unknown;
 };
+
+export type ListBackupsForScheduleError =
+  ListBackupsForScheduleErrors[keyof ListBackupsForScheduleErrors];
 
 export type ListBackupsForScheduleResponses = {
   /**
@@ -24133,6 +27789,14 @@ export type DisableBackupScheduleData = {
 
 export type DisableBackupScheduleErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Backup schedule not found
    */
   404: unknown;
@@ -24141,6 +27805,9 @@ export type DisableBackupScheduleErrors = {
    */
   500: unknown;
 };
+
+export type DisableBackupScheduleError =
+  DisableBackupScheduleErrors[keyof DisableBackupScheduleErrors];
 
 export type DisableBackupScheduleResponses = {
   /**
@@ -24163,6 +27830,14 @@ export type EnableBackupScheduleData = {
 
 export type EnableBackupScheduleErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Backup schedule not found
    */
   404: unknown;
@@ -24171,6 +27846,9 @@ export type EnableBackupScheduleErrors = {
    */
   500: unknown;
 };
+
+export type EnableBackupScheduleError =
+  EnableBackupScheduleErrors[keyof EnableBackupScheduleErrors];
 
 export type EnableBackupScheduleResponses = {
   /**
@@ -24478,6 +28156,10 @@ export type GetBackupErrors = {
    * Unauthorized
    */
   401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * Backup not found
    */
@@ -24938,6 +28620,38 @@ export type BlobHeadResponses = {
   200: unknown;
 };
 
+export type ClusterDnsStatusData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/cluster/dns/status";
+};
+
+export type ClusterDnsStatusErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type ClusterDnsStatusResponses = {
+  /**
+   * Cluster DNS resolver health
+   */
+  200: ClusterDnsStatusResponse;
+};
+
+export type ClusterDnsStatusResponse2 =
+  ClusterDnsStatusResponses[keyof ClusterDnsStatusResponses];
+
 export type GetDashboardProjectsAnalyticsData = {
   body?: never;
   path?: never;
@@ -25009,10 +28723,17 @@ export type GetActivityGraphErrors = {
    */
   401: unknown;
   /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Internal server error
    */
   500: unknown;
 };
+
+export type GetActivityGraphError =
+  GetActivityGraphErrors[keyof GetActivityGraphErrors];
 
 export type GetActivityGraphResponses = {
   /**
@@ -25023,6 +28744,87 @@ export type GetActivityGraphResponses = {
 
 export type GetActivityGraphResponse =
   GetActivityGraphResponses[keyof GetActivityGraphResponses];
+
+export type GetLatestDeploymentMediaData = {
+  body?: never;
+  path?: never;
+  query: {
+    /**
+     * Comma-separated project IDs. At most 100 IDs are accepted.
+     */
+    project_ids: string;
+  };
+  url: "/deployments/latest-media";
+};
+
+export type GetLatestDeploymentMediaErrors = {
+  /**
+   * Invalid project IDs
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permission or project access
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type GetLatestDeploymentMediaError =
+  GetLatestDeploymentMediaErrors[keyof GetLatestDeploymentMediaErrors];
+
+export type GetLatestDeploymentMediaResponses = {
+  /**
+   * Latest deployment media keyed by project ID
+   */
+  200: LatestDeploymentMediaResponse;
+};
+
+export type GetLatestDeploymentMediaResponse =
+  GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
+
+export type ListManagedEnvironmentVariablesData = {
+  body?: never;
+  path?: never;
+  query: {
+    /**
+     * Framework preset used to select public browser variable names.
+     */
+    preset: string;
+  };
+  url: "/deployments/managed-environment-variables";
+};
+
+export type ListManagedEnvironmentVariablesErrors = {
+  /**
+   * Unknown deployment preset
+   */
+  400: unknown;
+  /**
+   * Authentication required
+   */
+  401: unknown;
+  /**
+   * Missing project creation permission
+   */
+  403: unknown;
+};
+
+export type ListManagedEnvironmentVariablesResponses = {
+  /**
+   * Platform-managed environment variable metadata
+   */
+  200: Array<ManagedEnvironmentVariable>;
+};
+
+export type ListManagedEnvironmentVariablesResponse =
+  ListManagedEnvironmentVariablesResponses[keyof ListManagedEnvironmentVariablesResponses];
 
 export type GetScanByDeploymentData = {
   body?: never;
@@ -25083,6 +28885,7 @@ export type DeploymentMetricsGetRangeData = {
     metric: string;
     /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
      */
     range?: string;
     /**
@@ -25090,6 +28893,14 @@ export type DeploymentMetricsGetRangeData = {
      * fetches histogram buckets and computes the requested quantile.
      */
     percentile?: number | null;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
+    /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
   };
   url: "/deployments/{id}/metrics";
 };
@@ -25707,6 +29518,14 @@ export type LookupDnsARecordsErrors = {
    * Invalid domain name or lookup failed
    */
   400: DnsLookupError;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
 };
 
 export type LookupDnsARecordsError =
@@ -26324,6 +30143,52 @@ export type RenewDomainResponses = {
 
 export type RenewDomainResponse =
   RenewDomainResponses[keyof RenewDomainResponses];
+
+export type ListRenewalAttemptsData = {
+  body?: never;
+  path: {
+    /**
+     * Domain name
+     */
+    domain: string;
+  };
+  query?: {
+    /**
+     * Page number (1-indexed)
+     */
+    page?: number | null;
+    /**
+     * Number of items per page (max 100)
+     */
+    page_size?: number | null;
+  };
+  url: "/domains/{domain}/renewal-attempts";
+};
+
+export type ListRenewalAttemptsErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Domain not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type ListRenewalAttemptsResponses = {
+  /**
+   * Renewal attempts retrieved successfully
+   */
+  200: ListRenewalAttemptsResponse;
+};
+
+export type ListRenewalAttemptsResponse2 =
+  ListRenewalAttemptsResponses[keyof ListRenewalAttemptsResponses];
 
 export type CheckDomainStatusData = {
   body?: never;
@@ -27208,7 +31073,7 @@ export type SendEmailData = {
     /**
      * Required for deployment-token requests. Reusing a key with the same payload returns the original delivery; reusing it with a different payload returns 409.
      */
-    "Idempotency-Key"?: string;
+    "Idempotency-Key"?: string | null;
   };
   path?: never;
   query?: never;
@@ -27884,7 +31749,7 @@ export type GetProviderMetadataData = {
   body?: never;
   path: {
     /**
-     * Service type (mongodb, postgres, redis, s3)
+     * Service type (mariadb, mongodb, postgres, redis, s3, kv, blob, rustfs, or legacy minio)
      */
     service_type: string;
   };
@@ -28117,6 +31982,45 @@ export type GetClusterHealthResponses = {
 
 export type GetClusterHealthResponse =
   GetClusterHealthResponses[keyof GetClusterHealthResponses];
+
+export type RevealServiceEnvironmentVariablesData = {
+  body?: never;
+  path: {
+    /**
+     * External service ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/external-services/{id}/environment";
+};
+
+export type RevealServiceEnvironmentVariablesErrors = {
+  /**
+   * Caller cannot access a project linked to this service
+   */
+  403: unknown;
+  /**
+   * Service not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type RevealServiceEnvironmentVariablesResponses = {
+  /**
+   * Service environment variables in plaintext
+   */
+  200: {
+    [key: string]: string;
+  };
+};
+
+export type RevealServiceEnvironmentVariablesResponse =
+  RevealServiceEnvironmentVariablesResponses[keyof RevealServiceEnvironmentVariablesResponses];
 
 export type TriggerServiceHealthCheckData = {
   body?: never;
@@ -28361,6 +32265,7 @@ export type ExternalServiceMetricsGetRangeData = {
     metric: string;
     /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
      */
     range?: string;
     /**
@@ -28368,6 +32273,14 @@ export type ExternalServiceMetricsGetRangeData = {
      * fetches histogram buckets and computes the requested quantile.
      */
     percentile?: number | null;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
+    /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
   };
   url: "/external-services/{id}/metrics";
 };
@@ -28854,6 +32767,14 @@ export type ListServiceProjectsData = {
 
 export type ListServiceProjectsErrors = {
   /**
+   * Authentication required
+   */
+  401: unknown;
+  /**
+   * Insufficient permission to view this service
+   */
+  403: unknown;
+  /**
    * Service not found
    */
   404: unknown;
@@ -28887,9 +32808,21 @@ export type LinkServiceToProjectData = {
 
 export type LinkServiceToProjectErrors = {
   /**
+   * Authentication required
+   */
+  401: unknown;
+  /**
+   * Insufficient permission to link this service
+   */
+  403: unknown;
+  /**
    * Service or project not found
    */
   404: unknown;
+  /**
+   * Project already has a database of this type
+   */
+  409: unknown;
   /**
    * Internal server error
    */
@@ -28923,6 +32856,14 @@ export type UnlinkServiceFromProjectData = {
 };
 
 export type UnlinkServiceFromProjectErrors = {
+  /**
+   * Authentication required
+   */
+  401: unknown;
+  /**
+   * Insufficient permission to unlink this service
+   */
+  403: unknown;
   /**
    * Service link not found
    */
@@ -29025,6 +32966,55 @@ export type GetServiceEnvironmentVariableResponses = {
 export type GetServiceEnvironmentVariableResponse =
   GetServiceEnvironmentVariableResponses[keyof GetServiceEnvironmentVariableResponses];
 
+export type IssueRuntimeCredentialsData = {
+  body?: never;
+  path: {
+    /**
+     * External service ID
+     */
+    id: number;
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Environment ID
+     */
+    environment_id: number;
+  };
+  query?: never;
+  url: "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials";
+};
+
+export type IssueRuntimeCredentialsErrors = {
+  /**
+   * Plaintext secret access is not permitted
+   */
+  403: unknown;
+  /**
+   * Service, project, or environment not found
+   */
+  404: unknown;
+  /**
+   * Service is not linked to the project
+   */
+  409: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type IssueRuntimeCredentialsResponses = {
+  /**
+   * Connection credentials issued
+   */
+  200: RuntimeCredentialsResponse;
+};
+
+export type IssueRuntimeCredentialsResponse =
+  IssueRuntimeCredentialsResponses[keyof IssueRuntimeCredentialsResponses];
+
 export type UpdateServiceResourcesData = {
   body: ServiceResourceLimits;
   path: {
@@ -29080,6 +33070,14 @@ export type StartRestoreErrors = {
    */
   400: ProblemDetails;
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Backup or service not found
    */
   404: ProblemDetails;
@@ -29110,6 +33108,14 @@ export type GetRestoreCapabilitiesData = {
 };
 
 export type GetRestoreCapabilitiesErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * Service not found
    */
@@ -29147,6 +33153,14 @@ export type PlanRestoreErrors = {
    */
   400: ProblemDetails;
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Backup or service not found
    */
   404: ProblemDetails;
@@ -29175,6 +33189,24 @@ export type ListRestoreRunsForServiceData = {
   query?: never;
   url: "/external-services/{id}/restore-runs";
 };
+
+export type ListRestoreRunsForServiceErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Service not found
+   */
+  404: ProblemDetails;
+};
+
+export type ListRestoreRunsForServiceError =
+  ListRestoreRunsForServiceErrors[keyof ListRestoreRunsForServiceErrors];
 
 export type ListRestoreRunsForServiceResponses = {
   /**
@@ -30087,10 +34119,21 @@ export type ListPgUpgradesData = {
 
 export type ListPgUpgradesErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Internal error
    */
   500: unknown;
 };
+
+export type ListPgUpgradesError =
+  ListPgUpgradesErrors[keyof ListPgUpgradesErrors];
 
 export type ListPgUpgradesResponses = {
   /**
@@ -30120,6 +34163,14 @@ export type StartPgUpgradeErrors = {
    */
   400: unknown;
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * An upgrade is already running for this service
    */
   409: unknown;
@@ -30132,6 +34183,9 @@ export type StartPgUpgradeErrors = {
    */
   500: unknown;
 };
+
+export type StartPgUpgradeError =
+  StartPgUpgradeErrors[keyof StartPgUpgradeErrors];
 
 export type StartPgUpgradeResponses = {
   /**
@@ -30161,6 +34215,14 @@ export type GetPgUpgradeData = {
 
 export type GetPgUpgradeErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Not found
    */
   404: unknown;
@@ -30169,6 +34231,8 @@ export type GetPgUpgradeErrors = {
    */
   500: unknown;
 };
+
+export type GetPgUpgradeError = GetPgUpgradeErrors[keyof GetPgUpgradeErrors];
 
 export type GetPgUpgradeResponses = {
   /**
@@ -30198,6 +34262,14 @@ export type CancelPgUpgradeData = {
 
 export type CancelPgUpgradeErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Not found
    */
   404: unknown;
@@ -30210,6 +34282,9 @@ export type CancelPgUpgradeErrors = {
    */
   500: unknown;
 };
+
+export type CancelPgUpgradeError =
+  CancelPgUpgradeErrors[keyof CancelPgUpgradeErrors];
 
 export type CancelPgUpgradeResponses = {
   /**
@@ -30239,6 +34314,14 @@ export type GetPgUpgradeLogsData = {
 
 export type GetPgUpgradeLogsErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Not found
    */
   404: unknown;
@@ -30247,6 +34330,9 @@ export type GetPgUpgradeLogsErrors = {
    */
   500: unknown;
 };
+
+export type GetPgUpgradeLogsError =
+  GetPgUpgradeLogsErrors[keyof GetPgUpgradeLogsErrors];
 
 export type GetPgUpgradeLogsResponses = {
   /**
@@ -30280,6 +34366,14 @@ export type RetryPgUpgradeErrors = {
    */
   400: unknown;
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Not found
    */
   404: unknown;
@@ -30288,6 +34382,9 @@ export type RetryPgUpgradeErrors = {
    */
   500: unknown;
 };
+
+export type RetryPgUpgradeError =
+  RetryPgUpgradeErrors[keyof RetryPgUpgradeErrors];
 
 export type RetryPgUpgradeResponses = {
   /**
@@ -30317,6 +34414,14 @@ export type RollbackPgUpgradeData = {
 
 export type RollbackPgUpgradeErrors = {
   /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
    * Not found
    */
   404: unknown;
@@ -30329,6 +34434,9 @@ export type RollbackPgUpgradeErrors = {
    */
   500: unknown;
 };
+
+export type RollbackPgUpgradeError =
+  RollbackPgUpgradeErrors[keyof RollbackPgUpgradeErrors];
 
 export type RollbackPgUpgradeResponses = {
   /**
@@ -30830,13 +34938,25 @@ export type UpdateConnectionTokenData = {
 
 export type UpdateConnectionTokenErrors = {
   /**
+   * Invalid token configuration
+   */
+  400: unknown;
+  /**
    * Unauthorized
    */
   401: unknown;
   /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
    * Connection not found
    */
   404: unknown;
+  /**
+   * Git provider rate limit exceeded
+   */
+  429: unknown;
   /**
    * Internal server error
    */
@@ -30871,9 +34991,17 @@ export type ValidateConnectionErrors = {
    */
   401: unknown;
   /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
    * Connection not found
    */
   404: unknown;
+  /**
+   * Git provider rate limit exceeded
+   */
+  429: unknown;
   /**
    * Internal server error
    */
@@ -31597,7 +35725,12 @@ export type GetPublicRepositoryData = {
      */
     repo: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+     */
+    base_url?: string | null;
+  };
   url: "/git/public/{provider}/{owner}/{repo}";
 };
 
@@ -31606,6 +35739,14 @@ export type GetPublicRepositoryErrors = {
    * Provider not supported
    */
   400: unknown;
+  /**
+   * Authentication required for custom GitLab origins
+   */
+  401: unknown;
+  /**
+   * Git provider permission required
+   */
+  403: unknown;
   /**
    * Repository not found
    */
@@ -31648,6 +35789,10 @@ export type GetPublicBranchesData = {
   };
   query?: {
     /**
+     * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+     */
+    base_url?: string | null;
+    /**
      * Force fetch fresh data, bypassing cache (default: false)
      */
     fresh?: boolean;
@@ -31660,6 +35805,14 @@ export type GetPublicBranchesErrors = {
    * Provider not supported
    */
   400: unknown;
+  /**
+   * Authentication required for custom GitLab origins
+   */
+  401: unknown;
+  /**
+   * Git provider permission required
+   */
+  403: unknown;
   /**
    * Repository not found
    */
@@ -31684,6 +35837,201 @@ export type GetPublicBranchesResponses = {
 export type GetPublicBranchesResponse =
   GetPublicBranchesResponses[keyof GetPublicBranchesResponses];
 
+export type GetPublicComposeServicesData = {
+  body?: never;
+  path: {
+    /**
+     * Git provider (github or gitlab)
+     */
+    provider: string;
+    /**
+     * Repository owner
+     */
+    owner: string;
+    /**
+     * Repository name
+     */
+    repo: string;
+  };
+  query: {
+    /**
+     * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+     */
+    base_url?: string | null;
+    /**
+     * Branch to read the compose file from (default: repository's default branch)
+     */
+    branch?: string | null;
+    /**
+     * Compose file path to fetch and parse (from the `compose_files` list
+     * `/preset` already returned, or a custom path the user typed)
+     */
+    path: string;
+  };
+  url: "/git/public/{provider}/{owner}/{repo}/compose-file";
+};
+
+export type GetPublicComposeServicesErrors = {
+  /**
+   * Provider not supported, or the compose file could not be parsed
+   */
+  400: unknown;
+  /**
+   * Authentication required for custom GitLab origins
+   */
+  401: unknown;
+  /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
+   * Repository, branch, or compose file not found
+   */
+  404: unknown;
+  /**
+   * API rate limit exceeded
+   */
+  429: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetPublicComposeServicesResponses = {
+  /**
+   * Compose services parsed successfully
+   */
+  200: PublicComposeServicesResponse;
+};
+
+export type GetPublicComposeServicesResponse =
+  GetPublicComposeServicesResponses[keyof GetPublicComposeServicesResponses];
+
+export type GetPublicComposePreviewData = {
+  body: PublicComposePreviewRequest;
+  path: {
+    /**
+     * Git provider (github or gitlab)
+     */
+    provider: string;
+    /**
+     * Repository owner
+     */
+    owner: string;
+    /**
+     * Repository name
+     */
+    repo: string;
+  };
+  query?: {
+    /**
+     * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+     */
+    base_url?: string | null;
+  };
+  url: "/git/public/{provider}/{owner}/{repo}/compose-file";
+};
+
+export type GetPublicComposePreviewErrors = {
+  /**
+   * Compose file or override is invalid
+   */
+  400: unknown;
+  /**
+   * Authentication required for custom GitLab origins
+   */
+  401: unknown;
+  /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
+   * Repository, branch, or compose file not found
+   */
+  404: unknown;
+};
+
+export type GetPublicComposePreviewResponses = {
+  /**
+   * Effective Compose preview rendered
+   */
+  200: PublicComposePreviewResponse;
+};
+
+export type GetPublicComposePreviewResponse =
+  GetPublicComposePreviewResponses[keyof GetPublicComposePreviewResponses];
+
+export type DetectPublicEnvExampleData = {
+  body?: never;
+  path: {
+    /**
+     * Git provider (github or gitlab)
+     */
+    provider: string;
+    /**
+     * Repository owner
+     */
+    owner: string;
+    /**
+     * Repository name
+     */
+    repo: string;
+  };
+  query?: {
+    /**
+     * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+     */
+    base_url?: string | null;
+    /**
+     * Branch name to inspect (default: repository's default branch)
+     */
+    branch?: string | null;
+    /**
+     * Project root directory to search (default: repository root)
+     */
+    root_directory?: string | null;
+  };
+  url: "/git/public/{provider}/{owner}/{repo}/env-example";
+};
+
+export type DetectPublicEnvExampleErrors = {
+  /**
+   * Provider not supported
+   */
+  400: unknown;
+  /**
+   * Authentication required for custom GitLab origins
+   */
+  401: unknown;
+  /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
+   * Repository or branch not found
+   */
+  404: unknown;
+  /**
+   * API rate limit exceeded
+   */
+  429: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type DetectPublicEnvExampleResponses = {
+  /**
+   * Detected env-example variables
+   */
+  200: PublicEnvExampleResponse;
+};
+
+export type DetectPublicEnvExampleResponse =
+  DetectPublicEnvExampleResponses[keyof DetectPublicEnvExampleResponses];
+
 export type DetectPublicPresetsData = {
   body?: never;
   path: {
@@ -31702,6 +36050,10 @@ export type DetectPublicPresetsData = {
   };
   query?: {
     /**
+     * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+     */
+    base_url?: string | null;
+    /**
      * Branch name to detect presets for (default: repository's default branch)
      */
     branch?: string | null;
@@ -31718,6 +36070,14 @@ export type DetectPublicPresetsErrors = {
    * Provider not supported
    */
   400: unknown;
+  /**
+   * Authentication required for custom GitLab origins
+   */
+  401: unknown;
+  /**
+   * Git provider permission required
+   */
+  403: unknown;
   /**
    * Repository or branch not found
    */
@@ -33374,6 +37734,10 @@ export type GetProjectsMonitorHealthErrors = {
    */
   401: unknown;
   /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
    * Internal server error
    */
   500: unknown;
@@ -33655,6 +38019,7 @@ export type NodeMetricsGetRangeData = {
     metric: string;
     /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
      */
     range?: string;
     /**
@@ -33662,6 +38027,14 @@ export type NodeMetricsGetRangeData = {
      * fetches histogram buckets and computes the requested quantile.
      */
     percentile?: number | null;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
+    /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
   };
   url: "/nodes/{id}/metrics";
 };
@@ -33694,6 +38067,92 @@ export type NodeMetricsGetRangeResponses = {
 
 export type NodeMetricsGetRangeResponse =
   NodeMetricsGetRangeResponses[keyof NodeMetricsGetRangeResponses];
+
+export type NodeMetricsGetAlertRulesData = {
+  body?: never;
+  path: {
+    /**
+     * Node ID (0 = control plane)
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/nodes/{id}/metrics/alert-rules";
+};
+
+export type NodeMetricsGetAlertRulesErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type NodeMetricsGetAlertRulesResponses = {
+  /**
+   * List of node alert rules
+   */
+  200: Array<ServiceAlertRuleResponse>;
+};
+
+export type NodeMetricsGetAlertRulesResponse =
+  NodeMetricsGetAlertRulesResponses[keyof NodeMetricsGetAlertRulesResponses];
+
+export type NodeMetricsUpdateAlertRuleData = {
+  body: ServiceUpdateAlertRuleRequest;
+  path: {
+    /**
+     * Node ID (0 = control plane)
+     */
+    id: number;
+    /**
+     * Alert rule ID
+     */
+    rule_id: number;
+  };
+  query?: never;
+  url: "/nodes/{id}/metrics/alert-rules/{rule_id}";
+};
+
+export type NodeMetricsUpdateAlertRuleErrors = {
+  /**
+   * Invalid request
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Alert rule not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type NodeMetricsUpdateAlertRuleResponses = {
+  /**
+   * Updated alert rule
+   */
+  200: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsUpdateAlertRuleResponse =
+  NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
 
 export type DeletePreferencesData = {
   body?: never;
@@ -33884,6 +38343,10 @@ export type UpdateCloudflareProviderData = {
 
 export type UpdateCloudflareProviderErrors = {
   /**
+   * Invalid minimum severity or provider configuration
+   */
+  400: unknown;
+  /**
    * Provider not found
    */
   404: unknown;
@@ -33944,6 +38407,10 @@ export type UpdateNotificationEmailProviderData = {
 };
 
 export type UpdateNotificationEmailProviderErrors = {
+  /**
+   * Invalid minimum severity or provider configuration
+   */
+  400: unknown;
   /**
    * Provider not found
    */
@@ -34006,6 +38473,10 @@ export type UpdateSlackProviderData = {
 
 export type UpdateSlackProviderErrors = {
   /**
+   * Invalid minimum severity or provider configuration
+   */
+  400: unknown;
+  /**
    * Provider not found
    */
   404: unknown;
@@ -34066,6 +38537,10 @@ export type UpdateWebhookProviderData = {
 };
 
 export type UpdateWebhookProviderErrors = {
+  /**
+   * Invalid minimum severity or provider configuration
+   */
+  400: unknown;
   /**
    * Provider not found
    */
@@ -34166,7 +38641,7 @@ export type UpdateNotificationProviderData = {
 
 export type UpdateNotificationProviderErrors = {
   /**
-   * Invalid masked provider configuration
+   * Invalid minimum severity or masked provider configuration
    */
   400: unknown;
   /**
@@ -34266,6 +38741,180 @@ export type TestNotificationProviderResponses = {
 
 export type TestNotificationProviderResponse =
   TestNotificationProviderResponses[keyof TestNotificationProviderResponses];
+
+export type ListNotificationRoutesData = {
+  body?: never;
+  path?: never;
+  query?: {
+    /**
+     * Page number (1-indexed)
+     */
+    page?: number | null;
+    /**
+     * Number of items per page (max 100)
+     */
+    page_size?: number | null;
+    sort_by?: string | null;
+    sort_order?: string | null;
+  };
+  url: "/notification-routes";
+};
+
+export type ListNotificationRoutesErrors = {
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type ListNotificationRoutesResponses = {
+  /**
+   * Notification routes
+   */
+  200: NotificationRoutePage;
+};
+
+export type ListNotificationRoutesResponse =
+  ListNotificationRoutesResponses[keyof ListNotificationRoutesResponses];
+
+export type CreateNotificationRouteData = {
+  body: CreateNotificationRouteRequest;
+  path?: never;
+  query?: never;
+  url: "/notification-routes";
+};
+
+export type CreateNotificationRouteErrors = {
+  /**
+   * Invalid route
+   */
+  400: unknown;
+  /**
+   * Route name already exists
+   */
+  409: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type CreateNotificationRouteResponses = {
+  /**
+   * Route created
+   */
+  201: NotificationRoute;
+};
+
+export type CreateNotificationRouteResponse =
+  CreateNotificationRouteResponses[keyof CreateNotificationRouteResponses];
+
+export type DeleteNotificationRouteData = {
+  body?: never;
+  path: {
+    /**
+     * Route ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/notification-routes/{id}";
+};
+
+export type DeleteNotificationRouteErrors = {
+  /**
+   * Route not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type DeleteNotificationRouteResponses = {
+  /**
+   * Route deleted
+   */
+  204: void;
+};
+
+export type DeleteNotificationRouteResponse =
+  DeleteNotificationRouteResponses[keyof DeleteNotificationRouteResponses];
+
+export type GetNotificationRouteData = {
+  body?: never;
+  path: {
+    /**
+     * Route ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/notification-routes/{id}";
+};
+
+export type GetNotificationRouteErrors = {
+  /**
+   * Route not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetNotificationRouteResponses = {
+  /**
+   * Notification route
+   */
+  200: NotificationRoute;
+};
+
+export type GetNotificationRouteResponse =
+  GetNotificationRouteResponses[keyof GetNotificationRouteResponses];
+
+export type UpdateNotificationRouteData = {
+  body: UpdateNotificationRouteRequest;
+  path: {
+    /**
+     * Route ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/notification-routes/{id}";
+};
+
+export type UpdateNotificationRouteErrors = {
+  /**
+   * Invalid route
+   */
+  400: unknown;
+  /**
+   * Route not found
+   */
+  404: unknown;
+  /**
+   * Route name already exists
+   */
+  409: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type UpdateNotificationRouteResponses = {
+  /**
+   * Route updated
+   */
+  200: NotificationRoute;
+};
+
+export type UpdateNotificationRouteResponse =
+  UpdateNotificationRouteResponses[keyof UpdateNotificationRouteResponses];
 
 export type ListOrdersData = {
   body?: never;
@@ -34812,6 +39461,172 @@ export type UpdateDashboardResponses = {
 export type UpdateDashboardResponse =
   UpdateDashboardResponses[keyof UpdateDashboardResponses];
 
+export type ListFacetsData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/otel/facets";
+};
+
+export type ListFacetsErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type ListFacetsError = ListFacetsErrors[keyof ListFacetsErrors];
+
+export type ListFacetsResponses = {
+  /**
+   * Registered facets
+   */
+  200: FacetsResponse;
+};
+
+export type ListFacetsResponse = ListFacetsResponses[keyof ListFacetsResponses];
+
+export type CreateFacetData = {
+  body: CreateFacetRequest;
+  path?: never;
+  query?: never;
+  url: "/otel/facets";
+};
+
+export type CreateFacetErrors = {
+  /**
+   * Validation error
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Already registered or capacity exceeded
+   */
+  409: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type CreateFacetError = CreateFacetErrors[keyof CreateFacetErrors];
+
+export type CreateFacetResponses = {
+  /**
+   * Facet registered
+   */
+  201: FacetInfo;
+};
+
+export type CreateFacetResponse =
+  CreateFacetResponses[keyof CreateFacetResponses];
+
+export type DeleteFacetData = {
+  body?: never;
+  path: {
+    /**
+     * The OTel attribute key (URL-encoded)
+     */
+    key: string;
+  };
+  query?: never;
+  url: "/otel/facets/{key}";
+};
+
+export type DeleteFacetErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Facet not found
+   */
+  404: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type DeleteFacetError = DeleteFacetErrors[keyof DeleteFacetErrors];
+
+export type DeleteFacetResponses = {
+  /**
+   * Facet deleted
+   */
+  204: void;
+};
+
+export type DeleteFacetResponse =
+  DeleteFacetResponses[keyof DeleteFacetResponses];
+
+export type RetryFacetBackfillData = {
+  body?: never;
+  path: {
+    /**
+     * The OTel attribute key (URL-encoded)
+     */
+    key: string;
+  };
+  query?: never;
+  url: "/otel/facets/{key}/retry";
+};
+
+export type RetryFacetBackfillErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Facet not found
+   */
+  404: ProblemDetails;
+  /**
+   * Facet is not in a failed state
+   */
+  409: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type RetryFacetBackfillError =
+  RetryFacetBackfillErrors[keyof RetryFacetBackfillErrors];
+
+export type RetryFacetBackfillResponses = {
+  /**
+   * Backfill retry scheduled
+   */
+  200: FacetInfo;
+};
+
+export type RetryFacetBackfillResponse =
+  RetryFacetBackfillResponses[keyof RetryFacetBackfillResponses];
+
 export type QueryGenaiTracesData = {
   body?: never;
   path?: never;
@@ -34967,6 +39782,44 @@ export type GetUnifiedTraceResponses = {
 export type GetUnifiedTraceResponse =
   GetUnifiedTraceResponses[keyof GetUnifiedTraceResponses];
 
+export type HasTracesData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/otel/has-traces/{project_id}";
+};
+
+export type HasTracesErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type HasTracesError = HasTracesErrors[keyof HasTracesErrors];
+
+export type HasTracesResponses = {
+  /**
+   * Trace existence check
+   */
+  200: HasTracesResponse;
+};
+
+export type HasTracesResponse2 = HasTracesResponses[keyof HasTracesResponses];
+
 export type GetHealthData = {
   body?: never;
   path: {
@@ -35009,6 +39862,46 @@ export type GetHealthResponses = {
 };
 
 export type GetHealthResponse = GetHealthResponses[keyof GetHealthResponses];
+
+export type GetIngestErrorsData = {
+  body?: never;
+  path?: never;
+  query?: {
+    /**
+     * Max groups to return (default 20, max 100)
+     */
+    limit?: number;
+  };
+  url: "/otel/ingest-errors";
+};
+
+export type GetIngestErrorsErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type GetIngestErrorsError =
+  GetIngestErrorsErrors[keyof GetIngestErrorsErrors];
+
+export type GetIngestErrorsResponses = {
+  /**
+   * Recent ingest failure groups
+   */
+  200: IngestErrorsResponse;
+};
+
+export type GetIngestErrorsResponse =
+  GetIngestErrorsResponses[keyof GetIngestErrorsResponses];
 
 export type ListInsightsData = {
   body?: never;
@@ -35371,6 +40264,58 @@ export type QueryMetricsResponses = {
 export type QueryMetricsResponse =
   QueryMetricsResponses[keyof QueryMetricsResponses];
 
+export type GetPipelineHistoryData = {
+  body?: never;
+  path?: never;
+  query?: {
+    /**
+     * Preset window: 1h | 6h | 24h | 7d (default 24h). Ignored when start_time and end_time are both set.
+     */
+    range?: string;
+    /**
+     * Explicit window start (RFC 3339); must be paired with end_time
+     */
+    start_time?: string;
+    /**
+     * Explicit window end (RFC 3339); must be paired with start_time
+     */
+    end_time?: string;
+  };
+  url: "/otel/pipeline-history";
+};
+
+export type GetPipelineHistoryErrors = {
+  /**
+   * Invalid time range
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Metrics store not available
+   */
+  503: ProblemDetails;
+};
+
+export type GetPipelineHistoryError =
+  GetPipelineHistoryErrors[keyof GetPipelineHistoryErrors];
+
+export type GetPipelineHistoryResponses = {
+  /**
+   * Pipeline counter history
+   */
+  200: PipelineHistoryResponse;
+};
+
+export type GetPipelineHistoryResponse =
+  GetPipelineHistoryResponses[keyof GetPipelineHistoryResponses];
+
 export type GetPipelineStatsData = {
   body?: never;
   path?: never;
@@ -35593,6 +40538,10 @@ export type QueryTraceSummariesData = {
      */
     deployment_id?: number;
     /**
+     * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+     */
+    attributes?: string;
+    /**
      * Filter by span name pattern (ILIKE)
      */
     name_pattern?: string;
@@ -35688,6 +40637,14 @@ export type QueryTracesData = {
      * Filter by deployment ID
      */
     deployment_id?: number;
+    /**
+     * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+     */
+    attributes?: string;
+    /**
+     * Filter by span name pattern (ILIKE)
+     */
+    name_pattern?: string;
     /**
      * Max spans to return (default: 100, max: 1000)
      */
@@ -36732,6 +41689,10 @@ export type CreateProjectErrors = {
    */
   400: unknown;
   /**
+   * Expected project slug is already in use
+   */
+  409: unknown;
+  /**
    * Internal server error
    */
   500: unknown;
@@ -36775,6 +41736,43 @@ export type GetProjectBySlugResponses = {
 
 export type GetProjectBySlugResponse =
   GetProjectBySlugResponses[keyof GetProjectBySlugResponses];
+
+export type GetVisibleCustomDomainByHostnameData = {
+  body?: never;
+  path: {
+    /**
+     * Domain hostname
+     */
+    hostname: string;
+  };
+  query?: never;
+  url: "/projects/custom-domains/by-host/{hostname}";
+};
+
+export type GetVisibleCustomDomainByHostnameErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Project access denied
+   */
+  403: unknown;
+  /**
+   * Domain is not assigned to a project
+   */
+  404: unknown;
+};
+
+export type GetVisibleCustomDomainByHostnameResponses = {
+  /**
+   * Custom domain assignment retrieved
+   */
+  200: CustomDomainResponse;
+};
+
+export type GetVisibleCustomDomainByHostnameResponse =
+  GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
 
 export type CreateProjectFromTemplateData = {
   body: CreateProjectFromTemplateRequest;
@@ -36953,6 +41951,47 @@ export type UpdateProjectResponses = {
 
 export type UpdateProjectResponse =
   UpdateProjectResponses[keyof UpdateProjectResponses];
+
+export type SetAlternateSourcesData = {
+  body: SetAlternateSourcesRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    id: number;
+  };
+  query?: never;
+  url: "/projects/{id}/alternate-sources";
+};
+
+export type SetAlternateSourcesErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Forbidden
+   */
+  403: unknown;
+  /**
+   * Project not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type SetAlternateSourcesResponses = {
+  /**
+   * Alternate-source policy updated
+   */
+  200: ProjectResponse;
+};
+
+export type SetAlternateSourcesResponse =
+  SetAlternateSourcesResponses[keyof SetAlternateSourcesResponses];
 
 export type GetProjectDeploymentsData = {
   body?: never;
@@ -37234,7 +42273,7 @@ export type GetActiveVisitorsResponses = {
   /**
    * Successfully retrieved active visitors count
    */
-  200: ActiveVisitorsResponse;
+  200: ActiveVisitorCountResponse;
 };
 
 export type GetActiveVisitorsResponse =
@@ -38192,6 +43231,60 @@ export type ListPendingActionsResponses = {
 export type ListPendingActionsResponse =
   ListPendingActionsResponses[keyof ListPendingActionsResponses];
 
+export type ResolvePermissionData = {
+  body: ResolvePermissionRequest;
+  path: {
+    project_id: number;
+    /**
+     * Conversation public id
+     */
+    public_id: string;
+    /**
+     * The CLI's request_id from the SSE event
+     */
+    permission_id: string;
+  };
+  query?: never;
+  url: "/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve";
+};
+
+export type ResolvePermissionErrors = {
+  /**
+   * Invalid decision payload
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Unknown permission_id (may have timed out or been auto-denied)
+   */
+  404: unknown;
+  /**
+   * Permission already resolved (concurrent resolve race)
+   */
+  409: unknown;
+  /**
+   * Turn already ended (subprocess exited before decision arrived)
+   */
+  410: unknown;
+};
+
+export type ResolvePermissionResponses = {
+  /**
+   * Decision accepted; subprocess will continue
+   */
+  204: void;
+};
+
+export type ResolvePermissionResponse =
+  ResolvePermissionResponses[keyof ResolvePermissionResponses];
+
 export type GetPendingActionData = {
   body?: never;
   path: {
@@ -38297,6 +43390,44 @@ export type GetChatReadinessResponses = {
 
 export type GetChatReadinessResponse =
   GetChatReadinessResponses[keyof GetChatReadinessResponses];
+
+export type StreamStructuredOutputData = {
+  body: StreamStructuredOutputRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/ai/structured-output/stream";
+};
+
+export type StreamStructuredOutputErrors = {
+  /**
+   * Invalid prompt or JSON Schema
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * No active AI provider
+   */
+  409: unknown;
+};
+
+export type StreamStructuredOutputResponses = {
+  /**
+   * SSE events: started, partial, complete, or error
+   */
+  200: unknown;
+};
 
 export type ListProjectAlarmsData = {
   body?: never;
@@ -38488,6 +43619,605 @@ export type ResolveAlarmResponses = {
    */
   200: unknown;
 };
+
+export type SilenceAlarmData = {
+  body: SilenceAlarmRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Alarm ID
+     */
+    alarm_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/alarms/{alarm_id}/silence";
+};
+
+export type SilenceAlarmErrors = {
+  /**
+   * Invalid duration
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Alarm not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type SilenceAlarmResponses = {
+  /**
+   * Alarm silenced
+   */
+  200: unknown;
+};
+
+export type ListAnalyticsIngestKeysData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/analytics/ingest-keys";
+};
+
+export type ListAnalyticsIngestKeysErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type ListAnalyticsIngestKeysResponses = {
+  /**
+   * Ingest keys, active and revoked, newest first
+   */
+  200: Array<AnalyticsIngestKey>;
+};
+
+export type ListAnalyticsIngestKeysResponse =
+  ListAnalyticsIngestKeysResponses[keyof ListAnalyticsIngestKeysResponses];
+
+export type CreateAnalyticsIngestKeyData = {
+  body: CreateAnalyticsIngestKeyRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/analytics/ingest-keys";
+};
+
+export type CreateAnalyticsIngestKeyErrors = {
+  /**
+   * Validation error
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Project or environment not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type CreateAnalyticsIngestKeyResponses = {
+  /**
+   * Ingest key created
+   */
+  201: AnalyticsIngestKey;
+};
+
+export type CreateAnalyticsIngestKeyResponse =
+  CreateAnalyticsIngestKeyResponses[keyof CreateAnalyticsIngestKeyResponses];
+
+export type UpdateAnalyticsIngestKeyData = {
+  body: UpdateAnalyticsIngestKeyRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Analytics ingest key ID
+     */
+    key_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/analytics/ingest-keys/{key_id}";
+};
+
+export type UpdateAnalyticsIngestKeyErrors = {
+  /**
+   * Validation error
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Ingest key not found in this project
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type UpdateAnalyticsIngestKeyResponses = {
+  /**
+   * Ingest key updated
+   */
+  200: AnalyticsIngestKey;
+};
+
+export type UpdateAnalyticsIngestKeyResponse =
+  UpdateAnalyticsIngestKeyResponses[keyof UpdateAnalyticsIngestKeyResponses];
+
+export type RevokeAnalyticsIngestKeyData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Analytics ingest key ID
+     */
+    key_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke";
+};
+
+export type RevokeAnalyticsIngestKeyErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Ingest key not found in this project
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type RevokeAnalyticsIngestKeyResponses = {
+  /**
+   * Ingest key revoked
+   */
+  204: void;
+};
+
+export type RevokeAnalyticsIngestKeyResponse =
+  RevokeAnalyticsIngestKeyResponses[keyof RevokeAnalyticsIngestKeyResponses];
+
+export type RotateAnalyticsIngestKeyData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Analytics ingest key ID
+     */
+    key_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate";
+};
+
+export type RotateAnalyticsIngestKeyErrors = {
+  /**
+   * The key is revoked and cannot be rotated
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Ingest key not found in this project
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type RotateAnalyticsIngestKeyResponses = {
+  /**
+   * Ingest key rotated
+   */
+  200: AnalyticsIngestKey;
+};
+
+export type RotateAnalyticsIngestKeyResponse =
+  RotateAnalyticsIngestKeyResponses[keyof RotateAnalyticsIngestKeyResponses];
+
+export type GetApiCallersData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query: {
+    /**
+     * Environment ID (optional)
+     */
+    environment_id?: number;
+    /**
+     * Window start (ISO 8601)
+     */
+    start_date: string;
+    /**
+     * Window end (ISO 8601)
+     */
+    end_date: string;
+    /**
+     * Max callers to return (default: 20, max: 100)
+     */
+    limit?: number;
+    /**
+     * Ranked callers to skip (default: 0)
+     */
+    offset?: number;
+  };
+  url: "/projects/{project_id}/api-analytics/callers";
+};
+
+export type GetApiCallersErrors = {
+  /**
+   * Bad request
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetApiCallersResponses = {
+  /**
+   * Top callers by request count
+   */
+  200: ApiCallersResponse;
+};
+
+export type GetApiCallersResponse =
+  GetApiCallersResponses[keyof GetApiCallersResponses];
+
+export type GetApiTrafficProxyLogAccessData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/api-analytics/proxy-log-access";
+};
+
+export type GetApiTrafficProxyLogAccessErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient analytics permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Project permission check failed
+   */
+  500: ProblemDetails;
+};
+
+export type GetApiTrafficProxyLogAccessError =
+  GetApiTrafficProxyLogAccessErrors[keyof GetApiTrafficProxyLogAccessErrors];
+
+export type GetApiTrafficProxyLogAccessResponses = {
+  /**
+   * Proxy-log drilldown capability
+   */
+  200: ProxyLogAccessResponse;
+};
+
+export type GetApiTrafficProxyLogAccessResponse =
+  GetApiTrafficProxyLogAccessResponses[keyof GetApiTrafficProxyLogAccessResponses];
+
+export type AggregateApiTrafficData = {
+  body: TrafficAggregationRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/api-analytics/query";
+};
+
+export type AggregateApiTrafficErrors = {
+  /**
+   * Invalid dimensions, metrics, filters, or time range
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Aggregation request budget exceeded
+   */
+  429: ProblemDetails;
+  /**
+   * Storage query failed
+   */
+  500: ProblemDetails;
+  /**
+   * Aggregation query timed out
+   */
+  504: ProblemDetails;
+};
+
+export type AggregateApiTrafficError =
+  AggregateApiTrafficErrors[keyof AggregateApiTrafficErrors];
+
+export type AggregateApiTrafficResponses = {
+  /**
+   * Aggregated API traffic
+   */
+  200: TrafficAggregationResponse;
+};
+
+export type AggregateApiTrafficResponse =
+  AggregateApiTrafficResponses[keyof AggregateApiTrafficResponses];
+
+export type GetApiRoutesData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query: {
+    /**
+     * Environment ID (optional)
+     */
+    environment_id?: number;
+    /**
+     * Window start (ISO 8601)
+     */
+    start_date: string;
+    /**
+     * Window end (ISO 8601)
+     */
+    end_date: string;
+    /**
+     * Max routes to return (default: 20, max: 100)
+     */
+    limit?: number;
+    /**
+     * Ranked routes to skip (default: 0)
+     */
+    offset?: number;
+  };
+  url: "/projects/{project_id}/api-analytics/routes";
+};
+
+export type GetApiRoutesErrors = {
+  /**
+   * Bad request
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetApiRoutesResponses = {
+  /**
+   * Top routes by request count
+   */
+  200: ApiRoutesResponse;
+};
+
+export type GetApiRoutesResponse =
+  GetApiRoutesResponses[keyof GetApiRoutesResponses];
+
+export type GetApiSummaryData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query: {
+    /**
+     * Environment ID (optional)
+     */
+    environment_id?: number;
+    /**
+     * Window start (ISO 8601)
+     */
+    start_date: string;
+    /**
+     * Window end (ISO 8601)
+     */
+    end_date: string;
+    /**
+     * Bypass and replace the backend AI summary cache
+     */
+    refresh?: boolean;
+  };
+  url: "/projects/{project_id}/api-analytics/summary";
+};
+
+export type GetApiSummaryErrors = {
+  /**
+   * Bad request
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error (DB errors only; AI failures return 200 with summary: null)
+   */
+  500: unknown;
+};
+
+export type GetApiSummaryResponses = {
+  /**
+   * AI traffic summary (summary field may be null when AI is unavailable)
+   */
+  200: ApiTrafficSummaryResponse;
+};
+
+export type GetApiSummaryResponse =
+  GetApiSummaryResponses[keyof GetApiSummaryResponses];
+
+export type GetApiTimeseriesData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query: {
+    /**
+     * Environment ID (optional)
+     */
+    environment_id?: number;
+    /**
+     * Window start (ISO 8601)
+     */
+    start_date: string;
+    /**
+     * Window end (ISO 8601)
+     */
+    end_date: string;
+  };
+  url: "/projects/{project_id}/api-analytics/timeseries";
+};
+
+export type GetApiTimeseriesErrors = {
+  /**
+   * Bad request
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetApiTimeseriesResponses = {
+  /**
+   * Time-series of request volume, errors, and latency
+   */
+  200: ApiTimeseriesResponse;
+};
+
+export type GetApiTimeseriesResponse =
+  GetApiTimeseriesResponses[keyof GetApiTimeseriesResponses];
 
 export type StartAnalysisData = {
   body: StartAnalysisRequest;
@@ -39643,6 +45373,92 @@ export type GetDeploymentJobsResponses = {
 
 export type GetDeploymentJobsResponse =
   GetDeploymentJobsResponses[keyof GetDeploymentJobsResponses];
+
+export type GetFailureReportPreviewData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Deployment ID
+     */
+    deployment_id: number;
+    /**
+     * Failed job ID
+     */
+    job_id: string;
+  };
+  query?: never;
+  url: "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report";
+};
+
+export type GetFailureReportPreviewErrors = {
+  /**
+   * Job not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetFailureReportPreviewResponses = {
+  /**
+   * Redacted failure-report preview
+   */
+  200: FailureReportPreviewResponse;
+};
+
+export type GetFailureReportPreviewResponse =
+  GetFailureReportPreviewResponses[keyof GetFailureReportPreviewResponses];
+
+export type SendFailureReportData = {
+  body: SendFailureReportRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Deployment ID
+     */
+    deployment_id: number;
+    /**
+     * Failed job ID
+     */
+    job_id: string;
+  };
+  query?: never;
+  url: "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report";
+};
+
+export type SendFailureReportErrors = {
+  /**
+   * Job not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+  /**
+   * Failed to reach the central reporting endpoint
+   */
+  502: unknown;
+};
+
+export type SendFailureReportResponses = {
+  /**
+   * Report sent
+   */
+  204: void;
+};
+
+export type SendFailureReportResponse =
+  SendFailureReportResponses[keyof SendFailureReportResponses];
 
 export type GetDeploymentJobLogsData = {
   body?: never;
@@ -41128,6 +46944,60 @@ export type WakeEnvironmentResponses = {
 export type WakeEnvironmentResponse =
   WakeEnvironmentResponses[keyof WakeEnvironmentResponses];
 
+export type ListContainerHistoryData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+    /**
+     * Environment ID
+     */
+    environment_id: number;
+  };
+  query?: {
+    /**
+     * Only return containers belonging to this deployment. Omit to list
+     * containers across every deployment the environment has ever had.
+     */
+    deployment_id?: number | null;
+    /**
+     * Maximum number of *replaced* container rows to return, most recently
+     * replaced first (default 20, max 100). Every currently-running
+     * container is always included and does not count against this limit —
+     * it only bounds how much historical (replaced-by-redeploy) context
+     * comes back alongside them.
+     */
+    limit?: number | null;
+  };
+  url: "/projects/{project_id}/environments/{environment_id}/container-history";
+};
+
+export type ListContainerHistoryErrors = {
+  /**
+   * Environment or deployment not found
+   */
+  404: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type ListContainerHistoryError =
+  ListContainerHistoryErrors[keyof ListContainerHistoryErrors];
+
+export type ListContainerHistoryResponses = {
+  /**
+   * Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`
+   */
+  200: ContainerHistoryListResponse;
+};
+
+export type ListContainerHistoryResponse =
+  ListContainerHistoryResponses[keyof ListContainerHistoryResponses];
+
 export type GetContainerLogsData = {
   body?: never;
   path: {
@@ -41688,8 +47558,8 @@ export type DeployFromImageUploadData = {
   };
   query?: {
     /**
-     * Tag to apply to the imported image (e.g., "myapp:v1.0")
-     * If not provided, a unique tag will be generated
+     * Deprecated display hint retained for wire compatibility. Temps always
+     * generates the actual project-scoped internal image reference.
      */
     tag?: string | null;
     /**
@@ -42257,6 +48127,12 @@ export type GetErrorTimeSeriesData = {
      * Time bucket size (e.g., "1h", "15m", "1d", "1 hour", "30 minutes")
      */
     bucket?: string;
+    /**
+     * Filter chart data to a specific environment.
+     * Always AND-combined with project_id — an environment from a different project
+     * returns zero-filled buckets rather than cross-project data.
+     */
+    environment_id?: number | null;
   };
   url: "/projects/{project_id}/error-time-series";
 };
@@ -44254,8 +50130,11 @@ export type ObservabilityListEventsData = {
   };
   query?: {
     /**
-     * Comma-separated kinds: `log,request,span,error,revenue`. Empty or
-     * missing returns every kind.
+     * Comma-separated kinds: `request,span,error,revenue`. Empty or
+     * missing returns every kind. There is no `log` kind — runtime logs
+     * intentionally never appear in this feed (see `ObservabilityEvent`'s
+     * "No `Log` variant" doc); passing `kinds=log` is rejected with 400
+     * `InvalidKindsFilter`, not silently ignored.
      */
     kinds?: string;
     /**
@@ -45037,6 +50916,133 @@ export type UpdateProjectSecretResponses = {
 
 export type UpdateProjectSecretResponse =
   UpdateProjectSecretResponses[keyof UpdateProjectSecretResponses];
+
+export type UpdateServiceTemplateRuntimeData = {
+  body: UpdateServiceTemplateRuntimeRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/service-runtime";
+};
+
+export type UpdateServiceTemplateRuntimeErrors = {
+  /**
+   * Invalid service runtime
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Forbidden
+   */
+  403: unknown;
+  /**
+   * Project not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type UpdateServiceTemplateRuntimeResponses = {
+  /**
+   * Service runtime updated successfully
+   */
+  200: ProjectResponse;
+};
+
+export type UpdateServiceTemplateRuntimeResponse =
+  UpdateServiceTemplateRuntimeResponses[keyof UpdateServiceTemplateRuntimeResponses];
+
+export type GetProjectServiceTemplateData = {
+  body?: never;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/service-template";
+};
+
+export type GetProjectServiceTemplateErrors = {
+  /**
+   * Project is not a service
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Forbidden
+   */
+  403: unknown;
+  /**
+   * Project not found
+   */
+  404: unknown;
+};
+
+export type GetProjectServiceTemplateResponses = {
+  /**
+   * Applied service release and upgrade preview
+   */
+  200: ServiceTemplateInstanceResponse;
+};
+
+export type GetProjectServiceTemplateResponse =
+  GetProjectServiceTemplateResponses[keyof GetProjectServiceTemplateResponses];
+
+export type UpgradeProjectServiceTemplateData = {
+  body: UpgradeServiceTemplateRequest;
+  path: {
+    /**
+     * Project ID
+     */
+    project_id: number;
+  };
+  query?: never;
+  url: "/projects/{project_id}/service-template/upgrade";
+};
+
+export type UpgradeProjectServiceTemplateErrors = {
+  /**
+   * Invalid or stale upgrade
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Forbidden
+   */
+  403: unknown;
+  /**
+   * Project or template not found
+   */
+  404: unknown;
+};
+
+export type UpgradeProjectServiceTemplateResponses = {
+  /**
+   * Service template upgraded
+   */
+  200: ProjectResponse;
+};
+
+export type UpgradeProjectServiceTemplateResponse =
+  UpgradeProjectServiceTemplateResponses[keyof UpgradeProjectServiceTemplateResponses];
 
 export type UpdateProjectSettingsData = {
   body: UpdateProjectSettingsRequest;
@@ -46238,6 +52244,51 @@ export type WorkflowDryRunResponses = {
 export type WorkflowDryRunResponse =
   WorkflowDryRunResponses[keyof WorkflowDryRunResponses];
 
+export type ReassignProjectCustomDomainData = {
+  body: ReassignCustomDomainRequest;
+  path: {
+    /**
+     * Current project ID
+     */
+    source_project_id: number;
+    /**
+     * Custom domain ID
+     */
+    domain_id: number;
+  };
+  query?: never;
+  url: "/projects/{source_project_id}/custom-domains/{domain_id}/assignment";
+};
+
+export type ReassignProjectCustomDomainErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Write access required for both projects
+   */
+  403: unknown;
+  /**
+   * Custom domain or target environment not found in the authorized project scopes
+   */
+  404: unknown;
+  /**
+   * Domain assignment changed; refresh and retry
+   */
+  409: unknown;
+};
+
+export type ReassignProjectCustomDomainResponses = {
+  /**
+   * Domain assignment updated atomically
+   */
+  200: CustomDomainResponse;
+};
+
+export type ReassignProjectCustomDomainResponse =
+  ReassignProjectCustomDomainResponses[keyof ReassignProjectCustomDomainResponses];
+
 export type GetProxyLogsData = {
   body?: never;
   path?: never;
@@ -46295,9 +52346,18 @@ export type GetProxyLogsData = {
      */
     path?: string | null;
     /**
+     * Filter by an exact request path
+     */
+    path_exact?: string | null;
+    /**
      * Filter by client IP address
      */
     client_ip?: string | null;
+    /**
+     * Exclude Temps status-monitor requests, including legacy monitor rows
+     * identified only by their user-agent.
+     */
+    exclude_synthetic?: boolean | null;
     /**
      * Filter by HTTP status code
      */
@@ -46487,6 +52547,11 @@ export type GetProxyLogByRequestIdData = {
     request_id: string;
   };
   query?: {
+    /**
+     * Project scope for the lookup. Required for non-administrator callers.
+     * Instance administrators may omit it for legacy global deep links.
+     */
+    project_id?: number | null;
     /**
      * Event time of the log row (ISO 8601). When provided, the lookup is
      * bounded to the hypertable chunks around this instant instead of
@@ -46928,7 +52993,8 @@ export type GetTimeBucketStatsData = {
      */
     end_time: string;
     /**
-     * Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+     * Bucket interval (e.g., "1 hour", "1 day", "5 minutes").
+     * Must keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).
      */
     bucket_interval?: string;
     /**
@@ -47113,6 +53179,11 @@ export type GetProxyLogByIdData = {
     id: number;
   };
   query?: {
+    /**
+     * Project scope for the lookup. Required for non-administrator callers.
+     * Instance administrators may omit it for legacy global deep links.
+     */
+    project_id?: number | null;
     /**
      * Event time of the log row (ISO 8601). When provided, the lookup is
      * bounded to the hypertable chunks around this instant instead of
@@ -47374,6 +53445,10 @@ export type GetRepositoryBranchesErrors = {
    */
   401: unknown;
   /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
    * Repository not found
    */
   404: unknown;
@@ -47424,6 +53499,10 @@ export type GetRepositoryTagsErrors = {
    */
   401: unknown;
   /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
    * Repository not found
    */
   404: unknown;
@@ -47446,6 +53525,143 @@ export type GetRepositoryTagsResponses = {
 
 export type GetRepositoryTagsResponse =
   GetRepositoryTagsResponses[keyof GetRepositoryTagsResponses];
+
+export type GetRepositoryComposeServicesLiveData = {
+  body?: never;
+  path: {
+    /**
+     * Repository ID
+     */
+    repository_id: number;
+  };
+  query: {
+    /**
+     * Git branch to check (defaults to repository's default branch)
+     */
+    branch?: string;
+    /**
+     * Compose file path to fetch and parse
+     */
+    path: string;
+  };
+  url: "/repositories/{repository_id}/compose-file/live";
+};
+
+export type GetRepositoryComposeServicesLiveErrors = {
+  /**
+   * Bad request, or the compose file could not be parsed
+   */
+  400: unknown;
+  /**
+   * The git provider rejected the stored credential - the connection must be re-authorized
+   */
+  401: unknown;
+  /**
+   * Repository not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetRepositoryComposeServicesLiveResponses = {
+  /**
+   * Compose services parsed successfully
+   */
+  200: RepositoryComposeServicesResponse;
+};
+
+export type GetRepositoryComposeServicesLiveResponse =
+  GetRepositoryComposeServicesLiveResponses[keyof GetRepositoryComposeServicesLiveResponses];
+
+export type GetRepositoryComposePreviewData = {
+  body: ComposePreviewRequest;
+  path: {
+    /**
+     * Repository ID
+     */
+    repository_id: number;
+  };
+  query?: never;
+  url: "/repositories/{repository_id}/compose-file/preview";
+};
+
+export type GetRepositoryComposePreviewErrors = {
+  /**
+   * Compose file or override is invalid
+   */
+  400: unknown;
+  /**
+   * Authentication required
+   */
+  401: unknown;
+  /**
+   * Repository not found
+   */
+  404: unknown;
+};
+
+export type GetRepositoryComposePreviewResponses = {
+  /**
+   * Effective Compose preview rendered
+   */
+  200: ComposePreviewResponse;
+};
+
+export type GetRepositoryComposePreviewResponse =
+  GetRepositoryComposePreviewResponses[keyof GetRepositoryComposePreviewResponses];
+
+export type GetRepositoryEnvExampleLiveData = {
+  body?: never;
+  path: {
+    /**
+     * Repository ID
+     */
+    repository_id: number;
+  };
+  query?: {
+    /**
+     * Git branch to check (defaults to repository's default branch)
+     */
+    branch?: string;
+    /**
+     * Project root directory to search (defaults to repository root)
+     */
+    root_directory?: string;
+  };
+  url: "/repositories/{repository_id}/env-example/live";
+};
+
+export type GetRepositoryEnvExampleLiveErrors = {
+  /**
+   * Bad request
+   */
+  400: unknown;
+  /**
+   * The git provider rejected the stored credential - the connection must be re-authorized
+   */
+  401: unknown;
+  /**
+   * Repository not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetRepositoryEnvExampleLiveResponses = {
+  /**
+   * Env-example variables detected (empty if the repository has no env-example file)
+   */
+  200: RepositoryEnvExampleResponse;
+};
+
+export type GetRepositoryEnvExampleLiveResponse =
+  GetRepositoryEnvExampleLiveResponses[keyof GetRepositoryEnvExampleLiveResponses];
 
 export type GetRepositoryPresetLiveData = {
   body?: never;
@@ -47549,6 +53765,10 @@ export type GetBranchesByRepositoryIdErrors = {
    */
   401: unknown;
   /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
    * Repository not found
    */
   404: unknown;
@@ -47594,6 +53814,10 @@ export type ListCommitsByRepositoryIdErrors = {
    * Unauthorized
    */
   401: unknown;
+  /**
+   * Git provider permission required
+   */
+  403: unknown;
   /**
    * Repository not found
    */
@@ -47690,6 +53914,10 @@ export type GetTagsByRepositoryIdErrors = {
    */
   401: unknown;
   /**
+   * Git provider permission required
+   */
+  403: unknown;
+  /**
    * Repository not found
    */
   404: unknown;
@@ -47726,6 +53954,14 @@ export type GetRestoreRunData = {
 };
 
 export type GetRestoreRunErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
   /**
    * Restore run not found
    */
@@ -49037,6 +55273,221 @@ export type CheckForUpdateResponses = {
 export type CheckForUpdateResponse =
   CheckForUpdateResponses[keyof CheckForUpdateResponses];
 
+export type ListSystemAlarmsData = {
+  body?: never;
+  path?: never;
+  query?: {
+    /**
+     * Filter by alarm type (e.g. `container_restart`, `outage`).
+     */
+    alarm_type?: string | null;
+    /**
+     * Filter by status: `firing`, `acknowledged`, or `resolved`.
+     */
+    status?: string | null;
+    /**
+     * Filter by severity: `info`, `warning`, or `critical`.
+     */
+    severity?: string | null;
+    /**
+     * Filter by environment ID.
+     */
+    environment_id?: number | null;
+    /**
+     * Filter by deployment ID.
+     */
+    deployment_id?: number | null;
+    /**
+     * Filter by external service ID.
+     */
+    service_id?: number | null;
+    /**
+     * Page number (1-based, default 1).
+     */
+    page?: number | null;
+    /**
+     * Items per page (default 20, max 100).
+     */
+    page_size?: number | null;
+  };
+  url: "/system/alarms";
+};
+
+export type ListSystemAlarmsErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type ListSystemAlarmsResponses = {
+  /**
+   * Paginated list of system alarms
+   */
+  200: AlarmListResponse;
+};
+
+export type ListSystemAlarmsResponse =
+  ListSystemAlarmsResponses[keyof ListSystemAlarmsResponses];
+
+export type GetSystemAlarmsSummaryData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/system/alarms/summary";
+};
+
+export type GetSystemAlarmsSummaryErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type GetSystemAlarmsSummaryResponses = {
+  /**
+   * System alarm summary counts
+   */
+  200: AlarmSummaryResponse;
+};
+
+export type GetSystemAlarmsSummaryResponse =
+  GetSystemAlarmsSummaryResponses[keyof GetSystemAlarmsSummaryResponses];
+
+export type AcknowledgeSystemAlarmData = {
+  body?: never;
+  path: {
+    /**
+     * Alarm ID
+     */
+    alarm_id: number;
+  };
+  query?: never;
+  url: "/system/alarms/{alarm_id}/acknowledge";
+};
+
+export type AcknowledgeSystemAlarmErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Alarm not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type AcknowledgeSystemAlarmResponses = {
+  /**
+   * Alarm acknowledged
+   */
+  200: unknown;
+};
+
+export type ResolveSystemAlarmData = {
+  body?: never;
+  path: {
+    /**
+     * Alarm ID
+     */
+    alarm_id: number;
+  };
+  query?: never;
+  url: "/system/alarms/{alarm_id}/resolve";
+};
+
+export type ResolveSystemAlarmErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Alarm not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type ResolveSystemAlarmResponses = {
+  /**
+   * Alarm resolved
+   */
+  200: unknown;
+};
+
+export type SilenceSystemAlarmData = {
+  body: SilenceAlarmRequest;
+  path: {
+    /**
+     * Alarm ID
+     */
+    alarm_id: number;
+  };
+  query?: never;
+  url: "/system/alarms/{alarm_id}/silence";
+};
+
+export type SilenceSystemAlarmErrors = {
+  /**
+   * Invalid duration
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Alarm not found
+   */
+  404: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type SilenceSystemAlarmResponses = {
+  /**
+   * Alarm silenced
+   */
+  200: unknown;
+};
+
 export type ListTeamsData = {
   body?: never;
   path?: never;
@@ -49372,6 +55823,10 @@ export type ListProjectTemplatesData = {
      * Only return featured templates
      */
     featured?: boolean;
+    /**
+     * Filter by gallery: starter or service
+     */
+    kind?: TemplateKind;
   };
   url: "/templates";
 };
@@ -49461,6 +55916,277 @@ export type GetProjectTemplateResponses = {
 
 export type GetProjectTemplateResponse =
   GetProjectTemplateResponses[keyof GetProjectTemplateResponses];
+
+export type ListTraefikDiscoveredRoutesData = {
+  body?: never;
+  path?: never;
+  query?: {
+    /**
+     * Page number (default: 1)
+     */
+    page?: number;
+    /**
+     * Page size (default: 20, max: 100)
+     */
+    page_size?: number;
+  };
+  url: "/traefik-discovery/routes";
+};
+
+export type ListTraefikDiscoveredRoutesErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type ListTraefikDiscoveredRoutesError =
+  ListTraefikDiscoveredRoutesErrors[keyof ListTraefikDiscoveredRoutesErrors];
+
+export type ListTraefikDiscoveredRoutesResponses = {
+  /**
+   * Discovered routes and unresolved host conflicts
+   */
+  200: TraefikDiscoveredRouteListResponse;
+};
+
+export type ListTraefikDiscoveredRoutesResponse =
+  ListTraefikDiscoveredRoutesResponses[keyof ListTraefikDiscoveredRoutesResponses];
+
+export type DeauthorizeDiscoveredRouteCertData = {
+  body?: never;
+  path: {
+    /**
+     * Hostname of the discovered route
+     */
+    host: string;
+  };
+  query?: never;
+  url: "/traefik-discovery/routes/{host}/certificate";
+};
+
+export type DeauthorizeDiscoveredRouteCertErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * No authorization record for that host
+   */
+  404: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type DeauthorizeDiscoveredRouteCertError =
+  DeauthorizeDiscoveredRouteCertErrors[keyof DeauthorizeDiscoveredRouteCertErrors];
+
+export type DeauthorizeDiscoveredRouteCertResponses = {
+  /**
+   * TLS authorization cleared
+   */
+  204: void;
+};
+
+export type DeauthorizeDiscoveredRouteCertResponse =
+  DeauthorizeDiscoveredRouteCertResponses[keyof DeauthorizeDiscoveredRouteCertResponses];
+
+export type RequestDiscoveredRouteCertData = {
+  body: RequestDiscoveredRouteCertRequest;
+  path: {
+    /**
+     * Hostname of the discovered route
+     */
+    host: string;
+  };
+  query?: never;
+  url: "/traefik-discovery/routes/{host}/certificate";
+};
+
+export type RequestDiscoveredRouteCertErrors = {
+  /**
+   * Validation error (e.g. unsupported challenge_type)
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * No discovered route for that host
+   */
+  404: ProblemDetails;
+  /**
+   * Host owned by another resource, or verification_method conflict
+   */
+  409: ProblemDetails;
+  /**
+   * Certificate validation failed
+   */
+  422: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+  /**
+   * TLS provisioner error (ACME upstream failure)
+   */
+  502: ProblemDetails;
+};
+
+export type RequestDiscoveredRouteCertError =
+  RequestDiscoveredRouteCertErrors[keyof RequestDiscoveredRouteCertErrors];
+
+export type RequestDiscoveredRouteCertResponses = {
+  /**
+   * TLS authorization created and ACME challenge initiated
+   */
+  201: unknown;
+};
+
+export type SetTraefikDiscoveredRouteEnabledData = {
+  body: UpdateTraefikRouteEnabledRequest;
+  path: {
+    /**
+     * Hostname of the discovered route
+     */
+    host: string;
+  };
+  query?: never;
+  url: "/traefik-discovery/routes/{host}/enabled";
+};
+
+export type SetTraefikDiscoveredRouteEnabledErrors = {
+  /**
+   * Validation error
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * No discovered route for that host
+   */
+  404: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type SetTraefikDiscoveredRouteEnabledError =
+  SetTraefikDiscoveredRouteEnabledErrors[keyof SetTraefikDiscoveredRouteEnabledErrors];
+
+export type SetTraefikDiscoveredRouteEnabledResponses = {
+  /**
+   * Updated discovered route
+   */
+  200: TraefikDiscoveredRouteResponse;
+};
+
+export type SetTraefikDiscoveredRouteEnabledResponse =
+  SetTraefikDiscoveredRouteEnabledResponses[keyof SetTraefikDiscoveredRouteEnabledResponses];
+
+export type GetTraefikDiscoveryStatusData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/traefik-discovery/status";
+};
+
+export type GetTraefikDiscoveryStatusErrors = {
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type GetTraefikDiscoveryStatusError =
+  GetTraefikDiscoveryStatusErrors[keyof GetTraefikDiscoveryStatusErrors];
+
+export type GetTraefikDiscoveryStatusResponses = {
+  /**
+   * Discovery status. `configured: false` means it is not turned on here — the `setup` block says exactly how to turn it on
+   */
+  200: TraefikDiscoveryStatusResponse;
+};
+
+export type GetTraefikDiscoveryStatusResponse =
+  GetTraefikDiscoveryStatusResponses[keyof GetTraefikDiscoveryStatusResponses];
+
+export type ImportTraefikAcmeJsonData = {
+  body: ImportTraefikAcmeJsonRequest;
+  path?: never;
+  query?: never;
+  url: "/traefik-discovery/tls/import";
+};
+
+export type ImportTraefikAcmeJsonErrors = {
+  /**
+   * Validation error (malformed JSON, unsupported renewal_method)
+   */
+  400: ProblemDetails;
+  /**
+   * Unauthorized
+   */
+  401: ProblemDetails;
+  /**
+   * Insufficient permissions
+   */
+  403: ProblemDetails;
+  /**
+   * Request body exceeds the 1 MiB limit
+   */
+  413: ProblemDetails;
+  /**
+   * Internal server error
+   */
+  500: ProblemDetails;
+};
+
+export type ImportTraefikAcmeJsonError =
+  ImportTraefikAcmeJsonErrors[keyof ImportTraefikAcmeJsonErrors];
+
+export type ImportTraefikAcmeJsonResponses = {
+  /**
+   * Import results (per-host verdicts)
+   */
+  200: ImportTraefikAcmeJsonResponse;
+};
+
+export type ImportTraefikAcmeJsonResponse2 =
+  ImportTraefikAcmeJsonResponses[keyof ImportTraefikAcmeJsonResponses];
 
 export type GetCurrentUserData = {
   body?: never;
@@ -49608,7 +56334,7 @@ export type DisableMfaResponses = {
 export type DisableMfaResponse = DisableMfaResponses[keyof DisableMfaResponses];
 
 export type SetupMfaData = {
-  body?: never;
+  body: SetupMfaRequest;
   path?: never;
   query?: never;
   url: "/users/me/mfa/setup";
@@ -49616,7 +56342,11 @@ export type SetupMfaData = {
 
 export type SetupMfaErrors = {
   /**
-   * Unauthorized
+   * Current password is required but was not provided
+   */
+  400: unknown;
+  /**
+   * Unauthorized or current password is incorrect
    */
   401: unknown;
   /**
@@ -49924,6 +56654,169 @@ export type RemoveRoleResponses = {
 };
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
+
+export type GetFeatureMaturityData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/v1/platform/feature-maturity";
+};
+
+export type GetFeatureMaturityErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+};
+
+export type GetFeatureMaturityResponses = {
+  /**
+   * Feature maturity registry for this build
+   */
+  200: Array<FeatureMaturity>;
+};
+
+export type GetFeatureMaturityResponse =
+  GetFeatureMaturityResponses[keyof GetFeatureMaturityResponses];
+
+export type ListSnapshotsData = {
+  body?: never;
+  path?: never;
+  query?: {
+    /**
+     * Filter by project
+     */
+    project_id?: number;
+    /**
+     * Filter by status
+     */
+    status?: string;
+    /**
+     * Page number (1-indexed)
+     */
+    page?: number;
+    /**
+     * Page size (max 100)
+     */
+    page_size?: number;
+  };
+  url: "/v1/sandbox-snapshots";
+};
+
+export type ListSnapshotsErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+};
+
+export type ListSnapshotsResponses = {
+  /**
+   * List of snapshots
+   */
+  200: ListSnapshotsResponse;
+};
+
+export type ListSnapshotsResponse2 =
+  ListSnapshotsResponses[keyof ListSnapshotsResponses];
+
+export type StorageSummaryData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: "/v1/sandbox-snapshots/storage-summary";
+};
+
+export type StorageSummaryErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+};
+
+export type StorageSummaryResponses = {
+  /**
+   * Storage usage summary
+   */
+  200: StorageSummary;
+};
+
+export type StorageSummaryResponse =
+  StorageSummaryResponses[keyof StorageSummaryResponses];
+
+export type DeleteSnapshotData = {
+  body?: never;
+  path: {
+    /**
+     * Snapshot public ID
+     */
+    snap_id: string;
+  };
+  query?: never;
+  url: "/v1/sandbox-snapshots/{snap_id}";
+};
+
+export type DeleteSnapshotErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Not found
+   */
+  404: unknown;
+  /**
+   * Internal error
+   */
+  500: unknown;
+};
+
+export type DeleteSnapshotResponses = {
+  /**
+   * Snapshot deleted
+   */
+  204: void;
+};
+
+export type DeleteSnapshotResponse =
+  DeleteSnapshotResponses[keyof DeleteSnapshotResponses];
+
+export type GetSnapshotData = {
+  body?: never;
+  path: {
+    /**
+     * Snapshot public ID
+     */
+    snap_id: string;
+  };
+  query?: never;
+  url: "/v1/sandbox-snapshots/{snap_id}";
+};
+
+export type GetSnapshotErrors = {
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Not found
+   */
+  404: unknown;
+};
+
+export type GetSnapshotResponses = {
+  /**
+   * Snapshot detail
+   */
+  200: SnapshotResponse;
+};
+
+export type GetSnapshotResponse =
+  GetSnapshotResponses[keyof GetSnapshotResponses];
 
 export type ListSandboxesData = {
   body?: never;
@@ -50751,6 +57644,59 @@ export type ResumeSandboxResponses = {
 
 export type ResumeSandboxResponse =
   ResumeSandboxResponses[keyof ResumeSandboxResponses];
+
+export type CreateSnapshotData = {
+  body: CreateSnapshotBody;
+  path: {
+    /**
+     * Sandbox public ID
+     */
+    id: string;
+  };
+  query?: never;
+  url: "/v1/sandboxes/{id}/snapshots";
+};
+
+export type CreateSnapshotErrors = {
+  /**
+   * Validation error
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Sandbox not found
+   */
+  404: unknown;
+  /**
+   * Quota exceeded or invalid state
+   */
+  422: unknown;
+  /**
+   * Internal error
+   */
+  500: unknown;
+  /**
+   * Snapshots not supported by backend
+   */
+  501: unknown;
+};
+
+export type CreateSnapshotResponses = {
+  /**
+   * Snapshot initiated
+   */
+  202: SnapshotResponse;
+};
+
+export type CreateSnapshotResponse =
+  CreateSnapshotResponses[keyof CreateSnapshotResponses];
 
 export type SourceSandboxData = {
   body: SourceBody;

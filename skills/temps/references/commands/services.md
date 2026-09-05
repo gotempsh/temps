@@ -491,7 +491,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
-| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service. | - | No |
+| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |

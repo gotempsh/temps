@@ -14,12 +14,14 @@
 //!
 //! [`WorkflowPlanner`]: super::workflow_planner::WorkflowPlanner
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
 use temps_core::{EncryptionService, SecretsManagerResolver};
-use temps_entities::{deployments, environments, preset::Preset, projects};
+use temps_entities::{
+    deployments, env_var_environments, env_vars, environments, preset::Preset, projects,
+};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -77,6 +79,48 @@ pub enum DeploymentEnvResolutionError {
         project_id: i32,
         environment_id: i32,
         failures: String,
+    },
+
+    #[error(
+        "Managed service binding '{target}' for template '{template_slug}' could not read '{source_variable}' from the linked {service} service in project {project_id}, environment {environment_id}"
+    )]
+    ManagedServiceBindingMissing {
+        project_id: i32,
+        environment_id: i32,
+        template_slug: String,
+        service: String,
+        target: String,
+        source_variable: String,
+    },
+
+    #[error(
+        "Managed service bindings for template '{template_slug}' require a linked {service} service in project {project_id}, environment {environment_id}"
+    )]
+    ManagedServiceTypeMissing {
+        project_id: i32,
+        environment_id: i32,
+        template_slug: String,
+        service: String,
+    },
+
+    #[error(
+        "Managed service bindings for template '{template_slug}' require exactly one linked {service} service in project {project_id}, environment {environment_id}; found {count}"
+    )]
+    ManagedServiceTypeAmbiguous {
+        project_id: i32,
+        environment_id: i32,
+        template_slug: String,
+        service: String,
+        count: usize,
+    },
+
+    #[error(
+        "Stored service template for project {project_id}, environment {environment_id} is invalid: {reason}"
+    )]
+    InvalidServiceTemplate {
+        project_id: i32,
+        environment_id: i32,
+        reason: String,
     },
 
     #[error(
@@ -178,6 +222,149 @@ pub(super) fn merge_environment_variable_layers(
     resolved.extend(explicit_project_vars);
 }
 
+/// Apply declarative aliases from a reviewed bundled template to the variables
+/// supplied by linked Temps-managed services. Explicit project variables are
+/// merged afterwards and can override these defaults.
+type LinkedServiceVariables = BTreeMap<String, Vec<HashMap<String, String>>>;
+
+fn select_effective_environment_variables(
+    variables: Vec<env_vars::Model>,
+    links: &[env_var_environments::Model],
+    environment_id: i32,
+    is_preview_environment: bool,
+) -> BTreeMap<String, env_vars::Model> {
+    let linked_ids = links
+        .iter()
+        .map(|link| link.env_var_id)
+        .collect::<std::collections::HashSet<_>>();
+    let environment_linked_ids = links
+        .iter()
+        .filter(|link| link.environment_id == environment_id)
+        .map(|link| link.env_var_id)
+        .collect::<std::collections::HashSet<_>>();
+    let is_environment_specific = |variable: &env_vars::Model| {
+        variable.environment_id == Some(environment_id)
+            || environment_linked_ids.contains(&variable.id)
+    };
+    let mut effective = BTreeMap::<String, env_vars::Model>::new();
+    for variable in variables {
+        let environment_specific = is_environment_specific(&variable);
+        let global = variable.environment_id.is_none()
+            && !linked_ids.contains(&variable.id)
+            && (!is_preview_environment || variable.include_in_preview);
+        if !environment_specific && !global {
+            continue;
+        }
+        let replace = effective.get(&variable.key).is_none_or(|current| {
+            (environment_specific, variable.id) > (is_environment_specific(current), current.id)
+        });
+        if replace {
+            effective.insert(variable.key.clone(), variable);
+        }
+    }
+    effective
+}
+
+fn apply_managed_service_bindings(
+    linked_service_vars: &mut HashMap<String, String>,
+    linked_service_vars_by_type: &LinkedServiceVariables,
+    service_template: Option<&serde_json::Value>,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<(), DeploymentEnvResolutionError> {
+    let Some(value) = service_template else {
+        return Ok(());
+    };
+    let instance =
+        serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(value.clone())
+            .map_err(
+                |error| DeploymentEnvResolutionError::InvalidServiceTemplate {
+                    project_id,
+                    environment_id,
+                    reason: error.to_string(),
+                },
+            )?;
+    instance.validate().map_err(
+        |error| DeploymentEnvResolutionError::InvalidServiceTemplate {
+            project_id,
+            environment_id,
+            reason: error.to_string(),
+        },
+    )?;
+    let template = instance.template;
+    let template_slug = template.slug.clone();
+
+    for (service, bindings) in template.managed_service_bindings {
+        let normalized_service = temps_core::templates::canonical_managed_service_type(&service);
+        let service_candidates = linked_service_vars_by_type
+            .get(&normalized_service)
+            .ok_or_else(|| DeploymentEnvResolutionError::ManagedServiceTypeMissing {
+                project_id,
+                environment_id,
+                template_slug: template_slug.clone(),
+                service: service.clone(),
+            })?;
+        if service_candidates.len() != 1 {
+            return Err(DeploymentEnvResolutionError::ManagedServiceTypeAmbiguous {
+                project_id,
+                environment_id,
+                template_slug: template_slug.clone(),
+                service,
+                count: service_candidates.len(),
+            });
+        }
+        let service_variables = &service_candidates[0];
+        for (target, source) in bindings {
+            let value = service_variables.get(&source).cloned().ok_or_else(|| {
+                DeploymentEnvResolutionError::ManagedServiceBindingMissing {
+                    project_id,
+                    environment_id,
+                    template_slug: template_slug.clone(),
+                    service: service.clone(),
+                    target: target.clone(),
+                    source_variable: source.clone(),
+                }
+            })?;
+            linked_service_vars.entry(target).or_insert(value);
+        }
+    }
+
+    Ok(())
+}
+
+/// Add reviewed template aliases to linked-service values, then merge those
+/// defaults beneath explicit project variables. Both normal deployments and
+/// rollback/promotion paths use this entry point so their containers receive
+/// the same managed-service contract.
+pub(super) fn merge_managed_service_environment(
+    resolved: &mut HashMap<String, String>,
+    linked_service_vars_by_type: LinkedServiceVariables,
+    explicit_project_vars: HashMap<String, String>,
+    service_template: Option<&serde_json::Value>,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<(), DeploymentEnvResolutionError> {
+    let mut linked_service_vars = HashMap::new();
+    for service_candidates in linked_service_vars_by_type.values() {
+        for service_variables in service_candidates {
+            for (key, value) in service_variables {
+                linked_service_vars
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+    apply_managed_service_bindings(
+        &mut linked_service_vars,
+        &linked_service_vars_by_type,
+        service_template,
+        project_id,
+        environment_id,
+    )?;
+    merge_environment_variable_layers(resolved, linked_service_vars, explicit_project_vars);
+    Ok(())
+}
+
 /// Apply values owned by the deployment runtime after every tenant-controlled
 /// layer has been resolved. These keys must behave identically for normal,
 /// promoted, and rolled-back deployments.
@@ -227,7 +414,7 @@ impl DeploymentEnvResolver {
         environment: &environments::Model,
         deployment: &deployments::Model,
     ) -> Result<HashMap<String, String>, DeploymentEnvResolutionError> {
-        use temps_entities::{env_var_environments, env_vars, project_services};
+        use temps_entities::project_services;
 
         let mut env_vars_map = HashMap::new();
         let mut explicit_project_vars = HashMap::new();
@@ -238,60 +425,69 @@ impl DeploymentEnvResolver {
         // Can be overridden by user-defined environment variables
         env_vars_map.insert("HOST".to_string(), "0.0.0.0".to_string());
 
-        // 1. Get environment variables for this project and environment
-        // Query through the env_var_environments junction table to get all env vars
-        // associated with this environment
-        let env_var_ids: Vec<i32> = env_var_environments::Entity::find()
-            .filter(env_var_environments::Column::EnvironmentId.eq(environment.id))
+        // 1. Resolve project variables with the same precedence used by the
+        // service-template upgrade path: an environment-scoped row overrides
+        // an unlinked global row, and the newest ID wins within a scope. Both
+        // the current junction-table model and the legacy direct environment
+        // column remain deployable.
+        let env_vars_list = env_vars::Entity::find()
+            .filter(env_vars::Column::ProjectId.eq(project.id))
             .all(self.db.as_ref())
             .await
             .map_err(
-                |source| DeploymentEnvResolutionError::EnvironmentVariableBindingsQuery {
+                |source| DeploymentEnvResolutionError::EnvironmentVariablesQuery {
                     project_id: project.id,
                     environment_id: environment.id,
                     source,
                 },
-            )?
-            .into_iter()
-            .map(|eve| eve.env_var_id)
-            .collect();
-
-        if !env_var_ids.is_empty() {
-            let env_vars_list = env_vars::Entity::find()
-                .filter(env_vars::Column::Id.is_in(env_var_ids))
-                .filter(env_vars::Column::ProjectId.eq(project.id))
+            )?;
+        let env_var_ids = env_vars_list
+            .iter()
+            .map(|variable| variable.id)
+            .collect::<Vec<_>>();
+        let variable_links = if env_var_ids.is_empty() {
+            Vec::new()
+        } else {
+            env_var_environments::Entity::find()
+                .filter(env_var_environments::Column::EnvVarId.is_in(env_var_ids))
                 .all(self.db.as_ref())
                 .await
-                .map_err(
-                    |source| DeploymentEnvResolutionError::EnvironmentVariablesQuery {
+                .map_err(|source| {
+                    DeploymentEnvResolutionError::EnvironmentVariableBindingsQuery {
                         project_id: project.id,
                         environment_id: environment.id,
                         source,
-                    },
-                )?;
+                    }
+                })?
+        };
+        let effective_variables = select_effective_environment_variables(
+            env_vars_list,
+            &variable_links,
+            environment.id,
+            environment.is_preview,
+        );
 
-            for env_var in env_vars_list {
-                let value = if env_var.is_encrypted {
-                    self.encryption_service
-                        .decrypt_string(&env_var.value)
-                        .map_err(|error| {
-                            DeploymentEnvResolutionError::EnvironmentVariableDecryption {
-                                project_id: project.id,
-                                environment_id: environment.id,
-                                variable_id: env_var.id,
-                                key: env_var.key.clone(),
-                                reason: error.to_string(),
-                            }
-                        })?
-                } else {
-                    env_var.value
-                };
-                explicit_project_vars.insert(env_var.key, value);
-            }
+        for env_var in effective_variables.into_values() {
+            let value = if env_var.is_encrypted {
+                self.encryption_service
+                    .decrypt_string(&env_var.value)
+                    .map_err(|error| {
+                        DeploymentEnvResolutionError::EnvironmentVariableDecryption {
+                            project_id: project.id,
+                            environment_id: environment.id,
+                            variable_id: env_var.id,
+                            key: env_var.key.clone(),
+                            reason: error.to_string(),
+                        }
+                    })?
+            } else {
+                env_var.value
+            };
+            explicit_project_vars.insert(env_var.key, value);
         }
 
         debug!(
-            "📦 Loaded {} environment variables from env_vars table via env_var_environments",
+            "📦 Loaded {} effective project environment variables",
             explicit_project_vars.len()
         );
 
@@ -315,7 +511,7 @@ impl DeploymentEnvResolver {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
-        let mut linked_service_vars = HashMap::new();
+        let mut linked_service_vars: LinkedServiceVariables = BTreeMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -324,6 +520,19 @@ impl DeploymentEnvResolver {
                 project_service.service_id, project.id, environment.id
             );
 
+            let service = match self
+                .external_service_manager
+                .get_service(project_service.service_id)
+                .await
+            {
+                Ok(service) => service,
+                Err(error) => {
+                    failed_services.push((project_service.service_id, error.to_string()));
+                    continue;
+                }
+            };
+            let service_type =
+                temps_core::templates::canonical_managed_service_type(&service.service_type);
             match self
                 .external_service_manager
                 .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
@@ -340,7 +549,10 @@ impl DeploymentEnvResolver {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    linked_service_vars.extend(service_env_vars);
+                    linked_service_vars
+                        .entry(service_type)
+                        .or_default()
+                        .push(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails
@@ -371,13 +583,14 @@ impl DeploymentEnvResolver {
             });
         }
 
-        // Linked-service variables are defaults. Explicit project variables
-        // express user intent and therefore take precedence on collisions.
-        merge_environment_variable_layers(
+        merge_managed_service_environment(
             &mut env_vars_map,
             linked_service_vars,
             explicit_project_vars,
-        );
+            project.service_template.as_ref(),
+            project.id,
+            environment.id,
+        )?;
 
         // Secrets-manager bindings are operator-controlled and therefore
         // override linked-service defaults and explicit project variables.
@@ -592,7 +805,7 @@ impl DeploymentEnvResolver {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -600,9 +813,20 @@ mod tests {
     use temps_entities::preset::Preset;
 
     use super::{
-        apply_deployment_owned_variables, apply_secrets_manager_layer,
-        merge_environment_variable_layers, otel_exporter_headers, DeploymentEnvResolutionError,
+        apply_deployment_owned_variables, apply_managed_service_bindings,
+        apply_secrets_manager_layer, merge_environment_variable_layers,
+        merge_managed_service_environment, otel_exporter_headers,
+        select_effective_environment_variables, DeploymentEnvResolutionError,
     };
+
+    fn keycloak_release_json() -> serde_json::Value {
+        serde_json::to_value(temps_core::templates::ServiceTemplateInstance::new(
+            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_core::templates::bundled_template_by_slug("keycloak")
+                .expect("Keycloak service template must be bundled"),
+        ))
+        .expect("service release should serialize")
+    }
 
     struct TestSecretsResolver {
         result: Result<HashMap<String, String>, String>,
@@ -651,6 +875,244 @@ mod tests {
             Some("linked-database")
         );
         assert_eq!(resolved.get("HOST").map(String::as_str), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn environment_variable_selection_includes_globals_and_prefers_current_scope() {
+        let now = chrono::Utc::now();
+        let variable = |id: i32, key: &str, value: &str, environment_id: Option<i32>| {
+            temps_entities::env_vars::Model {
+                id,
+                project_id: 7,
+                environment_id,
+                key: key.to_string(),
+                value: value.to_string(),
+                created_at: now,
+                updated_at: now,
+                include_in_preview: false,
+                is_encrypted: false,
+                is_secret: false,
+            }
+        };
+        let variables = vec![
+            variable(1, "GLOBAL_ONLY", "global", None),
+            variable(2, "SHARED", "global-fallback", None),
+            variable(3, "SHARED", "production", None),
+            variable(4, "LEGACY_DIRECT", "legacy", Some(20)),
+            variable(5, "PREVIEW_ONLY", "preview", None),
+        ];
+        let links = vec![
+            temps_entities::env_var_environments::Model {
+                id: 1,
+                env_var_id: 3,
+                environment_id: 20,
+                created_at: now,
+            },
+            temps_entities::env_var_environments::Model {
+                id: 2,
+                env_var_id: 5,
+                environment_id: 21,
+                created_at: now,
+            },
+        ];
+
+        let selected = select_effective_environment_variables(variables, &links, 20, false);
+
+        assert_eq!(selected["GLOBAL_ONLY"].value, "global");
+        assert_eq!(selected["SHARED"].value, "production");
+        assert_eq!(selected["LEGACY_DIRECT"].value, "legacy");
+        assert!(!selected.contains_key("PREVIEW_ONLY"));
+    }
+
+    #[test]
+    fn preview_environment_excludes_global_values_without_explicit_opt_in() {
+        let now = chrono::Utc::now();
+        let variable =
+            |id: i32, key: &str, include_in_preview: bool| temps_entities::env_vars::Model {
+                id,
+                project_id: 7,
+                environment_id: None,
+                key: key.to_string(),
+                value: "value".to_string(),
+                created_at: now,
+                updated_at: now,
+                include_in_preview,
+                is_encrypted: false,
+                is_secret: key == "PRODUCTION_SECRET",
+            };
+
+        let selected = select_effective_environment_variables(
+            vec![
+                variable(1, "PRODUCTION_SECRET", false),
+                variable(2, "PREVIEW_ALLOWED", true),
+            ],
+            &[],
+            21,
+            true,
+        );
+
+        assert!(!selected.contains_key("PRODUCTION_SECRET"));
+        assert_eq!(selected["PREVIEW_ALLOWED"].value, "value");
+    }
+
+    #[test]
+    fn keycloak_aliases_are_derived_from_managed_postgres() {
+        let linked = HashMap::from([
+            ("POSTGRES_HOST".to_string(), "postgres-12".to_string()),
+            ("POSTGRES_PORT".to_string(), "5432".to_string()),
+            ("POSTGRES_DB".to_string(), "keycloak".to_string()),
+            ("POSTGRES_USER".to_string(), "temps".to_string()),
+            ("POSTGRES_PASSWORD".to_string(), "secret".to_string()),
+        ]);
+
+        let mut resolved = HashMap::new();
+        let service_template = keycloak_release_json();
+        merge_managed_service_environment(
+            &mut resolved,
+            BTreeMap::from([
+                ("postgres".to_string(), vec![linked]),
+                (
+                    "redis".to_string(),
+                    vec![HashMap::from([(
+                        "POSTGRES_HOST".to_string(),
+                        "wrong-provider".to_string(),
+                    )])],
+                ),
+            ]),
+            HashMap::new(),
+            Some(&service_template),
+            4,
+            8,
+        )
+        .expect("the reviewed Keycloak bindings should resolve");
+
+        assert_eq!(
+            resolved.get("KC_DB_URL_HOST"),
+            Some(&"postgres-12".to_string())
+        );
+        assert_eq!(resolved.get("KC_DB_URL_PORT"), Some(&"5432".to_string()));
+        assert_eq!(
+            resolved.get("KC_DB_URL_DATABASE"),
+            Some(&"keycloak".to_string())
+        );
+        assert_eq!(resolved.get("KC_DB_USERNAME"), Some(&"temps".to_string()));
+        assert_eq!(resolved.get("KC_DB_PASSWORD"), Some(&"secret".to_string()));
+    }
+
+    #[test]
+    fn managed_service_binding_type_lookup_is_case_insensitive() {
+        let linked = HashMap::from([
+            ("POSTGRES_HOST".to_string(), "postgres-12".to_string()),
+            ("POSTGRES_PORT".to_string(), "5432".to_string()),
+            ("POSTGRES_DB".to_string(), "keycloak".to_string()),
+            ("POSTGRES_USER".to_string(), "temps".to_string()),
+            ("POSTGRES_PASSWORD".to_string(), "secret".to_string()),
+        ]);
+        let mut instance =
+            serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+                keycloak_release_json(),
+            )
+            .expect("valid Keycloak service instance");
+        let bindings = instance
+            .template
+            .managed_service_bindings
+            .remove("postgres")
+            .expect("Keycloak PostgreSQL bindings");
+        instance
+            .template
+            .managed_service_bindings
+            .insert("Postgres".to_string(), bindings);
+
+        let mut resolved = HashMap::new();
+        merge_managed_service_environment(
+            &mut resolved,
+            BTreeMap::from([("postgres".to_string(), vec![linked])]),
+            HashMap::new(),
+            Some(&serde_json::to_value(instance).expect("serialize service instance")),
+            4,
+            8,
+        )
+        .expect("service binding type matching must be case insensitive");
+
+        assert_eq!(
+            resolved.get("KC_DB_URL_HOST"),
+            Some(&"postgres-12".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_required_managed_binding_fails_with_context() {
+        let mut linked = HashMap::new();
+        let linked_by_type = BTreeMap::from([("postgres".to_string(), vec![linked.clone()])]);
+        let service_template = keycloak_release_json();
+        let error = apply_managed_service_bindings(
+            &mut linked,
+            &linked_by_type,
+            Some(&service_template),
+            4,
+            8,
+        )
+        .expect_err("missing managed PostgreSQL values must fail closed");
+
+        assert!(matches!(
+            error,
+            DeploymentEnvResolutionError::ManagedServiceBindingMissing {
+                project_id: 4,
+                environment_id: 8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_managed_service_type_is_only_ambiguous_for_template_binding() {
+        let postgres_candidates = vec![
+            HashMap::from([("POSTGRES_HOST".to_string(), "postgres-a".to_string())]),
+            HashMap::from([("POSTGRES_HOST".to_string(), "postgres-b".to_string())]),
+        ];
+        let service_template = keycloak_release_json();
+        let error = merge_managed_service_environment(
+            &mut HashMap::new(),
+            BTreeMap::from([("postgres".to_string(), postgres_candidates)]),
+            HashMap::new(),
+            Some(&service_template),
+            4,
+            8,
+        )
+        .expect_err("a template binding must identify exactly one provider");
+
+        assert!(matches!(
+            error,
+            DeploymentEnvResolutionError::ManagedServiceTypeAmbiguous {
+                project_id: 4,
+                environment_id: 8,
+                count: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ordinary_projects_can_still_receive_multiple_services_of_the_same_type() {
+        let mut resolved = HashMap::new();
+        merge_managed_service_environment(
+            &mut resolved,
+            BTreeMap::from([(
+                "postgres".to_string(),
+                vec![
+                    HashMap::from([("DATABASE_A".to_string(), "postgres-a".to_string())]),
+                    HashMap::from([("DATABASE_B".to_string(), "postgres-b".to_string())]),
+                ],
+            )]),
+            HashMap::new(),
+            None,
+            4,
+            8,
+        )
+        .expect("projects without template bindings are not ambiguous");
+
+        assert_eq!(resolved.get("DATABASE_A"), Some(&"postgres-a".to_string()));
+        assert_eq!(resolved.get("DATABASE_B"), Some(&"postgres-b".to_string()));
     }
 
     #[test]

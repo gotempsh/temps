@@ -9558,10 +9558,13 @@ echo "[restore] Pre-seed complete"
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
         let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id_val))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!("Environment {} not found", environment_id),
+            .ok_or(ExternalServiceError::EnvironmentNotFound {
+                environment_id,
+                project_id: project_id_val,
             })?;
 
         let linked_services = project_services::Entity::find()
@@ -13662,6 +13665,89 @@ mod tests {
             container_name: None,
             created_by_user_id: None,
         }
+    }
+
+    fn environment_preview_project(id: i32) -> projects::Model {
+        let now = Utc::now();
+        projects::Model {
+            id,
+            name: "preview-project".to_string(),
+            repo_name: "preview-project".to_string(),
+            repo_owner: "test".to_string(),
+            directory: String::new(),
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::NextJs,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: "preview-project".to_string(),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: Default::default(),
+            project_type: temps_entities::types::ProjectType::Server,
+            allow_alternate_sources: None,
+            template_slug: None,
+            service_template: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            cross_project_trace_sharing: false,
+            ai_api_traffic_summary_enabled: None,
+            image_retention_hours: None,
+        }
+    }
+
+    async fn assert_preview_rejects_unavailable_environment(environment_id: i32) {
+        let project_id = 10;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![environment_preview_project(project_id)]])
+            // The scoped `id + project_id + deleted_at IS NULL` query returns
+            // no row for both foreign-project and soft-deleted environments.
+            .append_query_results([Vec::<temps_entities::environments::Model>::new()])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let error = manager
+            .preview_project_service_environment_variables(project_id, environment_id)
+            .await
+            .expect_err("unavailable environment must not be used for a service preview");
+
+        assert!(matches!(
+            error,
+            ExternalServiceError::EnvironmentNotFound {
+                environment_id: actual_environment_id,
+                project_id: 10,
+            } if actual_environment_id == environment_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn service_preview_rejects_cross_project_environment() {
+        assert_preview_rejects_unavailable_environment(20).await;
+    }
+
+    #[tokio::test]
+    async fn service_preview_rejects_soft_deleted_environment() {
+        assert_preview_rejects_unavailable_environment(21).await;
     }
 
     #[tokio::test]

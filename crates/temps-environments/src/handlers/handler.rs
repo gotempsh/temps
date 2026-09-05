@@ -43,6 +43,10 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             EnvVarError::NotFound(msg) => {
                 temps_core::error_builder::not_found().detail(msg).build()
             }
+            EnvVarError::EnvironmentNotFound { .. } => temps_core::error_builder::not_found()
+                .title("Environment not found")
+                .detail(err.to_string())
+                .build(),
             EnvVarError::InvalidInput(msg) => {
                 temps_core::error_builder::bad_request().detail(msg).build()
             }
@@ -73,12 +77,6 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             EnvVarError::SecretValueRequired { .. } => temps_core::error_builder::bad_request()
                 .detail(err.to_string())
                 .build(),
-            EnvVarError::SecretValueCannotBeRevealed { .. } => {
-                temps_core::error_builder::forbidden()
-                    .title("Secret environment variable is write-only")
-                    .detail(err.to_string())
-                    .build()
-            }
             EnvVarError::AmbiguousValue { .. } => temps_core::error_builder::conflict()
                 .title("Environment variable value is ambiguous")
                 .detail(err.to_string())
@@ -447,8 +445,8 @@ pub async fn get_environment_variables(
         .map(|v| {
             // Non-secret rows get a masked preview so the UI never has the
             // plaintext sitting in memory in a list view. Secret rows return
-            // `None` so the UI can render a stronger "write-only" affordance
-            // (and so an accidental JSON dump never contains a value at all).
+            // `None` so the UI can render the secret affordance (and so an
+            // accidental JSON dump never contains a value at all).
             let value = if v.is_secret {
                 None
             } else {
@@ -688,7 +686,12 @@ pub async fn get_resolved_environment_variable_value(
     if params.service_id.is_none() {
         match state
             .env_var_service
-            .get_environment_variable_value(project_id, &key, params.environment_id, params.var_id)
+            .get_environment_variable_value_for_audited_reveal(
+                project_id,
+                &key,
+                params.environment_id,
+                params.var_id,
+            )
             .await
         {
             Ok(value) => {
@@ -926,14 +929,14 @@ pub async fn update_environment_variable(
     let var = outcome.var;
 
     // Converting a variable to a secret is irreversible and removes the value
-    // from every read path — audit it explicitly.
+    // from list responses — audit it explicitly.
     if outcome.promoted_to_secret {
         info!(
             user_id = auth.user_id(),
             project_id,
             var_id,
             environment_variable_key = %var.key,
-            "Environment variable promoted to write-only secret"
+            "Environment variable promoted to secret"
         );
 
         let audit = EnvironmentVariablePromotedToSecretAudit {
@@ -1015,7 +1018,12 @@ pub async fn get_environment_variable_value(
 
     let value = state
         .env_var_service
-        .get_environment_variable_value(project_id, &key, params.environment_id, params.var_id)
+        .get_environment_variable_value_for_audited_reveal(
+            project_id,
+            &key,
+            params.environment_id,
+            params.var_id,
+        )
         .await?;
 
     audit_environment_variable_reveal(

@@ -5,7 +5,11 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use futures::StreamExt;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    Set,
+};
 use std::sync::Arc;
 use temps_core::{
     Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
@@ -32,6 +36,25 @@ use temps_screenshots::ScreenshotService;
 /// Version of the allowlisted failure taxonomy emitted in deployment telemetry.
 /// Increment this when matching semantics or wire labels change.
 const FAILURE_CLASSIFIER_VERSION: u8 = 1;
+
+/// A lexically-last retained status used after a cleanup attempt fails.
+///
+/// Cleanup orders by status before row ID. Normal retained states (Docker's
+/// created/running/exited/etc. and `failed-readiness`) are therefore attempted
+/// first, while retry rows rotate by their timestamp instead of permanently
+/// monopolizing the bounded cleanup window.
+const RETAINED_CLEANUP_RETRY_PREFIX: &str = "retained:zz-cleanup-retry:";
+
+fn retained_cleanup_retry_status() -> String {
+    retained_cleanup_retry_status_at(chrono::Utc::now())
+}
+
+fn retained_cleanup_retry_status_at(at: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "{RETAINED_CLEANUP_RETRY_PREFIX}{}",
+        at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeploymentFailureStage {
@@ -180,17 +203,7 @@ fn with_template_telemetry(
     event: temps_core::telemetry::TelemetryEvent,
     template_slug: Option<&str>,
 ) -> temps_core::telemetry::TelemetryEvent {
-    let safe_slug = template_slug.and_then(temps_core::templates::telemetry_safe_template_slug);
-    let template_source = match (template_slug, safe_slug) {
-        (None, _) => "none",
-        (Some(_), Some(_)) => "bundled",
-        (Some(_), None) => "custom",
-    };
-
-    event
-        .with("is_template", template_slug.is_some())
-        .with("template_source", template_source)
-        .with_opt("template_slug", safe_slug.map(str::to_string))
+    event.with_template_provenance(template_slug)
 }
 
 /// Preserve the pre-taxonomy `reason` wire value exactly for existing
@@ -1498,7 +1511,16 @@ impl WorkflowExecutionService {
                     .secrets(secrets)
                     .resources(resources)
                     .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone());
+                    .log_service(self.log_service.clone())
+                    .failed_container_retention(self.db.clone(), deployment.id);
+
+                if let Some(command) = deployment
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.command.clone())
+                {
+                    builder = builder.command(Some(command));
+                }
 
                 // Apply explicit deploy-time health-check path override (image/static
                 // deploys can't read .temps.yaml, so the deploy request carries it on
@@ -2519,6 +2541,7 @@ impl WorkflowExecutionService {
                     .deployment_id(deployment.id)
                     .project_id(project.id)
                     .environment_id(environment.id)
+                    .db(self.db.clone())
                     .compose_executor(compose_executor)
                     .compose_path(compose_path)
                     .directory(directory)
@@ -2745,11 +2768,19 @@ impl WorkflowExecutionService {
                 // its own `deploy_cancelled` with trigger="user"). Tagging
                 // this one "workflow" keeps the two mutually exclusive so
                 // the funnel is never double-counted.
+                let template_provenance =
+                    projects::Entity::find_by_id(updated_deployment.project_id)
+                        .one(self.db.as_ref())
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|project| project.template_slug);
                 self.telemetry().report(
                     temps_core::telemetry::TelemetryEvent::new(
                         temps_core::telemetry::TelemetryEventKind::DeployCancelled,
                     )
-                    .with("trigger", "workflow"),
+                    .with("trigger", "workflow")
+                    .with_template_provenance(template_provenance.as_deref()),
                 );
             }
             _ => {}
@@ -2880,6 +2911,147 @@ impl WorkflowExecutionService {
         Ok(())
     }
 
+    async fn teardown_deployer_for_node(
+        &self,
+        node_id: Option<i32>,
+    ) -> Result<Arc<dyn ContainerDeployer>, WorkflowExecutionError> {
+        let Some(node_id) = node_id else {
+            return Ok(self.container_deployer.clone());
+        };
+        use temps_entities::nodes;
+
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Cannot remove container from missing worker node {node_id}"
+                ))
+            })?;
+        let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Worker node {node_id} has no agent token; retained containers cannot be removed safely"
+            ))
+        })?;
+        let encryption_service = self.encryption_service.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Encryption service is unavailable; retained containers on worker node {node_id} cannot be removed safely"
+            ))
+        })?;
+        let token_bytes = encryption_service
+            .decrypt(encrypted_token)
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to decrypt the agent token for worker node {node_id}: {error}"
+                ))
+            })?;
+        let token = String::from_utf8(token_bytes).map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Agent token for worker node {node_id} is not valid UTF-8: {error}"
+            ))
+        })?;
+        let deployer = crate::cluster_ca::build_node_deployer(
+            &node.address,
+            token,
+            node.name,
+            self.config_service.as_ref(),
+            encryption_service.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Failed to connect to worker node {node_id} while removing a retained container: {error}"
+            ))
+        })?;
+        Ok(Arc::new(deployer))
+    }
+
+    async fn teardown_registered_container(
+        &self,
+        container: temps_entities::deployment_containers::Model,
+    ) -> Result<String, WorkflowExecutionError> {
+        use temps_entities::deployment_containers;
+
+        let container_id = container.container_id.clone();
+        let node_id = container.node_id;
+        let original_status = container.status.clone();
+        let was_retained = original_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("retained:"));
+        let deployer = match self.teardown_deployer_for_node(container.node_id).await {
+            Ok(deployer) => deployer,
+            Err(error) if was_retained => {
+                if let Err(rotation_error) = self
+                    .rotate_retained_cleanup_retry(&container, &container_id)
+                    .await
+                {
+                    return Err(WorkflowExecutionError::JobCreationFailed(format!(
+                        "{error}; additionally failed to rotate retained container {container_id} for a later cleanup attempt: {rotation_error}"
+                    )));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
+        // Mark deleted before stopping to prevent the independent health poll
+        // from reporting an intentional shutdown as a crash.
+        let mut active_container: deployment_containers::ActiveModel = container.clone().into();
+        active_container.deleted_at = Set(Some(chrono::Utc::now()));
+        active_container.status = Set(Some("deleted".to_string()));
+        active_container.update(self.db.as_ref()).await?;
+
+        if let Err(error) = deployer.stop_container(&container_id).await {
+            warn!(
+                "Failed to stop container {} on node {:?}: {}",
+                container_id, container.node_id, error
+            );
+        }
+
+        match deployer.remove_container(&container_id).await {
+            Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+            Err(error) => {
+                // Never hide a still-live container from later cleanup attempts.
+                // Retained failures receive a timestamped, lexically-last state,
+                // which moves them behind unattempted rows and rotates retries
+                // fairly inside the bounded cleanup window.
+                if was_retained {
+                    self.rotate_retained_cleanup_retry(&container, &container_id)
+                        .await?;
+                } else {
+                    let mut restore: deployment_containers::ActiveModel = container.into();
+                    restore.deleted_at = Set(None);
+                    restore.status = Set(original_status);
+                    restore.update(self.db.as_ref()).await?;
+                }
+                return Err(WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to remove container {container_id} from node {:?}: {error}",
+                    node_id
+                )));
+            }
+        }
+
+        Ok(container_id)
+    }
+
+    async fn rotate_retained_cleanup_retry(
+        &self,
+        container: &temps_entities::deployment_containers::Model,
+        container_id: &str,
+    ) -> Result<(), WorkflowExecutionError> {
+        use temps_entities::deployment_containers;
+
+        let mut retry: deployment_containers::ActiveModel = container.clone().into();
+        retry.deleted_at = Set(None);
+        retry.status = Set(Some(retained_cleanup_retry_status()));
+        retry.update(self.db.as_ref()).await.map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Failed to persist a later cleanup attempt for retained container {container_id}: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
     /// Teardown (stop and remove) ALL previous deployments in an environment
     /// Returns the container_id of the first stopped container, if any
     /// Excludes the current deployment_id to avoid stopping the newly deployed container
@@ -2905,8 +3077,9 @@ impl WorkflowExecutionService {
         // re-scanning the whole environment history on every deploy. Without
         // these bounds this `.all()` grows unbounded with deployment count and
         // tears down containers sequentially — minutes of work on busy
-        // environments. "failed"/"stopped" are excluded to preserve history and
-        // avoid re-processing already-stopped deployments.
+        // environments. Failed retained candidates are handled by the direct,
+        // uncapped active-row query below. "failed"/"stopped" remain excluded
+        // here to avoid repeatedly scanning historical deployments.
         const MAX_TEARDOWN_DEPLOYMENTS: u64 = 25;
         let previous_deployments = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
@@ -2953,51 +3126,73 @@ impl WorkflowExecutionService {
             );
 
             for container in containers {
-                let container_id = container.container_id.clone();
-
-                // Mark the row deleted *before* stopping the container in Docker.
-                // ContainerHealthMonitor (temps-monitoring) polls
-                // `deployment_containers` filtered on `DeletedAt.is_null()` on its
-                // own independent schedule. If that poll lands between
-                // `stop_container()` below (which puts Docker's container state
-                // into `Exited`) and this row being marked deleted, it has no way
-                // to tell the exit was an intentional teardown and fires a false
-                // ContainerCrash alarm. Writing `deleted_at` first closes that
-                // window: once this update commits, the health monitor's next
-                // query no longer returns this row at all.
-                use sea_orm::{ActiveModelTrait, Set};
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("deleted".to_string()));
-                active_container.update(self.db.as_ref()).await?;
-
-                // Stop and remove the container
-                match self.container_deployer.stop_container(&container_id).await {
-                    Ok(_) => {
-                        info!("Stopped container {}", container_id);
-                    }
-                    Err(e) => {
-                        warn!("Failed to stop container {}: {}", container_id, e);
-                    }
-                }
-
-                match self
-                    .container_deployer
-                    .remove_container(&container_id)
-                    .await
-                {
-                    Ok(_) => {
+                match self.teardown_registered_container(container).await {
+                    Ok(container_id) => {
                         info!("Removed container {}", container_id);
+                        if first_stopped_container_id.is_none() {
+                            first_stopped_container_id = Some(container_id);
+                        }
+                        total_containers_cleaned += 1;
                     }
-                    Err(e) => {
-                        warn!("Failed to remove container {}: {}", container_id, e);
-                    }
+                    Err(error) => warn!("Failed to teardown previous container: {error}"),
                 }
+            }
+        }
 
-                if first_stopped_container_id.is_none() {
-                    first_stopped_container_id = Some(container_id);
+        // Failed candidates are deliberately kept for debugging. Query their
+        // live rows directly rather than applying the active-deployment cap.
+        // The per-sweep limit below bounds latency, and status ordering gives
+        // unattempted rows priority while timestamped retry rows rotate fairly.
+        const MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT: u64 = 20;
+        const RETAINED_CLEANUP_CONCURRENCY: usize = 4;
+        let retained_failed = deployment_containers::Entity::find()
+            .find_also_related(deployments::Entity)
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .filter(deployment_containers::Column::Status.starts_with("retained:"))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::State.eq("failed"))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
+            .order_by_asc(deployment_containers::Column::Status)
+            .order_by_asc(deployment_containers::Column::Id)
+            .limit(MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT)
+            .all(self.db.as_ref())
+            .await?;
+
+        if retained_failed.len() == MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT as usize {
+            warn!(
+                "Retained-container cleanup reached the per-deployment limit of {}; unattempted candidates were prioritized and remaining rows will be retried after the next successful deployment",
+                MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT
+            );
+        }
+
+        let cleanup_results = futures::stream::iter(
+            retained_failed
+                .into_iter()
+                .map(|(container, _)| self.teardown_registered_container(container)),
+        )
+        .buffer_unordered(RETAINED_CLEANUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for result in cleanup_results {
+            match result {
+                Ok(container_id) => {
+                    info!("Removed retained failed container {}", container_id);
+                    if first_stopped_container_id.is_none() {
+                        first_stopped_container_id = Some(container_id);
+                    }
+                    total_containers_cleaned += 1;
                 }
-                total_containers_cleaned += 1;
+                Err(error) => warn!("Failed to teardown retained failed container: {error}"),
             }
         }
 
@@ -3134,6 +3329,31 @@ mod tests {
             Ok(docker) => docker.ping().await.is_ok(),
             Err(_) => false,
         }
+    }
+
+    #[test]
+    fn retained_cleanup_retries_sort_after_unattempted_rows_and_rotate() {
+        let first = retained_cleanup_retry_status_at(
+            chrono::DateTime::parse_from_rfc3339("2026-09-01T10:00:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&Utc),
+        );
+        let second = retained_cleanup_retry_status_at(
+            chrono::DateTime::parse_from_rfc3339("2026-09-01T10:01:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&Utc),
+        );
+
+        for unattempted in [
+            "retained:created",
+            "retained:exited",
+            "retained:failed-readiness",
+            "retained:running",
+            "retained:unhealthy",
+        ] {
+            assert!(unattempted < first.as_str());
+        }
+        assert!(first < second, "older retries must be selected first");
     }
 
     #[test]
@@ -3349,6 +3569,20 @@ mod tests {
             .properties
             .contains_key("template_slug"));
         assert!(!serialized.contains(private_slug));
+
+        let service_failure = deploy_failed_telemetry_event(
+            Some("failed to pull image: manifest unknown"),
+            Some("compose".to_string()),
+            Some("docker-compose".to_string()),
+            Some("keycloak".to_string()),
+        );
+        assert_eq!(service_failure.properties["template_source"], "bundled");
+        assert_eq!(service_failure.properties["template_slug"], "keycloak");
+        assert_eq!(service_failure.properties["failure_stage"], "image");
+        assert_eq!(
+            service_failure.properties["failure_code"],
+            "base_image_pull"
+        );
     }
 
     #[test]
@@ -4231,7 +4465,7 @@ mod tests {
     #[tokio::test]
     async fn test_teardown_previous_deployment_marks_deleted_before_stopping_container(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use temps_entities::deployment_containers;
+        use temps_entities::{deployment_containers, nodes};
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -4260,6 +4494,66 @@ mod tests {
             container_id: Set("old-container-1".to_string()),
             container_name: Set("old-container-1".to_string()),
             container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // A failed readiness check retains its candidate for logs. The next
+        // successful deployment must retire it just like the previous healthy
+        // container, otherwise repeated failures leak live Docker resources.
+        let failed_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("failed-deployment".to_string()),
+            state: Set("failed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(10)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let retained_container = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("failed-container-1".to_string()),
+            container_name: Set("failed-container-1".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("retained:failed-readiness".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // A remote retained row whose deployer cannot be constructed must move
+        // into the retry rotation. Otherwise twenty unavailable workers can
+        // permanently starve every newer diagnostic container.
+        let unavailable_node = nodes::ActiveModel {
+            name: Set("unavailable-worker".to_string()),
+            token_hash: Set("unused".to_string()),
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:39999".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("offline".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let retry_container = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("failed-remote-container".to_string()),
+            container_name: Set("failed-remote-container".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("retained:failed-readiness".to_string())),
+            node_id: Set(Some(unavailable_node.id)),
             deployed_at: Set(Utc::now()),
             ..Default::default()
         }
@@ -4339,6 +4633,27 @@ mod tests {
             .expect("container row still exists");
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        let retained_refreshed = deployment_containers::Entity::find_by_id(retained_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("retained container row still exists");
+        assert!(retained_refreshed.deleted_at.is_some());
+        assert_eq!(retained_refreshed.status.as_deref(), Some("deleted"));
+
+        let retry_refreshed = deployment_containers::Entity::find_by_id(retry_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("unavailable retained container row still exists");
+        assert!(retry_refreshed.deleted_at.is_none());
+        assert!(
+            retry_refreshed
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with(RETAINED_CLEANUP_RETRY_PREFIX)),
+            "deployer lookup failures must rotate instead of starving cleanup: {:?}",
+            retry_refreshed.status
+        );
 
         let newer_refreshed = deployment_containers::Entity::find_by_id(newer_container.id)
             .one(db.as_ref())

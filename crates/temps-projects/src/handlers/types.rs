@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use temps_core::templates::TemplateService;
+use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
 use temps_entities::source_type::SourceType;
@@ -26,6 +26,8 @@ pub struct AppState {
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
+    pub config_service: Arc<temps_config::ConfigService>,
+    pub public_hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
     pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
@@ -161,9 +163,9 @@ pub struct ProjectEnvVarInput {
     pub key: String,
     /// Variable value
     pub value: String,
-    /// Mark the variable as a write-only secret. Secret values are encrypted at
-    /// rest and never returned in plaintext by the API — they can only be
-    /// replaced, not read back. Defaults to `false`.
+    /// Mark the variable as a secret. Secret values are encrypted at rest,
+    /// masked in list responses, and revealable only through an audited,
+    /// permission-checked endpoint. Defaults to `false`.
     #[serde(default)]
     pub is_secret: bool,
 }
@@ -171,6 +173,10 @@ pub struct ProjectEnvVarInput {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,
+    /// Optimistically reserved slug used by template creation to ensure the
+    /// persisted project receives the URL shown during configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
@@ -216,15 +222,16 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub is_on_demand: Option<bool>,
-    /// Port exposed by the container (fallback when image has no EXPOSE directive)
+    /// Explicit port exposed by the container.
     ///
     /// Priority order for port resolution:
-    /// 1. Image EXPOSE directive (auto-detected from built image)
-    /// 2. Environment-level exposed_port (overrides this value per environment)
-    /// 3. This project-level exposed_port (fallback)
+    /// 1. Environment-level exposed_port (explicit override)
+    /// 2. This project-level exposed_port (explicit override)
+    /// 3. Image EXPOSE directive (auto-detected from built image)
     /// 4. Default: 3000
     ///
-    /// Only set this if your image doesn't use EXPOSE directive.
+    /// Set this when the desired application port differs from the image's
+    /// first EXPOSE directive (for example, an image exposing HTTP and HTTPS).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 8080)]
     pub exposed_port: Option<i32>,
@@ -319,8 +326,25 @@ pub struct ProjectResponse {
     pub directory: String,
     pub main_branch: String,
     pub preset: Option<String>,
+    /// Product lifecycle classification. `service` projects are tied to a
+    /// persisted, versioned template release; this is independent from the
+    /// deployment transport in `source_type`.
+    pub project_type: String,
+    /// Bundled template slug that created this project. Clients use this to
+    /// present template-specific runtime configuration instead of generic
+    /// source-build controls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_slug: Option<String>,
+    /// Logo from the immutable service-template release applied to this
+    /// project. Clients should prefer it over a deployed site's favicon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_template_image_url: Option<String>,
+    /// Exact service-template version currently applied to the project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_template_version: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<PresetConfigSchema>)]
     pub preset_config: Option<serde_json::Value>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -416,6 +440,10 @@ impl ProjectResponse {
             directory: project.directory,
             main_branch: project.main_branch,
             preset: project.preset,
+            project_type: project.project_type,
+            template_slug: project.template_slug,
+            service_template_image_url: project.service_template_image_url,
+            service_template_version: project.service_template_version,
             preset_config: project.preset_config,
             created_at: project.created_at.timestamp_millis(),
             updated_at: project.updated_at.timestamp_millis(),
@@ -695,6 +723,78 @@ pub struct UpdateDeploymentConfigRequest {
     pub max_concurrent_connections: Option<i32>,
 }
 
+/// Complete replacement for the editable runtime of a single-container
+/// service-template project. Runtime and resource fields are written to the
+/// same project row in one transaction.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServiceTemplateRuntimeRequest {
+    pub image_ref: String,
+    /// Empty means use the image's own default command.
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub health_check_path: String,
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+    pub exposed_port: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTemplateChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+/// One reviewable change between the project's applied service release and
+/// the current catalog release. Values contain public template metadata only;
+/// project environment values and secrets never enter this response.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ServiceTemplateUpgradeChange {
+    pub field: String,
+    pub kind: ServiceTemplateChangeKind,
+    pub current: Option<String>,
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ServiceTemplateInstanceResponse {
+    pub project_id: i32,
+    pub applied: ServiceTemplateInstance,
+    /// Latest release for the same service family. Absent when the catalog no
+    /// longer carries the template; the applied snapshot is still usable.
+    pub latest: Option<ServiceTemplateInstance>,
+    /// User-safe explanation when the active catalog could not provide this
+    /// service family. The applied snapshot remains authoritative and editable.
+    pub catalog_error: Option<String>,
+    pub upgrade_available: bool,
+    /// The catalog definition changed without a version bump. Applying it is
+    /// intentionally blocked because mutable releases make upgrades and
+    /// rollbacks non-reproducible.
+    pub catalog_drift: bool,
+    pub changes: Vec<ServiceTemplateUpgradeChange>,
+    /// Required target inputs that are not currently configured and cannot be
+    /// filled from a template default or generator.
+    pub required_configuration: Vec<EnvVarTemplate>,
+    /// Managed service families that must be linked before this release can be
+    /// applied. Existing links are never removed automatically.
+    pub missing_services: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct UpgradeServiceTemplateRequest {
+    /// Optimistic target selected from the preview. The server rejects a stale
+    /// target if the catalog changes between preview and apply.
+    pub target_version: String,
+    /// Values for inputs introduced by the target release. Existing project
+    /// values are preserved and cannot be overwritten through this endpoint.
+    #[serde(default)]
+    pub environment_variables: Vec<super::templates::EnvVarInput>,
+}
+
 /// Deserialize a PATCH integer field while preserving the distinction between
 /// an omitted key (`None`) and an explicit JSON null (`Some(None)`).
 fn deserialize_optional_optional_i32<'de, D>(
@@ -898,46 +998,6 @@ pub struct UpdateGitSettingsRequest {
 pub struct UpdateAutomaticDeployRequest {
     pub automatic_deploy: bool,
 }
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateEnvVar {
-    pub name: String,
-    pub example: String,
-    pub default: Option<String>,
-}
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct Template {
-    pub name: String,
-    pub github: Option<TemplateGitHub>,
-    pub description: Option<String>,
-    pub features: Option<Vec<String>>,
-    pub services: Option<Vec<String>>,
-    pub image: Option<String>,
-    pub preset: Option<String>,
-    pub env: Option<Vec<TemplateEnvVar>>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateGitHub {
-    pub owner: String,
-    pub repo: String,
-    pub path: Option<String>,
-    pub r#ref: String,
-}
-
-// Add this new struct with the request schema
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    #[schema(value_type = Option<Vec<ProjectEnvVarInput>>)]
-    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
 // Add query parameters struct
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ContainerLogsQuery {
@@ -1069,10 +1129,6 @@ impl From<ProjectError> for Problem {
                         connection_id
                     ))
             }
-
-            ProjectError::TemplateNotFound => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Template Not Found")
-                .with_detail("The requested template could not be found"),
 
             ProjectError::DatabaseError { reason } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)

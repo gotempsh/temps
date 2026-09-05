@@ -105,6 +105,10 @@ pub struct ComposeServicePreview {
     /// Compose port mappings. `target` is the container port Temps should
     /// proxy to; `published` is the optional Docker host port.
     pub ports: Vec<temps_entities::preset::ComposePortMapping>,
+    /// HTTP path declared by a loopback curl/wget Compose healthcheck. Temps
+    /// can reuse this path for deployment readiness and the public uptime
+    /// monitor without assuming that `/` is a valid application route.
+    pub health_check_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -173,6 +177,10 @@ pub fn list_compose_services(yaml: &str) -> Result<Vec<ComposeServicePreview>, C
             .map(compose_port_mappings)
             .unwrap_or_default();
 
+        let health_check_path = service
+            .and_then(|s| s.get("healthcheck"))
+            .and_then(http_healthcheck_path);
+
         let detected_service_type = image.as_deref().and_then(detect_service_family);
         let looks_like_database = image
             .as_deref()
@@ -187,10 +195,78 @@ pub fn list_compose_services(yaml: &str) -> Result<Vec<ComposeServicePreview>, C
             looks_like_database,
             detected_service_type,
             ports,
+            health_check_path,
         });
     }
 
     Ok(previews)
+}
+
+/// Extract one unambiguous HTTP path from a Compose healthcheck that probes a
+/// loopback address. We intentionally ignore remote hosts, non-HTTP commands,
+/// and checks with multiple different paths.
+fn http_healthcheck_path(healthcheck: &serde_yaml::Value) -> Option<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    visit_healthcheck_strings(healthcheck, &mut |text| {
+        for scheme in ["http://", "https://"] {
+            let mut remainder = text;
+            while let Some(index) = remainder.find(scheme) {
+                let candidate_with_tail = &remainder[index..];
+                let end = candidate_with_tail
+                    .find(|character: char| {
+                        character.is_whitespace()
+                            || matches!(character, '\'' | '"' | ')' | ']' | ';' | '|' | '&')
+                    })
+                    .unwrap_or(candidate_with_tail.len());
+                let candidate = &candidate_with_tail[..end];
+                if let Ok(url) = url::Url::parse(candidate) {
+                    let loopback = match url.host() {
+                        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                        Some(url::Host::Ipv4(address)) => {
+                            address.is_loopback() || address.is_unspecified()
+                        }
+                        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                        None => false,
+                    };
+                    if loopback && url.fragment().is_none() {
+                        let mut path = url.path().to_string();
+                        if let Some(query) = url.query() {
+                            path.push('?');
+                            path.push_str(query);
+                        }
+                        if path.starts_with('/') && path.len() <= 2048 {
+                            paths.insert(path);
+                        }
+                    }
+                }
+                remainder = &candidate_with_tail[end..];
+            }
+        }
+    });
+    (paths.len() == 1)
+        .then(|| paths.into_iter().next())
+        .flatten()
+}
+
+fn visit_healthcheck_strings(value: &serde_yaml::Value, visitor: &mut impl FnMut(&str)) {
+    match value {
+        serde_yaml::Value::String(text) => visitor(text),
+        serde_yaml::Value::Sequence(values) => {
+            for value in values {
+                visit_healthcheck_strings(value, visitor);
+            }
+        }
+        serde_yaml::Value::Mapping(values) => {
+            for (key, value) in values {
+                visit_healthcheck_strings(key, visitor);
+                visit_healthcheck_strings(value, visitor);
+            }
+        }
+        serde_yaml::Value::Tagged(tagged) => {
+            visit_healthcheck_strings(&tagged.value, visitor);
+        }
+        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) | serde_yaml::Value::Number(_) => {}
+    }
 }
 
 /// Combine discovery metadata from a repository Compose file and an optional
@@ -227,6 +303,9 @@ pub fn list_compose_services_with_override(
             base.ports
                 .sort_by_key(|port| (port.target, port.published, port.protocol.clone()));
             base.ports.dedup();
+            if override_service.health_check_path.is_some() {
+                base.health_check_path = override_service.health_check_path;
+            }
         } else {
             services.push(override_service);
         }
@@ -381,6 +460,15 @@ const NEVER_ALLOWED_SERVICE_KEYS: &[&str] = &[
     "security_opt",
     "sysctls",
     "volumes_from",
+    "external_links",
+    "label_file",
+    "post_start",
+    "pre_stop",
+    "provider",
+    "container_name",
+    "blkio_config",
+    "storage_opt",
+    "memswap_limit",
     "group_add",
     "runtime",
     "oom_kill_disable",
@@ -406,6 +494,9 @@ const REPO_ONLY_SERVICE_KEYS: &[&str] = &[
     "volumes",
     "shm_size",
     "labels",
+    "build",
+    "image",
+    "env_file",
 ];
 
 fn validate_preview_override(
@@ -964,6 +1055,34 @@ services:
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].image, None);
         assert!(!services[0].looks_like_database);
+    }
+
+    #[test]
+    fn extracts_http_path_from_loopback_compose_healthcheck() {
+        let yaml = r#"
+services:
+  browserless:
+    image: ghcr.io/browserless/chromium
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/docs"]
+"#;
+        let services = list_compose_services(yaml).expect("valid Compose source");
+        assert_eq!(services[0].health_check_path.as_deref(), Some("/docs"));
+    }
+
+    #[test]
+    fn ignores_remote_and_ambiguous_http_healthchecks() {
+        let remote = serde_yaml::from_str::<serde_yaml::Value>(
+            "test: ['CMD', 'curl', '-f', 'https://example.com/health']",
+        )
+        .expect("valid healthcheck");
+        assert_eq!(http_healthcheck_path(&remote), None);
+
+        let ambiguous = serde_yaml::from_str::<serde_yaml::Value>(
+            "test: ['CMD-SHELL', 'curl http://localhost:3000/ready || curl http://localhost:3000/live']",
+        )
+        .expect("valid healthcheck");
+        assert_eq!(http_healthcheck_path(&ambiguous), None);
     }
 
     #[test]

@@ -64,6 +64,9 @@ pub struct DeployImageRequestedJob {
     /// Must start with '/'. Defaults to "/" when absent.
     #[serde(default)]
     pub health_check_path: Option<String>,
+    /// Optional command passed to the image entrypoint.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

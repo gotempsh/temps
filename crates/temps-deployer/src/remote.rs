@@ -729,6 +729,7 @@ mod tests {
                 host_port: 18080,
                 container_port,
                 protocol: crate::Protocol::Tcp,
+                host_ip: None,
             }],
             network_name: None,
             extra_networks: Vec::new(),

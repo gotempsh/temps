@@ -63,6 +63,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { CopyButton } from '@/components/ui/copy-button'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { Input } from '@/components/ui/input'
@@ -1819,11 +1820,7 @@ export function ServiceDetail() {
           </DialogHeader>
           <div className="space-y-2">
             <Label htmlFor="confirm-delete-service-name">
-              Type{' '}
-              <span className="font-mono font-semibold text-foreground">
-                {service.service.name}
-              </span>{' '}
-              to confirm
+              Type <ConfirmNameBadge value={service.service.name} /> to confirm
             </Label>
             <Input
               id="confirm-delete-service-name"

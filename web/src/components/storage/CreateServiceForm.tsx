@@ -40,6 +40,11 @@ import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
+import {
+  completeServiceCreation,
+  ServiceCreationSuccessMessage,
+} from '@/lib/service-creation-success'
+
 /**
  * Parameter names that get tucked into the "Advanced" collapsible by
  * default. Heroku/Render users were confused by `database`, `username`,
@@ -106,6 +111,7 @@ interface CreateServiceFormProps {
   serviceType: CreatableServiceTypeRoute
   onCancel: () => void
   onSuccess: (data: CreateServiceResponse) => void
+  successMessage?: ServiceCreationSuccessMessage<CreateServiceResponse>
 }
 
 type ParamFieldObj = {
@@ -188,6 +194,7 @@ export function CreateServiceForm({
   serviceType,
   onCancel,
   onSuccess,
+  successMessage,
 }: CreateServiceFormProps) {
   const defaultName = useMemo(
     () => `${serviceType}-${generateId()}`,
@@ -351,8 +358,12 @@ export function CreateServiceForm({
       errorTitle: 'Failed to create service',
     },
     onSuccess: (data) => {
-      toast.success('Service created successfully')
-      onSuccess(data)
+      completeServiceCreation({
+        createdService: data,
+        notifySuccess: toast.success,
+        onSuccess,
+        successMessage,
+      })
     },
   })
 

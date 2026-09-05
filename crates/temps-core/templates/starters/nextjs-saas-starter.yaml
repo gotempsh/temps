@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+slug: nextjs-saas-starter
+name: Next.js SaaS Starter
+kind: starter
+description: A complete SaaS starter kit with authentication, billing, and database integration
+screenshot_url: /templates/nextjs-saas-starter.png
+git:
+  url: https://github.com/gotempsh/temps-examples.git
+  ref: main
+  subfolder: examples/nextjs-saas
+preset: nextjs
+tags:
+  - saas
+  - nextjs
+  - typescript
+  - fullstack
+features:
+  - Authentication with NextAuth.js
+  - Stripe subscription billing
+  - PostgreSQL database with Prisma
+  - Tailwind CSS styling
+  - Dark mode support
+services:
+  - postgres
+env_vars:
+  - name: NEXTAUTH_SECRET
+    description: Secret for NextAuth.js sessions
+    required: true
+    default_generator: random_hex_32
+  - name: NEXTAUTH_URL
+    description: Base URL for authentication callbacks
+    example: https://your-app.temps.sh
+    required: true
+    default_generator: app_url
+  - name: STRIPE_SECRET_KEY
+    description: Stripe secret API key
+    example: sk_test_...
+    required: true
+  - name: STRIPE_WEBHOOK_SECRET
+    description: Stripe webhook signing secret
+    example: whsec_...
+    required: true
+  - name: STRIPE_PRICE_ID
+    description: Stripe price ID for subscription
+    example: price_...
+    required: true
+is_public: true
+is_featured: true
+sort_order: 1

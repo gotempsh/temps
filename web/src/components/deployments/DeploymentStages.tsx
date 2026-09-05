@@ -397,6 +397,17 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
         </div>
       </div>
 
+      {connectionStatus === 'error' && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          Log stream disconnected. Existing lines are preserved while Temps
+          reconnects.
+        </div>
+      )}
+
       {/* Log Viewer */}
       <div className="relative group">
         {/* Copy Button - CodeBlock Style */}
@@ -438,7 +449,11 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
           <div className="text-xs font-mono p-4 w-max min-w-full">
             {logs.length === 0 ? (
               <div className="text-muted-foreground">
-                Connecting to log stream...
+                {connectionStatus === 'error'
+                  ? 'Could not connect to the log stream. Retrying…'
+                  : connectionStatus === 'connected'
+                    ? 'Connected. Waiting for log output…'
+                    : 'Connecting to log stream…'}
               </div>
             ) : filteredLogs.length === 0 ? (
               <div className="text-muted-foreground">

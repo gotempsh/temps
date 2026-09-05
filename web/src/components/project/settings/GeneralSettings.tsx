@@ -18,6 +18,7 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import {
   Card,
   CardContent,
@@ -358,11 +359,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             </AlertDialogHeader>
             <div className="space-y-2">
               <Label htmlFor="confirm-delete-project-name">
-                Type{' '}
-                <span className="font-mono font-semibold text-foreground">
-                  {project?.name}
-                </span>{' '}
-                to confirm
+                Type <ConfirmNameBadge value={project?.name ?? ''} /> to confirm
               </Label>
               <Input
                 id="confirm-delete-project-name"

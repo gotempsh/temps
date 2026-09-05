@@ -2278,7 +2278,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // Register TemplateService - provides project templates from YAML configuration
     // Bundled templates are loaded automatically; external file in data_dir can override them
     let templates_override_path = config.data_dir.join("templates.yaml");
-    let template_service = Arc::new(TemplateService::new(Some(templates_override_path)));
+    let template_service = Arc::new(TemplateService::new(Some(templates_override_path))?);
 
     // Load additional template files if specified
     for additional_path in &additional_templates {

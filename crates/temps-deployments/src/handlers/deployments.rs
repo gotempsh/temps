@@ -52,21 +52,11 @@ use crate::services::{
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 
-// ADR-028 guard pattern note for this file
-//
-// All handlers in this module use `permission_guard!` with Deployments* or
-// Environments* permissions (DeploymentsRead, DeploymentsCreate, DeploymentsDelete,
-// DeploymentsWrite, EnvironmentsRead, EnvironmentsWrite). None of these
-// permissions are bridged from deployment-token permissions in
-// `AuthContext::has_permission` — only AnalyticsRead, AnalyticsWrite, and
-// EmailsSend have token-to-permission mappings. A deployment token therefore
-// fails `permission_guard!` before reaching any handler in this file.
-//
-// `project_scope_guard!` is intentionally omitted from all handlers EXCEPT
-// `get_last_deployment` and `get_project_deployments`, which carry it as a
-// defence-in-depth measure for the ADR-028 Phase B rollout. Adding the guard
-// to every handler in this file would be redundant noise: the token is already
-// rejected by the earlier `permission_guard!` call.
+// Handlers whose path contains a project ID enforce both authorization
+// dimensions: the caller's permission and the credential's project scope.
+// Deployment tokens currently cannot satisfy the read permissions below, but
+// the explicit scope guard preserves isolation if those permissions are ever
+// bridged to project-scoped credentials.
 fn public_url_for_hostname(settings: &AppSettings, hostname: &str, proxy_port: u16) -> String {
     let (protocol, port) = if let Some(ref external_url) = settings.external_url {
         if let Ok(parsed) = url::Url::parse(external_url) {
@@ -654,6 +644,7 @@ pub async fn get_deployment(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
@@ -1111,6 +1102,7 @@ pub async fn list_containers(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!(
@@ -1205,6 +1197,7 @@ pub async fn get_container_logs_by_id(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     validate_websocket_origin(&headers)?;
 
@@ -1244,18 +1237,32 @@ struct ContainerLogParams {
     follow: bool,
 }
 
-/// Close a container-log WebSocket with an explicit `1000` (normal closure)
-/// code. `WebSocket::close()` sends a bare Close frame with no code, which
-/// browsers surface as an abnormal closure -- the frontend's reconnect logic
-/// only skips retrying on `event.code === 1000`, so a codeless close was
-/// silently treated as "try again".
-async fn send_close_normal(socket: &mut WebSocket, reason: &str) -> Result<(), axum::Error> {
+async fn send_log_stream_close(
+    socket: &mut WebSocket,
+    code: u16,
+    reason: &str,
+) -> Result<(), axum::Error> {
     socket
         .send(Message::Close(Some(CloseFrame {
-            code: 1000,
+            code,
             reason: reason.to_string().into(),
         })))
         .await
+}
+
+/// Close a completed container-log WebSocket explicitly. A bare Close frame
+/// is surfaced as abnormal by browsers and makes a completed historical stream
+/// look like a broken connection.
+async fn send_close_normal(socket: &mut WebSocket, reason: &str) -> Result<(), axum::Error> {
+    send_log_stream_close(socket, 1000, reason).await
+}
+
+/// Close a stream that failed after the WebSocket upgrade with 1011. Log text
+/// is tenant-controlled and may itself be JSON with an `error` field, so
+/// clients must use the close code—not payload inspection—to distinguish an
+/// application log line from a transport failure.
+async fn send_close_error(socket: &mut WebSocket, reason: &str) -> Result<(), axum::Error> {
+    send_log_stream_close(socket, 1011, reason).await
 }
 
 async fn handle_container_logs_socket(
@@ -1309,7 +1316,7 @@ async fn handle_container_logs_socket(
             // infinite reconnect loop for containers whose `container_id` no
             // longer resolves in Docker (e.g. long-lived rows pointing at a
             // container Docker has since removed).
-            let _ = send_close_normal(&mut socket, "container logs unavailable").await;
+            let _ = send_close_error(&mut socket, "container logs unavailable").await;
             return;
         }
     };
@@ -1326,6 +1333,7 @@ async fn handle_container_logs_socket(
     // First tick fires immediately; consume it so we don't ping at t=0.
     ping_interval.tick().await;
 
+    let mut stream_failed = false;
     loop {
         tokio::select! {
             biased;
@@ -1345,6 +1353,7 @@ async fn handle_container_logs_socket(
                         }
                     }
                     Err(e) => {
+                        stream_failed = true;
                         error!("Error reading log line: {}", e);
                         let error_msg = format!("ERROR: {}", e);
                         if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
@@ -1366,7 +1375,11 @@ async fn handle_container_logs_socket(
     // frontend treat that as abnormal and reconnect forever, re-fetching the
     // same already-exhausted log stream on every retry. See
     // `send_close_normal`.
-    let _ = send_close_normal(&mut socket, "log stream ended").await;
+    let _ = if stream_failed {
+        send_close_error(&mut socket, "log stream failed").await
+    } else {
+        send_close_normal(&mut socket, "log stream ended").await
+    };
 }
 
 /// Get logs for a container in an environment via WebSocket
@@ -1401,6 +1414,7 @@ pub async fn get_container_logs(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     validate_websocket_origin(&headers)?;
 
@@ -1485,7 +1499,7 @@ async fn handle_filtered_container_logs_socket(
             }
             // See the comment in `handle_container_logs_socket`: a codeless
             // close here caused an infinite client-side reconnect loop.
-            let _ = send_close_normal(&mut socket, "container logs unavailable").await;
+            let _ = send_close_error(&mut socket, "container logs unavailable").await;
             return;
         }
     };
@@ -1494,6 +1508,7 @@ async fn handle_filtered_container_logs_socket(
     tokio::pin!(log_stream);
 
     // Stream logs to WebSocket client
+    let mut stream_failed = false;
     while let Some(log_result) = log_stream.next().await {
         match log_result {
             Ok(line) => {
@@ -1504,6 +1519,7 @@ async fn handle_filtered_container_logs_socket(
                 }
             }
             Err(e) => {
+                stream_failed = true;
                 error!("Error reading log line: {}", e);
                 // Send error as plain text
                 let error_msg = format!("ERROR: {}", e);
@@ -1520,7 +1536,11 @@ async fn handle_filtered_container_logs_socket(
         params.environment_id
     );
     // See the comment in `handle_container_logs_socket`.
-    let _ = send_close_normal(&mut socket, "log stream ended").await;
+    let _ = if stream_failed {
+        send_close_error(&mut socket, "log stream failed").await
+    } else {
+        send_close_normal(&mut socket, "log stream ended").await
+    };
 }
 
 /// Get jobs for a specific deployment
@@ -1588,6 +1608,7 @@ pub async fn get_deployment_job_logs(
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Get the job to verify it exists and get its log_id
@@ -1643,6 +1664,7 @@ pub async fn list_deployment_container_logs(
     Path((project_id, deployment_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let logs = state
@@ -1683,6 +1705,7 @@ pub async fn get_deployment_container_log_content(
     Path((project_id, deployment_id, log_id)): Path<(i32, i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (row, content) = state
@@ -1843,6 +1866,7 @@ pub async fn get_container_detail(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (container, _) = state
@@ -2390,6 +2414,7 @@ pub async fn list_container_history(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (rows, total_count) = state
@@ -2758,6 +2783,33 @@ mod tests {
             "localhost:3000"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn container_read_handlers_enforce_credential_project_scope() {
+        let source = include_str!("deployments.rs");
+        for handler_name in [
+            "list_containers",
+            "get_container_logs_by_id",
+            "get_container_logs",
+            "list_container_history",
+            "list_deployment_container_logs",
+            "get_deployment_container_log_content",
+        ] {
+            let fn_start = source
+                .find(&format!("pub async fn {handler_name}"))
+                .unwrap_or_else(|| panic!("{handler_name} handler not found in source"));
+            let after_start = &source[fn_start + 1..];
+            let next_fn_offset = after_start
+                .find("pub async fn")
+                .unwrap_or(after_start.len());
+            let fn_body = &source[fn_start..fn_start + 1 + next_fn_offset];
+
+            assert!(
+                fn_body.contains("project_scope_guard!(auth, project_id)"),
+                "{handler_name} must reject credentials scoped to another project"
+            );
+        }
     }
 
     #[test]
@@ -3595,13 +3647,20 @@ mod tests {
         docker: &bollard::Docker,
         name: &str,
         log_lines: &[&str],
-    ) -> String {
+    ) -> Option<String> {
         use bollard::models::ContainerCreateBody;
         use bollard::query_parameters::{
             CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
             WaitContainerOptionsBuilder,
         };
         use futures::TryStreamExt;
+
+        // Docker can be available while the registry is intentionally
+        // unreachable. Do not make these unit tests depend on a network pull;
+        // callers skip when the local fixture image is absent.
+        if docker.inspect_image("alpine:latest").await.is_err() {
+            return None;
+        }
 
         // Build a shell command that echoes each line to stdout
         let echo_cmds: Vec<String> = log_lines.iter().map(|l| format!("echo '{}'", l)).collect();
@@ -3652,7 +3711,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await;
 
-        container_id
+        Some(container_id)
     }
 
     /// Helper: remove a Docker container created for testing.
@@ -3691,12 +3750,16 @@ mod tests {
         };
 
         // Create a real Docker container with known log output
-        let real_container_id = create_test_docker_container(
+        let Some(real_container_id) = create_test_docker_container(
             &docker,
             "logs-by-id",
             &["Container log line 1", "Container log line 2"],
         )
-        .await;
+        .await
+        else {
+            println!("alpine:latest is unavailable, skipping Docker log test");
+            return;
+        };
 
         // Setup test database and services
         let test_db = TestDatabase::with_migrations()
@@ -3895,7 +3958,7 @@ mod tests {
     /// codeless close read as abnormal and reconnected forever. This asserts
     /// the handler now closes with an explicit normal-closure (1000) code.
     #[tokio::test]
-    async fn test_container_logs_by_id_stale_container_closes_normally() {
+    async fn test_container_logs_by_id_stale_container_closes_with_error() {
         let docker = match bollard::Docker::connect_with_local_defaults() {
             Ok(d) => d,
             Err(_) => {
@@ -4062,10 +4125,9 @@ mod tests {
 
         assert_eq!(
             close_code,
-            Some(1000),
-            "Handler must close with an explicit normal-closure (1000) code so \
-             the frontend doesn't misread a stale-container error as abnormal \
-             and reconnect forever"
+            Some(1011),
+            "An unavailable container is a stream failure and must use 1011 so \
+             clients do not confuse it with a completed historical stream"
         );
 
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -4093,10 +4155,19 @@ mod tests {
         };
 
         // Create real Docker containers with known log output
-        let real_container1_id =
-            create_test_docker_container(&docker, "filtered-web", &["Web container log 1"]).await;
-        let real_container2_id =
-            create_test_docker_container(&docker, "filtered-db", &["DB container log 1"]).await;
+        let Some(real_container1_id) =
+            create_test_docker_container(&docker, "filtered-web", &["Web container log 1"]).await
+        else {
+            println!("alpine:latest is unavailable, skipping Docker log test");
+            return;
+        };
+        let Some(real_container2_id) =
+            create_test_docker_container(&docker, "filtered-db", &["DB container log 1"]).await
+        else {
+            cleanup_test_docker_container(&docker, &real_container1_id).await;
+            println!("alpine:latest is unavailable, skipping Docker log test");
+            return;
+        };
 
         // Setup test database and services
         let test_db = TestDatabase::with_migrations()
@@ -4358,7 +4429,6 @@ mod tests {
 
         let remote_deployment_service =
             Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
-
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),
             encryption_service.clone(),

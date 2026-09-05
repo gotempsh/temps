@@ -50,7 +50,7 @@ use crate::static_file_serving::{
 use crate::tls_fingerprint;
 use crate::traits::*;
 use async_trait::async_trait;
-use axum::http::header;
+use axum::http::{header, uri::Authority};
 use bytes::Bytes;
 use cookie::Cookie;
 use pingora::http::StatusCode;
@@ -59,7 +59,7 @@ use pingora_core::{
     upstreams::peer::{HttpPeer, Peer},
     Result,
 };
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
@@ -1053,22 +1053,23 @@ impl LoadBalancer {
         }
     }
 
-    fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
-        let host_with_port = if let Some(host) = session.req_header().headers.get("host") {
+    fn request_authority(&self, session: &PingoraSession) -> Result<PublicAuthority> {
+        let raw_authority = if let Some(host) = session.req_header().headers.get("host") {
             host.to_str()
                 .map_err(|_| Error::new_str("Invalid host header encoding"))?
-                .to_string()
-        } else if let Some(host) = session.req_header().uri.host() {
-            // Try to get the :authority pseudo-header first (used in HTTP/2)
-            host.to_string()
+        } else if let Some(authority) = session.req_header().uri.authority() {
+            // HTTP/2 carries the public authority in the request URI.
+            authority.as_str()
         } else {
             return Err(Error::new_str("Missing Host or :authority header"));
         };
 
-        // Remove port from host before returning (e.g., "example.com:3000" -> "example.com")
-        // This ensures we match against domain names in the route table correctly
-        let host = host_with_port.split(':').next().unwrap_or(&host_with_port);
-        Ok(host.to_string())
+        parse_public_authority(raw_authority)
+            .ok_or_else(|| Error::new_str("Invalid Host or :authority header"))
+    }
+
+    fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
+        Ok(self.request_authority(session)?.host)
     }
 
     /// Extract TLS fingerprint with client characteristics
@@ -2760,6 +2761,76 @@ fn ip_restriction_denies(
         Some(ip) => !gate.is_allowed(project_id, environment_id, ip),
         None => gate.has_active_policy(project_id, environment_id),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicAuthority {
+    host: String,
+    forwarded_host: String,
+    port: Option<u16>,
+}
+
+fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
+    // Userinfo is valid in generic URI authorities but never in an HTTP Host
+    // header. Reject it explicitly rather than forwarding ambiguous input.
+    if raw_authority.is_empty() || raw_authority.contains('@') {
+        return None;
+    }
+
+    let has_explicit_port = if raw_authority.starts_with('[') {
+        let closing_bracket = raw_authority.find(']')?;
+        match &raw_authority[closing_bracket + 1..] {
+            "" => false,
+            suffix if suffix.starts_with(':') && suffix.len() > 1 => true,
+            _ => return None,
+        }
+    } else if let Some((host, port)) = raw_authority.rsplit_once(':') {
+        // HTTP requires IPv6 literals to be bracketed. A single colon is the
+        // port separator and must be followed by a valid numeric port.
+        if host.contains(':') || port.is_empty() {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+
+    let authority = raw_authority.parse::<Authority>().ok()?;
+    let authority_host = authority.host();
+    let host = authority_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(authority_host);
+    if host.is_empty() {
+        return None;
+    }
+
+    let port = match (has_explicit_port, authority.port_u16()) {
+        (false, None) => None,
+        (true, Some(port)) if port > 0 => Some(port),
+        _ => return None,
+    };
+
+    let host = host.to_ascii_lowercase();
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let forwarded_host = match port {
+        Some(port) => format!("{authority_host}:{port}"),
+        None => authority_host,
+    };
+
+    Some(PublicAuthority {
+        host,
+        forwarded_host,
+        port,
+    })
+}
+
+fn strip_untrusted_forwarded_header(request: &mut RequestHeader) {
+    request.remove_header("forwarded");
 }
 
 /// Whether a `Content-Type` value's media type — its "essence", the part
@@ -4902,6 +4973,11 @@ impl ProxyHttp for LoadBalancer {
             return Ok(true); // Skip proxying
         }
 
+        // RFC 7239 Forwarded is client-controlled at this trust boundary. We
+        // emit a complete trusted X-Forwarded-* set below, so do not let an
+        // application prioritize a conflicting client-supplied value.
+        strip_untrusted_forwarded_header(session.req_header_mut());
+
         // Capture request headers
         let request_headers: HashMap<String, String> = session
             .req_header()
@@ -4954,15 +5030,30 @@ impl ProxyHttp for LoadBalancer {
                 .insert_header("X-Forwarded-For", ip.as_str())?;
         }
 
-        // Add X-Forwarded-Proto header to indicate the original protocol (HTTP/HTTPS)
-        let proto = if self.is_https_request(session) {
-            "https"
-        } else {
-            "http"
-        };
+        // Overwrite the complete public authority forwarded upstream. Apps
+        // such as Keycloak trust this set when constructing absolute URLs.
+        // Forwarding only the scheme loses non-default ports and produces
+        // redirects to port 80/443 instead of the Temps proxy.
+        let is_https = self.is_https_request(session);
+        let proto = if is_https { "https" } else { "http" };
+        let public_authority = self.request_authority(session)?;
+        let forwarded_port = public_authority
+            .port
+            .unwrap_or(if is_https { 443 } else { 80 });
+        // The same parsed authority controls routing and reaches the upstream.
+        // Never pass the raw client Host after making a routing decision.
+        session
+            .req_header_mut()
+            .insert_header("Host", public_authority.forwarded_host.clone())?;
         session
             .req_header_mut()
             .insert_header("X-Forwarded-Proto", proto)?;
+        session
+            .req_header_mut()
+            .insert_header("X-Forwarded-Host", public_authority.forwarded_host)?;
+        session
+            .req_header_mut()
+            .insert_header("X-Forwarded-Port", forwarded_port.to_string())?;
 
         ctx.referrer = session
             .req_header()
@@ -7487,6 +7578,90 @@ mod traffic_classification_tests {
         assert_eq!(
             LoadBalancer::traffic_classification("/api/health", "Mozilla/5.0"),
             ("proxy", false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwarded_authority_tests {
+    use super::{parse_public_authority, strip_untrusted_forwarded_header, PublicAuthority};
+    use axum::http::HeaderValue;
+    use pingora_http::RequestHeader;
+
+    #[test]
+    fn preserves_non_default_public_port() {
+        assert_eq!(
+            parse_public_authority("keycloak-production.localho.st:8200"),
+            Some(PublicAuthority {
+                host: "keycloak-production.localho.st".to_string(),
+                forwarded_host: "keycloak-production.localho.st:8200".to_string(),
+                port: Some(8200),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_bracketed_ipv6_authority() {
+        assert_eq!(
+            parse_public_authority("[::1]:8200"),
+            Some(PublicAuthority {
+                host: "::1".to_string(),
+                forwarded_host: "[::1]:8200".to_string(),
+                port: Some(8200),
+            })
+        );
+    }
+
+    #[test]
+    fn leaves_default_port_to_the_request_scheme_and_normalizes_route_host() {
+        assert_eq!(
+            parse_public_authority("KEYCLOAK-production.example.com"),
+            Some(PublicAuthority {
+                host: "keycloak-production.example.com".to_string(),
+                forwarded_host: "keycloak-production.example.com".to_string(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_authorities() {
+        for authority in [
+            "example.com:invalid",
+            "example.com:0",
+            "valid-route.example:80.evil",
+            "user@valid-route.example",
+            "::1:8200",
+            "",
+        ] {
+            assert_eq!(
+                parse_public_authority(authority),
+                None,
+                "authority {authority:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn removes_client_supplied_rfc_7239_forwarded_header() {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        request
+            .insert_header(
+                "forwarded",
+                HeaderValue::from_static("for=192.0.2.1;proto=https;host=evil.example"),
+            )
+            .expect("Forwarded test header must be valid");
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_forwarded_header(&mut request);
+
+        assert!(!request.headers.contains_key("forwarded"));
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
         );
     }
 }

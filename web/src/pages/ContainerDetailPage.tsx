@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ProjectResponse } from '@/api/client'
-import { listContainersOptions } from '@/api/client/@tanstack/react-query.gen'
+import { ContainerInfoResponse, ProjectResponse } from '@/api/client'
+import {
+  listContainerHistoryOptions,
+  listContainersOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { ContainerActionDialog } from '@/components/containers/ContainerActionDialog'
 import { ContainerDetail } from '@/components/containers/ContainerDetail'
 import { ContainerHeaderBar } from '@/components/containers/ContainerHeaderBar'
@@ -23,6 +26,7 @@ export function ContainerDetailPage({ project }: ContainerDetailPageProps) {
   const queryClient = useQueryClient()
 
   const environmentId = searchParams.get('env') || ''
+  const deploymentId = Number(searchParams.get('deployment')) || null
   const rawTab = searchParams.get('tab')
   const selectedTab: 'logs' | 'configuration' =
     rawTab === 'configuration' ? 'configuration' : 'logs'
@@ -31,18 +35,48 @@ export function ContainerDetailPage({ project }: ContainerDetailPageProps) {
     'start' | 'stop' | 'restart' | null
   >(null)
 
-  const { data, isLoading } = useQuery({
+  const currentContainersQuery = useQuery({
     ...listContainersOptions({
       path: {
         project_id: project.id,
         environment_id: parseInt(environmentId || '0'),
       },
     }),
-    enabled: !!environmentId,
+    enabled: !!environmentId && deploymentId === null,
+    staleTime: 5000,
+  })
+  const retainedContainersQuery = useQuery({
+    ...listContainerHistoryOptions({
+      path: {
+        project_id: project.id,
+        environment_id: parseInt(environmentId || '0'),
+      },
+      query: {
+        deployment_id: deploymentId ?? undefined,
+        limit: 20,
+      },
+    }),
+    enabled: !!environmentId && deploymentId !== null,
     staleTime: 5000,
   })
 
-  const containers = data?.containers ?? []
+  const isLoading =
+    deploymentId === null
+      ? currentContainersQuery.isLoading
+      : retainedContainersQuery.isLoading
+
+  const containers: ContainerInfoResponse[] =
+    deploymentId === null
+      ? (currentContainersQuery.data?.containers ?? [])
+      : (retainedContainersQuery.data?.containers.map((container) => ({
+          container_id: container.container_id,
+          container_name: container.container_name,
+          created_at: container.deployed_at,
+          finished_at: container.finished_at,
+          image_name: 'Compose candidate',
+          service_name: container.service_name,
+          status: container.finished_at ? 'exited' : 'retained',
+        })) ?? [])
   const selectedContainer =
     containers.find((c) => c.container_id === containerId) ?? null
 
@@ -52,8 +86,9 @@ export function ContainerDetailPage({ project }: ContainerDetailPageProps) {
   }
 
   const handleSelectContainer = (id: string) => {
+    const deploymentQuery = deploymentId ? `&deployment=${deploymentId}` : ''
     navigate(
-      `/projects/${project.slug}/environments/containers/${id}?env=${environmentId}&tab=${selectedTab}`
+      `/projects/${project.slug}/environments/containers/${id}?env=${environmentId}&tab=${selectedTab}${deploymentQuery}`
     )
   }
 
@@ -123,6 +158,7 @@ export function ContainerDetailPage({ project }: ContainerDetailPageProps) {
         tab={selectedTab}
         onTabChange={handleTabChange}
         onAction={setActionType}
+        actionsEnabled={deploymentId === null}
       />
 
       <div className="flex-1 overflow-auto">
@@ -145,23 +181,25 @@ export function ContainerDetailPage({ project }: ContainerDetailPageProps) {
         )}
       </div>
 
-      <ContainerActionDialog
-        projectId={project.id.toString()}
-        environmentId={environmentId}
-        action={actionType}
-        containerId={selectedContainer.container_id}
-        onClose={() => setActionType(null)}
-        onSuccess={() => {
-          queryClient.invalidateQueries({
-            queryKey: listContainersOptions({
-              path: {
-                project_id: project.id,
-                environment_id: parseInt(environmentId),
-              },
-            }).queryKey,
-          })
-        }}
-      />
+      {deploymentId === null && (
+        <ContainerActionDialog
+          projectId={project.id.toString()}
+          environmentId={environmentId}
+          action={actionType}
+          containerId={selectedContainer.container_id}
+          onClose={() => setActionType(null)}
+          onSuccess={() => {
+            queryClient.invalidateQueries({
+              queryKey: listContainersOptions({
+                path: {
+                  project_id: project.id,
+                  environment_id: parseInt(environmentId),
+                },
+              }).queryKey,
+            })
+          }}
+        />
+      )}
     </div>
   )
 }

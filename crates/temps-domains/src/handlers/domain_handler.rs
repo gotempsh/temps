@@ -9,6 +9,7 @@ use super::types::{
     ListRenewalAttemptsResponse, OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse,
     RenewalAttemptResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse, TxtRecord,
 };
+use crate::tls::models::DNS_CLEANUP_PLAN_KEY;
 use crate::tls::{ProviderError, RepositoryError, TlsError};
 use crate::DomainServiceError;
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
@@ -37,6 +38,149 @@ struct DomainAudit {
     context: AuditContext,
     domain: String,
     action: String,
+}
+
+/// Exact provider records created by `setup-dns`. Values are retained inside
+/// the already-private ACME order so finalization removes only this order's
+/// challenges, never a concurrent wildcard/base-domain sibling record that
+/// happens to share the same `_acme-challenge` name.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct DnsCleanupPlan {
+    provider_id: i32,
+    zone: String,
+    records: Vec<DnsCleanupRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct DnsCleanupRecord {
+    name: String,
+    value: String,
+    record_id: String,
+}
+
+#[derive(Debug)]
+struct DnsSetupOutcome {
+    results: Vec<DnsChallengeRecordResult>,
+    records_created: u32,
+    cleanup_records: Vec<DnsCleanupRecord>,
+}
+
+#[derive(Debug)]
+struct DnsCleanupOutcome {
+    deleted: u32,
+    errors: Vec<DnsCleanupError>,
+    remaining_records: Vec<DnsCleanupRecord>,
+}
+
+#[async_trait::async_trait]
+trait DnsCleanupReceiptStore: Send + Sync {
+    async fn save_cleanup_order(
+        &self,
+        order: crate::tls::models::AcmeOrder,
+    ) -> Result<(), RepositoryError>;
+    async fn delete_cleanup_order(&self, order_url: &str) -> Result<(), RepositoryError>;
+}
+
+#[async_trait::async_trait]
+impl<T> DnsCleanupReceiptStore for T
+where
+    T: crate::CertificateRepository + Send + Sync + ?Sized,
+{
+    async fn save_cleanup_order(
+        &self,
+        order: crate::tls::models::AcmeOrder,
+    ) -> Result<(), RepositoryError> {
+        self.save_acme_order(order).await.map(|_| ())
+    }
+
+    async fn delete_cleanup_order(&self, order_url: &str) -> Result<(), RepositoryError> {
+        self.delete_acme_order(order_url).await
+    }
+}
+
+#[derive(Debug)]
+enum DnsCleanupResolution {
+    Complete { deleted: u32 },
+    Pending { errors: Vec<DnsCleanupError> },
+    Manual { reason: DnsCleanupError },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DnsCleanupProgressError {
+    #[error("failed to serialize remaining DNS cleanup receipt: {source}")]
+    Serialize {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to save remaining DNS cleanup receipt: {source}")]
+    Save {
+        #[source]
+        source: RepositoryError,
+    },
+    #[error("failed to clear completed DNS cleanup receipt: {source}")]
+    Delete {
+        #[source]
+        source: RepositoryError,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DnsSetupProgressError {
+    #[error("failed to serialize pre-mutation DNS cleanup intent: {source}")]
+    IntentSerialize {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to save pre-mutation DNS cleanup intent: {source}")]
+    IntentSave {
+        #[source]
+        source: RepositoryError,
+    },
+    #[error(
+        "DNS records were changed but exact cleanup receipts could not be serialized: {source}"
+    )]
+    ReceiptSerialize {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("DNS records were changed but exact cleanup receipts could not be saved: {source}")]
+    ReceiptSave {
+        #[source]
+        source: RepositoryError,
+    },
+}
+
+impl DnsSetupProgressError {
+    fn records_may_have_changed(&self) -> bool {
+        matches!(
+            self,
+            Self::ReceiptSerialize { .. } | Self::ReceiptSave { .. }
+        )
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DnsCleanupError {
+    #[error(
+        "DNS provider '{provider}' represents TXT values as a shared record set; automatic ACME cleanup was skipped to preserve concurrent challenge values"
+    )]
+    SharedRecordSet {
+        provider: temps_dns::providers::DnsProviderType,
+    },
+    #[error(
+        "DNS cleanup receipt for TXT record '{name}' in zone '{zone}' has no provider record ID; automatic deletion is unsafe"
+    )]
+    MissingRecordId { zone: String, name: String },
+    #[error(
+        "Failed to delete ACME TXT record '{name}' (provider record {record_id}) in DNS zone '{zone}': {source}"
+    )]
+    DeleteRecord {
+        zone: String,
+        name: String,
+        record_id: String,
+        #[source]
+        source: Box<temps_dns::errors::DnsError>,
+    },
 }
 
 impl AuditOperation for DomainAudit {
@@ -536,8 +680,11 @@ async fn get_domain_by_host(
     path = "/domains/{domain}/provision",
     responses(
         (status = 200, description = "Certificate provisioning initiated", body = ProvisionResponse),
+        (status = 400, description = "Bad request - account email or challenge is invalid"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Domain permission denied or a user account is required"),
         (status = 404, description = "Domain not found"),
+        (status = 409, description = "DNS cleanup-aware order must use the finalize endpoint"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -590,6 +737,33 @@ async fn provision_domain(
 
     // For DNS-01 domains, use request_challenge + complete_challenge flow
     if domain_model.verification_method == "dns-01" {
+        if let Some(order) = app_state
+            .repository
+            .find_acme_order_by_domain(domain_model.id)
+            .await?
+        {
+            match dns_provision_requires_cleanup_aware_finalize(&order) {
+                Ok(true) => {
+                    return Err(ErrorBuilder::new(StatusCode::CONFLICT)
+                        .title("DNS Cleanup-Aware Finalization Required")
+                        .detail(format!(
+                            "Domain {} has automated DNS cleanup receipts. Finalize it with `temps domain order finalize --domain-id {}` so certificate issuance and DNS cleanup complete together.",
+                            domain, domain_model.id
+                        ))
+                        .build());
+                }
+                Ok(false) => {}
+                Err(source) => {
+                    return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Invalid DNS Cleanup Metadata")
+                        .detail(format!(
+                            "Cannot read persisted DNS cleanup metadata for domain {} (ID {}): {}",
+                            domain, domain_model.id, source
+                        ))
+                        .build());
+                }
+            }
+        }
         info!(
             "Starting DNS-01 challenge provisioning for domain: {} for user: {}",
             domain,
@@ -811,8 +985,13 @@ async fn check_domain_status(
     path = "/domains/{domain_id}/order/finalize",
     responses(
         (status = 200, description = "Order finalized successfully", body = DomainResponse),
+        (status = 400, description = "Bad request - account email or ACME order is invalid"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Domain or DNS provider permission denied"),
         (status = 404, description = "Domain or order not found"),
+        (status = 409, description = "Certificate issued but DNS cleanup requires operator action"),
+        (status = 502, description = "Certificate issued but DNS provider cleanup failed"),
+        (status = 503, description = "Certificate issued but DNS provider service is unavailable"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -864,22 +1043,249 @@ async fn finalize_order(
         })?;
 
     let domain_name = domain_model.domain.clone();
+    let cleanup_order = if domain_model.verification_method == "dns-01" {
+        match app_state
+            .repository
+            .find_acme_order_by_domain(domain_id)
+            .await?
+        {
+            Some(order) => match load_dns_cleanup_plan(&order) {
+                Ok(Some(plan)) => Some((order, plan)),
+                Ok(None) => None,
+                Err(source) => {
+                    return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Invalid DNS Cleanup Metadata")
+                        .detail(format!(
+                            "Cannot read persisted DNS cleanup metadata for domain {} (ID {}): {}",
+                            domain_name, domain_id, source
+                        ))
+                        .build())
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    // Finalization normally needs only domain access. A persisted cleanup plan
+    // turns it into an external DNS mutation, so require the same DNS provider
+    // permission that setup-dns required when the plan was created.
+    ensure_dns_cleanup_permission(&auth, cleanup_order.is_some())?;
     info!(
         "Finalizing order for domain: {} (ID: {}) for user: {}",
         domain_name, domain_id, user_email
     );
 
-    // Complete the challenge (after user has added DNS record or HTTP token is served)
-    let domain = app_state
-        .domain_service
-        .complete_challenge(&domain_name, user_email)
-        .await
-        .map_err(|e| {
-            error!("Failed to finalize order for domain {}: {}", domain_name, e);
-            e
-        })?;
+    // A previous call may have issued the certificate but left the cleanup
+    // receipt for retry after a transient provider failure. Do not submit the
+    // already-finalized ACME order again in that case.
+    let domain =
+        if should_retry_dns_cleanup_without_issuance(&domain_model.status, cleanup_order.is_some())
+        {
+            info!(
+                "Retrying pending ACME DNS cleanup for already-active domain {} (ID {})",
+                domain_name, domain_id
+            );
+            domain_model
+        } else {
+            app_state
+                .domain_service
+                .complete_challenge(&domain_name, user_email)
+                .await
+                .map_err(|e| {
+                    error!("Failed to finalize order for domain {}: {}", domain_name, e);
+                    e
+                })?
+        };
 
     info!("Order finalized successfully for domain: {}", domain.domain);
+
+    let mut cleanup_problem = None;
+    let mut cleanup_audit_action = "DOMAIN_ORDER_FINALIZED";
+    if let Some((order, plan)) = cleanup_order {
+        match app_state.dns_provider_service.as_ref() {
+            Some(dns_provider_service) => match dns_provider_service.get(plan.provider_id).await {
+                Ok(provider) if provider.is_active => {
+                    match dns_provider_service.create_provider_instance(&provider) {
+                        Ok(provider_instance) => {
+                            match execute_dns_cleanup(
+                                provider_instance.as_ref(),
+                                app_state.repository.as_ref(),
+                                order,
+                                plan,
+                            )
+                            .await
+                            {
+                                Ok(DnsCleanupResolution::Complete { deleted }) => {
+                                    cleanup_audit_action =
+                                        "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_COMPLETE";
+                                    info!(
+                                        "Removed {} ACME DNS TXT record(s) for domain {} after certificate issuance",
+                                        deleted, domain_name
+                                    );
+                                }
+                                Ok(DnsCleanupResolution::Pending { errors }) => {
+                                    for cleanup_error in errors {
+                                        warn!(
+                                            "ACME DNS cleanup was incomplete for domain {} (ID {}): {}",
+                                            domain_name, domain_id, cleanup_error
+                                        );
+                                    }
+                                    cleanup_problem = Some(
+                                        ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                                            .title("Certificate Issued; DNS Cleanup Pending")
+                                            .detail(format!(
+                                                "The certificate for domain {} was issued, but one or more ACME TXT records could not be removed. Retry finalization to complete cleanup.",
+                                                domain_name
+                                            ))
+                                            .build(),
+                                    );
+                                    cleanup_audit_action =
+                                        "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_PENDING";
+                                }
+                                Ok(DnsCleanupResolution::Manual {
+                                    reason: DnsCleanupError::SharedRecordSet { provider },
+                                }) => {
+                                    warn!(
+                                        "Automatic ACME DNS cleanup is unsafe for provider {} on domain {} (ID {}); manual cleanup is required",
+                                        provider, domain_name, domain_id
+                                    );
+                                    cleanup_problem = Some(
+                                        ErrorBuilder::new(StatusCode::CONFLICT)
+                                            .title("Certificate Issued; Manual DNS Cleanup Required")
+                                            .detail(format!(
+                                                "The certificate for domain {} was issued, but provider {} cannot safely delete one TXT value from a shared record set. Inspect this order's DNS challenge values, remove them manually, then cancel the order to clear its retained cleanup receipt.",
+                                                domain_name, provider
+                                            ))
+                                            .build(),
+                                    );
+                                    cleanup_audit_action =
+                                        "DOMAIN_ORDER_FINALIZED_MANUAL_DNS_CLEANUP";
+                                }
+                                Ok(DnsCleanupResolution::Manual {
+                                    reason: DnsCleanupError::MissingRecordId { zone, name },
+                                }) => {
+                                    warn!(
+                                        "Automatic ACME DNS cleanup lacks a provider record ID for {} in zone {} on domain {} (ID {}); manual cleanup is required",
+                                        name, zone, domain_name, domain_id
+                                    );
+                                    cleanup_problem = Some(
+                                        ErrorBuilder::new(StatusCode::CONFLICT)
+                                            .title("Certificate Issued; Manual DNS Cleanup Required")
+                                            .detail(format!(
+                                                "The certificate for domain {} was issued, but an exact provider record ID was not available. Inspect this order's DNS challenge values, remove them manually, then cancel the order to clear its retained cleanup receipt.",
+                                                domain_name
+                                            ))
+                                            .build(),
+                                    );
+                                    cleanup_audit_action =
+                                        "DOMAIN_ORDER_FINALIZED_MANUAL_DNS_CLEANUP";
+                                }
+                                Ok(DnsCleanupResolution::Manual { reason }) => {
+                                    warn!(
+                                        "ACME DNS cleanup failed for domain {} (ID {}): {}",
+                                        domain_name, domain_id, reason
+                                    );
+                                    cleanup_problem = Some(
+                                        ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                                            .title("Certificate Issued; DNS Cleanup Pending")
+                                            .detail(format!(
+                                                "The certificate for domain {} was issued, but ACME TXT cleanup failed. Retry finalization to complete cleanup.",
+                                                domain_name
+                                            ))
+                                            .build(),
+                                    );
+                                    cleanup_audit_action =
+                                        "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_PENDING";
+                                }
+                                Err(source) => {
+                                    warn!(
+                                        "DNS cleanup progress could not be persisted for domain {} (ID {}): {}",
+                                        domain_name, domain_id, source
+                                    );
+                                    cleanup_problem = Some(
+                                        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                                            .title("Certificate Issued; DNS Cleanup Progress Pending")
+                                            .detail(format!(
+                                                "The certificate for domain {} was issued, but cleanup progress could not be saved. Retry finalization; already-absent provider records are handled safely.",
+                                                domain_name
+                                            ))
+                                            .build(),
+                                    );
+                                    cleanup_audit_action =
+                                        "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_PROGRESS_PENDING";
+                                }
+                            }
+                        }
+                        Err(source) => {
+                            warn!(
+                                "Could not initialize DNS provider {} to clean ACME records for domain {} (ID {}): {}",
+                                plan.provider_id, domain_name, domain_id, source
+                            );
+                            cleanup_problem = Some(
+                                ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                                    .title("Certificate Issued; DNS Cleanup Pending")
+                                    .detail(format!(
+                                        "The certificate for domain {} was issued, but its DNS provider could not be initialized. Retry finalization to complete cleanup.",
+                                        domain_name
+                                    ))
+                                    .build(),
+                            );
+                            cleanup_audit_action = "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_PENDING";
+                        }
+                    }
+                }
+                Ok(_) => {
+                    warn!(
+                        "DNS provider {} is inactive; ACME TXT records for domain {} (ID {}) were not removed",
+                        plan.provider_id, domain_name, domain_id
+                    );
+                    cleanup_problem = Some(
+                        ErrorBuilder::new(StatusCode::CONFLICT)
+                            .title("Certificate Issued; DNS Cleanup Pending")
+                            .detail(format!(
+                                "The certificate for domain {} was issued, but DNS provider {} is inactive. Reactivate it and retry finalization to complete cleanup.",
+                                domain_name, plan.provider_id
+                            ))
+                            .build(),
+                    );
+                    cleanup_audit_action = "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_PENDING";
+                }
+                Err(source) => {
+                    warn!(
+                        "Could not load DNS provider {} to clean ACME records for domain {} (ID {}): {}",
+                        plan.provider_id, domain_name, domain_id, source
+                    );
+                    cleanup_problem = Some(
+                        ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                            .title("Certificate Issued; DNS Cleanup Pending")
+                            .detail(format!(
+                                "The certificate for domain {} was issued, but DNS provider {} could not be loaded. Retry finalization to complete cleanup.",
+                                domain_name, plan.provider_id
+                            ))
+                            .build(),
+                    );
+                    cleanup_audit_action = "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_PENDING";
+                }
+            },
+            None => {
+                warn!(
+                    "DNS provider service is unavailable; ACME TXT records for domain {} (ID {}) were not removed",
+                    domain_name, domain_id
+                );
+                cleanup_problem = Some(
+                    ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                        .title("Certificate Issued; DNS Cleanup Pending")
+                        .detail(format!(
+                            "The certificate for domain {} was issued, but the DNS provider service is unavailable. Retry finalization to complete cleanup.",
+                            domain_name
+                        ))
+                        .build(),
+                );
+                cleanup_audit_action = "DOMAIN_ORDER_FINALIZED_DNS_CLEANUP_PENDING";
+            }
+        }
+    }
 
     app_state.telemetry.report(
         temps_core::telemetry::TelemetryEvent::new(
@@ -898,13 +1304,40 @@ async fn finalize_order(
             user_agent: metadata.user_agent.clone(),
         },
         domain: domain_name,
-        action: "DOMAIN_ORDER_FINALIZED".to_string(),
+        action: cleanup_audit_action.to_string(),
     };
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 
+    if let Some(problem) = cleanup_problem {
+        return Err(problem);
+    }
+
     Ok((StatusCode::OK, Json(DomainResponse::from(domain))))
+}
+
+fn should_retry_dns_cleanup_without_issuance(
+    domain_status: &str,
+    has_cleanup_receipt: bool,
+) -> bool {
+    has_cleanup_receipt && domain_status == "active"
+}
+
+fn dns_provision_requires_cleanup_aware_finalize(
+    order: &crate::tls::models::AcmeOrder,
+) -> Result<bool, serde_json::Error> {
+    load_dns_cleanup_plan(order).map(|plan| plan.is_some())
+}
+
+fn ensure_dns_cleanup_permission(
+    auth: &temps_auth::AuthContext,
+    cleanup_required: bool,
+) -> Result<(), Problem> {
+    if cleanup_required {
+        permission_guard!(auth, DnsProvidersWrite);
+    }
+    Ok(())
 }
 
 /// Cancel ACME order for a domain
@@ -1868,23 +2301,7 @@ async fn list_orders(
 
     let orders: Vec<AcmeOrderResponse> = acme_orders
         .into_iter()
-        .map(|order| AcmeOrderResponse {
-            id: order.id,
-            order_url: order.order_url,
-            domain_id: order.domain_id,
-            email: order.email,
-            status: order.status,
-            identifiers: order.identifiers,
-            authorizations: order.authorizations,
-            finalize_url: order.finalize_url,
-            certificate_url: order.certificate_url,
-            error: order.error,
-            error_type: order.error_type,
-            created_at: order.created_at.timestamp(),
-            updated_at: order.updated_at.timestamp(),
-            expires_at: order.expires_at.map(|dt| dt.timestamp()),
-            challenge_validation: None,
-        })
+        .map(AcmeOrderResponse::from)
         .collect();
 
     Ok((StatusCode::OK, Json(ListOrdersResponse { orders })))
@@ -1964,6 +2381,7 @@ async fn get_http_challenge_debug(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain or DNS provider not found"),
+        (status = 409, description = "Ambiguous managed DNS zone"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2135,12 +2553,64 @@ async fn setup_dns_challenge(
         dns_provider.name
     );
 
-    let (results, records_created) = setup_dns_txt_records(
+    let setup_outcome = match execute_dns_setup(
         provider_instance.as_ref(),
+        app_state.repository.as_ref(),
+        order,
+        request.dns_provider_id,
         &authoritative_zone,
         &dns_txt_records,
     )
-    .await;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(source) if source.records_may_have_changed() => {
+            error!(
+                "DNS records may have changed for domain {} (ID {}), but exact cleanup receipts could not be saved: {}",
+                domain.domain, domain_id, source
+            );
+            let audit = DomainAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent.clone(),
+                },
+                domain: domain.domain.clone(),
+                action: "DNS_CHALLENGE_SETUP_RECEIPT_UPDATE_FAILED".to_string(),
+            };
+            if let Err(audit_error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(
+                    "Failed to create DNS setup failure audit log: {}",
+                    audit_error
+                );
+            }
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("DNS Records Created; Cleanup Receipt Update Failed")
+                .detail(format!(
+                    "DNS challenge records may have been created for domain {} (ID {}), but their exact provider IDs could not be saved. The original cleanup intent was retained; inspect the order and DNS provider before retrying.",
+                    domain.domain, domain_id
+                ))
+                .build());
+        }
+        Err(source) => {
+            error!(
+                "DNS cleanup intent could not be persisted for domain {} (ID {}): {}",
+                domain.domain, domain_id, source
+            );
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("DNS Cleanup Intent Persistence Failed")
+                .detail(format!(
+                    "DNS records were not changed because cleanup intent could not be saved for domain {} (ID {}).",
+                    domain.domain, domain_id
+                ))
+                .build());
+        }
+    };
+    let DnsSetupOutcome {
+        results,
+        records_created,
+        ..
+    } = setup_outcome;
 
     let total_records = dns_txt_records.len() as u32;
     let all_success = records_created == total_records;
@@ -2205,6 +2675,8 @@ fn ensure_dns_provider_active(
 /// Extract the record name relative to the base domain
 /// e.g., "_acme-challenge.example.com" for base domain "example.com" -> "_acme-challenge"
 fn acme_txt_record_name(base_domain: &str, name: &str) -> String {
+    let base_domain = base_domain.trim_end_matches('.');
+    let name = name.trim_end_matches('.');
     if name.ends_with(&format!(".{}", base_domain)) {
         name.strip_suffix(&format!(".{}", base_domain))
             .unwrap_or(name)
@@ -2214,6 +2686,197 @@ fn acme_txt_record_name(base_domain: &str, name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+fn dns_cleanup_plan(
+    provider_id: i32,
+    zone: &str,
+    cleanup_records: Vec<DnsCleanupRecord>,
+) -> DnsCleanupPlan {
+    let mut seen = std::collections::HashSet::new();
+    DnsCleanupPlan {
+        provider_id,
+        zone: zone.trim_end_matches('.').to_string(),
+        records: cleanup_records
+            .into_iter()
+            .filter(|record| {
+                seen.insert((
+                    record.record_id.clone(),
+                    record.name.clone(),
+                    record.value.clone(),
+                ))
+            })
+            .collect(),
+    }
+}
+
+fn store_dns_cleanup_plan(
+    order: &mut crate::tls::models::AcmeOrder,
+    plan: &DnsCleanupPlan,
+) -> Result<(), serde_json::Error> {
+    let authorizations = order
+        .authorizations
+        .get_or_insert_with(|| serde_json::json!({}));
+    let Some(object) = authorizations.as_object_mut() else {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "ACME order authorizations must be a JSON object",
+        ));
+    };
+    object.insert(
+        DNS_CLEANUP_PLAN_KEY.to_string(),
+        serde_json::to_value(plan)?,
+    );
+    Ok(())
+}
+
+fn load_dns_cleanup_plan(
+    order: &crate::tls::models::AcmeOrder,
+) -> Result<Option<DnsCleanupPlan>, serde_json::Error> {
+    order
+        .authorizations
+        .as_ref()
+        .and_then(|authorizations| authorizations.get(DNS_CLEANUP_PLAN_KEY))
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+}
+
+/// Remove the exact provider record IDs returned when this ACME order created
+/// its TXT values. Providers can have multiple values at the same name during
+/// wildcard issuance, so a later name-only lookup is unsafe and can also miss
+/// records beyond a provider's first list page.
+async fn cleanup_dns_txt_records(
+    provider: &dyn temps_dns::providers::DnsProvider,
+    plan: &DnsCleanupPlan,
+) -> Result<DnsCleanupOutcome, DnsCleanupError> {
+    // Cloudflare and DigitalOcean expose a distinct ID for each TXT value.
+    // Pebble is the explicitly gated, local-test-only exception: its synthetic
+    // ID is the challenge FQDN and delete_record calls challtestsrv's
+    // post-validation clear-txt endpoint. Azure, GCP, Route53, and Namecheap
+    // expose one synthetic ID per RRset/name in real user-controlled zones, so
+    // calling their delete_record implementation could remove a sibling ACME
+    // order's value even after our exact-value filter succeeds.
+    let provider_type = provider.provider_type();
+    if !matches!(
+        provider_type,
+        temps_dns::providers::DnsProviderType::Cloudflare
+            | temps_dns::providers::DnsProviderType::DigitalOcean
+            | temps_dns::providers::DnsProviderType::Pebble
+    ) {
+        return Err(DnsCleanupError::SharedRecordSet {
+            provider: provider_type,
+        });
+    }
+
+    let mut deleted = 0;
+    let mut errors = Vec::new();
+    let mut remaining_records = Vec::new();
+    for expected in &plan.records {
+        if expected.record_id.is_empty() {
+            return Err(DnsCleanupError::MissingRecordId {
+                zone: plan.zone.clone(),
+                name: expected.name.clone(),
+            });
+        }
+        match provider
+            .delete_record(&plan.zone, &expected.record_id)
+            .await
+        {
+            Ok(()) => deleted += 1,
+            // Deletion is idempotent: the provider may have applied a previous
+            // request whose response or subsequent receipt write was lost.
+            Err(temps_dns::errors::DnsError::RecordNotFound(_)) => deleted += 1,
+            Err(source) => {
+                remaining_records.push(expected.clone());
+                errors.push(DnsCleanupError::DeleteRecord {
+                    zone: plan.zone.clone(),
+                    name: expected.name.clone(),
+                    record_id: expected.record_id.clone(),
+                    source: Box::new(source),
+                });
+            }
+        }
+    }
+
+    Ok(DnsCleanupOutcome {
+        deleted,
+        errors,
+        remaining_records,
+    })
+}
+
+async fn execute_dns_setup<S>(
+    provider: &dyn temps_dns::providers::DnsProvider,
+    receipt_store: &S,
+    mut order: crate::tls::models::AcmeOrder,
+    provider_id: i32,
+    zone: &str,
+    dns_txt_records: &[(String, String)],
+) -> Result<DnsSetupOutcome, DnsSetupProgressError>
+where
+    S: DnsCleanupReceiptStore + ?Sized,
+{
+    let pending_records = dns_txt_records
+        .iter()
+        .map(|(name, value)| DnsCleanupRecord {
+            name: acme_txt_record_name(zone, name),
+            value: value.clone(),
+            record_id: String::new(),
+        })
+        .collect();
+    let pending_plan = dns_cleanup_plan(provider_id, zone, pending_records);
+    store_dns_cleanup_plan(&mut order, &pending_plan)
+        .map_err(|source| DnsSetupProgressError::IntentSerialize { source })?;
+    receipt_store
+        .save_cleanup_order(order.clone())
+        .await
+        .map_err(|source| DnsSetupProgressError::IntentSave { source })?;
+
+    let outcome = setup_dns_txt_records_with_cleanup(provider, zone, dns_txt_records).await;
+    let exact_plan = dns_cleanup_plan(provider_id, zone, outcome.cleanup_records.clone());
+    store_dns_cleanup_plan(&mut order, &exact_plan)
+        .map_err(|source| DnsSetupProgressError::ReceiptSerialize { source })?;
+    receipt_store
+        .save_cleanup_order(order)
+        .await
+        .map_err(|source| DnsSetupProgressError::ReceiptSave { source })?;
+    Ok(outcome)
+}
+
+async fn execute_dns_cleanup<S>(
+    provider: &dyn temps_dns::providers::DnsProvider,
+    receipt_store: &S,
+    mut order: crate::tls::models::AcmeOrder,
+    mut plan: DnsCleanupPlan,
+) -> Result<DnsCleanupResolution, DnsCleanupProgressError>
+where
+    S: DnsCleanupReceiptStore + ?Sized,
+{
+    let outcome = match cleanup_dns_txt_records(provider, &plan).await {
+        Ok(outcome) => outcome,
+        Err(reason) => return Ok(DnsCleanupResolution::Manual { reason }),
+    };
+
+    if outcome.errors.is_empty() {
+        receipt_store
+            .delete_cleanup_order(&order.order_url)
+            .await
+            .map_err(|source| DnsCleanupProgressError::Delete { source })?;
+        return Ok(DnsCleanupResolution::Complete {
+            deleted: outcome.deleted,
+        });
+    }
+
+    plan.records = outcome.remaining_records;
+    store_dns_cleanup_plan(&mut order, &plan)
+        .map_err(|source| DnsCleanupProgressError::Serialize { source })?;
+    receipt_store
+        .save_cleanup_order(order)
+        .await
+        .map_err(|source| DnsCleanupProgressError::Save { source })?;
+    Ok(DnsCleanupResolution::Pending {
+        errors: outcome.errors,
+    })
 }
 
 /// Remove stale TXT records left over from a previous order/renewal, then create every
@@ -2226,6 +2889,15 @@ pub(crate) async fn setup_dns_txt_records(
     base_domain: &str,
     dns_txt_records: &[(String, String)],
 ) -> (Vec<DnsChallengeRecordResult>, u32) {
+    let outcome = setup_dns_txt_records_with_cleanup(provider, base_domain, dns_txt_records).await;
+    (outcome.results, outcome.records_created)
+}
+
+async fn setup_dns_txt_records_with_cleanup(
+    provider: &dyn temps_dns::providers::DnsProvider,
+    base_domain: &str,
+    dns_txt_records: &[(String, String)],
+) -> DnsSetupOutcome {
     use std::collections::HashSet;
     use temps_dns::providers::DnsRecordType;
 
@@ -2247,15 +2919,24 @@ pub(crate) async fn setup_dns_txt_records(
 
     let mut results = Vec::new();
     let mut records_created: u32 = 0;
+    let mut cleanup_records = Vec::new();
     for (name, value) in dns_txt_records {
-        let result = create_acme_txt_record(provider, base_domain, name, value).await;
+        let (result, cleanup_record) =
+            create_acme_txt_record(provider, base_domain, name, value).await;
         if result.success {
             records_created += 1;
+        }
+        if let Some(cleanup_record) = cleanup_record {
+            cleanup_records.push(cleanup_record);
         }
         results.push(result);
     }
 
-    (results, records_created)
+    DnsSetupOutcome {
+        results,
+        records_created,
+        cleanup_records,
+    }
 }
 
 pub(crate) enum DnsAutomationAuthorization {
@@ -2343,7 +3024,7 @@ async fn create_acme_txt_record(
     base_domain: &str,
     name: &str,
     value: &str,
-) -> DnsChallengeRecordResult {
+) -> (DnsChallengeRecordResult, Option<DnsCleanupRecord>) {
     use temps_dns::providers::{DnsRecordContent, DnsRecordRequest};
 
     let record_name = acme_txt_record_name(base_domain, name);
@@ -2363,29 +3044,40 @@ async fn create_acme_txt_record(
     };
 
     match provider.create_record(base_domain, request).await {
-        Ok(_record) => {
+        Ok(record) => {
             info!(
                 "Successfully created TXT record {} for {}",
                 name, base_domain
             );
-            DnsChallengeRecordResult {
-                name: name.to_string(),
+            let cleanup_record = record.id.map(|record_id| DnsCleanupRecord {
+                name: record_name,
                 value: value.to_string(),
-                success: true,
-                message: "TXT record created successfully".to_string(),
-            }
+                record_id,
+            });
+            (
+                DnsChallengeRecordResult {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    success: true,
+                    message: "TXT record created successfully".to_string(),
+                },
+                cleanup_record,
+            )
         }
         Err(e) => {
             error!(
                 "Failed to create TXT record {} for {}: {}",
                 name, base_domain, e
             );
-            DnsChallengeRecordResult {
-                name: name.to_string(),
-                value: value.to_string(),
-                success: false,
-                message: format!("Failed to create TXT record: {}", e),
-            }
+            (
+                DnsChallengeRecordResult {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    success: false,
+                    message: format!("Failed to create TXT record: {}", e),
+                },
+                None,
+            )
         }
     }
 }
@@ -2615,6 +3307,48 @@ mod tests {
     };
     use temps_dns::DnsError;
 
+    fn test_auth(role: temps_auth::Role) -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "CLI Operator".to_string(),
+            email: "operator@example.test".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[test]
+    fn dns_cleanup_permission_denial_precedes_cleanup_execution() {
+        let denied = ensure_dns_cleanup_permission(&test_auth(temps_auth::Role::Reader), true)
+            .expect_err("reader must not mutate DNS during finalization");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        assert!(ensure_dns_cleanup_permission(&test_auth(temps_auth::Role::Reader), false).is_ok());
+        assert!(ensure_dns_cleanup_permission(&test_auth(temps_auth::Role::Admin), true).is_ok());
+    }
+
+    #[test]
+    fn active_domain_with_cleanup_receipt_retries_without_acme_reissuance() {
+        assert!(should_retry_dns_cleanup_without_issuance("active", true));
+        assert!(!should_retry_dns_cleanup_without_issuance("pending", true));
+        assert!(!should_retry_dns_cleanup_without_issuance("active", false));
+    }
+
     #[test]
     fn inactive_dns_provider_is_rejected_with_context() {
         let now = chrono::Utc::now();
@@ -2655,6 +3389,42 @@ mod tests {
         records: Mutex<Vec<DnsRecord>>,
         next_id: AtomicU32,
         fail_create_after: Option<u32>,
+        fail_delete_id: Option<String>,
+        provider_type: DnsProviderType,
+    }
+
+    #[derive(Default)]
+    struct RecordingCleanupReceiptStore {
+        saved: Mutex<Vec<crate::tls::models::AcmeOrder>>,
+        deleted: Mutex<Vec<String>>,
+        fail_save: bool,
+        fail_delete: bool,
+    }
+
+    #[async_trait]
+    impl DnsCleanupReceiptStore for RecordingCleanupReceiptStore {
+        async fn save_cleanup_order(
+            &self,
+            order: crate::tls::models::AcmeOrder,
+        ) -> Result<(), RepositoryError> {
+            if self.fail_save {
+                return Err(RepositoryError::Database(
+                    "injected receipt save failure".to_string(),
+                ));
+            }
+            self.saved.lock().unwrap().push(order);
+            Ok(())
+        }
+
+        async fn delete_cleanup_order(&self, order_url: &str) -> Result<(), RepositoryError> {
+            if self.fail_delete {
+                return Err(RepositoryError::Database(
+                    "injected receipt delete failure".to_string(),
+                ));
+            }
+            self.deleted.lock().unwrap().push(order_url.to_string());
+            Ok(())
+        }
     }
 
     impl MockDnsProvider {
@@ -2663,6 +3433,8 @@ mod tests {
                 records: Mutex::new(Vec::new()),
                 next_id: AtomicU32::new(1),
                 fail_create_after: None,
+                fail_delete_id: None,
+                provider_type: DnsProviderType::Cloudflare,
             }
         }
 
@@ -2677,7 +3449,19 @@ mod tests {
                 records: Mutex::new(Vec::new()),
                 next_id: AtomicU32::new(1),
                 fail_create_after: Some(successful_creates),
+                fail_delete_id: None,
+                provider_type: DnsProviderType::Cloudflare,
             }
+        }
+
+        fn with_provider_type(mut self, provider_type: DnsProviderType) -> Self {
+            self.provider_type = provider_type;
+            self
+        }
+
+        fn failing_delete(mut self, record_id: &str) -> Self {
+            self.fail_delete_id = Some(record_id.to_string());
+            self
         }
 
         fn record_names(&self) -> Vec<(String, String)> {
@@ -2708,7 +3492,7 @@ mod tests {
     #[async_trait]
     impl DnsProvider for MockDnsProvider {
         fn provider_type(&self) -> DnsProviderType {
-            DnsProviderType::Cloudflare
+            self.provider_type
         }
 
         fn capabilities(&self) -> DnsProviderCapabilities {
@@ -2789,12 +3573,375 @@ mod tests {
         }
 
         async fn delete_record(&self, _domain: &str, record_id: &str) -> Result<(), DnsError> {
-            self.records
-                .lock()
-                .unwrap()
-                .retain(|r| r.id.as_deref() != Some(record_id));
+            if self.fail_delete_id.as_deref() == Some(record_id) {
+                return Err(DnsError::ApiError("injected delete failure".to_string()));
+            }
+            let mut records = self.records.lock().unwrap();
+            let before = records.len();
+            records.retain(|r| r.id.as_deref() != Some(record_id));
+            if records.len() == before {
+                return Err(DnsError::RecordNotFound(record_id.to_string()));
+            }
             Ok(())
         }
+    }
+
+    fn test_acme_order(authorizations: Option<serde_json::Value>) -> crate::tls::models::AcmeOrder {
+        let now = chrono::Utc::now();
+        crate::tls::models::AcmeOrder {
+            id: 11,
+            order_url: "https://acme.example.test/order/11".to_string(),
+            domain_id: 17,
+            email: "operator@example.test".to_string(),
+            status: "pending".to_string(),
+            identifiers: serde_json::json!([]),
+            authorizations,
+            finalize_url: None,
+            certificate_url: None,
+            error: None,
+            error_type: None,
+            token: None,
+            key_authorization: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn dns_cleanup_plan_round_trips_through_order_metadata() {
+        let records = vec![
+            DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "order-token".to_string(),
+                record_id: "provider-record-7".to_string(),
+            },
+            DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "wildcard-order-token".to_string(),
+                record_id: "provider-record-7".to_string(),
+            },
+            DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "order-token".to_string(),
+                record_id: "provider-record-7".to_string(),
+            },
+        ];
+        let plan = dns_cleanup_plan(42, "example.com.", records);
+        let mut order = test_acme_order(Some(serde_json::json!({
+            "dns_txt_records": [{"name": "_acme-challenge.example.com", "value": "order-token"}]
+        })));
+
+        store_dns_cleanup_plan(&mut order, &plan).expect("cleanup metadata should serialize");
+
+        assert_eq!(load_dns_cleanup_plan(&order).unwrap(), Some(plan.clone()));
+        assert_eq!(plan.zone, "example.com");
+        assert_eq!(
+            plan.records.len(),
+            2,
+            "exact duplicates must be removed without losing sibling RRset values"
+        );
+        assert_eq!(plan.records[0].record_id, "provider-record-7");
+        assert_eq!(plan.records[1].value, "wildcard-order-token");
+        assert!(dns_provision_requires_cleanup_aware_finalize(&order)
+            .expect("cleanup-aware provision guard should decode metadata"));
+        assert!(
+            !dns_provision_requires_cleanup_aware_finalize(&test_acme_order(None))
+                .expect("orders without cleanup metadata should use the legacy path")
+        );
+    }
+
+    #[test]
+    fn acme_order_responses_use_epoch_milliseconds() {
+        let mut order = test_acme_order(None);
+        order.expires_at = Some(order.created_at + chrono::Duration::hours(1));
+        let expected_created_at = order.created_at.timestamp_millis();
+        let expected_updated_at = order.updated_at.timestamp_millis();
+        let expected_expires_at = order.expires_at.map(|value| value.timestamp_millis());
+
+        let response = AcmeOrderResponse::from(order);
+
+        assert_eq!(response.created_at, expected_created_at);
+        assert_eq!(response.updated_at, expected_updated_at);
+        assert_eq!(response.expires_at, expected_expires_at);
+        assert!(response.created_at > 1_000_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_only_the_exact_acme_order_value() {
+        let provider = MockDnsProvider::seed(vec![
+            txt_record("1", "_acme-challenge", "completed-order-token"),
+            txt_record("2", "_acme-challenge", "concurrent-order-token"),
+            txt_record("3", "www", "unrelated"),
+        ]);
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "completed-order-token".to_string(),
+                record_id: "1".to_string(),
+            }],
+        );
+
+        let outcome = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect("record cleanup should succeed");
+
+        assert_eq!(outcome.deleted, 1);
+        assert!(outcome.errors.is_empty());
+        assert!(outcome.remaining_records.is_empty());
+        let remaining = provider.record_names();
+        assert!(!remaining
+            .iter()
+            .any(|(_, value)| value == "completed-order-token"));
+        assert!(remaining
+            .iter()
+            .any(|(_, value)| value == "concurrent-order-token"));
+        assert!(remaining.iter().any(|(name, _)| name == "www"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_providers_with_shared_txt_record_set_ids() {
+        let provider = MockDnsProvider::seed(vec![
+            txt_record(
+                "_acme-challenge::TXT",
+                "_acme-challenge",
+                "completed-order-token",
+            ),
+            txt_record(
+                "_acme-challenge::TXT",
+                "_acme-challenge",
+                "concurrent-order-token",
+            ),
+        ])
+        .with_provider_type(DnsProviderType::Azure);
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "completed-order-token".to_string(),
+                record_id: "_acme-challenge::TXT".to_string(),
+            }],
+        );
+
+        let error = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect_err("shared-record-set providers must not delete by synthetic ID");
+
+        assert!(matches!(
+            error,
+            DnsCleanupError::SharedRecordSet {
+                provider: DnsProviderType::Azure
+            }
+        ));
+        assert_eq!(provider.record_names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_allows_local_test_only_pebble_provider() {
+        let provider = MockDnsProvider::seed(vec![txt_record(
+            "_acme-challenge.example.com.",
+            "_acme-challenge",
+            "completed-order-token",
+        )])
+        .with_provider_type(DnsProviderType::Pebble);
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "completed-order-token".to_string(),
+                record_id: "_acme-challenge.example.com.".to_string(),
+            }],
+        );
+
+        let outcome = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect("the gated local Pebble provider should clear its test RRset");
+
+        assert_eq!(outcome.deleted, 1);
+        assert!(outcome.errors.is_empty());
+        assert!(outcome.remaining_records.is_empty());
+        assert!(provider.record_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_only_failed_records_for_a_safe_retry() {
+        let provider = MockDnsProvider::seed(vec![
+            txt_record("1", "_acme-challenge", "first-token"),
+            txt_record("2", "_acme-challenge", "second-token"),
+        ])
+        .failing_delete("2");
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![
+                DnsCleanupRecord {
+                    name: "_acme-challenge".to_string(),
+                    value: "first-token".to_string(),
+                    record_id: "1".to_string(),
+                },
+                DnsCleanupRecord {
+                    name: "_acme-challenge".to_string(),
+                    value: "second-token".to_string(),
+                    record_id: "2".to_string(),
+                },
+            ],
+        );
+
+        let outcome = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect("safe providers return a cleanup outcome");
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.remaining_records.len(), 1);
+        assert_eq!(outcome.remaining_records[0].record_id, "2");
+        assert_eq!(
+            provider.record_names(),
+            vec![("_acme-challenge".to_string(), "second-token".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_treats_an_already_absent_provider_record_as_complete() {
+        let provider = MockDnsProvider::new();
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "already-removed-token".to_string(),
+                record_id: "gone".to_string(),
+            }],
+        );
+
+        let outcome = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect("safe providers make missing-record cleanup idempotent");
+
+        assert_eq!(outcome.deleted, 1);
+        assert!(outcome.errors.is_empty());
+        assert!(outcome.remaining_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_retains_pre_mutation_intent_without_a_provider_record_id() {
+        let provider = MockDnsProvider::new();
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "durable-intent-token".to_string(),
+                record_id: String::new(),
+            }],
+        );
+
+        let error = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect_err("missing provider IDs require explicit manual cleanup");
+
+        assert!(matches!(
+            error,
+            DnsCleanupError::MissingRecordId { zone, name }
+                if zone == "example.com" && name == "_acme-challenge"
+        ));
+        assert!(provider.record_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_workflow_deletes_exact_records_then_clears_the_receipt() {
+        let provider =
+            MockDnsProvider::seed(vec![txt_record("1", "_acme-challenge", "issued-token")]);
+        let store = RecordingCleanupReceiptStore::default();
+        let order = test_acme_order(None);
+        let order_url = order.order_url.clone();
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "issued-token".to_string(),
+                record_id: "1".to_string(),
+            }],
+        );
+
+        let resolution = execute_dns_cleanup(&provider, &store, order, plan)
+            .await
+            .expect("cleanup workflow should persist its terminal transition");
+
+        assert!(matches!(
+            resolution,
+            DnsCleanupResolution::Complete { deleted: 1 }
+        ));
+        assert!(provider.record_names().is_empty());
+        assert!(store.saved.lock().unwrap().is_empty());
+        assert_eq!(store.deleted.lock().unwrap().as_slice(), &[order_url]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_workflow_persists_only_failures_then_retries_to_completion() {
+        let first_provider = MockDnsProvider::seed(vec![
+            txt_record("1", "_acme-challenge", "first-token"),
+            txt_record("2", "_acme-challenge", "second-token"),
+        ])
+        .failing_delete("2");
+        let store = RecordingCleanupReceiptStore::default();
+        let order = test_acme_order(None);
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![
+                DnsCleanupRecord {
+                    name: "_acme-challenge".to_string(),
+                    value: "first-token".to_string(),
+                    record_id: "1".to_string(),
+                },
+                DnsCleanupRecord {
+                    name: "_acme-challenge".to_string(),
+                    value: "second-token".to_string(),
+                    record_id: "2".to_string(),
+                },
+            ],
+        );
+
+        let first_resolution = execute_dns_cleanup(&first_provider, &store, order, plan)
+            .await
+            .expect("partial cleanup should save retry progress");
+        assert!(matches!(
+            first_resolution,
+            DnsCleanupResolution::Pending { ref errors } if errors.len() == 1
+        ));
+
+        let retry_order = store
+            .saved
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("partial cleanup should retain the order");
+        let retry_plan = load_dns_cleanup_plan(&retry_order)
+            .expect("retry receipt should decode")
+            .expect("retry receipt should exist");
+        assert_eq!(retry_plan.records.len(), 1);
+        assert_eq!(retry_plan.records[0].record_id, "2");
+
+        let retry_provider =
+            MockDnsProvider::seed(vec![txt_record("2", "_acme-challenge", "second-token")]);
+        let retry_resolution =
+            execute_dns_cleanup(&retry_provider, &store, retry_order, retry_plan)
+                .await
+                .expect("retry should clear the retained receipt");
+
+        assert!(matches!(
+            retry_resolution,
+            DnsCleanupResolution::Complete { deleted: 1 }
+        ));
+        assert!(retry_provider.record_names().is_empty());
+        assert_eq!(store.deleted.lock().unwrap().len(), 1);
     }
 
     // ==================== acme_txt_record_name ====================
@@ -2841,6 +3988,109 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert!(remaining.iter().any(|(_, v)| v == "token-wildcard"));
         assert!(remaining.iter().any(|(_, v)| v == "token-base"));
+    }
+
+    #[tokio::test]
+    async fn setup_captures_exact_provider_record_ids_for_cleanup() {
+        let provider = MockDnsProvider::new();
+        let dns_txt_records = vec![
+            (
+                "_acme-challenge.example.com".to_string(),
+                "token-wildcard".to_string(),
+            ),
+            (
+                "_acme-challenge.example.com".to_string(),
+                "token-base".to_string(),
+            ),
+        ];
+
+        let outcome =
+            setup_dns_txt_records_with_cleanup(&provider, "example.com", &dns_txt_records).await;
+
+        assert_eq!(outcome.records_created, 2);
+        assert_eq!(outcome.cleanup_records.len(), 2);
+        assert_eq!(outcome.cleanup_records[0].record_id, "1");
+        assert_eq!(outcome.cleanup_records[0].value, "token-wildcard");
+        assert_eq!(outcome.cleanup_records[1].record_id, "2");
+        assert_eq!(outcome.cleanup_records[1].value, "token-base");
+    }
+
+    #[tokio::test]
+    async fn setup_workflow_persists_intent_before_replacing_it_with_exact_ids() {
+        let provider = MockDnsProvider::new();
+        let store = RecordingCleanupReceiptStore::default();
+        let records = vec![
+            (
+                "_acme-challenge.example.com".to_string(),
+                "token-wildcard".to_string(),
+            ),
+            (
+                "_acme-challenge.example.com".to_string(),
+                "token-base".to_string(),
+            ),
+        ];
+
+        let outcome = execute_dns_setup(
+            &provider,
+            &store,
+            test_acme_order(None),
+            42,
+            "example.com",
+            &records,
+        )
+        .await
+        .expect("setup should persist both lifecycle transitions");
+
+        assert_eq!(outcome.records_created, 2);
+        let saved = store.saved.lock().unwrap();
+        assert_eq!(saved.len(), 2);
+        let intent = load_dns_cleanup_plan(&saved[0])
+            .expect("intent should decode")
+            .expect("intent should exist");
+        assert_eq!(intent.records.len(), 2);
+        assert!(intent
+            .records
+            .iter()
+            .all(|record| record.record_id.is_empty()));
+        let exact = load_dns_cleanup_plan(&saved[1])
+            .expect("exact receipt should decode")
+            .expect("exact receipt should exist");
+        assert_eq!(
+            exact
+                .records
+                .iter()
+                .map(|record| record.record_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_workflow_does_not_mutate_dns_when_intent_save_fails() {
+        let provider = MockDnsProvider::new();
+        let store = RecordingCleanupReceiptStore {
+            fail_save: true,
+            ..Default::default()
+        };
+        let records = vec![(
+            "_acme-challenge.example.com".to_string(),
+            "must-not-be-created".to_string(),
+        )];
+
+        let error = execute_dns_setup(
+            &provider,
+            &store,
+            test_acme_order(None),
+            42,
+            "example.com",
+            &records,
+        )
+        .await
+        .expect_err("intent persistence failure must stop before DNS mutation");
+
+        assert!(matches!(error, DnsSetupProgressError::IntentSave { .. }));
+        assert!(!error.records_may_have_changed());
+        assert!(provider.record_names().is_empty());
     }
 
     #[tokio::test]
