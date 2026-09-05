@@ -226,6 +226,12 @@ impl EmailProvider for SmtpProvider {
             dkim_records: Vec::new(),
             mx_record: None,
             mail_from_subdomain: None,
+            // SMTP has no domain-management API and no records to probe, so
+            // an empty spf_record/dkim_records here means "not applicable",
+            // not "not yet configured" -- the required-record gate must
+            // treat this identity as verified rather than permanently
+            // pending. See `resolve_verification_status`'s doc comment.
+            manages_dns_records: false,
         })
     }
 

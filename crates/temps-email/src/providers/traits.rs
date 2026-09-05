@@ -114,6 +114,21 @@ pub struct DomainIdentityDetails {
     /// MAIL FROM subdomain (e.g., "send" for send.domain.com)
     #[serde(default)]
     pub mail_from_subdomain: Option<String>,
+    /// Whether this provider manages DNS-based sender authentication records
+    /// (SPF/DKIM) for this identity at all. `false` for providers like SMTP
+    /// that have no domain-management API and no records to probe — for
+    /// those, an empty `spf_record`/`dkim_records` means "not applicable",
+    /// not "not yet configured", so the required-record verification gate
+    /// must not require them. Defaults to `true` so providers that do manage
+    /// records (Scaleway, SES) are unaffected without listing the field.
+    #[serde(default = "DomainIdentityDetails::default_manages_dns_records")]
+    pub manages_dns_records: bool,
+}
+
+impl DomainIdentityDetails {
+    fn default_manages_dns_records() -> bool {
+        true
+    }
 }
 
 /// Domain verification status

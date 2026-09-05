@@ -538,6 +538,7 @@ impl EmailProvider for SesProvider {
             dkim_records,
             mx_record,
             mail_from_subdomain: Some(mail_from_subdomain),
+            manages_dns_records: true,
         })
     }
 

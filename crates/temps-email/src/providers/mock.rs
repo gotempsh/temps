@@ -212,6 +212,7 @@ impl EmailProvider for MockEmailProvider {
                 status: record_status,
             }),
             mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
         })
     }
 

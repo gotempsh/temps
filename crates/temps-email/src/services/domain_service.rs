@@ -200,12 +200,8 @@ impl DomainService {
         dns_records.push(Self::dmarc_record_template(&request.domain));
 
         // Compute the initial status from the fetched verification data.
-        let (status_str, last_verified_at) =
-            match Self::resolve_verification_status(&identity_details) {
-                VerificationStatus::Verified => ("verified".to_string(), Some(chrono::Utc::now())),
-                VerificationStatus::Failed(_) => ("failed".to_string(), None),
-                _ => ("pending".to_string(), None),
-            };
+        let (status_str, verification_error, last_verified_at) =
+            Self::status_fields(Self::resolve_verification_status(&identity_details));
 
         // Persist the new row.
         let active_model = email_domains::ActiveModel {
@@ -236,6 +232,7 @@ impl DomainService {
                 .and_then(|r| r.priority.map(|p| p as i16))),
             provider_identity_id: Set(request.provider_identity_id.clone()),
             last_verified_at: Set(last_verified_at),
+            verification_error: Set(verification_error),
             ..Default::default()
         };
 
@@ -499,6 +496,17 @@ impl DomainService {
     ///
     /// DMARC is also excluded — see `dmarc_record_template`'s doc comment.
     fn are_all_records_verified(details: &DomainIdentityDetails) -> bool {
+        // A provider that doesn't manage DNS records at all (SMTP: no
+        // domain-management API, nothing to probe) has no SPF/DKIM to check
+        // in the first place — empty here means "not applicable", not "not
+        // yet configured". Gating on records that structurally can never
+        // exist would permanently strand every SMTP-backed domain at
+        // Pending. Providers that do manage records (Scaleway, SES, the
+        // mock) are unaffected since they set this to `true`.
+        if !details.manages_dns_records {
+            return true;
+        }
+
         // SPF must be present AND verified — `None` means the provider never
         // returned an SPF record at all, which must not vacuously pass.
         let spf_verified = matches!(
@@ -581,6 +589,32 @@ impl DomainService {
         VerificationStatus::Pending
     }
 
+    /// Map a resolved `VerificationStatus` to the persisted `(status, verification_error,
+    /// last_verified_at)` triple. Shared by `import()` and `verify()` so a status like
+    /// `TemporaryFailure` is recorded distinctly everywhere instead of one caller
+    /// collapsing it into a generic "pending" that hides why the provider is unsure.
+    fn status_fields(
+        status: VerificationStatus,
+    ) -> (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        match status {
+            VerificationStatus::Verified => {
+                ("verified".to_string(), None, Some(chrono::Utc::now()))
+            }
+            VerificationStatus::Pending => ("pending".to_string(), None, None),
+            VerificationStatus::Failed(msg) => ("failed".to_string(), Some(msg), None),
+            VerificationStatus::NotStarted => ("not_started".to_string(), None, None),
+            VerificationStatus::TemporaryFailure => (
+                "temporary_failure".to_string(),
+                Some("DNS records no longer valid".to_string()),
+                None,
+            ),
+        }
+    }
+
     /// List all domains
     pub async fn list(&self) -> Result<Vec<email_domains::Model>, EmailError> {
         let domains = email_domains::Entity::find()
@@ -657,8 +691,16 @@ impl DomainService {
         // verification. MX and DMARC are intentionally excluded from this
         // gate — see `resolve_verification_status`'s doc comment.
         let status = Self::resolve_verification_status(&identity_details);
-        if matches!(status, VerificationStatus::Verified) {
-            debug!("All required DNS records verified via DNS lookup, marking domain as verified");
+        match &status {
+            VerificationStatus::Verified => {
+                debug!(
+                    "All required DNS records verified via DNS lookup, marking domain as verified"
+                );
+                info!("Domain verified successfully");
+            }
+            VerificationStatus::Pending => debug!("Domain verification pending"),
+            VerificationStatus::Failed(msg) => error!("Domain verification failed: {}", msg),
+            VerificationStatus::NotStarted | VerificationStatus::TemporaryFailure => {}
         }
 
         dns_records.push(Self::dmarc_record_live(&domain.domain).await);
@@ -666,32 +708,11 @@ impl DomainService {
         // Update domain status in database
         let mut active_model: email_domains::ActiveModel = domain.into();
 
-        match &status {
-            VerificationStatus::Verified => {
-                active_model.status = Set("verified".to_string());
-                active_model.last_verified_at = Set(Some(chrono::Utc::now()));
-                active_model.verification_error = Set(None);
-                info!("Domain verified successfully");
-            }
-            VerificationStatus::Pending => {
-                active_model.status = Set("pending".to_string());
-                active_model.verification_error = Set(None);
-                debug!("Domain verification pending");
-            }
-            VerificationStatus::Failed(msg) => {
-                active_model.status = Set("failed".to_string());
-                active_model.verification_error = Set(Some(msg.clone()));
-                error!("Domain verification failed: {}", msg);
-            }
-            VerificationStatus::NotStarted => {
-                active_model.status = Set("not_started".to_string());
-                active_model.verification_error = Set(None);
-            }
-            VerificationStatus::TemporaryFailure => {
-                active_model.status = Set("temporary_failure".to_string());
-                active_model.verification_error =
-                    Set(Some("DNS records no longer valid".to_string()));
-            }
+        let (status_str, verification_error, last_verified_at) = Self::status_fields(status);
+        active_model.status = Set(status_str);
+        active_model.verification_error = Set(verification_error);
+        if last_verified_at.is_some() {
+            active_model.last_verified_at = Set(last_verified_at);
         }
 
         let result = active_model.update(self.db.as_ref()).await?;
@@ -1074,6 +1095,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: Some(make_mx(DnsRecordStatus::Pending)),
             mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
         };
         assert!(
             DomainService::are_all_records_verified(&details),
@@ -1091,6 +1113,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: Some(make_mx(DnsRecordStatus::Failed)),
             mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
         };
         assert!(
             DomainService::are_all_records_verified(&details),
@@ -1107,6 +1130,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: Some(make_mx(DnsRecordStatus::Verified)),
             mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
         };
         assert!(
             !DomainService::are_all_records_verified(&details),
@@ -1123,6 +1147,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Pending)],
             mx_record: Some(make_mx(DnsRecordStatus::Verified)),
             mail_from_subdomain: Some("send".to_string()),
+            manages_dns_records: true,
         };
         assert!(
             !DomainService::are_all_records_verified(&details),
@@ -1139,10 +1164,38 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(
             DomainService::are_all_records_verified(&details),
             "domain with SPF+DKIM verified and no MX must be considered verified"
+        );
+    }
+
+    /// SMTP-imported domains have no DNS-management API and never return SPF
+    /// or DKIM records at all -- `manages_dns_records: false` must let them
+    /// through the gate immediately, without ever reaching the SPF/DKIM
+    /// presence checks that would otherwise strand them at Pending forever.
+    #[test]
+    fn provider_that_does_not_manage_dns_records_is_verified_without_spf_or_dkim() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: None,
+            dkim_records: vec![],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: false,
+        };
+        assert!(
+            DomainService::are_all_records_verified(&details),
+            "a provider that does not manage DNS records must not be gated on missing SPF/DKIM"
+        );
+        assert!(
+            matches!(
+                DomainService::resolve_verification_status(&details),
+                VerificationStatus::Verified
+            ),
+            "resolve_verification_status must resolve to Verified for an SMTP-style identity"
         );
     }
 
@@ -1154,6 +1207,7 @@ mod tests {
             dkim_records: vec![],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(
             !DomainService::are_all_records_verified(&details),
@@ -1169,6 +1223,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(
             !DomainService::are_all_records_verified(&details),
@@ -1190,6 +1245,7 @@ mod tests {
             dkim_records: vec![],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         let status = DomainService::resolve_verification_status(&details);
         assert!(
@@ -1207,6 +1263,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         let status = DomainService::resolve_verification_status(&details);
         assert!(
@@ -1224,6 +1281,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(matches!(
             DomainService::resolve_verification_status(&details),
@@ -1239,6 +1297,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(matches!(
             DomainService::resolve_verification_status(&details),
@@ -1257,6 +1316,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Pending)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(matches!(
             DomainService::resolve_verification_status(&details),
@@ -1275,6 +1335,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(
             matches!(
@@ -1298,6 +1359,7 @@ mod tests {
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         };
         assert!(
             matches!(

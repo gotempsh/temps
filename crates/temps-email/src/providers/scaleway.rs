@@ -249,6 +249,18 @@ fn parse_scaleway_mx_value(raw: &str) -> (Option<u16>, String) {
     (None, raw.to_string())
 }
 
+/// Extract the `include:<host>` token from a full SPF record value like
+/// `"v=spf1 include:_spf.tem.scaleway.com ~all"`, returning it with the
+/// `include:` prefix intact (e.g. `"include:_spf.tem.scaleway.com"`) so it
+/// can be matched as a substring of whatever TXT record the operator actually
+/// publishes. Returns `None` if the value has no `include:` token.
+fn extract_spf_include(value: &str) -> Option<&str> {
+    let start = value.find("include:")?;
+    let rest = &value[start..];
+    let end = rest.find(' ').unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
 /// Verify that a Scaleway identity's own domain name matches the domain the
 /// caller asked for. Without this check, a stale or mistyped
 /// `provider_identity_id` (e.g. reused from a different domain) would
@@ -386,7 +398,39 @@ impl EmailProvider for ScalewayProvider {
             ))
         })?;
 
-        // First, trigger the check
+        // Confirm the UUID still belongs to this domain before triggering a
+        // provider-side check against it — the check is a side-effecting call
+        // on Scaleway's identity, so a stale or mistyped `provider_identity_id`
+        // must be rejected before it reaches a different domain's identity,
+        // the same way `delete_identity` validates before its DELETE.
+        let precheck_response = self
+            .client
+            .get(self.api_url(&format!("/domains/{}", identity_id)))
+            .header("X-Auth-Token", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| EmailError::Scaleway(format!("Failed to get domain: {}", e)))?;
+
+        if !precheck_response.status().is_success() {
+            let status = precheck_response.status();
+            let body = precheck_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(EmailError::Scaleway(format!(
+                "Failed to get domain ({}) before check: {}",
+                status, body
+            )));
+        }
+
+        let precheck_domain: ScalewayDomainResponse = precheck_response
+            .json()
+            .await
+            .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
+
+        check_identity_domain_matches(identity_id, &precheck_domain.name, domain)?;
+
+        // Now trigger the check
         let check_response = self
             .client
             .post(self.api_url(&format!("/domains/{}/check", identity_id)))
@@ -506,6 +550,21 @@ impl EmailProvider for ScalewayProvider {
         // Verify records via DNS lookup for accurate per-record status
         let dns_verifier = DnsVerifier::new();
 
+        // The include Scaleway actually expects, derived from the authoritative
+        // records.spf/spf_config values already in this response, with a
+        // hardcoded fallback only for the case where Scaleway returns neither.
+        // Verifying against a value parsed from what we just told the user to
+        // publish means this can't silently go stale the way a bare constant
+        // already has once (previously `_spf.scw-tem.cloud`, since corrected).
+        let expected_spf_include: String = domain_response
+            .records
+            .as_ref()
+            .and_then(|r| r.spf.as_ref())
+            .and_then(|r| extract_spf_include(&r.value))
+            .or(domain_response.spf_config.as_deref())
+            .unwrap_or("include:_spf.tem.scaleway.com")
+            .to_string();
+
         // Build SPF record — prefer records.spf (full publishable record) over the
         // raw spf_config snippet, which is only the include:… fragment.
         let spf_record = if let Some(records_spf) = domain_response
@@ -514,7 +573,7 @@ impl EmailProvider for ScalewayProvider {
             .and_then(|r| r.spf.as_ref())
         {
             let spf_status = dns_verifier
-                .verify_spf_record(domain, "_spf.tem.scaleway.com")
+                .verify_spf_record(domain, &expected_spf_include)
                 .await;
             Some(DnsRecord {
                 record_type: "TXT".to_string(),
@@ -528,7 +587,7 @@ impl EmailProvider for ScalewayProvider {
             match domain_response.spf_config {
                 Some(spf_snippet) => {
                     let spf_status = dns_verifier
-                        .verify_spf_record(domain, "_spf.tem.scaleway.com")
+                        .verify_spf_record(domain, &expected_spf_include)
                         .await;
                     Some(DnsRecord {
                         record_type: "TXT".to_string(),
@@ -582,6 +641,7 @@ impl EmailProvider for ScalewayProvider {
             dkim_records,
             mx_record,
             mail_from_subdomain: None,
+            manages_dns_records: true,
         })
     }
 
@@ -844,6 +904,25 @@ mod tests {
         let (priority, host) = parse_scaleway_mx_value("0 mx.example.com");
         assert_eq!(priority, Some(0));
         assert_eq!(host, "mx.example.com");
+    }
+
+    // ── extract_spf_include ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_spf_include_from_full_record_value() {
+        let include = extract_spf_include("v=spf1 include:_spf.tem.scaleway.com ~all");
+        assert_eq!(include, Some("include:_spf.tem.scaleway.com"));
+    }
+
+    #[test]
+    fn extract_spf_include_at_end_of_value() {
+        let include = extract_spf_include("v=spf1 include:_spf.tem.scaleway.com");
+        assert_eq!(include, Some("include:_spf.tem.scaleway.com"));
+    }
+
+    #[test]
+    fn extract_spf_include_returns_none_without_include_token() {
+        assert_eq!(extract_spf_include("v=spf1 ~all"), None);
     }
 
     // ── check_identity_domain_matches ────────────────────────────────────────
