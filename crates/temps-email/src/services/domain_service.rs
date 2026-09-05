@@ -800,17 +800,19 @@ impl DomainService {
     }
 }
 
-/// True only for a Postgres unique-constraint violation (SQLSTATE 23505).
+/// True only for a genuine Postgres unique-constraint violation (SQLSTATE 23505).
 ///
-/// `DbErr::Exec`/`Query`/`RecordNotInserted` also cover connection resets,
-/// statement timeouts and permission-denied-on-table. Mapping that whole
-/// class to "already exists" tells an operator debugging an outage to go
-/// look for a duplicate row that does not exist.
+/// Does NOT match bare `DbErr::RecordNotInserted`: this insert never uses
+/// `on_conflict().do_nothing()`, so a `RecordNotInserted` here means the
+/// query executed without error but returned zero rows — on Postgres that
+/// happens when a row-level-security policy hides the inserted row from the
+/// `RETURNING` clause, not when a unique index rejects the row. Treating it
+/// as "already exists" would hide a permission/RLS misconfiguration behind
+/// an incorrect 409, so it is left to fall through to the generic database
+/// error path instead.
 fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
-    matches!(err, sea_orm::DbErr::RecordNotInserted)
-        || err
-            .sql_err()
-            .is_some_and(|e| matches!(e, sea_orm::SqlErr::UniqueConstraintViolation(_)))
+    err.sql_err()
+        .is_some_and(|e| matches!(e, sea_orm::SqlErr::UniqueConstraintViolation(_)))
 }
 
 #[cfg(test)]
@@ -1321,6 +1323,25 @@ mod tests {
             result.unwrap_err(),
             EmailError::DomainAlreadyExists { provider_id: 1, .. }
         ));
+    }
+
+    // ========== is_unique_violation Tests ==========
+
+    #[test]
+    fn record_not_inserted_is_not_treated_as_a_unique_violation() {
+        // This insert never uses `on_conflict().do_nothing()`, so a bare
+        // `RecordNotInserted` (query succeeded, zero rows returned — e.g. an
+        // RLS policy hiding the row from RETURNING) must not be classified
+        // as "domain already exists": that would hide a permission/RLS
+        // misconfiguration behind an incorrect 409 conflict response.
+        assert!(!is_unique_violation(&sea_orm::DbErr::RecordNotInserted));
+    }
+
+    #[test]
+    fn unrelated_database_errors_are_not_treated_as_a_unique_violation() {
+        assert!(!is_unique_violation(&sea_orm::DbErr::Custom(
+            "connection reset by peer".to_string()
+        )));
     }
 
     #[tokio::test]
