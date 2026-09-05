@@ -2,14 +2,29 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  confirmPendingAction,
+  confirmUserPendingAction,
   createConversation,
   findConversation,
   getAiProviderStatus,
   getConversation,
+  getPendingAction,
+  getUserConversation,
+  getUserPendingAction,
   listAiProviders,
   refreshAiProviderStatus,
+  rejectPendingAction,
+  rejectUserPendingAction,
+  sendProjectAiMessage,
+  sendUserMessage,
+  stopTurn,
+  stopUserTurn,
+  updatePermissionMode,
+  updateUserPermissionMode,
+  uploadUserConversationAttachment,
   type ConversationDetailResponse,
   type ConversationResponse,
+  type SendMessageRequest,
 } from '@/api/client'
 import {
   PermissionCard,
@@ -904,12 +919,14 @@ const ACTION_STATUS: Record<string, { label: string; cls: string }> = {
  * API, so a reloaded chat shows executed/rejected instead of a stale prompt.
  */
 function PendingActionCard({
-  pendingActionBasePath,
+  userScoped,
+  projectId,
   tool,
   onFix,
   onStatusChange,
 }: {
-  pendingActionBasePath: string
+  userScoped: boolean
+  projectId?: number
   tool: ToolCall
   /** Send a follow-up chat message (used by "Fix with AI" on failure). */
   onFix?: (text: string) => void
@@ -941,11 +958,8 @@ function PendingActionCard({
   useEffect(() => {
     if (!actionId) return
     let cancelled = false
-    fetch(`${pendingActionBasePath}/${actionId}`, {
-      credentials: 'include',
-    })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
+    void getScopedPendingAction(userScoped, projectId, actionId)
+      .then(({ data: d }) => {
         if (cancelled || !d) return
         if (typeof d.status === 'string') {
           setStatus(d.status)
@@ -962,7 +976,7 @@ function PendingActionCard({
     return () => {
       cancelled = true
     }
-  }, [pendingActionBasePath, actionId])
+  }, [actionId, projectId, userScoped])
 
   if (committedApplicationProjects) {
     return (
@@ -998,21 +1012,23 @@ function PendingActionCard({
     setBusy(kind)
     setError(null)
     try {
-      const r = await fetch(
-        `${pendingActionBasePath}/${proposal.action_id}/${kind}`,
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-        }
+      const {
+        data: d,
+        error: problem,
+        response,
+      } = await resolveScopedPendingAction(
+        userScoped,
+        projectId,
+        proposal.action_id,
+        kind
       )
-      const d = await r.json().catch(() => null)
-      if (!r.ok) {
+      if (!d) {
+        const detail = problem as { detail?: string } | undefined
         setError(
-          (d as { detail?: string } | null)?.detail ||
-            `Could not ${kind} the action.`
+          detail?.detail ??
+            `Could not ${kind} the action (HTTP ${response?.status ?? 'unknown'}).`
         )
-      } else if (d) {
+      } else {
         if (typeof d.status === 'string') {
           setStatus(d.status)
           onStatusChangeRef.current?.(d.status)
@@ -1250,11 +1266,13 @@ interface StepState {
  * groups and sequences them.
  */
 function PlanActionCard({
-  pendingActionBasePath,
+  userScoped,
+  projectId,
   plan,
   onFix,
 }: {
-  pendingActionBasePath: string
+  userScoped: boolean
+  projectId?: number
   plan: PlanProposal
   /** Send a follow-up chat message (used by "Fix with AI" on a failed step). */
   onFix?: (text: string) => void
@@ -1271,11 +1289,8 @@ function PlanActionCard({
     let cancelled = false
     void Promise.all(
       plan.steps.map((s) =>
-        fetch(`${pendingActionBasePath}/${s.action_id}`, {
-          credentials: 'include',
-        })
-          .then((r) => (r.ok ? r.json() : null))
-          .then((d) => [s.action_id, d] as const)
+        getScopedPendingAction(userScoped, projectId, s.action_id)
+          .then(({ data }) => [s.action_id, data ?? null] as const)
           .catch(() => [s.action_id, null] as const)
       )
     ).then((pairs) => {
@@ -1297,7 +1312,7 @@ function PlanActionCard({
     return () => {
       cancelled = true
     }
-  }, [pendingActionBasePath, plan])
+  }, [plan, projectId, userScoped])
 
   useEffect(() => fetchAll(), [fetchAll])
 
@@ -1319,12 +1334,16 @@ function PlanActionCard({
   const act = async (actionId: string, kind: 'confirm' | 'reject') => {
     setBusy(actionId)
     try {
-      const r = await fetch(`${pendingActionBasePath}/${actionId}/${kind}`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-      })
-      const d = await r.json().catch(() => null)
+      const {
+        data: d,
+        error: problem,
+        response,
+      } = await resolveScopedPendingAction(
+        userScoped,
+        projectId,
+        actionId,
+        kind
+      )
       setStates((prev) => ({
         ...prev,
         [actionId]: {
@@ -1336,9 +1355,9 @@ function PlanActionCard({
             d?.result != null
               ? JSON.stringify(d.result)
               : prev[actionId]?.result,
-          error: !r.ok
-            ? ((d as { detail?: string } | null)?.detail ??
-              `Could not ${kind} this step.`)
+          error: !d
+            ? ((problem as { detail?: string } | undefined)?.detail ??
+              `Could not ${kind} this step (HTTP ${response?.status ?? 'unknown'}).`)
             : typeof d?.error === 'string'
               ? d.error
               : prev[actionId]?.error,
@@ -1506,11 +1525,13 @@ function PlanActionCard({
 
 /** Route a `temps_write` tool part to the plan card or the single-action card. */
 function WriteProposalCard({
-  pendingActionBasePath,
+  userScoped,
+  projectId,
   tool,
   onFix,
 }: {
-  pendingActionBasePath: string
+  userScoped: boolean
+  projectId?: number
   tool: ToolCall
   onFix?: (text: string) => void
 }) {
@@ -1518,14 +1539,16 @@ function WriteProposalCard({
   if (plan)
     return (
       <PlanActionCard
-        pendingActionBasePath={pendingActionBasePath}
+        userScoped={userScoped}
+        projectId={projectId}
         plan={plan}
         onFix={onFix}
       />
     )
   return (
     <PendingActionCard
-      pendingActionBasePath={pendingActionBasePath}
+      userScoped={userScoped}
+      projectId={projectId}
       tool={tool}
       onFix={onFix}
     />
@@ -1659,6 +1682,8 @@ interface DebugChatPanelProps {
   onLiveEvent?: (eventName: string, data: string) => void
   /** Re-read the conversation summary after a message/stop command settles. */
   onConversationStatusInvalidated?: () => void
+  /** Show persisted history without exposing mutation controls. */
+  readOnly?: boolean
 }
 
 export function chatApiPaths(userScoped: boolean, projectId?: number) {
@@ -1675,6 +1700,120 @@ export function chatApiPaths(userScoped: boolean, projectId?: number) {
     conversations: `/api/projects/${projectId}/ai/conversations`,
     pendingActions: `/api/projects/${projectId}/ai/pending-actions`,
   }
+}
+
+function requiredProjectId(projectId?: number): number {
+  if (projectId == null) {
+    throw new Error('A project-scoped chat requires a project id.')
+  }
+  return projectId
+}
+
+function getScopedConversation(
+  userScoped: boolean,
+  projectId: number | undefined,
+  publicId: string,
+  query?: { before?: string; limit?: number }
+) {
+  return userScoped
+    ? getUserConversation({
+        path: { public_id: publicId },
+        query,
+      })
+    : getConversation({
+        path: {
+          project_id: requiredProjectId(projectId),
+          public_id: publicId,
+        },
+        query,
+      })
+}
+
+function getScopedPendingAction(
+  userScoped: boolean,
+  projectId: number | undefined,
+  actionId: string
+) {
+  return userScoped
+    ? getUserPendingAction({ path: { action_public_id: actionId } })
+    : getPendingAction({
+        path: {
+          project_id: requiredProjectId(projectId),
+          action_public_id: actionId,
+        },
+      })
+}
+
+function resolveScopedPendingAction(
+  userScoped: boolean,
+  projectId: number | undefined,
+  actionId: string,
+  kind: 'confirm' | 'reject'
+) {
+  if (userScoped) {
+    return kind === 'confirm'
+      ? confirmUserPendingAction({ path: { action_public_id: actionId } })
+      : rejectUserPendingAction({ path: { action_public_id: actionId } })
+  }
+  const path = {
+    project_id: requiredProjectId(projectId),
+    action_public_id: actionId,
+  }
+  return kind === 'confirm'
+    ? confirmPendingAction({ path })
+    : rejectPendingAction({ path })
+}
+
+function updateScopedPermissionMode(
+  userScoped: boolean,
+  projectId: number | undefined,
+  publicId: string,
+  permissionMode: string
+) {
+  const body = { permission_mode: permissionMode }
+  return userScoped
+    ? updateUserPermissionMode({ path: { public_id: publicId }, body })
+    : updatePermissionMode({
+        path: {
+          project_id: requiredProjectId(projectId),
+          public_id: publicId,
+        },
+        body,
+      })
+}
+
+function stopScopedTurn(
+  userScoped: boolean,
+  projectId: number | undefined,
+  publicId: string
+) {
+  return userScoped
+    ? stopUserTurn({ path: { public_id: publicId } })
+    : stopTurn({
+        path: {
+          project_id: requiredProjectId(projectId),
+          public_id: publicId,
+        },
+      })
+}
+
+async function sendScopedMessage(
+  userScoped: boolean,
+  projectId: number | undefined,
+  publicId: string,
+  body: SendMessageRequest
+) {
+  if (userScoped) {
+    return sendUserMessage({ path: { public_id: publicId }, body })
+  }
+
+  return sendProjectAiMessage({
+    path: {
+      project_id: requiredProjectId(projectId),
+      public_id: publicId,
+    },
+    body,
+  })
 }
 
 export function conversationHistoryErrorMessage(status?: number): string {
@@ -1872,9 +2011,10 @@ function AssistantBody({
   streaming,
   activityLabel,
   turnStartedAt,
-  pendingActionBasePath,
   conversationBasePath,
   conversationPublicId,
+  userScoped,
+  projectId,
   onFix,
   onPermissionResolved,
 }: {
@@ -1882,9 +2022,10 @@ function AssistantBody({
   streaming: boolean
   activityLabel: string
   turnStartedAt?: string | null
-  pendingActionBasePath: string
   conversationBasePath: string
   conversationPublicId: string | null
+  userScoped: boolean
+  projectId?: number
   onFix?: (text: string) => void
   onPermissionResolved?: () => void
 }) {
@@ -1903,7 +2044,8 @@ function AssistantBody({
           isTempsWriteToolName(part.tool.name) ? (
             <WriteProposalCard
               key={part.tool.id}
-              pendingActionBasePath={pendingActionBasePath}
+              userScoped={userScoped}
+              projectId={projectId}
               tool={part.tool}
               onFix={onFix}
             />
@@ -2015,6 +2157,8 @@ export function ensureRunningAssistant(
  */
 function useConversationStream(
   conversationBasePath: string,
+  userScoped: boolean,
+  projectId: number | undefined,
   publicId: string | null,
   turnActiveRef: { current: boolean },
   suppressRef: { current: number },
@@ -2056,12 +2200,11 @@ function useConversationStream(
       const requestedAtRevision = liveEventRevision
       const requestRevision = ++resyncRequestRevision
       try {
-        const response = await fetch(`${conversationBasePath}/${publicId}`, {
-          credentials: 'include',
-        })
-        const data = response.ok
-          ? ((await response.json()) as ConversationDetailResponse)
-          : null
+        const { data } = await getScopedConversation(
+          userScoped,
+          projectId,
+          publicId
+        )
         if (!cancelled && data) {
           const running = hasRunningServerTurn(
             data as typeof data & { turn_status?: string }
@@ -2257,6 +2400,8 @@ function useConversationStream(
     }
   }, [
     conversationBasePath,
+    userScoped,
+    projectId,
     publicId,
     turnActiveRef,
     suppressRef,
@@ -2289,10 +2434,10 @@ export function DebugChatPanel({
   onConversationChange,
   onLiveEvent,
   onConversationStatusInvalidated,
+  readOnly = false,
 }: DebugChatPanelProps) {
   const paths = chatApiPaths(userScoped, projectId)
   const base = paths.conversations
-  const pendingActionBasePath = paths.pendingActions
   const ctxId = String(contextId)
   // Per-chat draft key: a half-typed message survives closing the dock,
   // switching chats, and reloads.
@@ -2408,26 +2553,22 @@ export function DebugChatPanel({
       if (!turnActive || !publicId) return
 
       try {
-        const response = await fetch(`${base}/${publicId}/permission-mode`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({ permission_mode: permissionModeId }),
-        })
-        const payload = (await response.json().catch(() => ({}))) as {
-          ai_permission_mode?: string
-          title?: string
-          detail?: string
-        }
-        if (!response.ok) {
+        const {
+          data: payload,
+          error: problem,
+          response,
+        } = await updateScopedPermissionMode(
+          userScoped,
+          projectId,
+          publicId,
+          permissionModeId
+        )
+        if (!payload) {
           setRuntimeSelection((selection) => ({
             ...selection,
             permissionModeId: previousPermissionModeId,
           }))
-          setError(chatFailureFromProblem(payload, response.status))
+          setError(chatFailureFromProblem(problem, response?.status))
           return
         }
         setRuntimeSelection((selection) => ({
@@ -2448,7 +2589,13 @@ export function DebugChatPanel({
         )
       }
     },
-    [base, publicId, runtimeSelection.permissionModeId, turnActive]
+    [
+      projectId,
+      publicId,
+      runtimeSelection.permissionModeId,
+      turnActive,
+      userScoped,
+    ]
   )
 
   const loadProviderStatus = useCallback(
@@ -2551,6 +2698,8 @@ export function DebugChatPanel({
 
   useConversationStream(
     base,
+    userScoped,
+    projectId,
     publicId,
     turnActiveRef,
     wsSuppressRef,
@@ -2566,13 +2715,12 @@ export function DebugChatPanel({
     if (!publicId) return
     // Execution is server-owned. Stop is therefore an explicit mutation; a
     // client disconnect or cancelled HTTP request never owns task lifetime.
-    void fetch(`${base}/${publicId}/stop`, {
-      method: 'POST',
-      credentials: 'include',
-    })
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error(`Could not stop turn (${response.status})`)
+    void stopScopedTurn(userScoped, projectId, publicId)
+      .then(({ error: problem, response }) => {
+        if (problem) {
+          throw new Error(
+            `Could not stop turn (${response?.status ?? 'unknown'})`
+          )
         }
         setWsTurnActive(false)
         onConversationStatusInvalidated?.()
@@ -2596,14 +2744,11 @@ export function DebugChatPanel({
           )
         )
       })
-  }, [base, onConversationStatusInvalidated, publicId])
+  }, [onConversationStatusInvalidated, projectId, publicId, userScoped])
 
   const composerRef = useRef<HTMLTextAreaElement>(null)
-  const composerDisabled = isChatComposerDisabled(
-    Boolean(publicId),
-    starting,
-    lazyCreate
-  )
+  const composerDisabled =
+    readOnly || isChatComposerDisabled(Boolean(publicId), starting, lazyCreate)
 
   // `autoFocus` handles a composer that mounts enabled. Existing chats first
   // mount disabled while their conversation id loads, so focus again whenever
@@ -2675,18 +2820,14 @@ export function DebugChatPanel({
         // a remounted tab believed the thread was idle while the server still
         // owned a running turn.
         if (id) {
-          const snapshotResponse = await fetch(`${base}/${id}`, {
-            credentials: 'include',
-            cache: 'no-store',
-          })
-          const snapshotPayload = (await snapshotResponse
-            .json()
-            .catch(() => ({}))) as ConversationDetailResponse & {
-            detail?: string
-          }
-          if (!snapshotResponse.ok) {
+          const {
+            data: snapshotPayload,
+            error: snapshotProblem,
+            response: snapshotResponse,
+          } = await getScopedConversation(userScoped, projectId, id)
+          if (!snapshotPayload) {
             setError(
-              chatFailureFromProblem(snapshotPayload, snapshotResponse.status)
+              chatFailureFromProblem(snapshotProblem, snapshotResponse?.status)
             )
             return
           }
@@ -2774,46 +2915,35 @@ export function DebugChatPanel({
           providerPinnedRef.current = true
           setPublicId(conv.public_id)
         }
-        const res = await fetch(`${base}/${id}/messages`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({
-            content,
-            attachments: attachments.map(({ id, name }) => ({ id, name })),
-            turn_id: turnId,
-            ai_model: runtimeSelection.modelId,
-            ai_thinking_level: runtimeSelection.thinkingOptionId,
-            ai_permission_mode: runtimeSelection.permissionModeId,
-            // Ephemeral framing about the page the user is on — not stored or
-            // shown; the backend attaches it to this turn only. Honours the
-            // user's include toggle.
-            page_context:
-              includeContext && pageContext ? pageContext.value : undefined,
-          }),
+        const {
+          data: responsePayload,
+          error: responseProblem,
+          response: res,
+        } = await sendScopedMessage(userScoped, projectId, id, {
+          content,
+          attachments: attachments.map(({ id, name }) => ({ id, name })),
+          turn_id: turnId,
+          ai_model: runtimeSelection.modelId,
+          ai_thinking_level: runtimeSelection.thinkingOptionId,
+          ai_permission_mode: runtimeSelection.permissionModeId,
+          // Ephemeral framing about the page the user is on — not stored or
+          // shown; the backend attaches it to this turn only. Honours the
+          // user's include toggle.
+          page_context:
+            includeContext && pageContext ? pageContext.value : undefined,
         })
-        const responsePayload = (await res.json().catch(() => ({}))) as {
-          detail?: string
-          turn_started_at?: string
-        }
         onConversationStatusInvalidated?.()
-        if (!res.ok) {
-          const problem = responsePayload
-          if (res.status === 409) {
+        if (!responsePayload) {
+          const problem = responseProblem
+          if (res?.status === 409) {
             // Another tab may have won the atomic claim after our preflight.
             // Immediately replace optimism with the authoritative snapshot.
-            const latest = await fetch(`${base}/${id}`, {
-              credentials: 'include',
-              cache: 'no-store',
-            })
-              .then(async (response) =>
-                response.ok
-                  ? ((await response.json()) as ConversationDetailResponse)
-                  : null
-              )
+            const latest = await getScopedConversation(
+              userScoped,
+              projectId,
+              id
+            )
+              .then(({ data }) => data ?? null)
               .catch(() => null)
             if (latest) {
               const running = hasRunningServerTurn(latest)
@@ -2831,9 +2961,9 @@ export function DebugChatPanel({
               setWsTurnActive(true)
               dropOptimisticTurn(setMessages, turnId)
             }
-            setError(chatFailureFromProblem(problem, res.status))
+            setError(chatFailureFromProblem(problem, res?.status))
           } else {
-            setError(chatFailureFromProblem(problem, res.status))
+            setError(chatFailureFromProblem(problem, res?.status))
             dropOptimisticTurn(setMessages, turnId)
           }
           return
@@ -2861,7 +2991,6 @@ export function DebugChatPanel({
       }
     },
     [
-      base,
       publicId,
       lazyCreate,
       userScoped,
@@ -2928,19 +3057,19 @@ export function DebugChatPanel({
             )
             return
           }
-          const form = new FormData()
-          form.append('file', file)
           try {
-            const response = await fetch(`${base}/${publicId}/attachments`, {
-              method: 'POST',
-              credentials: 'include',
-              body: form,
+            const {
+              data: payload,
+              error: problem,
+              response,
+            } = await uploadUserConversationAttachment({
+              path: { public_id: publicId },
+              body: { file },
             })
-            const payload = (await response.json().catch(() => ({}))) as
-              (ChatAttachment & { detail?: string }) | { detail?: string }
-            if (!response.ok || !('id' in payload)) {
+            if (!payload) {
               throw new Error(
-                payload.detail ?? `Could not upload ${file.name}.`
+                (problem as { detail?: string } | undefined)?.detail ??
+                  `Could not upload ${file.name} (HTTP ${response?.status ?? 'unknown'}).`
               )
             }
             const attachment: ChatAttachment = {
@@ -2966,7 +3095,7 @@ export function DebugChatPanel({
       setAttachmentUploads((count) => Math.max(0, count - selected.length))
       if (attachmentInputRef.current) attachmentInputRef.current.value = ''
     },
-    [base, pendingAttachments.length, publicId, userScoped]
+    [pendingAttachments.length, publicId, userScoped]
   )
 
   const removePendingAttachment = useCallback((id: string) => {
@@ -3070,13 +3199,13 @@ export function DebugChatPanel({
         let conv: ConversationResponse | null = null
         if (userScoped) {
           if (!conversationPublicId) return
-          const response = await fetch(`${base}/${conversationPublicId}`, {
-            credentials: 'include',
+          const { data, response } = await getUserConversation({
+            path: { public_id: conversationPublicId },
           })
-          if (!response.ok) {
-            throw new Error(conversationHistoryErrorMessage(response.status))
+          if (!data) {
+            throw new Error(conversationHistoryErrorMessage(response?.status))
           }
-          initialDetail = (await response.json()) as PaginatedConversationDetail
+          initialDetail = data
           conv = initialDetail
         } else if (projectId != null) {
           const result = await findConversation({
@@ -3212,22 +3341,18 @@ export function DebugChatPanel({
       : null
 
     try {
-      const response = await fetch(
-        `${base}/${publicId}?before=${encodeURIComponent(before)}&limit=50`,
-        {
-          credentials: 'include',
-          cache: 'no-store',
-        }
-      )
-      const detail = (await response
-        .json()
-        .catch(() => ({}))) as PaginatedConversationDetail & {
-        detail?: string
-      }
-      if (!response.ok) {
+      const {
+        data: detail,
+        error: problem,
+        response,
+      } = await getScopedConversation(userScoped, projectId, publicId, {
+        before,
+        limit: 50,
+      })
+      if (!detail) {
         throw new Error(
-          detail.detail ??
-            `Couldn’t load earlier messages (HTTP ${response.status}).`
+          (problem as { detail?: string } | undefined)?.detail ??
+            `Couldn’t load earlier messages (HTTP ${response?.status ?? 'unknown'}).`
         )
       }
 
@@ -3248,7 +3373,7 @@ export function DebugChatPanel({
       historyPageRequestRef.current = false
       setLoadingEarlierMessages(false)
     }
-  }, [base, historyPage, publicId])
+  }, [historyPage, projectId, publicId, userScoped])
 
   const handleTranscriptScroll = useCallback(() => {
     const viewport = scrollRef.current
@@ -3315,14 +3440,12 @@ export function DebugChatPanel({
         return
       }
       attempt += 1
-      const detail = await fetch(`${base}/${publicId}`, {
-        credentials: 'include',
-      })
-        .then(async (response) =>
-          response.ok
-            ? ((await response.json()) as ConversationDetailResponse)
-            : null
-        )
+      const detail = await getScopedConversation(
+        userScoped,
+        projectId,
+        publicId
+      )
+        .then(({ data }) => data ?? null)
         .catch(() => null)
       if (cancelled || !detail) {
         release()
@@ -3361,7 +3484,7 @@ export function DebugChatPanel({
       cancelled = true
       release()
     }
-  }, [base, publicId])
+  }, [projectId, publicId, userScoped])
 
   // Report the active conversation id upward (lets the dock reset it).
   useEffect(() => {
@@ -3565,9 +3688,10 @@ export function DebugChatPanel({
                       streaming={liveTurn && isTrailing}
                       activityLabel={activityLabel}
                       turnStartedAt={turnStartedAt}
-                      pendingActionBasePath={pendingActionBasePath}
                       conversationBasePath={base}
                       conversationPublicId={publicId}
+                      userScoped={userScoped}
+                      projectId={projectId}
                       onFix={(text) => void send(text)}
                       onPermissionResolved={pollForReply}
                     />
@@ -3741,326 +3865,337 @@ export function DebugChatPanel({
           </div>
         )}
 
-      <div className="shrink-0 overflow-hidden rounded-2xl border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20">
-        {(pendingAttachments.length > 0 || attachmentUploads > 0) && (
-          <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-            <ChatAttachments
-              attachments={pendingAttachments}
-              onRemove={removePendingAttachment}
-              contentBase={
-                userScoped && publicId
-                  ? `${base}/${publicId}/attachments`
-                  : undefined
+      {readOnly ? (
+        <div className="shrink-0 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          This archived thread is read-only. Restore it from the thread list to
+          continue the conversation.
+        </div>
+      ) : (
+        <div className="shrink-0 overflow-hidden rounded-2xl border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20">
+          {(pendingAttachments.length > 0 || attachmentUploads > 0) && (
+            <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
+              <ChatAttachments
+                attachments={pendingAttachments}
+                onRemove={removePendingAttachment}
+                contentBase={
+                  userScoped && publicId
+                    ? `${base}/${publicId}/attachments`
+                    : undefined
+                }
+              />
+              {attachmentUploads > 0 && (
+                <div className="flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  Uploading {attachmentUploads}
+                </div>
+              )}
+            </div>
+          )}
+          <Textarea
+            ref={composerRef}
+            autoFocus
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={placeholder}
+            rows={2}
+            disabled={composerDisabled}
+            className="min-h-[72px] resize-none overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                submitComposer()
               }
-            />
-            {attachmentUploads > 0 && (
-              <div className="flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-xs text-muted-foreground">
-                <Loader2 className="size-3.5 animate-spin" />
-                Uploading {attachmentUploads}
-              </div>
-            )}
-          </div>
-        )}
-        <Textarea
-          ref={composerRef}
-          autoFocus
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder={placeholder}
-          rows={2}
-          disabled={composerDisabled}
-          className="min-h-[72px] resize-none overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              submitComposer()
-            }
-          }}
-        />
-        <div className="flex items-center justify-between gap-2 border-t px-2 py-1.5 sm:px-3 sm:py-2">
-          <div className="flex min-w-0 flex-wrap items-center gap-1">
-            <input
-              ref={attachmentInputRef}
-              type="file"
-              multiple
-              className="sr-only"
-              onChange={(event) => void uploadAttachments(event.target.files)}
-            />
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 shrink-0 rounded-full"
-              disabled={
-                !userScoped ||
-                !publicId ||
-                attachmentUploads > 0 ||
-                pendingAttachments.length >= 8
-              }
-              onClick={() => attachmentInputRef.current?.click()}
-              aria-label="Attach files or images"
-              title={
-                !publicId
-                  ? 'Create the workspace thread before attaching files'
-                  : 'Attach files or images (20 MB each)'
-              }
-            >
-              <Paperclip className="size-3.5" />
-            </Button>
-            {providerStatusState === 'loading' ? (
-              <div
-                className="flex h-8 items-center gap-2 px-2"
-                role="status"
-                aria-label="Loading AI runtime options"
+            }}
+          />
+          <div className="flex items-center justify-between gap-2 border-t px-2 py-1.5 sm:px-3 sm:py-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-1">
+              <input
+                ref={attachmentInputRef}
+                type="file"
+                multiple
+                className="sr-only"
+                onChange={(event) => void uploadAttachments(event.target.files)}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 shrink-0 rounded-full"
+                disabled={
+                  !userScoped ||
+                  !publicId ||
+                  attachmentUploads > 0 ||
+                  pendingAttachments.length >= 8
+                }
+                onClick={() => attachmentInputRef.current?.click()}
+                aria-label="Attach files or images"
+                title={
+                  !publicId
+                    ? 'Create the workspace thread before attaching files'
+                    : 'Attach files or images (20 MB each)'
+                }
               >
-                <Skeleton className="h-4 w-44 rounded-sm" />
-                <Skeleton className="h-4 w-32 rounded-sm" />
-                <Skeleton className="h-4 w-20 rounded-sm" />
-                <Skeleton className="h-4 w-36 rounded-sm" />
-              </div>
-            ) : (
-              <>
-                <Select
-                  value={selectedProvider}
-                  onValueChange={(providerId) =>
-                    setRuntimeSelection(
-                      resolveChatRuntimeSelection(providerOptions, providerId)
-                    )
-                  }
-                  disabled={
-                    Boolean(publicId) ||
-                    turnActive ||
-                    starting ||
-                    providerOptions.length === 0
-                  }
+                <Paperclip className="size-3.5" />
+              </Button>
+              {providerStatusState === 'loading' ? (
+                <div
+                  className="flex h-8 items-center gap-2 px-2"
+                  role="status"
+                  aria-label="Loading AI runtime options"
                 >
-                  <SelectTrigger
-                    className="h-8 w-auto max-w-64 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
-                    title={
-                      publicId
-                        ? 'Provider is fixed when a conversation is created'
-                        : 'Choose the provider for this new chat'
+                  <Skeleton className="h-4 w-44 rounded-sm" />
+                  <Skeleton className="h-4 w-32 rounded-sm" />
+                  <Skeleton className="h-4 w-20 rounded-sm" />
+                  <Skeleton className="h-4 w-36 rounded-sm" />
+                </div>
+              ) : (
+                <>
+                  <Select
+                    value={selectedProvider}
+                    onValueChange={(providerId) =>
+                      setRuntimeSelection(
+                        resolveChatRuntimeSelection(providerOptions, providerId)
+                      )
+                    }
+                    disabled={
+                      Boolean(publicId) ||
+                      turnActive ||
+                      starting ||
+                      providerOptions.length === 0
                     }
                   >
-                    {publicId ? (
-                      <Lock className="mr-1 h-3 w-3 shrink-0" />
-                    ) : null}
-                    {selectedProvider && (
-                      <AiHarnessLogo
-                        providerId={selectedProvider}
-                        size={20}
-                        className="mr-1"
+                    <SelectTrigger
+                      className="h-8 w-auto max-w-64 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                      title={
+                        publicId
+                          ? 'Provider is fixed when a conversation is created'
+                          : 'Choose the provider for this new chat'
+                      }
+                    >
+                      {publicId ? (
+                        <Lock className="mr-1 h-3 w-3 shrink-0" />
+                      ) : null}
+                      {selectedProvider && (
+                        <AiHarnessLogo
+                          providerId={selectedProvider}
+                          size={20}
+                          className="mr-1"
+                        />
+                      )}
+                      <SelectValue>
+                        {selectedProviderOption
+                          ? chatProviderLabel(selectedProviderOption)
+                          : providerOptions.length === 0
+                            ? 'No provider configured'
+                            : 'Select provider'}
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {providerOptions.map((provider) => (
+                        <SelectItem key={provider.id} value={provider.id}>
+                          <span className="flex items-center gap-2">
+                            <AiHarnessLogo providerId={provider.id} size={22} />
+                            <span>{chatProviderLabel(provider)}</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  {providerStatusState === 'success' &&
+                    providerOptions.length === 0 && (
+                      <Button
+                        asChild
+                        variant="link"
+                        size="sm"
+                        className="h-8 px-1 text-xs"
+                      >
+                        <a
+                          href={
+                            contextType === 'application'
+                              ? '/agent-sandbox/providers'
+                              : '/ai-gateway'
+                          }
+                        >
+                          {contextType === 'application'
+                            ? 'Configure a harness'
+                            : 'Configure an AI provider'}
+                        </a>
+                      </Button>
+                    )}
+
+                  {selectedProviderOption &&
+                    selectedProviderOption.models.length > 0 && (
+                      <SearchableSelect
+                        value={runtimeSelection.modelId ?? undefined}
+                        onValueChange={(modelId) =>
+                          setRuntimeSelection(
+                            resolveChatRuntimeSelection(
+                              providerOptions,
+                              selectedProvider,
+                              {
+                                modelId,
+                                permissionModeId:
+                                  runtimeSelection.permissionModeId,
+                              }
+                            )
+                          )
+                        }
+                        options={modelOptions}
+                        placeholder="Model"
+                        searchPlaceholder="Search models..."
+                        emptyText="No matching models."
+                        searchMode="contains"
+                        disabled={turnActive || starting}
+                        icon={
+                          <Sparkles className="mr-1 h-3.5 w-3.5 shrink-0" />
+                        }
+                        title="Choose the model for the next turn"
+                        className="h-8 w-auto max-w-56 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
                       />
                     )}
-                    <SelectValue>
-                      {selectedProviderOption
-                        ? chatProviderLabel(selectedProviderOption)
-                        : providerOptions.length === 0
-                          ? 'No provider configured'
-                          : 'Select provider'}
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providerOptions.map((provider) => (
-                      <SelectItem key={provider.id} value={provider.id}>
-                        <span className="flex items-center gap-2">
-                          <AiHarnessLogo providerId={provider.id} size={22} />
-                          <span>{chatProviderLabel(provider)}</span>
-                        </span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
 
-                {providerStatusState === 'success' &&
-                  providerOptions.length === 0 && (
-                    <Button
-                      asChild
-                      variant="link"
-                      size="sm"
-                      className="h-8 px-1 text-xs"
-                    >
-                      <a
-                        href={
-                          contextType === 'application'
-                            ? '/agent-sandbox/providers'
-                            : '/ai-gateway'
+                  {selectedModelOption &&
+                    (
+                      selectedModelOption.tool_thinking_options ??
+                      selectedModelOption.thinking_options
+                    ).length > 0 && (
+                      <Select
+                        value={runtimeSelection.thinkingOptionId ?? undefined}
+                        onValueChange={(thinkingOptionId) =>
+                          setRuntimeSelection((selection) => ({
+                            ...selection,
+                            thinkingOptionId,
+                          }))
                         }
+                        disabled={turnActive || starting}
                       >
-                        {contextType === 'application'
-                          ? 'Configure a harness'
-                          : 'Configure an AI provider'}
-                      </a>
-                    </Button>
-                  )}
-
-                {selectedProviderOption &&
-                  selectedProviderOption.models.length > 0 && (
-                    <SearchableSelect
-                      value={runtimeSelection.modelId ?? undefined}
-                      onValueChange={(modelId) =>
-                        setRuntimeSelection(
-                          resolveChatRuntimeSelection(
-                            providerOptions,
-                            selectedProvider,
-                            {
-                              modelId,
-                              permissionModeId:
-                                runtimeSelection.permissionModeId,
-                            }
-                          )
-                        )
-                      }
-                      options={modelOptions}
-                      placeholder="Model"
-                      searchPlaceholder="Search models..."
-                      emptyText="No matching models."
-                      searchMode="contains"
-                      disabled={turnActive || starting}
-                      icon={<Sparkles className="mr-1 h-3.5 w-3.5 shrink-0" />}
-                      title="Choose the model for the next turn"
-                      className="h-8 w-auto max-w-56 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
-                    />
-                  )}
-
-                {selectedModelOption &&
-                  (
-                    selectedModelOption.tool_thinking_options ??
-                    selectedModelOption.thinking_options
-                  ).length > 0 && (
-                    <Select
-                      value={runtimeSelection.thinkingOptionId ?? undefined}
-                      onValueChange={(thinkingOptionId) =>
-                        setRuntimeSelection((selection) => ({
-                          ...selection,
-                          thinkingOptionId,
-                        }))
-                      }
-                      disabled={turnActive || starting}
-                    >
-                      <SelectTrigger
-                        className="h-8 w-auto max-w-40 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
-                        title={
-                          publicId
-                            ? 'Choose the reasoning level for the next turn'
-                            : 'Choose how much reasoning the model should use'
-                        }
-                      >
-                        <Brain
-                          className="mr-1 size-4 shrink-0"
-                          aria-hidden="true"
-                        />
-                        <SelectValue placeholder="Thinking" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {(
-                          selectedModelOption.tool_thinking_options ??
-                          selectedModelOption.thinking_options
-                        ).map((option) => (
-                          <SelectItem key={option.id} value={option.id}>
-                            {chatThinkingItemContent(option)}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
-
-                {selectedProviderOption &&
-                  selectedProviderOption.permission_modes.length > 0 && (
-                    <Select
-                      value={runtimeSelection.permissionModeId ?? undefined}
-                      onValueChange={(permissionModeId) =>
-                        void changePermissionMode(permissionModeId)
-                      }
-                      disabled={
-                        starting ||
-                        (turnActive &&
-                          permissionModeIsAuto(
-                            runtimeSelection.permissionModeId
-                          ))
-                      }
-                    >
-                      <SelectTrigger
-                        className="h-8 w-auto max-w-48 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
-                        title={
-                          turnActive
-                            ? 'Switch this running sandbox turn to Auto'
-                            : 'Choose the permission mode for the next turn'
-                        }
-                      >
-                        <Shield className="mr-1 h-3.5 w-3.5 shrink-0" />
-                        <SelectValue placeholder="Permissions" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {selectedProviderOption.permission_modes.map((mode) => (
-                          <SelectItem
-                            key={mode.id}
-                            value={mode.id}
-                            disabled={permissionModeOptionDisabled(
-                              turnActive,
-                              mode.id
-                            )}
-                          >
-                            {chatPermissionLabel(mode)}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
-
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8 shrink-0"
-                  disabled={providerRefreshing || turnActive || starting}
-                  onClick={() => void loadProviderStatus(true)}
-                  aria-label="Refresh provider authentication and models"
-                  title="Refresh provider authentication and models"
-                >
-                  <RefreshCw
-                    className={cn(
-                      'h-3.5 w-3.5',
-                      providerRefreshing && 'animate-spin'
+                        <SelectTrigger
+                          className="h-8 w-auto max-w-40 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                          title={
+                            publicId
+                              ? 'Choose the reasoning level for the next turn'
+                              : 'Choose how much reasoning the model should use'
+                          }
+                        >
+                          <Brain
+                            className="mr-1 size-4 shrink-0"
+                            aria-hidden="true"
+                          />
+                          <SelectValue placeholder="Thinking" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {(
+                            selectedModelOption.tool_thinking_options ??
+                            selectedModelOption.thinking_options
+                          ).map((option) => (
+                            <SelectItem key={option.id} value={option.id}>
+                              {chatThinkingItemContent(option)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     )}
-                  />
-                </Button>
-              </>
+
+                  {selectedProviderOption &&
+                    selectedProviderOption.permission_modes.length > 0 && (
+                      <Select
+                        value={runtimeSelection.permissionModeId ?? undefined}
+                        onValueChange={(permissionModeId) =>
+                          void changePermissionMode(permissionModeId)
+                        }
+                        disabled={
+                          starting ||
+                          (turnActive &&
+                            permissionModeIsAuto(
+                              runtimeSelection.permissionModeId
+                            ))
+                        }
+                      >
+                        <SelectTrigger
+                          className="h-8 w-auto max-w-48 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                          title={
+                            turnActive
+                              ? 'Switch this running sandbox turn to Auto'
+                              : 'Choose the permission mode for the next turn'
+                          }
+                        >
+                          <Shield className="mr-1 h-3.5 w-3.5 shrink-0" />
+                          <SelectValue placeholder="Permissions" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {selectedProviderOption.permission_modes.map(
+                            (mode) => (
+                              <SelectItem
+                                key={mode.id}
+                                value={mode.id}
+                                disabled={permissionModeOptionDisabled(
+                                  turnActive,
+                                  mode.id
+                                )}
+                              >
+                                {chatPermissionLabel(mode)}
+                              </SelectItem>
+                            )
+                          )}
+                        </SelectContent>
+                      </Select>
+                    )}
+
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 shrink-0"
+                    disabled={providerRefreshing || turnActive || starting}
+                    onClick={() => void loadProviderStatus(true)}
+                    aria-label="Refresh provider authentication and models"
+                    title="Refresh provider authentication and models"
+                  >
+                    <RefreshCw
+                      className={cn(
+                        'h-3.5 w-3.5',
+                        providerRefreshing && 'animate-spin'
+                      )}
+                    />
+                  </Button>
+                </>
+              )}
+            </div>
+            {turnActive && !input.trim() ? (
+              <Button
+                type="button"
+                onClick={stop}
+                size="icon"
+                variant="secondary"
+                className="rounded-full"
+                title="Stop generating"
+                aria-label="Stop generating"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+              </Button>
+            ) : (
+              <Button
+                onClick={submitComposer}
+                disabled={
+                  (!input.trim() && pendingAttachments.length === 0) ||
+                  attachmentUploads > 0 ||
+                  (!publicId && !lazyCreate) ||
+                  (!publicId && providerOptions.length === 0)
+                }
+                size="icon"
+                className="rounded-full"
+                aria-label={
+                  streaming ? 'Interrupt and send message' : 'Send message'
+                }
+                title={streaming ? 'Interrupt and send message' : undefined}
+              >
+                <Send className="h-4 w-4" />
+              </Button>
             )}
           </div>
-          {turnActive && !input.trim() ? (
-            <Button
-              type="button"
-              onClick={stop}
-              size="icon"
-              variant="secondary"
-              className="rounded-full"
-              title="Stop generating"
-              aria-label="Stop generating"
-            >
-              <Square className="h-3.5 w-3.5 fill-current" />
-            </Button>
-          ) : (
-            <Button
-              onClick={submitComposer}
-              disabled={
-                (!input.trim() && pendingAttachments.length === 0) ||
-                attachmentUploads > 0 ||
-                (!publicId && !lazyCreate) ||
-                (!publicId && providerOptions.length === 0)
-              }
-              size="icon"
-              className="rounded-full"
-              aria-label={
-                streaming ? 'Interrupt and send message' : 'Send message'
-              }
-              title={streaming ? 'Interrupt and send message' : undefined}
-            >
-              <Send className="h-4 w-4" />
-            </Button>
-          )}
         </div>
-      </div>
+      )}
     </div>
   )
 }

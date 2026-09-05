@@ -39,6 +39,9 @@ impl MigrationTrait for Migration {
                      CHECK (pids_limit BETWEEN 64 AND 2048), \
                    ADD CONSTRAINT ai_application_workspaces_disk_check \
                      CHECK (disk_limit_mb BETWEEN 512 AND 65536); \
+                 /* SeaORM runs this migration transactionally, so PostgreSQL
+                    cannot build this index CONCURRENTLY. A brief write lock on
+                    sandboxes during upgrade is expected. */ \
                  CREATE UNIQUE INDEX uq_sandboxes_active_application_workspace \
                    ON sandboxes (user_id, name) \
                    WHERE name LIKE 'ai-application:%' AND status <> 'destroyed';",

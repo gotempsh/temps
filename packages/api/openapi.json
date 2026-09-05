@@ -2047,6 +2047,104 @@
         ],
         "type": "object"
       },
+      "AnalyticsIngestKey": {
+        "description": "An analytics ingest key as returned by the admin API.\n\n`public_key` is present in full on every response — see the module docs.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Exact origins (`scheme://host[:port]`) permitted to use this key from a\nbrowser. `None` or `[]` means any origin. This is a browser-enforced\nconvenience control, not authentication — a non-browser client ignores\n`Origin` entirely.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "`None` means the key is scoped to the whole project. An\nenvironment-scoped key additionally attributes ingested data to that\nenvironment's current deployment, when it has one.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "event_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "last_used_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Operator-facing label.",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "public_key": {
+            "description": "The ingest key itself, `pa_` + 64 hex characters.\n\n**Not a secret.** It is designed to ship in client-side JavaScript and\nis returned unmasked so operators can copy it. See the module docs.",
+            "type": "string"
+          },
+          "rate_limit_per_minute": {
+            "description": "`None` or `<= 0` means unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "revoked_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "public_key",
+          "is_active",
+          "event_count",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "AnalyticsSessionEventsResponse": {
         "properties": {
           "events": {
@@ -3312,7 +3410,10 @@
             "type": "string"
           },
           "repository": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "slug": {
             "type": "string"
@@ -3322,7 +3423,6 @@
           "id",
           "name",
           "slug",
-          "repository",
           "main_branch",
           "is_private",
           "is_primary",
@@ -4746,7 +4846,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image being used",
-            "example": "ghcr.io/rustfs/rustfs:0.5.0",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -4764,7 +4864,7 @@
           },
           "version": {
             "description": "Current version (if running)",
-            "example": "0.5.0",
+            "example": "1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -6304,6 +6404,13 @@
       "ComposePublicPort": {
         "description": "A port that should be exposed publicly through the proxy for a compose service.",
         "properties": {
+          "healthCheckPath": {
+            "description": "Optional user override for the public health probe. When absent, Temps\nuses the path discovered from this service's Compose healthcheck.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "port": {
             "description": "Container port to expose (e.g. 8123)",
             "format": "int32",
@@ -7603,6 +7710,20 @@
           }
         ]
       },
+      "ConversationListScope": {
+        "enum": [
+          "all",
+          "global"
+        ],
+        "type": "string"
+      },
+      "ConversationListStatus": {
+        "enum": [
+          "active",
+          "archived"
+        ],
+        "type": "string"
+      },
       "ConversationMessagePageResponse": {
         "properties": {
           "has_more": {
@@ -7988,6 +8109,45 @@
         ],
         "type": "object"
       },
+      "CreateAnalyticsIngestKeyRequest": {
+        "description": "Request body for minting a new ingest key.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Exact origins permitted to use this key from a browser. Omit or send an\nempty array to allow any origin.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Scope the key to a single environment. Recommended: it lets Temps\nattribute ingested data to that environment's current deployment.\nOmit for a project-wide key.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Operator-facing label. Defaults to \"Default ingest key\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rate_limit_per_minute": {
+            "description": "Requests per minute for this key. Omit for the 600/min default; send a\nnon-positive value for unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "CreateApiKeyRequest": {
         "properties": {
           "expires_at": {
@@ -8216,6 +8376,14 @@
           "schedule_expression": {
             "type": "string"
           },
+          "service_ids": {
+            "description": "External services to target when `target_all_services` is `false`.\nThe schedule and these memberships are created atomically, so an\nenabled schedule can never be observed without its requested targets.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "tags": {
             "items": {
               "type": "string"
@@ -8223,7 +8391,7 @@
             "type": "array"
           },
           "target_all_services": {
-            "description": "When `true` (default), the schedule backs up every external service\non the host — including databases created in the future. When\n`false`, the schedule backs up only the services explicitly attached\nvia `POST /backups/schedules/{id}/services`. Omit to use the default.",
+            "description": "When `true` (default), the schedule backs up every external service\non the host — including databases created in the future. When\n`false`, the schedule backs up only the services supplied in\n`service_ids` (or later attached through the schedule-services API).\nOmit to use the default.",
             "type": [
               "boolean",
               "null"
@@ -8650,7 +8818,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "When true the variable is treated as write-only: never returned in\nplaintext from the API, masked in the UI, and updates that omit the\nvalue preserve the existing ciphertext. The flag is one-way — secret\nvars cannot be demoted back to regular vars.",
+            "description": "When true the variable is masked in list responses and can only be\nviewed through the permission-checked, audited per-variable reveal\nendpoint. Updates that omit the value preserve the existing ciphertext.\nThe flag is one-way — secret vars cannot be demoted to regular vars.",
             "type": "boolean"
           },
           "key": {
@@ -9427,11 +9595,37 @@
         "type": "object"
       },
       "CreateProjectFromTemplateRequest": {
-        "description": "Request to create a project from a template\n\nSupports two deploy modes:\n  * **Fork mode** — when `git_provider_connection_id` is set, the template\n    repo is cloned into a new repository under the user's Git account and the\n    project tracks that fork (git-push deploys, automatic deploy on push).\n  * **One-click public-repo mode** — when `git_provider_connection_id` is\n    omitted, the project deploys directly from the template's public source\n    repository (no fork, no Git account required). This is the activation\n    path: a brand-new user with no Git provider connected can still deploy a\n    demo in one click. `repository_name` / `repository_owner` are ignored in\n    this mode, and automatic-deploy-on-push is unavailable (there is no fork\n    to receive webhooks).",
+        "description": "Request to create a project from a template\n\nSupports three deploy modes:\n  * **Native image service mode** — curated service templates deploy a\n    digest-pinned container image and retain their template release identity,\n    runtime configuration, and managed-service bindings.\n  * **Fork mode** — when `git_provider_connection_id` is set, the template\n    repo is cloned into a new repository under the user's Git account and the\n    project tracks that fork (git-push deploys, automatic deploy on push).\n  * **One-click public-repo mode** — when `git_provider_connection_id` is\n    omitted, the project deploys directly from the template's public source\n    repository (no fork, no Git account required). This is the activation\n    path: a brand-new user with no Git provider connected can still deploy a\n    demo in one click. `repository_name` / `repository_owner` are ignored in\n    this mode, and automatic-deploy-on-push is unavailable (there is no fork\n    to receive webhooks).",
         "properties": {
           "automatic_deploy": {
             "description": "Enable automatic deployment on push (defaults to true). Only honoured in\nfork mode; public-repo deploys cannot receive push webhooks.",
             "type": "boolean"
+          },
+          "command": {
+            "description": "Optional image entrypoint arguments. An empty list explicitly uses the\nimage's own default command instead of the template command.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cpu_limit": {
+            "description": "CPU limit override in microcores. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpu_request": {
+            "description": "CPU request override in microcores (1_000_000 = one CPU core).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "environment_variables": {
             "description": "Environment variables to set (key-value pairs)",
@@ -9440,8 +9634,46 @@
             },
             "type": "array"
           },
+          "exposed_port": {
+            "description": "Public container port override.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "git_provider_connection_id": {
             "description": "Git provider connection ID. When omitted, the project deploys directly\nfrom the template's public source repository instead of forking it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "health_check_path": {
+            "description": "Relative HTTP health-check path override.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Optional prebuilt-image override. Curated template values remain the\ndefault when this is omitted. Accepted only for image templates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "description": "Memory limit override in MiB. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_request": {
+            "description": "Memory request override in MiB.",
             "format": "int32",
             "type": [
               "integer",
@@ -9492,6 +9724,20 @@
       "CreateProjectFromTemplateResponse": {
         "description": "Response after creating a project from template",
         "properties": {
+          "deployment_error": {
+            "description": "Actionable retry guidance when project creation succeeded but deployment\ndispatch did not. Internal queue errors are never exposed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_queued": {
+            "description": "Whether the initial deployment was successfully queued. This is set for\nnative image service templates; Git-backed modes use their pipeline flow.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "message": {
             "description": "Message with additional info",
             "type": "string"
@@ -9561,8 +9807,15 @@
               "null"
             ]
           },
+          "expected_slug": {
+            "description": "Optimistically reserved slug used by template creation to ensure the\npersisted project receives the URL shown during configuration.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "exposed_port": {
-            "description": "Port exposed by the container (fallback when image has no EXPOSE directive)\n\nPriority order for port resolution:\n1. Image EXPOSE directive (auto-detected from built image)\n2. Environment-level exposed_port (overrides this value per environment)\n3. This project-level exposed_port (fallback)\n4. Default: 3000\n\nOnly set this if your image doesn't use EXPOSE directive.",
+            "description": "Explicit port exposed by the container.\n\nPriority order for port resolution:\n1. Environment-level exposed_port (explicit override)\n2. This project-level exposed_port (explicit override)\n3. Image EXPOSE directive (auto-detected from built image)\n4. Default: 3000\n\nSet this when the desired application port differs from the image's\nfirst EXPOSE directive (for example, an image exposing HTTP and HTTPS).",
             "example": 8080,
             "format": "int32",
             "type": [
@@ -9805,6 +10058,14 @@
           "access_key_id": {
             "type": "string"
           },
+          "backing_service_id": {
+            "description": "Managed RustFS/S3 service that supplies this destination. When set,\nschedules using this source can never target that service itself.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "bucket_name": {
             "type": "string"
           },
@@ -9962,7 +10223,7 @@
             ]
           },
           "project_id": {
-            "description": "Create the sandbox against a temps project (temps-native). The\nproject's connected repo and git credential seed the work dir when\nno explicit `source` is given, and the sandbox is attributed to the\nproject so it can be listed alongside it.\n\nRequires access to the project — the same team/scope rules that\ngate every other project-scoped endpoint apply.",
+            "description": "Create the sandbox against a temps project (temps-native). The\nproject's connected repo and git credential seed the work dir when\nno explicit `source` is given, and the sandbox is attributed to the\nproject so it can be listed alongside it.\n\nRequires access to the project and `git_repositories:read` when Temps\nderives the source from the project. The same team/scope rules that\ngate every other project-scoped endpoint apply.",
             "format": "int32",
             "type": [
               "integer",
@@ -10921,6 +11182,16 @@
             "description": "Claim an image already present in the platform host's Docker daemon.\nTemps retags it into a generated project-owned namespace and records\nits immutable image ID. Never set this for a registry image.",
             "type": "boolean"
           },
+          "command": {
+            "description": "Optional container command override. Each entry is passed directly as\none argv element; no shell parsing or interpolation is performed.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "external_image_id": {
             "description": "External image ID (if already registered). If provided without image_ref,\nthe image reference will be fetched from the registered external image.",
             "format": "int32",
@@ -11624,6 +11895,16 @@
             "description": "Docker builder used (e.g., \"nixpacks\", \"dockerfile\")",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "command": {
+            "description": "Command passed to a prebuilt image entrypoint. Stored in deployment\nmetadata so redeploy, rollback, and node failover reproduce the exact\nworkload rather than falling back to the image default.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },
@@ -13535,6 +13816,13 @@
               "$ref": "#/components/schemas/ComposePublicPort"
             },
             "type": "array"
+          },
+          "relaxedCapabilityServices": {
+            "description": "Services granted the limited startup capability profile after explicit approval.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -13637,6 +13925,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "imageRuntime": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageRuntimeConfig",
+                "description": "Durable runtime selected for a curated single-container image template."
+              }
             ]
           },
           "variant": {
@@ -14018,6 +14317,13 @@
           },
           "directory": {
             "type": "string"
+          },
+          "dockerfilePath": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `directory` of `\".\"`). `None` for a Dockerfile located\ndirectly at `{directory}/Dockerfile` and for every non-Dockerfile\npreset.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "isStatic": {
             "type": "boolean"
@@ -14722,7 +15028,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image to use (optional, defaults to RustFS)",
-            "example": "ghcr.io/rustfs/rustfs:0.5.0",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -15161,7 +15467,7 @@
         "description": "Input for environment variable",
         "properties": {
           "is_secret": {
-            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
             "type": "boolean"
           },
           "name": {
@@ -15230,6 +15536,55 @@
         ],
         "type": "object"
       },
+      "EnvVarTemplate": {
+        "description": "Environment variable template definition",
+        "properties": {
+          "default": {
+            "description": "Default value if not provided by user",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_generator": {
+            "description": "Frontend-side generator for the default value. Recognised values:\n`app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),\n`random_hex_32` (32-byte hex). Unknown values are ignored client-side.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Description of what this variable is used for",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "example": {
+            "description": "Example value for documentation",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Name of the environment variable",
+            "type": "string"
+          },
+          "required": {
+            "description": "Whether this variable is required",
+            "type": "boolean"
+          },
+          "secret": {
+            "description": "Explicit sensitivity classification for credentials whose names do not\nmatch the conservative built-in heuristic.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "EnvVarTemplateResponse": {
         "description": "Environment variable template response",
         "properties": {
@@ -15268,11 +15623,16 @@
           "required": {
             "description": "Whether this variable is required",
             "type": "boolean"
+          },
+          "secret": {
+            "description": "Whether values must use the protected secret reveal path.",
+            "type": "boolean"
           }
         },
         "required": [
           "name",
-          "required"
+          "required",
+          "secret"
         ],
         "type": "object"
       },
@@ -15543,7 +15903,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "Whether the variable is a write-only secret. Secrets always have\n`value: None` in responses.",
+            "description": "Whether the variable is a secret. Secrets always have `value: None` in\nlist responses.",
             "type": "boolean"
           },
           "key": {
@@ -15554,7 +15914,7 @@
             "type": "integer"
           },
           "value": {
-            "description": "Plaintext value for non-secret vars (or `\"***\"` mask for list responses).\n`None` for secret vars — secrets are write-only.",
+            "description": "Plaintext value for non-secret vars (or `\"***\"` mask for list responses).\n`None` for secret vars; use the audited per-variable reveal endpoint.",
             "type": [
               "string",
               "null"
@@ -16425,6 +16785,13 @@
               "null"
             ]
           },
+          "domain": {
+            "description": "The tracked site's own domain, computed client-side by the SDK's\n`resolveDomain()` and sent as a sibling of `event_data` (not nested\ninside it). Used on the keyed ingest path (ADR-040 §3) to attribute\nself-referrals/channels correctly: there, `Host` names the Temps\nserver rather than the customer's site, so it can't be used for that.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "event_data": {},
           "event_name": {
             "type": "string"
@@ -16502,6 +16869,13 @@
               "null"
             ]
           },
+          "session_id": {
+            "description": "Client-generated session id fallback (see `visitor_id`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ttfb": {
             "description": "Time to First Byte (milliseconds)",
             "format": "float",
@@ -16523,6 +16897,13 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "visitor_id": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).\nAccepts the SDK's `visitorId` key too, since the shared SDK helper that\ngenerates this value sends camelCase for every ingest endpoint.",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -17367,6 +17748,19 @@
           "service_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "service_name_snapshot": {
+            "description": "Immutable provenance retained when the source service is deleted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_type_snapshot": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "size_bytes": {
             "format": "int64",
@@ -19592,6 +19986,30 @@
         ],
         "type": "object"
       },
+      "GitRef": {
+        "description": "Git repository reference (supports any git provider: GitHub, GitLab, Bitbucket, etc.)",
+        "properties": {
+          "path": {
+            "description": "Path within the repository (for monorepos)\nAlso accepts \"subfolder\" as an alias in YAML/JSON",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ref": {
+            "description": "Git reference (branch, tag, or commit)",
+            "type": "string"
+          },
+          "url": {
+            "description": "Git repository URL (e.g., \"https://github.com/owner/repo.git\" or \"https://gitlab.com/owner/repo.git\")",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
       "GitRefResponse": {
         "description": "Git repository reference response",
         "properties": {
@@ -20672,6 +21090,34 @@
         },
         "type": "object"
       },
+      "ImageRuntimeConfig": {
+        "description": "Editable runtime settings for a single-container image template.\n\nMulti-container service templates will use a separate container collection;\nkeeping this shape explicitly singular prevents silently applying one image\nor command to an unrelated sidecar.",
+        "properties": {
+          "command": {
+            "description": "`None` explicitly means \"use the image's default command\". Keep the\nserialized `null` when a runtime snapshot exists so clients can\ndistinguish that choice from an omitted runtime setting.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "healthCheckPath": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "imageRef": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "imageRef"
+        ],
+        "type": "object"
+      },
       "ImportApplicationWorkspaceGitRequest": {
         "additionalProperties": false,
         "properties": {
@@ -21184,6 +21630,113 @@
           "warnings",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "ImportTraefikAcmeJsonRequest": {
+        "description": "Request body for Path B: import from Traefik's `acme.json`.\n\n`Debug` is hand-written: `acme_json` contains Traefik's private keys and\nmust never appear in logs. Only the host list, renewal method, dry-run flag,\nand byte length are logged.",
+        "properties": {
+          "acknowledge_manual_dns_renewal": {
+            "description": "Required when `renewal_method` is `\"dns-01\"` and no auto-manage zone\ncovers the host.",
+            "type": "boolean"
+          },
+          "acme_json": {
+            "description": "Raw contents of the Traefik `acme.json` file (uploaded by the CLI or\npasted in the console). **Never** a server-side file path.\nRedacted in `Debug` output — the field holds private key material.",
+            "type": "string"
+          },
+          "dry_run": {
+            "description": "`true` → full parse and validation, no writes. The identical per-host\nverdicts are returned, giving the operator a preview before committing.",
+            "type": "boolean"
+          },
+          "hosts": {
+            "description": "Hosts to import. Only hosts that appear in the document's certificates\n(by X.509 SAN, not JSON `domain.main`) are accepted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "renewal_method": {
+            "description": "`\"http-01\"` or `\"dns-01\"`. Stored as `verification_method` so the\nrenewal scheduler knows how to renew.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "acme_json",
+          "hosts",
+          "renewal_method"
+        ],
+        "type": "object"
+      },
+      "ImportTraefikAcmeJsonResponse": {
+        "description": "Response body for the Path B import endpoint.",
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "failed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "succeeded": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_requested": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "verdicts": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedHostVerdict"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dry_run",
+          "total_requested",
+          "succeeded",
+          "failed",
+          "verdicts"
+        ],
+        "type": "object"
+      },
+      "ImportedHostVerdict": {
+        "description": "Per-host result from a Path B import.",
+        "properties": {
+          "error": {
+            "description": "Human-readable failure reason when `success` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          },
+          "not_after": {
+            "description": "ISO 8601 expiry of the imported certificate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sans": {
+            "description": "DNS SANs carried in the imported certificate.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "success": {
+            "description": "Whether the cert was written (or would be written on `dry_run: false`).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "host",
+          "success",
+          "sans"
         ],
         "type": "object"
       },
@@ -22145,6 +22698,9 @@
       },
       "LatestDeploymentMediaResponseItem": {
         "properties": {
+          "latest_attempt_status": {
+            "type": "string"
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -22163,7 +22719,8 @@
           }
         },
         "required": [
-          "project_id"
+          "project_id",
+          "latest_attempt_status"
         ],
         "type": "object"
       },
@@ -22429,6 +22986,29 @@
         "type": "object"
       },
       "ListDeploymentTokensQuery": {
+        "properties": {
+          "page": {
+            "example": 1,
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page_size": {
+            "example": 20,
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ListDiscoveredRoutesQuery": {
         "properties": {
           "page": {
             "example": 1,
@@ -22876,6 +23456,17 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateKind",
+                "description": "Filter by gallery (`starter` or `service`)."
+              }
             ]
           },
           "tag": {
@@ -29047,6 +29638,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "relay_dropped_batches": {
+            "description": "Cumulative count of best-effort relay batches rejected because the\nbounded relay handoff was saturated or closed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "relay_dropped_items": {
+            "description": "Cumulative signal-item count contained in rejected relay batches.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "spans_dropped": {
             "format": "int64",
             "minimum": 0,
@@ -29076,7 +29679,9 @@
           "logs_dropped",
           "ingest_errors",
           "rate_limited_requests",
-          "quota_exceeded_requests"
+          "quota_exceeded_requests",
+          "relay_dropped_batches",
+          "relay_dropped_items"
         ],
         "type": "object"
       },
@@ -29141,7 +29746,7 @@
             ]
           },
           "format": {
-            "description": "\"walg\", \"pg_dump\", \"unknown\".",
+            "description": "\"walg\", \"pg_dump\", \"mariadb_physical\", \"mariadb_dump\", \"unknown\".",
             "type": "string"
           },
           "id": {
@@ -29469,6 +30074,13 @@
               "null"
             ]
           },
+          "dockerfile_path": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `path` of `\"./\"`). `None` for a Dockerfile located\ndirectly at `{path}/Dockerfile` and for every non-Dockerfile preset.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "exposed_port": {
             "description": "Default exposed port for this preset",
             "format": "int32",
@@ -29548,6 +30160,20 @@
           "icon_url",
           "project_type",
           "description"
+        ],
+        "type": "object"
+      },
+      "PreviewGatewayLogsResponse": {
+        "properties": {
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lines"
         ],
         "type": "object"
       },
@@ -29935,7 +30561,7 @@
         "description": "Documentation-only schema for a project-creation environment variable.\n\nThe wire format is deserialized by [`CreateProjectEnvVar`], which also\naccepts the legacy `[\"KEY\", \"value\"]` tuple form. This struct exists so the\nOpenAPI spec (and the generated clients) describe the preferred object form\nwith its `is_secret` flag.",
         "properties": {
           "is_secret": {
-            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
             "type": "boolean"
           },
           "key": {
@@ -30070,6 +30696,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "dockerfilePath": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `path` of `\"./\"`). `None` for a Dockerfile located\ndirectly at `{path}/Dockerfile` and for every non-Dockerfile preset.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -30276,7 +30909,15 @@
             ]
           },
           "preset_config": {
-            "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PresetConfigSchema",
+                "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+              }
+            ]
           },
           "preview_envs_idle_timeout_seconds": {
             "description": "Idle timeout (seconds) for on-demand preview environments.",
@@ -30292,6 +30933,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "project_type": {
+            "description": "Product lifecycle classification. `service` projects are tied to a\npersisted, versioned template release; this is independent from the\ndeployment transport in `source_type`.",
+            "type": "string"
+          },
           "repo_name": {
             "type": [
               "string",
@@ -30304,6 +30949,20 @@
               "null"
             ]
           },
+          "service_template_image_url": {
+            "description": "Logo from the immutable service-template release applied to this\nproject. Clients should prefer it over a deployed site's favicon.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_template_version": {
+            "description": "Exact service-template version currently applied to the project.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "slug": {
             "type": "string"
           },
@@ -30311,9 +30970,20 @@
             "$ref": "#/components/schemas/SourceType",
             "description": "Source type for deployments (git, docker_image, or static_files)"
           },
+          "template_slug": {
+            "description": "Bundled template slug that created this project. Clients use this to\npresent template-specific runtime configuration instead of generic\nsource-build controls.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "updated_at": {
             "format": "int64",
             "type": "integer"
+          },
+          "vulnerability_scanning_enabled": {
+            "description": "Opt-in Trivy vulnerability scanning of this project's deployed Docker\nimages. Off by default — project owners explicitly enable it.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -30322,12 +30992,14 @@
           "name",
           "directory",
           "main_branch",
+          "project_type",
           "created_at",
           "updated_at",
           "is_public_repo",
           "deployment_config",
           "attack_mode",
           "error_source_context_enabled",
+          "vulnerability_scanning_enabled",
           "enable_preview_environments",
           "preview_envs_on_demand",
           "preview_envs_idle_timeout_seconds",
@@ -30480,6 +31152,166 @@
           "total_page_views",
           "bounce_rate",
           "engagement_rate"
+        ],
+        "type": "object"
+      },
+      "ProjectTemplate": {
+        "description": "A curated project template",
+        "properties": {
+          "command": {
+            "description": "Optional command passed to the container image. This is needed for\nproduction images whose default command is intentionally a development\nmode (for example Keycloak).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Short description",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env_vars": {
+            "description": "Environment variables template",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
+            },
+            "type": "array"
+          },
+          "exposed_port": {
+            "description": "Container port the prebuilt image listens on (used for routing when\ndeploying from `image`). Falls back to the image's EXPOSE / 3000 default.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "features": {
+            "description": "Feature highlights",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "git": {
+            "$ref": "#/components/schemas/GitRef",
+            "description": "Git repository reference (supports any git provider). Always present as\nthe source-of-truth / build fallback, even for image-based templates."
+          },
+          "health_check_path": {
+            "description": "HTTP health-check path probed after the container starts (image deploys\ncan't read `.temps.yaml`). Must start with '/'. Defaults to \"/\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Prebuilt Docker image reference (e.g. \"ghcr.io/org/app:latest\"). When set,\nthe one-click deploy pulls and runs this image directly (source_type\ndocker_image) instead of building from `git` — instant, no BuildKit. When\nabsent, the template builds from source.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image_url": {
+            "description": "URL to template image/icon",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_featured": {
+            "description": "Whether the template is featured/promoted",
+            "type": "boolean"
+          },
+          "is_public": {
+            "description": "Whether the template is publicly visible",
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TemplateKind",
+            "description": "Gallery this template belongs to. Older configurations default to a\nsource-code starter, preserving their existing behaviour."
+          },
+          "managed_service_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Environment aliases populated from a linked managed service. The outer\nkey is the Temps service type and each inner entry maps an application\nvariable to a variable supplied by that service.\n\nExample: `postgres.KC_DB_USERNAME: POSTGRES_USER`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "description": "Display name",
+            "type": "string"
+          },
+          "preset": {
+            "description": "Framework/preset to use (e.g., \"nextjs\", \"fastapi\", \"dockerfile\")",
+            "type": "string"
+          },
+          "preset_config": {
+            "description": "Preset-specific configuration"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Minimum/safe runtime resources for this application. These values are\nvalidated against operator-configured tenant ceilings before creation."
+              }
+            ]
+          },
+          "screenshot_url": {
+            "description": "URL to a full screenshot/banner preview of the deployed template (e.g.\n`/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the\ntemplate card; optional — templates without one show no banner.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "services": {
+            "description": "Required external services (e.g., [\"postgres\", \"redis\"])",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "slug": {
+            "description": "Unique identifier for the template (used in URLs)",
+            "type": "string"
+          },
+          "sort_order": {
+            "description": "Sort order for display (lower = first)",
+            "format": "int32",
+            "type": "integer"
+          },
+          "tags": {
+            "description": "Tags/categories for filtering",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "description": "Version of this template release. Service projects pin this value and\nthe complete resolved definition so catalog updates are always an\nexplicit, reviewable upgrade rather than a silent runtime mutation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "name",
+          "git",
+          "preset"
         ],
         "type": "object"
       },
@@ -31840,6 +32672,13 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "health_check_path": {
+            "description": "HTTP path declared by a loopback Compose healthcheck, if unambiguous.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "image": {
             "type": [
@@ -33401,6 +34240,23 @@
         ],
         "type": "object"
       },
+      "RequestDiscoveredRouteCertRequest": {
+        "description": "Request body for Path A: operator-triggered ACME issuance.",
+        "properties": {
+          "acknowledge_manual_dns_renewal": {
+            "description": "Must be `true` when `challenge_type` is `\"dns-01\"` and no verified\n`auto_manage` zone covers this host. Lets the operator confirm they\nknow renewal will require manual DNS updates.",
+            "type": "boolean"
+          },
+          "challenge_type": {
+            "description": "`\"http-01\"` or `\"dns-01\"`. Required — no silent default.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "challenge_type"
+        ],
+        "type": "object"
+      },
       "RequestRow": {
         "properties": {
           "client_ip": {
@@ -34069,7 +34925,7 @@
             "type": "array"
           },
           "strategy": {
-            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\nor \"unsupported\".",
+            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\n\"mariadb_physical_restore\", \"mariadb_dump_restore\", or \"unsupported\".",
             "type": "string"
           },
           "target_service": {
@@ -34139,7 +34995,7 @@
             "type": "object"
           },
           {
-            "description": "Point-in-time recovery. Only valid on WAL-G backups (Postgres).",
+            "description": "Point-in-time recovery. Only valid on a backup that anchors a\ncontinuous change stream: a WAL-G base (Postgres) or a physical\n`mariadb-backup` base with archived binary logs (MariaDB).",
             "properties": {
               "mode": {
                 "enum": [
@@ -37389,6 +38245,136 @@
         ],
         "type": "object"
       },
+      "ServiceTemplateChangeKind": {
+        "enum": [
+          "added",
+          "removed",
+          "changed"
+        ],
+        "type": "string"
+      },
+      "ServiceTemplateInstance": {
+        "description": "Immutable template release attached to a service project.\n\nThe resolved definition is deliberately stored with the project. The live\ncatalog is only needed to discover a newer release; deployments, edits and\nrollbacks continue to work if the catalog later changes or disappears.",
+        "properties": {
+          "schema_version": {
+            "description": "Catalog schema used to deserialize `template`.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "Stable service family identifier.",
+            "type": "string"
+          },
+          "template": {
+            "$ref": "#/components/schemas/ProjectTemplate",
+            "description": "Exact resolved release from which this project was created/upgraded."
+          },
+          "version": {
+            "description": "Applied template release.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "slug",
+          "version",
+          "template"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateInstanceResponse": {
+        "properties": {
+          "applied": {
+            "$ref": "#/components/schemas/ServiceTemplateInstance"
+          },
+          "catalog_drift": {
+            "description": "The catalog definition changed without a version bump. Applying it is\nintentionally blocked because mutable releases make upgrades and\nrollbacks non-reproducible.",
+            "type": "boolean"
+          },
+          "catalog_error": {
+            "description": "User-safe explanation when the active catalog could not provide this\nservice family. The applied snapshot remains authoritative and editable.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTemplateUpgradeChange"
+            },
+            "type": "array"
+          },
+          "latest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceTemplateInstance",
+                "description": "Latest release for the same service family. Absent when the catalog no\nlonger carries the template; the applied snapshot is still usable."
+              }
+            ]
+          },
+          "missing_services": {
+            "description": "Managed service families that must be linked before this release can be\napplied. Existing links are never removed automatically.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "required_configuration": {
+            "description": "Required target inputs that are not currently configured and cannot be\nfilled from a template default or generator.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarTemplate"
+            },
+            "type": "array"
+          },
+          "upgrade_available": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project_id",
+          "applied",
+          "upgrade_available",
+          "catalog_drift",
+          "changes",
+          "required_configuration",
+          "missing_services"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateUpgradeChange": {
+        "description": "One reviewable change between the project's applied service release and\nthe current catalog release. Values contain public template metadata only;\nproject environment values and secrets never enter this response.",
+        "properties": {
+          "current": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ServiceTemplateChangeKind"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "field",
+          "kind"
+        ],
+        "type": "object"
+      },
       "ServiceTypeInfo": {
         "properties": {
           "parameters": {
@@ -37995,6 +38981,13 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).\nThe SDK already sends this today via `getSessionMetadata()`.",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -40027,6 +41020,13 @@
               "null"
             ]
           },
+          "sessionId": {
+            "description": "Client-generated session id fallback (see `visitor_id`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ttfb": {
             "description": "Time to First Byte (milliseconds)",
             "format": "float",
@@ -40048,6 +41048,13 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -41409,9 +42416,61 @@
         ],
         "type": "string"
       },
+      "TemplateKind": {
+        "description": "Where a template is presented in the project creation flow.",
+        "enum": [
+          "starter",
+          "service"
+        ],
+        "type": "string"
+      },
+      "TemplateResources": {
+        "description": "Resource profile required by a curated template. CPU values use the same\nmicrocore unit as project deployment configuration; memory values are MiB.",
+        "properties": {
+          "cpu_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpu_request": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_request": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "TemplateResponse": {
         "description": "Response type for a single template",
         "properties": {
+          "command": {
+            "description": "Optional command passed to the image entrypoint.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "description": {
             "description": "Short description",
             "type": [
@@ -41470,6 +42529,26 @@
             "description": "Whether the template is featured/promoted",
             "type": "boolean"
           },
+          "kind": {
+            "$ref": "#/components/schemas/TemplateKind",
+            "description": "Gallery this template belongs to."
+          },
+          "managed_service_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Managed-service environment aliases used at deployment time.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "name": {
             "description": "Display name",
             "type": "string"
@@ -41477,6 +42556,17 @@
           "preset": {
             "description": "Framework/preset to use",
             "type": "string"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Curated CPU/memory profile applied when the project is created."
+              }
+            ]
           },
           "screenshot_url": {
             "description": "URL to a wide screenshot/banner preview of the deployed template.\nAbsent for templates that don't have one captured yet.",
@@ -41502,18 +42592,25 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "version": {
+            "description": "Immutable release identifier for service templates.",
+            "type": "string"
           }
         },
         "required": [
           "slug",
           "name",
+          "version",
+          "kind",
           "git",
           "preset",
           "tags",
           "features",
           "services",
           "env_vars",
-          "is_featured"
+          "is_featured",
+          "managed_service_bindings"
         ],
         "type": "object"
       },
@@ -42300,6 +43397,442 @@
           "email_id",
           "event_type",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveredRouteListResponse": {
+        "description": "Paginated discovered routes, plus the hosts that were found and rejected.",
+        "properties": {
+          "conflicts": {
+            "description": "Labelled containers found by the last reconciliation that were NOT\nadopted (host owned by a Temps route, or claimed by another container).\nThese have no row of their own — without surfacing them here the\noperator sees nothing at all for a container they labelled.",
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveryConflictResponse"
+            },
+            "type": "array"
+          },
+          "discovery_running": {
+            "description": "`false` when the watcher isn't running, so a client can explain an\nempty list as \"discovery is off\" rather than \"nothing was found\".",
+            "type": "boolean"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveredRouteResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "routes",
+          "total",
+          "page",
+          "page_size",
+          "conflicts",
+          "discovery_running"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveredRouteResponse": {
+        "description": "One row of `traefik_discovered_routes`, annotated for an operator.",
+        "properties": {
+          "active": {
+            "description": "Whether this route is currently served by the proxy.",
+            "type": "boolean"
+          },
+          "contested_by": {
+            "description": "Other labelled containers that claim this host and lost the collision.\nNon-empty means someone's container is silently not being routed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "inactive_reason": {
+            "description": "Why it isn't, when `active` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_seen_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "network": {
+            "type": "string"
+          },
+          "router_name": {
+            "type": "string"
+          },
+          "target_container_id": {
+            "type": "string"
+          },
+          "target_container_name": {
+            "type": "string"
+          },
+          "target_host_port": {
+            "description": "Host-published port, used on baremetal installs where the proxy cannot\nresolve container names.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_port": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "tls": {
+            "type": "boolean"
+          },
+          "tls_certificate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TraefikRouteTlsBlock",
+                "description": "TLS authorization state for this host (ADR-041). Present only when a\n`traefik_route_certificates` row exists. `null` means no operator has\never authorized TLS for this host — the container label's `tls` field\n(above) records what the label says, but this is what has been acted on."
+              }
+            ]
+          },
+          "updated_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "host",
+          "router_name",
+          "target_container_id",
+          "target_container_name",
+          "target_port",
+          "network",
+          "tls",
+          "enabled",
+          "active",
+          "contested_by",
+          "last_seen_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveryConflictResponse": {
+        "description": "A labelled container that was found but deliberately **not** adopted.",
+        "properties": {
+          "container_id": {
+            "type": "string"
+          },
+          "container_name": {
+            "type": "string"
+          },
+          "detail": {
+            "description": "Human-readable explanation of the conflict.",
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Machine-readable discriminator: `owned_by_temps_route` or\n`claimed_by_another_container`.",
+            "type": "string"
+          },
+          "router_name": {
+            "description": "Traefik router name the host came from.",
+            "type": "string"
+          },
+          "winner_container_name": {
+            "description": "Container that holds the host instead, when the conflict is between two\ndiscovered containers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "host",
+          "container_id",
+          "container_name",
+          "router_name",
+          "reason",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoverySetupResponse": {
+        "description": "How an operator turns discovery on. Always returned, including when\ndiscovery is already running, so the console/CLI can render the exact\ninvocation instead of sending the reader to the docs.",
+        "properties": {
+          "enable_env_var": {
+            "description": "Environment variable that opts this installation in.",
+            "example": "TEMPS_TRAEFIK_DISCOVERY_ENABLED",
+            "type": "string"
+          },
+          "example": {
+            "description": "A concrete, copy-pasteable example of enabling it.",
+            "type": "string"
+          },
+          "network_env_var": {
+            "description": "Environment variable overriding the watched Docker network.",
+            "example": "TEMPS_TRAEFIK_DISCOVERY_NETWORK",
+            "type": "string"
+          },
+          "requires_restart": {
+            "description": "These are read once at process start: changing them needs a restart.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enable_env_var",
+          "network_env_var",
+          "example",
+          "requires_restart"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveryStatusResponse": {
+        "description": "Capability + status of Traefik label discovery on this instance.",
+        "properties": {
+          "configured": {
+            "description": "`true` only when the watcher is actually running in this process.\n`false` means \"not turned on here\", never \"not supported\" — the setup\nblock below always says how to turn it on.",
+            "type": "boolean"
+          },
+          "discovered_route_count": {
+            "description": "Rows currently in `traefik_discovered_routes` (all networks).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "description": "Whether `TEMPS_TRAEFIK_DISCOVERY_ENABLED` resolved to true. Can be\n`true` while `configured` is `false` (e.g. Docker unreachable).",
+            "type": "boolean"
+          },
+          "enabled_route_count": {
+            "description": "Of those, how many are enabled and therefore in the live route table.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_reconciliation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TraefikReconciliationResponse",
+                "description": "Last reconciliation pass, absent until the first one completes."
+              }
+            ]
+          },
+          "network": {
+            "description": "Docker network being watched, or the one that *would* be watched.",
+            "type": "string"
+          },
+          "poll_interval_seconds": {
+            "description": "Interval of the full reconciliation safety net.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why discovery isn't active, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup": {
+            "$ref": "#/components/schemas/TraefikDiscoverySetupResponse"
+          }
+        },
+        "required": [
+          "configured",
+          "enabled",
+          "network",
+          "poll_interval_seconds",
+          "setup",
+          "discovered_route_count",
+          "enabled_route_count"
+        ],
+        "type": "object"
+      },
+      "TraefikReconciliationResponse": {
+        "description": "Summary of the most recent reconciliation pass.",
+        "properties": {
+          "completed_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "conflicts": {
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveryConflictResponse"
+            },
+            "type": "array"
+          },
+          "containers_scanned": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "network": {
+            "type": "string"
+          },
+          "routes_removed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes_unchanged": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes_upserted": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_temps_managed": {
+            "description": "Containers skipped because Temps deployed them (they already have a\nroute and must never re-derive one from labels they control).",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "network",
+          "containers_scanned",
+          "skipped_temps_managed",
+          "routes_upserted",
+          "routes_unchanged",
+          "routes_removed",
+          "conflicts",
+          "completed_at"
+        ],
+        "type": "object"
+      },
+      "TraefikRouteTlsBlock": {
+        "description": "TLS state for a single discovered route (ADR-041 §3/§4).\n\nAbsent when no `traefik_route_certificates` row exists for this host.\nNever `null` on a host where `cert_authorized = true`.",
+        "properties": {
+          "authorized_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "authorized_container_id": {
+            "description": "Container ID that was authorized. Used for drift comparison.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authorized_container_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cert_authorized": {
+            "description": "The operator has explicitly authorized TLS for this host.",
+            "type": "boolean"
+          },
+          "container_drift": {
+            "description": "`true` when the currently-serving container differs from the one\nthat was authorized. Requires operator acknowledgment.",
+            "type": "boolean"
+          },
+          "container_drift_detected_at": {
+            "description": "When drift was first detected.",
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "current_container_name": {
+            "description": "Name of the container that currently holds the host (for the drift UI).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "days_remaining": {
+            "description": "Days until expiry.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "imported_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_after": {
+            "description": "ISO 8601 expiry time of the current certificate, if one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "renewal_method": {
+            "description": "`\"http-01\"` or `\"dns-01\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serving": {
+            "description": "`true` when the proxy is currently loading a cert for this host.",
+            "type": "boolean"
+          },
+          "source": {
+            "description": "`\"acme\"` or `\"imported\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Certificate status as reported by the `domains` row, e.g. `\"active\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cert_authorized",
+          "serving",
+          "container_drift",
+          "container_drift_detected_at",
+          "authorized_at",
+          "imported_at"
         ],
         "type": "object"
       },
@@ -43289,6 +44822,37 @@
         },
         "type": "object"
       },
+      "UpdateAnalyticsIngestKeyRequest": {
+        "description": "Request body for a partial update.\n\n`allowed_origins` and `rate_limit_per_minute` use the three-state\ndouble-`Option` encoding: field absent = leave unchanged, explicit `null` =\nclear, value = set. Plain `Option<Option<T>>` alone cannot express this\nbecause serde collapses an explicit JSON `null` into the outer `None`.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Absent = unchanged, `null` = clear (any origin allowed), array = replace.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "New operator-facing label. Absent leaves it unchanged. The column is\n`NOT NULL`, so there is no \"clear\" state — send a new label instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rate_limit_per_minute": {
+            "description": "Absent = unchanged, `null` = clear (unlimited), value = replace.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateApiKeyRequest": {
         "properties": {
           "expires_at": {
@@ -43438,6 +45002,17 @@
               "null"
             ]
           },
+          "service_ids": {
+            "description": "Replace the explicit external-service selection atomically with the\nschedule update. Only meaningful when `target_all_services` resolves\nto `false`; an empty list explicitly clears the selection.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "tags": {
             "description": "Replace the full tag list. Skipped when `None`.",
             "items": {
@@ -43462,8 +45037,8 @@
         "description": "Request to update Blob service configuration",
         "properties": {
           "docker_image": {
-            "description": "Docker image to use (e.g., \"rustfs/rustfs:1.0.0-alpha.98\")",
-            "example": "rustfs/rustfs:1.0.0-alpha.98",
+            "description": "Docker image to use (e.g., \"rustfs/rustfs:1.0.0-rc.5\")",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -44942,6 +46517,13 @@
               "string",
               "null"
             ]
+          },
+          "vulnerability_scanning_enabled": {
+            "description": "Opt in to Trivy vulnerability scanning of this project's deployed Docker\nimages (post-deployment scan + daily rescans). Off by default.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -45196,6 +46778,64 @@
         },
         "type": "object"
       },
+      "UpdateServiceTemplateRuntimeRequest": {
+        "description": "Complete replacement for the editable runtime of a single-container\nservice-template project. Runtime and resource fields are written to the\nsame project row in one transaction.",
+        "properties": {
+          "command": {
+            "description": "Empty means use the image's own default command.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cpuLimit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpuRequest": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exposedPort": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "healthCheckPath": {
+            "type": "string"
+          },
+          "imageRef": {
+            "type": "string"
+          },
+          "memoryLimit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memoryRequest": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "imageRef",
+          "healthCheckPath"
+        ],
+        "type": "object"
+      },
       "UpdateSessionDurationRequest": {
         "properties": {
           "duration": {
@@ -45281,6 +46921,20 @@
             "format": "float",
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "sessionId": {
+            "description": "Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).\nRequired to identify the right row on the keyed path, where there is\nno Temps-issued cookie to fall back on.",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -45394,6 +47048,19 @@
         ],
         "type": "object"
       },
+      "UpdateTraefikRouteEnabledRequest": {
+        "description": "Body of `PATCH /traefik-discovery/routes/{host}/enabled`.",
+        "properties": {
+          "enabled": {
+            "description": "`false` suppresses the route without touching the container's labels;\nthe row stays visible so the operator can see what was found.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "UpdateUserRequest": {
         "properties": {
           "email": {
@@ -45494,6 +47161,25 @@
         },
         "required": [
           "image"
+        ],
+        "type": "object"
+      },
+      "UpgradeServiceTemplateRequest": {
+        "properties": {
+          "environment_variables": {
+            "description": "Values for inputs introduced by the target release. Existing project\nvalues are preserved and cannot be overwritten through this endpoint.",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarInput"
+            },
+            "type": "array"
+          },
+          "target_version": {
+            "description": "Optimistic target selected from the preview. The server rejects a stale\ntarget if the catalog changes between preview and apply.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_version"
         ],
         "type": "object"
       },
@@ -48425,6 +50111,29 @@
     "/_temps/event": {
       "post": {
         "operationId": "record_event_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48499,6 +50208,29 @@
     "/_temps/session-replay/events": {
       "post": {
         "operationId": "add_session_replay_events",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48561,6 +50293,29 @@
     "/_temps/session-replay/init": {
       "post": {
         "operationId": "init_session_replay",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48613,6 +50368,29 @@
     "/_temps/speed": {
       "post": {
         "operationId": "record_speed_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48667,6 +50445,29 @@
     "/_temps/speed/update": {
       "post": {
         "operationId": "update_speed_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -49178,6 +50979,57 @@
     "/ai/applications": {
       "get": {
         "operationId": "list_applications",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Application lifecycle state (defaults to active)",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -49254,6 +51106,47 @@
       }
     },
     "/ai/applications/{application_public_id}": {
+      "delete": {
+        "description": "Archives the application and pauses its workspace compute while retaining projects, conversations, and persistent files.",
+        "operationId": "archive_application",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Archive an AI application",
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      },
       "get": {
         "operationId": "get_application",
         "parameters": [
@@ -49263,6 +51156,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Application lifecycle state (defaults to active)",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
             }
           }
         ],
@@ -49308,6 +51210,55 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Conversation lifecycle state (defaults to active)",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
             }
           }
         ],
@@ -50029,6 +51980,53 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/applications/{application_public_id}/restore": {
+      "post": {
+        "description": "Restores an archived application and requests that its retained persistent workspace resume on next access.",
+        "operationId": "restore_application",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Restore an archived AI application",
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/applications/{application_public_id}/workspace": {
       "get": {
         "operationId": "get_application_workspace",
@@ -50340,6 +52338,66 @@
     "/ai/conversations": {
       "get": {
         "operationId": "list_all_conversations",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Conversation lifecycle state (defaults to active)",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          },
+          {
+            "description": "Limit results to the global AI workspace, or return all readable contexts",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListScope"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -50943,6 +53001,45 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/restore": {
+      "post": {
+        "operationId": "restore_user_conversation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Restore a user-owned archived conversation.",
         "tags": [
           "AI Chat"
         ],
@@ -61511,14 +63608,29 @@
             },
             "description": "Order finalized successfully"
           },
+          "400": {
+            "description": "Bad request - account email or ACME order is invalid"
+          },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Domain or DNS provider permission denied"
           },
           "404": {
             "description": "Domain or order not found"
           },
+          "409": {
+            "description": "Certificate issued but DNS cleanup requires operator action"
+          },
           "500": {
             "description": "Internal server error"
+          },
+          "502": {
+            "description": "Certificate issued but DNS provider cleanup failed"
+          },
+          "503": {
+            "description": "Certificate issued but DNS provider service is unavailable"
           }
         },
         "security": [
@@ -61580,6 +63692,9 @@
           },
           "404": {
             "description": "Domain or DNS provider not found"
+          },
+          "409": {
+            "description": "Ambiguous managed DNS zone"
           },
           "500": {
             "description": "Internal server error"
@@ -61796,11 +63911,20 @@
             },
             "description": "Certificate provisioning initiated"
           },
+          "400": {
+            "description": "Bad request - account email or challenge is invalid"
+          },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Domain permission denied or a user account is required"
+          },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "description": "DNS cleanup-aware order must use the finalize endpoint"
           },
           "500": {
             "description": "Internal server error"
@@ -63649,10 +65773,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -63664,10 +65785,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -63675,10 +65793,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -63686,10 +65801,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -63934,10 +66046,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -63949,10 +66058,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -63960,10 +66066,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -63971,10 +66074,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -64089,7 +66189,7 @@
         "operationId": "get_provider_metadata",
         "parameters": [
           {
-            "description": "Service type (mongodb, postgres, redis, s3)",
+            "description": "Service type (mariadb, mongodb, postgres, redis, s3, kv, blob, rustfs, or legacy minio)",
             "in": "path",
             "name": "service_type",
             "required": true,
@@ -65420,10 +67520,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -65435,10 +67532,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -65446,10 +67540,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -65457,10 +67548,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -65477,6 +67565,12 @@
               }
             },
             "description": "List of linked projects"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to view this service"
           },
           "404": {
             "description": "Service not found"
@@ -65525,8 +67619,17 @@
             },
             "description": "Service linked to project successfully"
           },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to link this service"
+          },
           "404": {
             "description": "Service or project not found"
+          },
+          "409": {
+            "description": "Project already has a database of this type"
           },
           "500": {
             "description": "Internal server error"
@@ -65566,6 +67669,12 @@
         "responses": {
           "204": {
             "description": "Service unlinked from project successfully"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to unlink this service"
           },
           "404": {
             "description": "Service link not found"
@@ -73255,10 +75364,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -73270,10 +75376,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -73281,10 +75384,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -73292,10 +75392,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -74029,10 +76126,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -74044,10 +76138,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -74055,10 +76146,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -74066,10 +76154,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -74292,10 +76377,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -74307,10 +76389,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -74318,10 +76397,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -74329,10 +76405,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -79296,11 +81369,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LogsResponse"
+                  "$ref": "#/components/schemas/PreviewGatewayLogsResponse"
                 }
               }
             },
             "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Docker log request failed"
           }
         },
         "security": [
@@ -79319,6 +81402,16 @@
         "responses": {
           "204": {
             "description": "Gateway restarted"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Gateway restart failed"
           }
         },
         "security": [
@@ -79377,6 +81470,16 @@
               }
             },
             "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Settings update failed"
           }
         },
         "security": [
@@ -79402,6 +81505,16 @@
               }
             },
             "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Docker status request failed"
           }
         },
         "security": [
@@ -79430,6 +81543,16 @@
         "responses": {
           "204": {
             "description": "Gateway upgraded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Gateway upgrade failed"
           }
         },
         "security": [
@@ -79532,6 +81655,9 @@
           },
           "400": {
             "description": "Invalid input"
+          },
+          "409": {
+            "description": "Expected project slug is already in use"
           },
           "500": {
             "description": "Internal server error"
@@ -79636,7 +81762,7 @@
     },
     "/projects/from-template": {
       "post": {
-        "description": "Creates a new repository from a template and sets up the project with the\nspecified configuration. The template is cloned to a new repository under\nthe authenticated user's account or specified organization.",
+        "description": "Image-backed service templates are created directly from their pinned image.\nSource-backed starter templates can either use their public repository or\ncreate a repository under the selected Git provider account.",
         "operationId": "create_project_from_template",
         "requestBody": {
           "content": {
@@ -81768,7 +83894,7 @@
     },
     "/projects/{project_id}/ai/conversations/{public_id}/messages": {
       "post": {
-        "operationId": "send_message",
+        "operationId": "send_project_ai_message",
         "parameters": [
           {
             "in": "path",
@@ -82721,6 +84847,311 @@
         "summary": "Silence an alarm (and future re-fires of the same type/scope) for a\nchosen duration, without permanently resolving it.",
         "tags": [
           "Alarms"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys": {
+      "get": {
+        "description": "Includes revoked keys: revocation is soft, and an operator investigating\n\"which key sent this?\" needs to see the rows that no longer work. Every\n`public_key` is returned unmasked — see [`create_analytics_ingest_key`].",
+        "operationId": "list_analytics_ingest_keys",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AnalyticsIngestKey"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Ingest keys, active and revoked, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's analytics ingest keys, newest first.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      },
+      "post": {
+        "description": "The returned `public_key` is **not a secret**: it is designed to be embedded\nin client-side JavaScript and sent as `X-Temps-Analytics-Key` or\n`?temps_key=`. It is returned in full here and on every subsequent read, so\nan operator can copy it at any time; there is no \"reveal\" step because there\nis nothing to conceal.",
+        "operationId": "create_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAnalyticsIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key created"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mint a new analytics ingest key.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}": {
+      "patch": {
+        "description": "`allowed_origins` and `rate_limit_per_minute` are three-state: omit to leave\nunchanged, send `null` to clear, send a value to replace. Clearing\n`allowed_origins` allows any origin; clearing `rate_limit_per_minute`\nremoves the limit.",
+        "operationId": "update_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAnalyticsIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key updated"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update an ingest key's label, origin allowlist, or rate limit.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke": {
+      "post": {
+        "description": "Soft by design: the row is kept with `is_active = false` and `revoked_at`\nset, so the record of which key ingested what survives. The key stops\nresolving immediately.",
+        "operationId": "revoke_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Ingest key revoked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Revoke an ingest key.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate": {
+      "post": {
+        "description": "The previous value stops working immediately — the resolution cache entry\nfor it is evicted synchronously rather than left to expire. Any client still\nsending the old value will start receiving 401s, so roll out the new value\nbefore rotating.",
+        "operationId": "rotate_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key rotated"
+          },
+          "400": {
+            "description": "The key is revoked and cannot be rotated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace an ingest key's value, keeping the same row and scope.",
+        "tags": [
+          "Analytics Ingest Keys"
         ]
       }
     },
@@ -93386,6 +95817,180 @@
         ]
       }
     },
+    "/projects/{project_id}/service-runtime": {
+      "patch": {
+        "operationId": "update_service_template_runtime",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceTemplateRuntimeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Service runtime updated successfully"
+          },
+          "400": {
+            "description": "Invalid service runtime"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/service-template": {
+      "get": {
+        "operationId": "get_project_service_template",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceTemplateInstanceResponse"
+                }
+              }
+            },
+            "description": "Applied service release and upgrade preview"
+          },
+          "400": {
+            "description": "Project is not a service"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Return the immutable service-template release applied to a project together\nwith catalog drift, missing requirements, and an available upgrade preview.",
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/service-template/upgrade": {
+      "post": {
+        "operationId": "upgrade_project_service_template",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeServiceTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Service template upgraded"
+          },
+          "400": {
+            "description": "Invalid or stale upgrade"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project or template not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/settings": {
       "post": {
         "operationId": "update_project_settings",
@@ -94640,10 +97245,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -94655,10 +97257,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -94666,10 +97265,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -94677,10 +97273,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -101125,6 +103718,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "description": "Filter by gallery: starter or service",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TemplateKind"
+            }
           }
         ],
         "responses": {
@@ -101233,6 +103835,517 @@
         "summary": "Get a specific template by slug",
         "tags": [
           "Templates"
+        ]
+      }
+    },
+    "/traefik-discovery/routes": {
+      "get": {
+        "operationId": "list_traefik_discovered_routes",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (default: 20, max: 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveredRouteListResponse"
+                }
+              }
+            },
+            "description": "Discovered routes and unresolved host conflicts"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List every container adopted from Traefik labels, plus the labelled\ncontainers that were found and rejected.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/routes/{host}/certificate": {
+      "delete": {
+        "description": "Clears `cert_authorized` so Temps stops attempting renewal. Does **not**\ndelete the `domains` row or the certificate — deleting live key material as\na side effect of deauthorization is the kind of surprise this codebase\navoids. Use `DELETE /domains/{host}` to remove the certificate itself.",
+        "operationId": "deauthorize_discovered_route_cert",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "TLS authorization cleared"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No authorization record for that host"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove TLS authorization for a discovered route.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      },
+      "post": {
+        "description": "The operator explicitly authorizes issuance; `cert_eligible` stays `false`\nso the container's own labels can never trigger this. Both `SettingsWrite`\nand `DomainsCreate` are required: `SettingsWrite` is Admin/PlatformAdmin\nonly, so any caller reaching this endpoint is already an administrator.\n\nThe authorization is recorded against the container identity currently\nserving the host (§2a). Container drift after authorization fires a Critical\nalarm but does not auto-clear `cert_authorized` — auto-clearing would not\nremove the certificate and would be a DoS primitive (ADR-041 §2a).",
+        "operationId": "request_discovered_route_cert",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestDiscoveredRouteCertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "TLS authorization created and ACME challenge initiated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error (e.g. unsupported challenge_type)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No discovered route for that host"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Host owned by another resource, or verification_method conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Certificate validation failed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "TLS provisioner error (ACME upstream failure)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Request Temps to issue an ACME certificate for a discovered route (Path A).",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/routes/{host}/enabled": {
+      "patch": {
+        "description": "This is a plain column update: the `traefik_discovered_routes` row-level\ntrigger fires `notify_route_table_change()` on an `enabled` change, so the\nexisting `route_table_changes` LISTEN/NOTIFY path reloads this node's route\ntable *and* every other control plane node's. No manual reload here.",
+        "operationId": "set_traefik_discovered_route_enabled",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTraefikRouteEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveredRouteResponse"
+                }
+              }
+            },
+            "description": "Updated discovered route"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No discovered route for that host"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Suppress or restore a single discovered route.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/status": {
+      "get": {
+        "operationId": "get_traefik_discovery_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveryStatusResponse"
+                }
+              }
+            },
+            "description": "Discovery status. `configured: false` means it is not turned on here — the `setup` block says exactly how to turn it on"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether Traefik label discovery is active on this instance, and how to turn\nit on when it is not.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/tls/import": {
+      "post": {
+        "description": "Upload the raw contents of Traefik's `acme.json` and a list of hosts to\nimport. Each host is independently validated (8-step chain from ADR-041 §5)\nand a per-host verdict is returned. `dry_run: true` runs all validation\nwithout writing anything, so the operator can preview before committing.\n\nThe request body is capped at 1 MiB. Do **not** add a decompression layer\nto this route — the 1 MiB cap's security properties depend on the absence\nof decompression here (ADR-041 §4).",
+        "operationId": "import_traefik_acme_json",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportTraefikAcmeJsonRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportTraefikAcmeJsonResponse"
+                }
+              }
+            },
+            "description": "Import results (per-host verdicts)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error (malformed JSON, unsupported renewal_method)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the 1 MiB limit"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import certificates from a Traefik `acme.json` document (Path B).",
+        "tags": [
+          "Traefik Discovery"
         ]
       }
     },
@@ -105117,6 +108230,10 @@
     {
       "description": "Gateway capability and summary-default endpoints",
       "name": "AI Provider Status"
+    },
+    {
+      "description": "Manage non-secret analytics ingest keys for apps Temps does not deploy",
+      "name": "Analytics Ingest Keys"
     },
     {
       "description": "Cron jobs management API",

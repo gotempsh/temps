@@ -17,45 +17,29 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .alter_table(
-                Table::alter()
-                    .table(AiConversations::Table)
-                    .add_column(
-                        ColumnDef::new(AiConversations::TurnStatus)
-                            .text()
-                            .not_null()
-                            .default("idle"),
-                    )
-                    .add_column(ColumnDef::new(AiConversations::ActiveTurnId).text())
-                    .add_column(ColumnDef::new(AiConversations::LastTurnId).text())
-                    .add_column(
-                        ColumnDef::new(AiConversations::TurnStartedAt).timestamp_with_time_zone(),
-                    )
-                    .to_owned(),
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE ai_conversations
+                   ADD COLUMN IF NOT EXISTS turn_status TEXT NOT NULL DEFAULT 'idle',
+                   ADD COLUMN IF NOT EXISTS active_turn_id TEXT,
+                   ADD COLUMN IF NOT EXISTS last_turn_id TEXT,
+                   ADD COLUMN IF NOT EXISTS turn_started_at TIMESTAMPTZ;",
             )
-            .await
+            .await?;
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .alter_table(
-                Table::alter()
-                    .table(AiConversations::Table)
-                    .drop_column(AiConversations::TurnStartedAt)
-                    .drop_column(AiConversations::ActiveTurnId)
-                    .drop_column(AiConversations::LastTurnId)
-                    .drop_column(AiConversations::TurnStatus)
-                    .to_owned(),
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE ai_conversations
+                   DROP COLUMN IF EXISTS turn_started_at,
+                   DROP COLUMN IF EXISTS active_turn_id,
+                   DROP COLUMN IF EXISTS last_turn_id,
+                   DROP COLUMN IF EXISTS turn_status;",
             )
-            .await
+            .await?;
+        Ok(())
     }
-}
-
-#[derive(DeriveIden)]
-enum AiConversations {
-    Table,
-    TurnStatus,
-    ActiveTurnId,
-    LastTurnId,
-    TurnStartedAt,
 }

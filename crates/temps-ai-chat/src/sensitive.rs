@@ -14,7 +14,7 @@ const DISPLAY_FIELD: &str = "__temps_display";
 /// closed because they are rendered and stored outside the conversational
 /// transcript.
 pub(crate) fn contains_likely_credential(value: &str) -> bool {
-    static CREDENTIAL: OnceLock<regex::Regex> = OnceLock::new();
+    static CREDENTIAL: OnceLock<Option<regex::Regex>> = OnceLock::new();
     CREDENTIAL
         .get_or_init(|| {
             regex::Regex::new(
@@ -29,9 +29,10 @@ pub(crate) fn contains_likely_credential(value: &str) -> bool {
                 |\bxox[baprs]-[a-z0-9-]{10,}\b
                 "#,
             )
-            .expect("static credential-detection regex")
+            .ok()
         })
-        .is_match(value)
+        .as_ref()
+        .is_some_and(|credential| credential.is_match(value))
         || contains_high_entropy_token(value)
 }
 
@@ -53,7 +54,8 @@ fn contains_high_entropy_token(value: &str) -> bool {
 fn looks_like_uuid(value: &str) -> bool {
     value.len() == 36
         && value.chars().enumerate().all(|(index, character)| {
-            matches!(index, 8 | 13 | 18 | 23) && character == '-' || character.is_ascii_hexdigit()
+            (matches!(index, 8 | 13 | 18 | 23) && character == '-')
+                || (!matches!(index, 8 | 13 | 18 | 23) && character.is_ascii_hexdigit())
         })
 }
 
@@ -173,28 +175,32 @@ pub(crate) fn redact_json_string(value: &str) -> String {
 /// errors. `temps_write` intentionally carries a command inside a neutral JSON
 /// key, so recursive key redaction alone cannot protect `--value SECRET`.
 pub(crate) fn redact_text(value: &str) -> String {
-    static ASSIGNMENT_SECRET: OnceLock<regex::Regex> = OnceLock::new();
-    static BEARER_SECRET: OnceLock<regex::Regex> = OnceLock::new();
-    static PROVIDER_SECRET: OnceLock<regex::Regex> = OnceLock::new();
+    static ASSIGNMENT_SECRET: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static BEARER_SECRET: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static PROVIDER_SECRET: OnceLock<Option<regex::Regex>> = OnceLock::new();
 
     let assignments = ASSIGNMENT_SECRET.get_or_init(|| {
         regex::Regex::new(
             r#"(?i)\b(password|secret|token|api[_-]?key|access[_-]?key)\b(["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}]+)"#,
         )
-        .expect("static assignment-secret regex")
+        .ok()
     });
-    let bearer = BEARER_SECRET.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bBearer\s+[^\s,;]+").expect("static bearer-secret regex")
-    });
-    let provider = PROVIDER_SECRET.get_or_init(|| {
-        regex::Regex::new(r"\b(?:sk|key|token)-[A-Za-z0-9._-]{6,}")
-            .expect("static provider-secret regex")
-    });
+    let bearer = BEARER_SECRET.get_or_init(|| regex::Regex::new(r"(?i)\bBearer\s+[^\s,;]+").ok());
+    let provider = PROVIDER_SECRET
+        .get_or_init(|| regex::Regex::new(r"\b(?:sk|key|token)-[A-Za-z0-9._-]{6,}").ok());
 
     let scrubbed = redact_cli_secret_flags(value);
-    let scrubbed = assignments.replace_all(&scrubbed, "$1$2***");
-    let scrubbed = bearer.replace_all(&scrubbed, "Bearer ***");
-    provider.replace_all(&scrubbed, "[redacted]").into_owned()
+    let scrubbed = assignments.as_ref().map_or_else(
+        || scrubbed.clone(),
+        |pattern| pattern.replace_all(&scrubbed, "$1$2***").into_owned(),
+    );
+    let scrubbed = bearer.as_ref().map_or_else(
+        || scrubbed.clone(),
+        |pattern| pattern.replace_all(&scrubbed, "Bearer ***").into_owned(),
+    );
+    provider.as_ref().map_or(scrubbed.clone(), |pattern| {
+        pattern.replace_all(&scrubbed, "[redacted]").into_owned()
+    })
 }
 
 /// Redact unified diff content without destroying its line shape. Ordinary
@@ -326,6 +332,8 @@ mod tests {
             "token: github_pat_12345678901234567890",
             "postgres://admin:supersecret@db.internal/app",
             "-----BEGIN PRIVATE KEY-----",
+            "AKIAIOSFODNN7EXAMPLE",
+            "xoxb-1234567890-example",
         ] {
             assert!(
                 contains_likely_credential(value),
@@ -335,6 +343,16 @@ mod tests {
         assert!(!contains_likely_credential(
             "We need a payments capability and a credential_ref."
         ));
+    }
+
+    #[test]
+    fn uuid_shape_requires_dashes_in_the_canonical_positions() {
+        let uuid = "123e4567-e89b-12d3-a456-426614174000";
+        let mixed_case_hex_without_dashes = "AbCd1234EfAb5678CdEf9012AbCd3456Ef12";
+
+        assert!(looks_like_uuid(uuid));
+        assert!(!looks_like_uuid(mixed_case_hex_without_dashes));
+        assert!(contains_likely_credential(mixed_case_hex_without_dashes));
     }
 
     #[test]

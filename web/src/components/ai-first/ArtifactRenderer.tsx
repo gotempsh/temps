@@ -9,9 +9,15 @@ import {
   ListChecks,
   Table2,
 } from 'lucide-react'
+import { useState } from 'react'
+import { Link } from 'react-router'
 import type { ThreadArtifactResponse } from '@/api/client'
 import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
 import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { cn } from '@/lib/utils'
 
 function stringValue(value: unknown): string {
   if (typeof value === 'string') return value
@@ -39,6 +45,136 @@ function positiveInteger(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
     ? value
     : null
+}
+
+function statusClassName(status: unknown): string {
+  const value = stringValue(status).toLowerCase()
+  if (
+    [
+      'success',
+      'succeeded',
+      'complete',
+      'completed',
+      'ready',
+      'healthy',
+    ].includes(value)
+  ) {
+    return 'text-emerald-600 dark:text-emerald-400'
+  }
+  if (['warning', 'pending', 'queued', 'running', 'starting'].includes(value)) {
+    return 'text-amber-600 dark:text-amber-400'
+  }
+  if (['error', 'failed', 'failure', 'down', 'unhealthy'].includes(value)) {
+    return 'text-red-600 dark:text-red-400'
+  }
+  return 'text-muted-foreground'
+}
+
+function CredentialRequestArtifact({
+  artifact,
+  payload,
+}: {
+  artifact: ThreadArtifactResponse
+  payload: Record<string, unknown>
+}) {
+  const requirements = rows(payload.requirements ?? payload.rows)
+  const projectId = positiveInteger(payload.project_id)
+  const destination = projectId
+    ? `/projects/${projectId}/settings/environment-variables`
+    : '/projects'
+
+  return (
+    <section className="rounded-lg border border-border bg-background p-4">
+      <div className="flex items-center gap-2">
+        <KeyRound className="size-4 text-amber-600 dark:text-amber-400" />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-medium">
+            {artifact.title ?? 'Credentials required'}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Add values through Temps secret storage. Values are never submitted
+            through chat.
+          </p>
+        </div>
+      </div>
+      {requirements.length > 0 && (
+        <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
+          {requirements.map((requirement, index) => (
+            <li key={`${stringValue(requirement.name)}-${index}`}>
+              {stringValue(requirement.name) ||
+                stringValue(requirement.key) ||
+                stringValue(requirement.capability) ||
+                `Credential ${index + 1}`}
+            </li>
+          ))}
+        </ul>
+      )}
+      <Button asChild size="sm" className="mt-3">
+        <Link to={destination}>Open secret settings</Link>
+      </Button>
+    </section>
+  )
+}
+
+function FormArtifact({
+  artifact,
+  payload,
+}: {
+  artifact: ThreadArtifactResponse
+  payload: Record<string, unknown>
+}) {
+  const fields = rows(payload.fields)
+  const [values, setValues] = useState<Record<string, string>>({})
+  const [submitted, setSubmitted] = useState(false)
+
+  return (
+    <section className="rounded-lg border border-border bg-background p-4">
+      <p className="text-sm font-medium">
+        {artifact.title ?? 'Provide details'}
+      </p>
+      <form
+        className="mt-3 space-y-3"
+        onSubmit={(event) => {
+          event.preventDefault()
+          setSubmitted(true)
+        }}
+      >
+        {fields.map((field, index) => {
+          const name = stringValue(field.name) || `field_${index + 1}`
+          const label = stringValue(field.label) || name
+          return (
+            <div key={name} className="space-y-1.5">
+              <Label htmlFor={`${artifact.public_id}-${name}`}>{label}</Label>
+              <Input
+                id={`${artifact.public_id}-${name}`}
+                name={name}
+                required={field.required === true}
+                value={values[name] ?? ''}
+                onChange={(event) => {
+                  setSubmitted(false)
+                  setValues((current) => ({
+                    ...current,
+                    [name]: event.target.value,
+                  }))
+                }}
+              />
+            </div>
+          )
+        })}
+        <Button type="submit" size="sm" disabled={fields.length === 0}>
+          Submit
+        </Button>
+        {submitted && (
+          <p
+            role="status"
+            className="text-xs text-emerald-600 dark:text-emerald-400"
+          >
+            Form response captured for this view.
+          </p>
+        )}
+      </form>
+    </section>
+  )
 }
 
 function ProjectCollectionArtifact({
@@ -95,6 +231,12 @@ export function ArtifactRenderer({
   ) {
     return <ProjectCollectionArtifact artifact={artifact} payload={payload} />
   }
+  if (artifact.kind === 'credential_request') {
+    return <CredentialRequestArtifact artifact={artifact} payload={payload} />
+  }
+  if (artifact.kind === 'form') {
+    return <FormArtifact artifact={artifact} payload={payload} />
+  }
   if (
     (artifact.kind === 'resource' || artifact.kind === 'operation') &&
     resourceType === 'deployment'
@@ -136,7 +278,7 @@ export function ArtifactRenderer({
   return (
     <section className="rounded-lg border border-border bg-background p-4">
       <div className="flex items-center gap-2">
-        <Icon className="size-4 stroke-success" />
+        <Icon className={cn('size-4', statusClassName(artifact.status))} />
         <div className="min-w-0">
           <p className="truncate text-sm font-medium">
             {artifact.title ?? artifact.kind.replace(/_/g, ' ')}
@@ -165,7 +307,12 @@ export function ArtifactRenderer({
                 key={`${label}-${index}`}
                 className="flex items-start gap-2 rounded-md border border-border bg-muted/50 px-3 py-2"
               >
-                <Circle className="mt-1 size-2.5 shrink-0 stroke-success" />
+                <Circle
+                  className={cn(
+                    'mt-1 size-2.5 shrink-0',
+                    statusClassName(row.status)
+                  )}
+                />
                 <div className="min-w-0">
                   <p className="truncate text-xs text-foreground">{label}</p>
                   {detail && (

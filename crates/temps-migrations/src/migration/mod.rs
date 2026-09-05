@@ -210,23 +210,24 @@ mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
 mod m20260830_000001_create_traefik_discovered_routes;
-// Main shipped this migration first with the same date and sequence stamp as
-// the certificates migration below. Preserve that upgrade history.
+// Module declarations are kept lexically sorted by rustfmt. Migration execution
+// order is defined by Migrator::migrations below, where all mainline migrations
+// remain ahead of this branch's AI workspace chain.
+mod m20260831_000001_ai_first_applications;
 mod m20260831_000001_create_analytics_ingest_keys;
 mod m20260831_000001_create_traefik_route_certificates;
 mod m20260831_000002_add_managed_status_monitors;
 mod m20260831_000002_backfill_acme_verification_method;
+mod m20260901_000001_persist_ai_turn_state;
+mod m20260901_000002_user_owned_ai_conversations;
 mod m20260902_000001_backup_safety_and_provenance;
 mod m20260903_000001_add_service_project_identity;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
-mod m20260904_000001_reset_ambiguous_managed_status_monitors;
-mod m20260831_000001_ai_first_applications;
-mod m20260901_000001_persist_ai_turn_state;
-mod m20260901_000002_user_owned_ai_conversations;
 mod m20260903_000001_application_workspace_topology;
 mod m20260903_000002_harden_application_workspaces;
 mod m20260903_000003_application_workspace_quarantine;
 mod m20260903_000004_repair_application_primary_projects;
+mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 
 pub struct Migrator;
 
@@ -543,6 +544,10 @@ mod registry_tests {
             (
                 "m20260903_000001_add_service_project_identity",
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",
+            ),
+            (
+                "m20260904_000001_reset_ambiguous_managed_status_monitors",
+                "m20260831_000001_ai_first_applications",
             ),
         ] {
             let shipped_position = names

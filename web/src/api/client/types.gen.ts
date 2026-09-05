@@ -1685,7 +1685,7 @@ export type ApplicationProjectResponse = {
     last_deployment_at?: string | null;
     main_branch: string;
     name: string;
-    repository: string;
+    repository?: string | null;
     slug: string;
 };
 
@@ -3732,6 +3732,8 @@ export type ConversationDetailResponse = ConversationResponse & {
     pending_permission?: null | PermissionRequest;
 };
 
+export type ConversationListScope = 'all' | 'global';
+
 export type ConversationListStatus = 'active' | 'archived';
 
 export type ConversationMessagePageResponse = {
@@ -4912,7 +4914,8 @@ export type CreateSandboxBody = {
      * no explicit `source` is given, and the sandbox is attributed to the
      * project so it can be listed alongside it.
      *
-     * Requires access to the project — the same team/scope rules that
+     * Requires access to the project and `git_repositories:read` when Temps
+     * derives the source from the project. The same team/scope rules that
      * gate every other project-scoped endpoint apply.
      */
     project_id?: number | null;
@@ -9775,17 +9778,6 @@ export type ImageRetentionSettings = {
     enabled?: boolean;
 };
 
-export type ImportApplicationWorkspaceGitRequest = {
-    depth?: number | null;
-    /**
-     * Opaque user-owned connection reference. The credential value remains
-     * server-side and is restricted to the provider's configured origin.
-     */
-    git_connection_id?: number | null;
-    revision?: string | null;
-    url: string;
-};
-
 /**
  * Editable runtime settings for a single-container image template.
  *
@@ -9802,6 +9794,17 @@ export type ImageRuntimeConfig = {
     command?: Array<string> | null;
     healthCheckPath?: string | null;
     imageRef: string;
+};
+
+export type ImportApplicationWorkspaceGitRequest = {
+    depth?: number | null;
+    /**
+     * Opaque user-owned connection reference. The credential value remains
+     * server-side and is restricted to the provider's configured origin.
+     */
+    git_connection_id?: number | null;
+    revision?: string | null;
+    url: string;
 };
 
 /**
@@ -23554,7 +23557,22 @@ export type WebhookTriggerResponse2 = WebhookTriggerResponses[keyof WebhookTrigg
 export type ListApplicationsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
+        /**
+         * Application lifecycle state (defaults to active)
+         */
+        status?: ConversationListStatus;
+    };
     url: '/ai/applications';
 };
 
@@ -23588,12 +23606,39 @@ export type CreateApplicationResponses = {
 
 export type CreateApplicationResponse = CreateApplicationResponses[keyof CreateApplicationResponses];
 
-export type GetApplicationData = {
+export type ArchiveApplicationData = {
     body?: never;
     path: {
         application_public_id: string;
     };
     query?: never;
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type ArchiveApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type ArchiveApplicationResponses = {
+    204: void;
+};
+
+export type ArchiveApplicationResponse = ArchiveApplicationResponses[keyof ArchiveApplicationResponses];
+
+export type GetApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Application lifecycle state (defaults to active)
+         */
+        status?: ConversationListStatus;
+    };
     url: '/ai/applications/{application_public_id}';
 };
 
@@ -23615,6 +23660,16 @@ export type ListApplicationConversationsData = {
         application_public_id: string;
     };
     query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
         /**
          * Conversation lifecycle state (defaults to active)
          */
@@ -23887,6 +23942,27 @@ export type ImportApplicationWorkspaceGitResponses = {
 
 export type ImportApplicationWorkspaceGitResponse = ImportApplicationWorkspaceGitResponses[keyof ImportApplicationWorkspaceGitResponses];
 
+export type RestoreApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/restore';
+};
+
+export type RestoreApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RestoreApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type RestoreApplicationResponse = RestoreApplicationResponses[keyof RestoreApplicationResponses];
+
 export type GetApplicationWorkspaceData = {
     body?: never;
     path: {
@@ -24019,9 +24095,23 @@ export type ListAllConversationsData = {
     path?: never;
     query?: {
         /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
+        /**
          * Conversation lifecycle state (defaults to active)
          */
         status?: ConversationListStatus;
+        /**
+         * Limit results to the global AI workspace, or return all readable contexts
+         */
+        scope?: ConversationListScope;
     };
     url: '/ai/conversations';
 };
@@ -32124,13 +32214,13 @@ export type ListServicesData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/external-services';
 };
@@ -32312,13 +32402,13 @@ export type ListProjectServicesData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/external-services/projects/{project_id}';
 };
@@ -33389,13 +33479,13 @@ export type ListServiceProjectsData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/external-services/{id}/projects';
 };
@@ -38756,13 +38846,13 @@ export type ListNotificationProvidersData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/notification-providers';
 };
@@ -39245,13 +39335,13 @@ export type ListNotificationRoutesData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/notification-routes';
 };
@@ -39414,13 +39504,13 @@ export type ListOrdersData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/orders';
 };
@@ -43583,6 +43673,32 @@ export type ArchiveConversationResponses = {
 };
 
 export type ArchiveConversationResponse = ArchiveConversationResponses[keyof ArchiveConversationResponses];
+
+export type SendProjectAiMessageData = {
+    body: SendMessageRequest;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/messages';
+};
+
+export type SendProjectAiMessageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type SendProjectAiMessageResponses = {
+    /**
+     * Turn accepted; output follows on the conversation WebSocket
+     */
+    202: SendMessageAcceptedResponse;
+};
+
+export type SendProjectAiMessageResponse = SendProjectAiMessageResponses[keyof SendProjectAiMessageResponses];
 
 export type ListPendingActionsData = {
     body?: never;
@@ -52044,13 +52160,13 @@ export type ListWebhooksData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/projects/{project_id}/webhooks';
 };

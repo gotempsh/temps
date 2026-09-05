@@ -1564,11 +1564,41 @@ impl ConversationService {
         hidden_project_ids: &[i32],
         status: &str,
     ) -> Result<Vec<ConversationWithProject>, ChatError> {
+        self.list_all_conversations_filtered(
+            user_id,
+            hidden_project_ids,
+            status,
+            false,
+            1,
+            Self::LIST_ALL_LIMIT,
+        )
+        .await
+    }
+
+    /// Bounded conversation list with optional global-workspace filtering
+    /// applied in SQL before the limit. This prevents project/application
+    /// activity from crowding global threads out of the workspace sidebar.
+    pub async fn list_all_conversations_filtered(
+        &self,
+        user_id: i32,
+        hidden_project_ids: &[i32],
+        status: &str,
+        global_only: bool,
+        page: u64,
+        page_size: u64,
+    ) -> Result<Vec<ConversationWithProject>, ChatError> {
         let mut query = ai_conversations::Entity::find()
             .filter(ai_conversations::Column::CreatedBy.eq(user_id))
             .filter(ai_conversations::Column::Status.eq(status))
             .order_by_desc(ai_conversations::Column::LastActivityAt)
-            .limit(Self::LIST_ALL_LIMIT);
+            .offset(page.saturating_sub(1).saturating_mul(page_size))
+            .limit(page_size.min(Self::LIST_ALL_LIMIT));
+        if global_only {
+            query = query
+                .filter(ai_conversations::Column::ProjectId.is_null())
+                .filter(ai_conversations::Column::ApplicationId.is_null())
+                .filter(ai_conversations::Column::ContextType.eq("global"));
+        }
         if !hidden_project_ids.is_empty() {
             query = query.filter(
                 Condition::any()
@@ -2207,7 +2237,7 @@ impl ConversationService {
         }
         log_phase("provider_readiness_checked");
         let mut application_seed_title = None;
-        let mut sandbox_environment = temps_ai::SensitiveEnvironment::default();
+        let sandbox_environment = temps_ai::SensitiveEnvironment::default();
         let harness_workspace = if conv.context_type == "application" {
             let workspaces = self.application_workspaces.as_ref().ok_or_else(|| {
                 ChatError::Ai("application sandbox workspace is unavailable".to_string())
@@ -2240,6 +2270,11 @@ impl ConversationService {
             let sandboxes = self.application_sandboxes.as_ref().ok_or_else(|| {
                 ChatError::Ai("application preview sandbox is unavailable".to_string())
             })?;
+            let project_ids = application
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>();
             let sandbox = sandboxes
                 .get_or_create_application_workspace_with_config(
                     auth.user_id(),
@@ -2247,43 +2282,12 @@ impl ConversationService {
                     application.primary_project_id,
                     workspace.host_work_dir.clone(),
                     (&desired_workspace).into(),
-                )
-                .await
-                .map_err(|error| {
-                    ChatError::Ai(format!(
-                        "could not prepare the application execution sandbox: {error}"
-                    ))
-                })?;
-            let project_ids = application
-                .projects
-                .iter()
-                .map(|project| project.id)
-                .collect::<Vec<_>>();
-            sandbox_environment = temps_ai::SensitiveEnvironment::new(
-                sandboxes
-                    .runtime_environment(auth.user_id(), &sandbox.public_id)
-                    .await
-                    .map_err(|error| {
-                        ChatError::Ai(format!(
-                            "could not prepare the application sandbox's linked database variables: {error}"
-                        ))
-                    })?,
-            );
-            // Credential issuance reconciles the generic sandbox attachment
-            // (the primary project). Finish with the full application
-            // topology so databases linked through secondary projects remain
-            // reachable for this shared workspace.
-            sandboxes
-                .synchronize_application_data_network(
-                    auth.user_id(),
-                    &application.application.public_id,
-                    &sandbox.public_id,
                     &project_ids,
                 )
                 .await
                 .map_err(|error| {
                     ChatError::Ai(format!(
-                        "could not connect the application workspace to its linked databases: {error}"
+                        "could not prepare the application execution sandbox: {error}"
                     ))
                 })?;
             // Docker names first-class sandboxes with the opaque id suffix
@@ -2540,7 +2544,7 @@ impl ConversationService {
             // reusable API key, stored secret values, or arbitrary host access.
             if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
                 system.content.push_str(
-                    "\n\n## Development workspace\nYou are running inside a persistent Temps sandbox. The application projects are under ./projects. Use your native filesystem and terminal tools only inside this workspace. Use the registered `temps` MCP tool for platform reads and `temps_write` for confirm-gated platform changes such as creating services or deploying. The primary project's linked database variables are injected into your process and may be used by application code and child dev servers. Never print, inspect, persist, or commit their values. No reusable platform credential is present. Do not try to access host paths. Describe workspace changes and pending platform proposals clearly when you finish.",
+                    "\n\n## Development workspace\nYou are running inside a persistent Temps sandbox. The application projects are under ./projects. Use your native filesystem and terminal tools only inside this workspace. Use the registered `temps` MCP tool for platform reads and `temps_write` for confirm-gated platform changes such as creating services or deploying. Linked database credentials are not exposed to the harness process. Use Temps platform tools for managed service operations; do not attempt to discover or reconstruct stored secret values. No reusable platform credential is present. Do not try to access host paths. Describe workspace changes and pending platform proposals clearly when you finish.",
                 );
             }
         }
@@ -7527,6 +7531,36 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].conversation.public_id, "visible");
+    }
+
+    #[tokio::test]
+    async fn global_workspace_filter_is_applied_before_the_bounded_query() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_conversations::Model>::new()])
+                .into_connection(),
+        );
+        let service = db_service_from_arc(db.clone());
+
+        assert!(service
+            .list_all_conversations_filtered(5, &[], "active", true, 2, 25)
+            .await
+            .expect("global conversation list")
+            .is_empty());
+
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("project_id") && sql.contains("IS NULL"));
+        assert!(sql.contains("application_id") && sql.contains("IS NULL"));
+        assert!(sql.contains("context_type"));
+        assert!(sql.contains("LIMIT") && sql.contains("OFFSET"));
     }
 
     // Legacy project toggle values no longer affect chat visibility. Access is

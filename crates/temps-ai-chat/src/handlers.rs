@@ -29,9 +29,7 @@ use axum::{
     Extension, Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
-};
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -44,16 +42,17 @@ use temps_auth::{
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
 use temps_entities::source_type::SourceType;
-use temps_entities::{ai_conversations, ai_messages, ai_pending_actions, environments, projects};
+use temps_entities::{ai_conversations, ai_messages, ai_pending_actions};
 
 use temps_ai::streaming::{PermissionDecision, PermissionKind, PermissionRequest};
 
 use crate::audit::{
-    AiActionConfirmedAudit, AiActionRejectedAudit, ApplicationCreatedAudit,
-    ApplicationTopologyChangedAudit, ApplicationWorkspaceChangedAudit,
-    ApplicationWorkspaceDeployedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
-    ConversationCreatedAudit, ConversationPermissionModeChangedAudit, ConversationRenamedAudit,
-    ConversationRestoredAudit, PermissionResolvedAudit, ThreadArtifactCreatedAudit,
+    AiActionConfirmedAudit, AiActionRejectedAudit, ApplicationArchivedAudit,
+    ApplicationCreatedAudit, ApplicationRestoredAudit, ApplicationTopologyChangedAudit,
+    ApplicationWorkspaceChangedAudit, ApplicationWorkspaceDeployedAudit, ChatMessageSentAudit,
+    ConversationArchivedAudit, ConversationCreatedAudit, ConversationPermissionModeChangedAudit,
+    ConversationRenamedAudit, ConversationRestoredAudit, PermissionResolvedAudit,
+    ThreadArtifactCreatedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
 use crate::sensitive::{
@@ -156,7 +155,7 @@ pub struct ApplicationProjectResponse {
     pub id: i32,
     pub name: String,
     pub slug: String,
-    pub repository: String,
+    pub repository: Option<String>,
     pub main_branch: String,
     pub is_private: bool,
     pub is_primary: bool,
@@ -200,7 +199,8 @@ impl From<crate::applications::ApplicationWithProjects> for ApplicationResponse 
                     id: project.id,
                     name: project.name,
                     slug: project.slug,
-                    repository: format!("{}/{}", project.repo_owner, project.repo_name),
+                    repository: (!project.repo_owner.is_empty() && !project.repo_name.is_empty())
+                        .then(|| format!("{}/{}", project.repo_owner, project.repo_name)),
                     main_branch: project.main_branch,
                     is_private: !project.is_public_repo,
                     is_primary: primary_project_id == Some(project.id),
@@ -656,10 +656,30 @@ impl ConversationListStatus {
     }
 }
 
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationListScope {
+    #[default]
+    All,
+    Global,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ConversationListQuery {
     #[serde(default)]
     pub status: ConversationListStatus,
+    #[serde(default)]
+    pub scope: ConversationListScope,
+    #[serde(flatten)]
+    pub pagination: temps_core::PaginationParams,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ApplicationListQuery {
+    #[serde(default)]
+    pub status: ConversationListStatus,
+    #[serde(flatten)]
+    pub pagination: temps_core::PaginationParams,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1412,6 +1432,33 @@ async fn ensure_application_project_permission(
     Ok(())
 }
 
+/// Existing projects may only be bundled when the installation can prove the
+/// caller's project membership. OSS has no project ownership column to fall
+/// back to, so a non-admin request must fail closed when no checker is
+/// registered. Starter projects created by this request are safe because they
+/// are not supplied by the caller and therefore bypass this preflight.
+async fn ensure_application_creation_project_permission(
+    auth: &AuthContext,
+    checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_ids: &[i32],
+    required: &Permission,
+) -> Result<(), Problem> {
+    if project_ids.is_empty()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin)
+    {
+        return ensure_application_project_permission(auth, checker, project_ids, required).await;
+    }
+    if checker.is_none() {
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Project Ownership Cannot Be Verified")
+            .with_detail(
+                "This installation cannot verify access to existing projects. Ask an administrator to create the workspace, or create it with a new starter project.",
+            ));
+    }
+    ensure_application_project_permission(auth, checker, project_ids, required).await
+}
+
 async fn ensure_application_conversation_permission(
     state: &AppState,
     auth: &AuthContext,
@@ -1421,28 +1468,25 @@ async fn ensure_application_conversation_permission(
     if conversation.context_type != "application" {
         return Ok(());
     }
-    let application_public_id =
-        conversation.context_id.split(':').next().ok_or_else(|| {
-            ApplicationError::ConversationNotFound(conversation.public_id.clone())
-        })?;
-    let application = state
+    let application_id = conversation
+        .application_id
+        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
+    let mut scopes = state
         .applications
-        .get(auth.user_id(), application_public_id)
+        .project_scopes(auth.user_id(), &[application_id])
         .await?;
-    let project_ids = application
-        .projects
-        .iter()
-        .map(|project| project.id)
-        .collect::<Vec<_>>();
+    let scope = scopes
+        .remove(&application_id)
+        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
     let permission = ensure_application_project_permission(
         auth,
         &state.project_access_checker,
-        &project_ids,
+        &scope.project_ids,
         required,
     )
     .await;
     if permission.is_err() {
-        quarantine_application_workspace(state, auth.user_id(), application_public_id).await;
+        quarantine_application_workspace(state, auth.user_id(), &scope.public_id).await;
     }
     permission
 }
@@ -1455,81 +1499,103 @@ async fn ensure_application_conversation_access(
     if conversation.context_type != "application" {
         return Ok(());
     }
-    let application_public_id =
-        conversation.context_id.split(':').next().ok_or_else(|| {
-            ApplicationError::ConversationNotFound(conversation.public_id.clone())
-        })?;
-    let application = state
+    let application_id = conversation
+        .application_id
+        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
+    let mut scopes = state
         .applications
-        .get(auth.user_id(), application_public_id)
+        .project_scopes(auth.user_id(), &[application_id])
         .await?;
-    let project_ids = application
-        .projects
-        .iter()
-        .map(|project| project.id)
-        .collect::<Vec<_>>();
+    let scope = scopes
+        .remove(&application_id)
+        .ok_or_else(|| ApplicationError::ConversationNotFound(conversation.public_id.clone()))?;
     let access = ensure_application_project_permission(
         auth,
         &state.project_access_checker,
-        &project_ids,
+        &scope.project_ids,
         &Permission::ProjectsRead,
     )
     .await;
     if access.is_err() {
-        quarantine_application_workspace(state, auth.user_id(), application_public_id).await;
+        quarantine_application_workspace(state, auth.user_id(), &scope.public_id).await;
     }
     access
 }
 
-/// Resolve one application membership decision per application in list views.
-/// This keeps multiple threads from the same application from multiplying
-/// database topology reads and team-access checks.
+async fn application_list_access(
+    state: &AppState,
+    auth: &AuthContext,
+    application_ids: &[i64],
+) -> Result<
+    (
+        HashMap<i64, crate::applications::ApplicationProjectScope>,
+        Option<std::collections::BTreeMap<i32, bool>>,
+    ),
+    Problem,
+> {
+    let scopes = state
+        .applications
+        .project_scopes(auth.user_id(), application_ids)
+        .await?;
+    let project_ids = scopes
+        .values()
+        .flat_map(|scope| scope.project_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let access =
+        application_project_access_map(auth, &state.project_access_checker, &project_ids).await?;
+    Ok((scopes, access))
+}
+
+/// Resolve visibility from a topology/access snapshot loaded once per list.
 async fn application_conversation_is_visible(
     state: &AppState,
     auth: &AuthContext,
     conversation: &ai_conversations::Model,
-    visibility: &mut HashMap<String, bool>,
+    scopes: &HashMap<i64, crate::applications::ApplicationProjectScope>,
+    access: &Option<std::collections::BTreeMap<i32, bool>>,
 ) -> Result<bool, Problem> {
     if conversation.context_type != "application" {
         return Ok(true);
     }
-    let application_public_id =
-        conversation.context_id.split(':').next().ok_or_else(|| {
-            ApplicationError::ConversationNotFound(conversation.public_id.clone())
-        })?;
-    if let Some(visible) = visibility.get(application_public_id) {
-        return Ok(*visible);
-    }
-    let application = state
-        .applications
-        .get(auth.user_id(), application_public_id)
-        .await?;
-    let project_ids = application
-        .projects
-        .iter()
-        .map(|project| project.id)
-        .collect::<Vec<_>>();
-    let visible =
-        has_application_project_access(auth, &state.project_access_checker, &project_ids).await?;
+    let Some(application_id) = conversation.application_id else {
+        return Ok(false);
+    };
+    let Some(scope) = scopes.get(&application_id) else {
+        return Ok(false);
+    };
+    let visible = access.as_ref().is_none_or(|access| {
+        scope
+            .project_ids
+            .iter()
+            .all(|project_id| access.get(project_id).copied().unwrap_or(false))
+    });
     if !visible {
-        quarantine_application_workspace(state, auth.user_id(), application_public_id).await;
+        quarantine_application_workspace(state, auth.user_id(), &scope.public_id).await;
     }
-    visibility.insert(application_public_id.to_string(), visible);
     Ok(visible)
 }
 
 #[utoipa::path(
     get, tag = "AI Applications", path = "/ai/applications",
+    params(
+        temps_core::PaginationParams,
+        ("status" = Option<ConversationListStatus>, Query, description = "Application lifecycle state (defaults to active)"),
+    ),
     responses((status = 200, body = Vec<ApplicationResponse>), (status = 401), (status = 403)),
     security(("bearer_auth" = []))
 )]
 pub async fn list_applications(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Query(query): Query<ApplicationListQuery>,
 ) -> Result<Json<Vec<ApplicationResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
-    let applications = state.applications.list(auth.user_id()).await?;
+    let (page, page_size) = query.pagination.normalize();
+    let applications = state
+        .applications
+        .list_with_status(auth.user_id(), page, page_size, query.status.as_str())
+        .await?;
     let project_ids = applications
         .iter()
         .flat_map(|application| application.projects.iter().map(|project| project.id))
@@ -1584,14 +1650,14 @@ pub async fn create_application(
         permission_guard!(auth, ProjectsCreate);
         permission_guard!(auth, ProjectsWrite);
     }
-    ensure_application_project_permission(
+    ensure_application_creation_project_permission(
         &auth,
         &state.project_access_checker,
         &request.project_ids,
         &Permission::ProjectsWrite,
     )
     .await?;
-    ensure_application_project_permission(
+    ensure_application_creation_project_permission(
         &auth,
         &state.project_access_checker,
         &request.project_ids,
@@ -1706,6 +1772,7 @@ async fn create_starter_project(
     project_service
         .create_project(temps_projects::services::types::CreateProjectRequest {
             name: request.name.trim().to_string(),
+            expected_slug: None,
             repo_name: None,
             repo_owner: None,
             directory: ".".to_string(),
@@ -1715,10 +1782,16 @@ async fn create_starter_project(
             environment_variables: None,
             automatic_deploy: false,
             storage_service_ids: Vec::new(),
+            storage_service_claim_ids: Vec::new(),
+            storage_service_claim_user_id: None,
             is_public_repo: Some(false),
             git_url: None,
             git_provider_connection_id: None,
             exposed_port: request.exposed_port.or(Some(3000)),
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
             source_type: SourceType::UploadedSource,
             template_slug: None,
         })
@@ -1752,32 +1825,18 @@ enum ApplicationDropArchiveError {
 }
 
 fn drop_ignored_directory(entry: &walkdir::DirEntry) -> bool {
-    entry.depth() > 0
-        && entry.file_type().is_dir()
-        && matches!(entry.file_name().to_str(), Some(".git" | "node_modules"))
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return false;
+    }
+    entry.file_name().to_str().is_some_and(|name| {
+        name.eq_ignore_ascii_case("node_modules") || is_sensitive_workspace_path(name)
+    })
 }
 
 fn drop_ignored_file(path: &FsPath) -> bool {
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    name == ".env"
-        || name.starts_with(".env.")
-        || matches!(
-            name,
-            ".npmrc"
-                | ".yarnrc"
-                | ".pypirc"
-                | ".netrc"
-                | "id_rsa"
-                | "id_ed25519"
-                | "credentials.json"
-        )
-        || name == ".DS_Store"
-        || matches!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("pem" | "key" | "p12" | "pfx")
-        )
+    path.to_str()
+        .map(|value| value.replace(std::path::MAIN_SEPARATOR, "/"))
+        .is_some_and(|path| is_sensitive_workspace_path(&path))
 }
 
 fn canonical_workspace_subdirectory(
@@ -1919,10 +1978,6 @@ fn prepare_application_drop_archive(
                 relative.display().to_string(),
             ));
         }
-        source_bytes = source_bytes.saturating_add(metadata.len());
-        if source_bytes > MAX_APPLICATION_DROP_BYTES {
-            return Err(ApplicationDropArchiveError::TooLarge);
-        }
         let archive_name = relative
             .to_str()
             .ok_or_else(|| {
@@ -1932,10 +1987,12 @@ fn prepare_application_drop_archive(
         writer
             .start_file(archive_name, options)
             .map_err(|error| ApplicationDropArchiveError::Io(std::io::Error::other(error)))?;
-        std::io::copy(
-            &mut source.take(MAX_APPLICATION_DROP_BYTES + 1),
-            &mut writer,
-        )?;
+        let remaining = MAX_APPLICATION_DROP_BYTES.saturating_sub(source_bytes);
+        let copied = std::io::copy(&mut source.take(remaining + 1), &mut writer)?;
+        if copied > remaining {
+            return Err(ApplicationDropArchiveError::TooLarge);
+        }
+        source_bytes = source_bytes.saturating_add(copied);
     }
     if file_count == 0 {
         return Err(ApplicationDropArchiveError::Missing(
@@ -2185,7 +2242,14 @@ pub async fn deploy_application_workspace_project(
         &Permission::DeploymentsCreate,
     )
     .await?;
-    let mut project = application
+    ensure_application_project_permission(
+        &auth,
+        &state.project_access_checker,
+        &[project_id],
+        &Permission::ProjectsWrite,
+    )
+    .await?;
+    let project = application
         .projects
         .iter()
         .find(|project| project.id == project_id)
@@ -2198,45 +2262,6 @@ pub async fn deploy_application_workspace_project(
                 ))
         })?;
 
-    // Early application workspaces were created as `manual`, before Drop was
-    // the canonical source for them. Upgrade only that legacy source kind; Git,
-    // image, and static projects still require their explicit alternate-source
-    // opt-in and are never silently rewritten.
-    let legacy_manual_source = project.source_type == SourceType::Manual;
-
-    let environments = environments::Entity::find()
-        .filter(environments::Column::ProjectId.eq(project_id))
-        .filter(environments::Column::DeletedAt.is_null())
-        .order_by_asc(environments::Column::CreatedAt)
-        .all(state.db.as_ref())
-        .await
-        .map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Environment Lookup Failed")
-                .with_detail(format!(
-                    "Could not list environments for project {project_id}: {error}"
-                ))
-        })?;
-    let environment = match request.environment_id {
-        Some(environment_id) => environments
-            .into_iter()
-            .find(|environment| environment.id == environment_id),
-        None => environments
-            .iter()
-            .find(|environment| environment.name == "production")
-            .cloned()
-            .or_else(|| environments.into_iter().next()),
-    }
-    .ok_or_else(|| {
-        problemdetails::new(StatusCode::NOT_FOUND)
-            .with_title("Environment Not Found")
-            .with_detail(match request.environment_id {
-                Some(environment_id) => {
-                    format!("Environment {environment_id} does not belong to project {project_id}")
-                }
-                None => format!("Project {project_id} has no active environments"),
-            })
-    })?;
     let workspace = state
         .application_workspaces
         .ensure(&application.application.public_id, &application.projects)
@@ -2273,29 +2298,20 @@ pub async fn deploy_application_workspace_project(
             .with_title("Drop Deployment Unavailable")
             .with_detail("The deployments plugin is not available on this Temps instance")
     })?;
-    if legacy_manual_source {
-        let mut active: projects::ActiveModel = project.into();
-        active.source_type = Set(SourceType::UploadedSource);
-        project = active.update(state.db.as_ref()).await.map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Project Source Update Failed")
-                .with_detail(format!(
-                    "Could not prepare project {project_id} for workspace Drop: {error}"
-                ))
-        })?;
-    }
     let deployed = deployer
         .deploy_source_drop(temps_core::SourceDropRequest {
             project_id,
-            environment_id: environment.id,
+            environment_id: request.environment_id,
             archive_path: archive.path().to_path_buf(),
             original_filename: format!("{}.zip", project.slug),
+            promote_manual_source: true,
         })
         .await
         .map_err(|error| {
             let status = match error {
                 temps_core::SourceDropError::ProjectNotFound { .. }
-                | temps_core::SourceDropError::EnvironmentNotFound { .. } => StatusCode::NOT_FOUND,
+                | temps_core::SourceDropError::EnvironmentNotFound { .. }
+                | temps_core::SourceDropError::NoEnvironment { .. } => StatusCode::NOT_FOUND,
                 temps_core::SourceDropError::SourceNotAllowed { .. }
                 | temps_core::SourceDropError::InvalidArchive { .. } => StatusCode::BAD_REQUEST,
                 temps_core::SourceDropError::ArchiveTooLarge { .. } => {
@@ -2500,12 +2516,22 @@ pub async fn unlink_application_project(
         &Permission::SandboxesWrite,
     )
     .await?;
+    let project_slug = current
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| project.slug.clone())
+        .ok_or_else(|| ApplicationError::ProjectNotLinked {
+            application_id: application_public_id.clone(),
+            project_id,
+        })?;
     let remaining_project_ids = current
         .projects
         .iter()
         .filter(|project| project.id != project_id)
         .map(|project| project.id)
         .collect::<Vec<_>>();
+    let mut paused_sandbox = None;
     if let Some(sandboxes) = state.application_sandboxes.as_ref() {
         if let Some(summary) = sandboxes
             .application_workspace_summary(auth.user_id(), &application_public_id)
@@ -2513,24 +2539,112 @@ pub async fn unlink_application_project(
             .map_err(Problem::from)?
             .filter(|summary| workspace_may_retain_data_plane(&summary.status))
         {
-            // Revoke data-plane access before committing the topology change.
-            // A database failure can temporarily narrow access, but can never
-            // leave an unlinked project's services reachable.
+            // Stop compute before moving its source tree. This closes both the
+            // filesystem and data-network race while unlinking.
             sandboxes
-                .synchronize_application_data_network(
-                    auth.user_id(),
-                    &application_public_id,
-                    &summary.public_id,
-                    &remaining_project_ids,
-                )
+                .pause_sandbox(&summary.public_id, auth.user_id())
                 .await
                 .map_err(Problem::from)?;
+            paused_sandbox = Some(summary.public_id);
         }
     }
-    let application = state
+    let staged_source = match state
+        .application_workspaces
+        .stage_project_removal(&application_public_id, &project_slug)
+        .await
+    {
+        Ok(staged) => staged,
+        Err(error) => {
+            if let (Some(sandboxes), Some(sandbox_id)) = (
+                state.application_sandboxes.as_ref(),
+                paused_sandbox.as_deref(),
+            ) {
+                if let Err(resume_error) =
+                    sandboxes.resume_sandbox(sandbox_id, auth.user_id()).await
+                {
+                    tracing::error!(
+                        application_id = application_public_id,
+                        %resume_error,
+                        "Failed to resume application workspace after unlink staging failed"
+                    );
+                }
+            }
+            return Err(error.into());
+        }
+    };
+    let application = match state
         .applications
         .unlink_project(auth.user_id(), &application_public_id, project_id)
-        .await?;
+        .await
+    {
+        Ok(application) => application,
+        Err(error) => {
+            if let Some(staged) = staged_source.as_ref() {
+                if let Err(restore_error) = state
+                    .application_workspaces
+                    .restore_staged_project(staged)
+                    .await
+                {
+                    tracing::error!(
+                        application_id = application_public_id,
+                        project_id,
+                        %restore_error,
+                        "Failed to restore application project source after unlink rollback"
+                    );
+                }
+            }
+            if let (Some(sandboxes), Some(sandbox_id)) = (
+                state.application_sandboxes.as_ref(),
+                paused_sandbox.as_deref(),
+            ) {
+                if let Err(resume_error) =
+                    sandboxes.resume_sandbox(sandbox_id, auth.user_id()).await
+                {
+                    tracing::error!(
+                        application_id = application_public_id,
+                        %resume_error,
+                        "Failed to resume application workspace after unlink rollback"
+                    );
+                }
+            }
+            return Err(error.into());
+        }
+    };
+    if let Some(staged) = staged_source {
+        if let Err(error) = state
+            .application_workspaces
+            .finalize_staged_project(staged)
+            .await
+        {
+            tracing::error!(
+                application_id = application_public_id,
+                project_id,
+                %error,
+                "Failed to delete staged source after project unlink; source remains outside the mounted workspace"
+            );
+        }
+    }
+    if let (Some(sandboxes), Some(sandbox_id)) = (
+        state.application_sandboxes.as_ref(),
+        paused_sandbox.as_deref(),
+    ) {
+        // Narrow data-plane reachability while compute is still stopped. If
+        // synchronization fails, leave the sandbox paused rather than briefly
+        // reopening access to the unlinked project's services.
+        sandboxes
+            .synchronize_application_data_network(
+                auth.user_id(),
+                &application_public_id,
+                sandbox_id,
+                &remaining_project_ids,
+            )
+            .await
+            .map_err(Problem::from)?;
+        sandboxes
+            .resume_sandbox(sandbox_id, auth.user_id())
+            .await
+            .map_err(Problem::from)?;
+    }
     state
         .audit(&ApplicationTopologyChangedAudit {
             context: audit_context(&auth, &metadata),
@@ -2588,7 +2702,10 @@ pub async fn set_application_primary_project(
 
 #[utoipa::path(
     get, tag = "AI Applications", path = "/ai/applications/{application_public_id}",
-    params(("application_public_id" = String, Path,)),
+    params(
+        ("application_public_id" = String, Path,),
+        ("status" = Option<ConversationListStatus>, Query, description = "Application lifecycle state (defaults to active)"),
+    ),
     responses((status = 200, body = ApplicationResponse), (status = 401), (status = 403), (status = 404)),
     security(("bearer_auth" = []))
 )]
@@ -2596,17 +2713,167 @@ pub async fn get_application(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(application_public_id): Path<String>,
+    Query(query): Query<ApplicationListQuery>,
 ) -> Result<Json<ApplicationResponse>, Problem> {
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
-    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    let application = authorized_application_with_status(
+        &state,
+        &auth,
+        &application_public_id,
+        query.status.as_str(),
+    )
+    .await?;
     Ok(Json(ApplicationResponse::from(application)))
+}
+
+#[utoipa::path(
+    delete, tag = "AI Applications", path = "/ai/applications/{application_public_id}",
+    operation_id = "archive_application",
+    summary = "Archive an AI application",
+    description = "Archives the application and pauses its workspace compute while retaining projects, conversations, and persistent files.",
+    params(("application_public_id" = String, Path,)),
+    responses((status = 204), (status = 401), (status = 403), (status = 404), (status = 503)),
+    security(("bearer_auth" = []))
+)]
+pub async fn archive_application(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(application_public_id): Path<String>,
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_permission(
+        &auth,
+        &state.project_access_checker,
+        &project_ids,
+        &Permission::ProjectsWrite,
+    )
+    .await?;
+    ensure_application_project_permission(
+        &auth,
+        &state.project_access_checker,
+        &project_ids,
+        &Permission::SandboxesWrite,
+    )
+    .await?;
+
+    let mut paused_sandbox = None;
+    if let Some(sandboxes) = state.application_sandboxes.as_ref() {
+        if let Some(summary) = sandboxes
+            .application_workspace_summary(auth.user_id(), &application_public_id)
+            .await
+            .map_err(Problem::from)?
+        {
+            sandboxes
+                .pause_sandbox(&summary.public_id, auth.user_id())
+                .await
+                .map_err(Problem::from)?;
+            paused_sandbox = Some(summary.public_id);
+        }
+    }
+
+    let project_ids = match state
+        .applications
+        .archive(auth.user_id(), &application_public_id)
+        .await
+    {
+        Ok(project_ids) => project_ids,
+        Err(error) => {
+            if let (Some(sandboxes), Some(sandbox_id)) = (
+                state.application_sandboxes.as_ref(),
+                paused_sandbox.as_deref(),
+            ) {
+                if let Err(resume_error) =
+                    sandboxes.resume_sandbox(sandbox_id, auth.user_id()).await
+                {
+                    tracing::error!(
+                        application_id = application_public_id,
+                        %resume_error,
+                        "Failed to resume application workspace after archive rollback"
+                    );
+                }
+            }
+            return Err(error.into());
+        }
+    };
+    state
+        .audit(&ApplicationArchivedAudit {
+            context: audit_context(&auth, &metadata),
+            application_id: application_public_id,
+            project_ids,
+        })
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post, tag = "AI Applications", path = "/ai/applications/{application_public_id}/restore",
+    operation_id = "restore_application",
+    summary = "Restore an archived AI application",
+    description = "Restores an archived application and requests that its retained persistent workspace resume on next access.",
+    params(("application_public_id" = String, Path,)),
+    responses((status = 200, body = ApplicationResponse), (status = 401), (status = 403), (status = 404)),
+    security(("bearer_auth" = []))
+)]
+pub async fn restore_application(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(application_public_id): Path<String>,
+) -> Result<Json<ApplicationResponse>, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    let archived =
+        authorized_application_with_status(&state, &auth, &application_public_id, "archived")
+            .await?;
+    let project_ids = archived
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_permission(
+        &auth,
+        &state.project_access_checker,
+        &project_ids,
+        &Permission::ProjectsWrite,
+    )
+    .await?;
+    ensure_application_project_permission(
+        &auth,
+        &state.project_access_checker,
+        &project_ids,
+        &Permission::SandboxesWrite,
+    )
+    .await?;
+    let restored = state
+        .applications
+        .restore(auth.user_id(), &application_public_id)
+        .await?;
+    state
+        .audit(&ApplicationRestoredAudit {
+            context: audit_context(&auth, &metadata),
+            application_id: application_public_id,
+            project_ids,
+        })
+        .await;
+    Ok(Json(ApplicationResponse::from(restored)))
 }
 
 #[utoipa::path(
     get, tag = "AI Applications", path = "/ai/applications/{application_public_id}/conversations",
     params(
         ("application_public_id" = String, Path,),
+        temps_core::PaginationParams,
         ("status" = Option<ConversationListStatus>, Query, description = "Conversation lifecycle state (defaults to active)"),
     ),
     responses((status = 200, body = Vec<ConversationResponse>), (status = 401), (status = 403), (status = 404)),
@@ -2616,17 +2883,20 @@ pub async fn list_application_conversations(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(application_public_id): Path<String>,
-    Query(query): Query<ConversationListQuery>,
+    Query(query): Query<ApplicationListQuery>,
 ) -> Result<Json<Vec<ConversationResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let application = authorized_application(&state, &auth, &application_public_id).await?;
+    let (page, page_size) = query.pagination.normalize();
     let conversations = state
         .applications
         .conversations_with_status(
             application.application.id,
             auth.user_id(),
             query.status.as_str(),
+            page,
+            page_size,
         )
         .await?;
     Ok(Json(
@@ -2849,6 +3119,9 @@ pub async fn import_application_workspace_git(
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, ProjectsWrite);
     permission_guard!(auth, SandboxesWrite);
+    if request.git_connection_id.is_some() {
+        permission_guard!(auth, GitRepositoriesRead);
+    }
     deny_deployment_token!(auth);
     let (application, sandbox_public_id) =
         application_workspace_sandbox(&state, &auth, &application_public_id).await?;
@@ -2958,12 +3231,21 @@ fn is_sensitive_workspace_path(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') || path.contains("../") {
         return true;
     }
-    path.split('/').any(|component| {
-        let lower = component.to_ascii_lowercase();
+    let components = path
+        .split('/')
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| component == ".config")
+        && components.iter().any(|component| component == "gcloud")
+    {
+        return true;
+    }
+    components.iter().any(|lower| {
+        let lower = lower.as_str();
         lower == ".git"
             || lower.starts_with(".git/")
             || matches!(
-                lower.as_str(),
+                lower,
                 ".aws"
                     | ".azure"
                     | ".docker"
@@ -2977,12 +3259,18 @@ fn is_sensitive_workspace_path(path: &str) -> bool {
             || (lower.starts_with(".env.") && lower != ".env.example")
             || lower == ".envrc"
             || lower == ".git-credentials"
+            || lower == ".ds_store"
+            || lower == ".netrc"
             || lower == ".npmrc"
             || lower == ".pypirc"
+            || lower == ".yarnrc"
             || lower == "credentials"
             || lower == "credentials.json"
+            || lower == "id_dsa"
             || lower == "id_rsa"
             || lower == "id_ed25519"
+            || lower.ends_with(".credentials.json")
+            || (lower.contains("service-account") && lower.ends_with(".json"))
             || lower.ends_with(".pem")
             || lower.ends_with(".key")
             || lower.ends_with(".p12")
@@ -3170,6 +3458,7 @@ async fn application_workspace_sandbox(
             project_ids.first().copied(),
             workspace.host_work_dir,
             (&desired_workspace).into(),
+            &project_ids,
         )
         .await
         .map_err(|error| {
@@ -3177,20 +3466,6 @@ async fn application_workspace_sandbox(
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Application Workspace Failed")
                 .with_detail("Temps could not prepare the persistent application workspace.")
-        })?;
-    sandboxes
-        .synchronize_application_data_network(
-            auth.user_id(),
-            &application.application.public_id,
-            &sandbox.public_id,
-            &project_ids,
-        )
-        .await
-        .map_err(|error| {
-            error!(%error, application_id = application_public_id, "failed to reconcile application data network");
-            problemdetails::new(StatusCode::BAD_GATEWAY)
-                .with_title("Application Data Network Failed")
-                .with_detail("The workspace started, but Temps could not attach its linked databases.")
         })?;
     state
         .applications
@@ -3754,7 +4029,11 @@ pub async fn find_conversation(
 #[utoipa::path(
     get, tag = "AI Chat",
     path = "/ai/conversations",
-    params(("status" = Option<ConversationListStatus>, Query, description = "Conversation lifecycle state (defaults to active)")),
+    params(
+        temps_core::PaginationParams,
+        ("status" = Option<ConversationListStatus>, Query, description = "Conversation lifecycle state (defaults to active)"),
+        ("scope" = Option<ConversationListScope>, Query, description = "Limit results to the global AI workspace, or return all readable contexts"),
+    ),
     responses((status = 200, body = Vec<GlobalConversationResponse>), (status = 401), (status = 403)),
     security(("bearer_auth" = []))
 )]
@@ -3768,18 +4047,27 @@ pub async fn list_all_conversations(
     // project-scoped deployment/project token must not reach another tenant's
     // chats through it. Restrict to human/admin (user/API-key) principals.
     deny_deployment_token!(auth);
+    let (page, page_size) = query.pagination.normalize();
     let hidden_project_ids =
         hidden_conversation_project_ids(&auth, &state.project_access_checker).await?;
     let items = state
         .service
-        .list_all_conversations_with_status(
+        .list_all_conversations_filtered(
             auth.user_id(),
             &hidden_project_ids,
             query.status.as_str(),
+            query.scope == ConversationListScope::Global,
+            page,
+            page_size,
         )
         .await?;
+    let application_ids = items
+        .iter()
+        .filter_map(|item| item.conversation.application_id)
+        .collect::<Vec<_>>();
+    let (application_scopes, application_access) =
+        application_list_access(&state, &auth, &application_ids).await?;
     let mut conversations = Vec::with_capacity(items.len());
-    let mut application_visibility = HashMap::new();
     for item in items {
         if !can_read_context(&auth, &item.conversation.context_type) {
             continue;
@@ -3788,7 +4076,8 @@ pub async fn list_all_conversations(
             &state,
             &auth,
             &item.conversation,
-            &mut application_visibility,
+            &application_scopes,
+            &application_access,
         )
         .await?
         {
@@ -4152,6 +4441,15 @@ fn workspace_may_retain_data_plane(status: &str) -> bool {
     matches!(status, "running" | "recovering")
 }
 
+fn ensure_conversation_is_active(conversation: &ai_conversations::Model) -> Result<(), Problem> {
+    if conversation.status == "active" {
+        return Ok(());
+    }
+    Err(problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Conversation Is Archived")
+        .with_detail("Restore this conversation before sending another message."))
+}
+
 fn audit_context(auth: &AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
@@ -4165,9 +4463,18 @@ async fn authorized_application(
     auth: &AuthContext,
     application_public_id: &str,
 ) -> Result<crate::applications::ApplicationWithProjects, Problem> {
+    authorized_application_with_status(state, auth, application_public_id, "active").await
+}
+
+async fn authorized_application_with_status(
+    state: &AppState,
+    auth: &AuthContext,
+    application_public_id: &str,
+    status: &str,
+) -> Result<crate::applications::ApplicationWithProjects, Problem> {
     let application = state
         .applications
-        .get(auth.user_id(), application_public_id)
+        .get_with_status(auth.user_id(), application_public_id, status)
         .await?;
     if let Err(problem) = ensure_application_project_permission(
         auth,
@@ -4702,8 +5009,13 @@ pub async fn list_conversations(
         .service
         .list_conversations(project_id, auth.user_id())
         .await?;
+    let application_ids = conversations
+        .iter()
+        .filter_map(|conversation| conversation.application_id)
+        .collect::<Vec<_>>();
+    let (application_scopes, application_access) =
+        application_list_access(&state, &auth, &application_ids).await?;
     let mut responses = Vec::with_capacity(conversations.len());
-    let mut application_visibility = HashMap::new();
     for conversation in conversations {
         if !can_read_context(&auth, &conversation.context_type) {
             continue;
@@ -4712,7 +5024,8 @@ pub async fn list_conversations(
             &state,
             &auth,
             &conversation,
-            &mut application_visibility,
+            &application_scopes,
+            &application_access,
         )
         .await?
         {
@@ -4865,13 +5178,18 @@ async fn ensure_user_conversation_access(
     // still checked, while each platform tool/endpoint independently enforces
     // its current resource permission and scope.
     if conversation.context_type == "application" {
-        let application_public_id = conversation.context_id.split(':').next().ok_or_else(|| {
+        let application_id = conversation.application_id.ok_or_else(|| {
             ApplicationError::ConversationNotFound(conversation.public_id.clone())
         })?;
-        state
+        let scopes = state
             .applications
-            .get(auth.user_id(), application_public_id)
+            .project_scopes(auth.user_id(), &[application_id])
             .await?;
+        if !scopes.contains_key(&application_id) {
+            return Err(
+                ApplicationError::ConversationNotFound(conversation.public_id.clone()).into(),
+            );
+        }
     }
     ensure_conversation_read_permission(auth, conversation)
 }
@@ -4884,7 +5202,7 @@ async fn ensure_user_conversation_mutation_access(
     auth: &AuthContext,
     conversation: &ai_conversations::Model,
 ) -> Result<(), Problem> {
-    ensure_user_conversation_access(state, auth, conversation).await?;
+    ensure_conversation_read_permission(auth, conversation)?;
     if conversation.context_type == "application" {
         ensure_application_conversation_access(state, auth, conversation).await?;
     } else {
@@ -5108,6 +5426,7 @@ fn turn_state_frame(
 #[utoipa::path(
     post, tag = "AI Chat",
     path = "/projects/{project_id}/ai/conversations/{public_id}/messages",
+    operation_id = "send_project_ai_message",
     params(("project_id" = i32, Path,), ("public_id" = String, Path,)),
     request_body = SendMessageRequest,
     responses((status = 202, description = "Turn accepted; output follows on the conversation WebSocket", body = SendMessageAcceptedResponse), (status = 401), (status = 403), (status = 404), (status = 409)),
@@ -5135,6 +5454,7 @@ pub async fn send_message(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_conversation_is_active(&conv)?;
     ensure_application_conversation_access(&state, &auth, &conv).await?;
     let effective_permission = req
         .ai_permission_mode
@@ -5267,6 +5587,7 @@ pub async fn send_user_message(
         .service
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
+    ensure_conversation_is_active(&conversation)?;
     ensure_user_conversation_mutation_access(&state, &auth, &conversation).await?;
     if conversation_context_requires_sandbox_write(&conversation.context_type) {
         // Starting an application/global turn grants the provider access to a
@@ -7050,7 +7371,14 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/ai/applications",
             get(list_applications).post(create_application),
         )
-        .route("/ai/applications/{application_public_id}", get(get_application))
+        .route(
+            "/ai/applications/{application_public_id}",
+            get(get_application).delete(archive_application),
+        )
+        .route(
+            "/ai/applications/{application_public_id}/restore",
+            post(restore_application),
+        )
         .route(
             "/ai/applications/{application_public_id}/projects",
             post(create_application_project),
@@ -7241,11 +7569,17 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
 }
 
+// `user_conversation_stream` and `sandbox_tools_mcp` are intentionally absent
+// from the public OpenAPI document. They are capability-bound streaming
+// transports (SSE and MCP respectively), not ordinary bearer-authenticated
+// JSON APIs, and the generated REST clients cannot model either lifecycle.
 #[derive(OpenApi)]
 #[openapi(
     paths(
         list_applications,
         create_application,
+        archive_application,
+        restore_application,
         create_application_project,
         deploy_application_workspace_project,
         link_application_project,
@@ -7332,6 +7666,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ConversationMessagePageResponse,
         ConversationDetailResponse,
         ConversationListStatus,
+        ConversationListScope,
         CreateConversationRequest,
         CreateGlobalConversationRequest,
         RenameConversationRequest,
@@ -7380,11 +7715,34 @@ mod tests {
         std::fs::create_dir_all(workspace.path().join("node_modules/pkg"))
             .expect("node_modules fixture");
         std::fs::create_dir_all(workspace.path().join(".git")).expect("git fixture");
+        std::fs::create_dir_all(workspace.path().join(".SSH"))
+            .expect("credential directory fixture");
+        std::fs::create_dir_all(workspace.path().join("infra/.Terraform"))
+            .expect("terraform directory fixture");
+        std::fs::create_dir_all(workspace.path().join(".KUBE")).expect("kube directory fixture");
         std::fs::write(workspace.path().join("package.json"), b"{}").expect("package fixture");
         std::fs::write(workspace.path().join(".env"), b"SECRET=must-not-deploy")
             .expect("env fixture");
         std::fs::write(workspace.path().join("private.pem"), b"must-not-deploy")
             .expect("pem fixture");
+        std::fs::write(workspace.path().join(".ENV.LOCAL"), b"must-not-deploy")
+            .expect("uppercase env fixture");
+        std::fs::write(
+            workspace.path().join("CREDENTIALS.JSON"),
+            b"must-not-deploy",
+        )
+        .expect("uppercase credential fixture");
+        std::fs::write(workspace.path().join(".SSH/id_ed25519"), b"must-not-deploy")
+            .expect("credential directory file fixture");
+        std::fs::write(
+            workspace.path().join("infra/.Terraform/terraform.tfstate"),
+            b"must-not-deploy",
+        )
+        .expect("terraform state fixture");
+        std::fs::write(workspace.path().join(".KUBE/config"), b"must-not-deploy")
+            .expect("kube config fixture");
+        std::fs::write(workspace.path().join("signing.JKS"), b"must-not-deploy")
+            .expect("keystore fixture");
         std::fs::write(
             workspace.path().join("node_modules/pkg/index.js"),
             b"ignored",
@@ -7834,6 +8192,18 @@ mod tests {
     }
 
     #[test]
+    fn archived_conversation_is_read_only_until_restored() {
+        let active = conversation_with_runtime("claude_code", "ask");
+        assert!(ensure_conversation_is_active(&active).is_ok());
+
+        let mut archived = active;
+        archived.status = "archived".to_string();
+        let problem = ensure_conversation_is_active(&archived)
+            .expect_err("archived conversations must reject new messages");
+        assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
     fn global_conversation_response_exposes_durable_turn_status() {
         let mut conversation = conversation_with_runtime("codex_cli", "auto");
         conversation.turn_status = "failed".to_string();
@@ -7908,6 +8278,7 @@ mod tests {
     struct EffectivePermissionChecker {
         permissions: Option<Vec<String>>,
         member: bool,
+        denied_project_id: Option<i32>,
     }
 
     #[async_trait::async_trait]
@@ -7915,17 +8286,21 @@ mod tests {
         async fn user_can_access_project(
             &self,
             _user_id: i32,
-            _project_id: i32,
+            project_id: i32,
         ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(self.member)
+            Ok(self.member && self.denied_project_id != Some(project_id))
         }
 
         async fn effective_project_permissions(
             &self,
             _user_id: i32,
-            _project_id: i32,
+            project_id: i32,
         ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(self.permissions.clone())
+            if self.denied_project_id == Some(project_id) {
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(self.permissions.clone())
+            }
         }
     }
 
@@ -7936,6 +8311,7 @@ mod tests {
             Some(Arc::new(EffectivePermissionChecker {
                 permissions: Some(vec![Permission::ProjectsRead.to_string()]),
                 member: true,
+                denied_project_id: None,
             }));
         let error = ensure_application_project_permission(
             &auth,
@@ -7951,6 +8327,7 @@ mod tests {
             Some(Arc::new(EffectivePermissionChecker {
                 permissions: Some(vec![Permission::SandboxesWrite.to_string()]),
                 member: true,
+                denied_project_id: None,
             }));
         ensure_application_project_permission(
             &auth,
@@ -7969,6 +8346,7 @@ mod tests {
             Some(Arc::new(EffectivePermissionChecker {
                 permissions: None,
                 member: true,
+                denied_project_id: None,
             }));
         ensure_application_project_permission(&auth, &checker, &[7], &Permission::SandboxesWrite)
             .await
@@ -7982,6 +8360,7 @@ mod tests {
             Some(Arc::new(EffectivePermissionChecker {
                 permissions: Some(vec![Permission::ProjectsWrite.to_string()]),
                 member: true,
+                denied_project_id: None,
             }));
 
         let access = application_project_access_map(&auth, &denied, &[7, 9])
@@ -8000,6 +8379,7 @@ mod tests {
             Some(Arc::new(EffectivePermissionChecker {
                 permissions: None,
                 member: true,
+                denied_project_id: None,
             }));
 
         let access = application_project_access_map(&auth, &checker, &[7])
@@ -8008,6 +8388,44 @@ mod tests {
             .expect("configured checker should return a visibility map");
 
         assert_eq!(access.get(&7), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn application_access_requires_permission_on_every_project() {
+        let auth = custom_auth(vec![Permission::ProjectsRead]);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![Permission::ProjectsRead.to_string()]),
+                member: true,
+                denied_project_id: Some(9),
+            }));
+
+        assert!(
+            !has_application_project_access(&auth, &checker, &[7, 9])
+                .await
+                .expect("project access check"),
+            "access to one project must not authorize a multi-project application"
+        );
+    }
+
+    #[tokio::test]
+    async fn application_creation_fails_closed_without_project_membership_checker() {
+        let auth = custom_auth(vec![
+            Permission::ProjectsRead,
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+        ]);
+
+        let error = ensure_application_creation_project_permission(
+            &auth,
+            &None,
+            &[42],
+            &Permission::ProjectsWrite,
+        )
+        .await
+        .expect_err("an existing cross-user project must not be accepted without ownership data");
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -8153,113 +8571,6 @@ mod tests {
         let auth = custom_auth(vec![Permission::ProjectsRead]);
         ensure_context_read_permission(&auth, "project")
             .expect("project chat keeps its existing project permission boundary");
-    }
-
-    fn project_with_toggle(id: i32, toggle: Option<bool>) -> temps_entities::projects::Model {
-        let now = chrono::Utc::now();
-        temps_entities::projects::Model {
-            id,
-            image_retention_hours: None,
-            name: "P".to_string(),
-            repo_name: "r".to_string(),
-            repo_owner: "o".to_string(),
-            directory: ".".to_string(),
-            main_branch: "main".to_string(),
-            preset: temps_entities::preset::Preset::Static,
-            preset_config: None,
-            deployment_config: None,
-            created_at: now,
-            updated_at: now,
-            slug: "p".to_string(),
-            template_slug: None,
-            is_deleted: false,
-            deleted_at: None,
-            last_deployment: None,
-            is_public_repo: false,
-            git_url: None,
-            git_provider_connection_id: None,
-            attack_mode: false,
-            ai_alert_summaries_enabled: None,
-            ai_api_traffic_summary_enabled: None,
-            allow_alternate_sources: None,
-            ai_debug_chat_enabled: toggle,
-            ai_write_actions_enabled: false,
-            error_source_context_enabled: false,
-            vulnerability_scanning_enabled: false,
-            error_source_root: None,
-            enable_preview_environments: false,
-            preview_envs_on_demand: false,
-            preview_envs_idle_timeout_seconds: 300,
-            preview_envs_wake_timeout_seconds: 30,
-            source_type: temps_entities::source_type::SourceType::Git,
-            project_type: temps_entities::types::ProjectType::Server,
-            service_template: None,
-            gitlab_webhook_id: None,
-            gitlab_webhook_signing_token: None,
-            gitea_webhook_signing_token: None,
-            bitbucket_webhook_token: None,
-            bitbucket_webhook_hook_id: None,
-            generic_webhook_token: None,
-            cross_project_trace_sharing: true,
-        }
-    }
-
-    fn db_returning(project: Option<temps_entities::projects::Model>) -> DatabaseConnection {
-        let rows = match project {
-            Some(p) => vec![p],
-            None => Vec::new(),
-        };
-        MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![rows])
-            .into_connection()
-    }
-
-    #[tokio::test]
-    async fn test_ensure_chat_enabled_allows_when_toggle_on() {
-        let db = db_returning(Some(project_with_toggle(7, Some(true))));
-        assert!(ensure_chat_enabled(&db, 7).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_ensure_chat_enabled_allows_when_write_actions_on_even_if_chat_off() {
-        // Write actions are proposed + confirmed inside the chat, so enabling
-        // them must never leave the chat itself unreachable, regardless of the
-        // read-only debug-chat toggle (off or NULL).
-        for chat_toggle in [None, Some(false)] {
-            let mut p = project_with_toggle(7, chat_toggle);
-            p.ai_write_actions_enabled = true;
-            let db = db_returning(Some(p));
-            assert!(
-                ensure_chat_enabled(&db, 7).await.is_ok(),
-                "write actions on must allow the chat (chat toggle {chat_toggle:?})"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_ensure_chat_enabled_403_when_toggle_off() {
-        let db = db_returning(Some(project_with_toggle(7, Some(false))));
-        let err = ensure_chat_enabled(&db, 7)
-            .await
-            .expect_err("toggle off must be denied");
-        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn test_ensure_chat_enabled_allows_when_toggle_null() {
-        let db = db_returning(Some(project_with_toggle(7, None)));
-        ensure_chat_enabled(&db, 7)
-            .await
-            .expect("toggle null (default on) must be allowed");
-    }
-
-    #[tokio::test]
-    async fn test_ensure_chat_enabled_403_when_project_missing() {
-        let db = db_returning(None);
-        let err = ensure_chat_enabled(&db, 999)
-            .await
-            .expect_err("missing project must be denied");
-        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
     // (c) Over-length input is rejected as 400 before any DB/AI work (cost/DoS
@@ -8733,8 +9044,16 @@ mod tests {
         assert!(is_sensitive_workspace_path(".env.production"));
         assert!(is_sensitive_workspace_path(".Git-Credentials"));
         assert!(is_sensitive_workspace_path(".docker/config.json"));
+        assert!(is_sensitive_workspace_path(".config/gcloud/credentials.db"));
         assert!(is_sensitive_workspace_path("infra/terraform.tfstate"));
         assert!(is_sensitive_workspace_path("config/private-key.pem"));
+        assert!(is_sensitive_workspace_path("keys/id_dsa"));
+        assert!(is_sensitive_workspace_path(
+            "config/production.credentials.json"
+        ));
+        assert!(is_sensitive_workspace_path(
+            "config/google-service-account.json"
+        ));
         assert!(is_sensitive_workspace_path("../outside"));
         assert!(!is_sensitive_workspace_path(".env.example"));
         assert!(!is_sensitive_workspace_path("src/config.ts"));

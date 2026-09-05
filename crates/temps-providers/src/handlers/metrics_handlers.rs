@@ -43,7 +43,9 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, Permission, RequireAuth};
+#[cfg(test)]
+use temps_auth::Permission;
+use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
     problemdetails::Problem,
@@ -1627,6 +1629,66 @@ async fn session_caller_may_access_linked_projects(
         }
         None => Ok(()),
     }
+}
+
+/// Require a project-scoped permission on at least one project linked to the
+/// service. Installations without scoped project roles retain the existing
+/// membership behavior, while configured roles cannot use an instance-level
+/// permission to mutate a service outside their effective project grants.
+#[cfg(test)]
+async fn session_caller_has_permission_on_linked_projects(
+    auth: &temps_auth::AuthContext,
+    project_ids: &[i32],
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+    required: &Permission,
+) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(());
+    }
+
+    let Some(checker) = checker else {
+        return Ok(());
+    };
+    let required = required.to_string();
+    for &project_id in project_ids {
+        let effective = checker
+            .effective_project_permissions(auth.user_id(), project_id)
+            .await
+            .map_err(|error| {
+                internal_server_error()
+                    .detail(format!(
+                        "Could not verify project permissions for external service access: {error}"
+                    ))
+                    .build()
+            })?;
+        match effective {
+            Some(permissions) if permissions.iter().any(|permission| permission == &required) => {
+                return Ok(());
+            }
+            Some(_) => {}
+            None => {
+                let is_member = checker
+                    .user_can_access_project(auth.user_id(), project_id)
+                    .await
+                    .map_err(|error| {
+                        internal_server_error()
+                            .detail(format!(
+                                "Could not verify project access for external service: {error}"
+                            ))
+                            .build()
+                    })?;
+                if is_member {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(forbidden()
+        .detail(format!(
+            "The external service is not linked to a project where you have the {required} permission"
+        ))
+        .build())
 }
 
 /// Allow iff `user_id` can access at least one of `project_ids`, per the

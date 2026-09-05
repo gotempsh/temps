@@ -72,4 +72,41 @@ describe('semantic artifact renderers', () => {
     expect(html).toContain('Queued')
     expect(html).toContain('Environment 11')
   })
+
+  test('renders credential requests with a real secret-settings action', () => {
+    const html = renderArtifact(
+      artifact('credential_request', {
+        project_id: 7,
+        requirements: [{ key: 'STRIPE_SECRET_KEY' }],
+      })
+    )
+
+    expect(html).toContain('STRIPE_SECRET_KEY')
+    expect(html).toContain('Open secret settings')
+    expect(html).toContain('/projects/7/settings/environment-variables')
+  })
+
+  test('renders forms as bound form controls', () => {
+    const html = renderArtifact(
+      artifact('form', {
+        fields: [{ name: 'region', label: 'Region', required: true }],
+      })
+    )
+
+    expect(html).toContain('<form')
+    expect(html).toContain('name="region"')
+    expect(html).toContain('required=""')
+    expect(html).toContain('Submit')
+  })
+
+  test('uses error status color instead of unconditional success green', () => {
+    const html = renderArtifact(
+      artifact('status', {
+        rows: [{ name: 'Deploy', status: 'failed' }],
+      })
+    )
+
+    expect(html).toContain('text-red-600')
+    expect(html).not.toContain('stroke-success')
+  })
 })

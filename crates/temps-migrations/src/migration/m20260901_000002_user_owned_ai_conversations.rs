@@ -4,9 +4,12 @@
 //! Makes AI conversations private, user-owned resources.
 //!
 //! A project is optional execution context, not the authorization boundary.
-//! Legacy rows without an owner fail closed and are removed before the owner
-//! columns become non-null. Pending actions follow the same ownership model so
-//! a global operation can be proposed without inventing a project scope.
+//! Legacy rows must already carry the user that created them. Projects are
+//! team-scoped resources and do not have a single deterministic owner, so rows
+//! without an owner abort the migration with an actionable error instead of
+//! guessing an identity or silently deleting conversation history.
+//! Pending actions follow the conversation owner so a global operation can be
+//! proposed without inventing a project scope.
 
 use sea_orm_migration::prelude::*;
 
@@ -19,34 +22,41 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
-                "DELETE FROM ai_pending_actions AS pending
-                   WHERE pending.created_by IS NULL
-                      OR NOT EXISTS (
-                          SELECT 1 FROM users
-                           WHERE users.id = pending.created_by
-                      )
-                      OR NOT EXISTS (
-                          SELECT 1 FROM ai_conversations AS conversation
-                           WHERE conversation.id = pending.conversation_id
-                      )
-                      OR EXISTS (
-                          SELECT 1 FROM ai_conversations AS conversation
-                           WHERE conversation.id = pending.conversation_id
-                             AND (
-                                 conversation.created_by IS NULL
-                                 OR conversation.created_by IS DISTINCT FROM pending.created_by
-                                 OR NOT EXISTS (
-                                     SELECT 1 FROM users
-                                      WHERE users.id = conversation.created_by
-                                 )
-                             )
-                      );
-                 DELETE FROM ai_conversations AS conversation
-                  WHERE conversation.created_by IS NULL
-                     OR NOT EXISTS (
-                         SELECT 1 FROM users
-                          WHERE users.id = conversation.created_by
-                     );
+                "UPDATE ai_pending_actions AS pending
+                    SET created_by = conversation.created_by
+                   FROM ai_conversations AS conversation
+                  WHERE conversation.id = pending.conversation_id
+                    AND conversation.created_by IS NOT NULL
+                    AND pending.created_by IS DISTINCT FROM conversation.created_by;
+
+                 DO $$
+                 BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM ai_conversations AS conversation
+                         WHERE conversation.created_by IS NULL
+                            OR NOT EXISTS (
+                                SELECT 1 FROM users
+                                 WHERE users.id = conversation.created_by
+                            )
+                    ) THEN
+                        RAISE EXCEPTION 'cannot make AI conversations user-owned: legacy rows have no valid owner; assign created_by to a valid user before retrying the migration';
+                    END IF;
+                    IF EXISTS (
+                        SELECT 1 FROM ai_pending_actions AS pending
+                         WHERE pending.created_by IS NULL
+                            OR NOT EXISTS (
+                                SELECT 1 FROM users
+                                 WHERE users.id = pending.created_by
+                            )
+                            OR NOT EXISTS (
+                                SELECT 1 FROM ai_conversations AS conversation
+                                 WHERE conversation.id = pending.conversation_id
+                                   AND conversation.created_by = pending.created_by
+                            )
+                    ) THEN
+                        RAISE EXCEPTION 'cannot make AI pending actions user-owned: rows do not have a valid matching conversation owner; repair them before retrying the migration';
+                    END IF;
+                 END $$;
 
                  ALTER TABLE ai_conversations
                    ALTER COLUMN project_id DROP NOT NULL,
@@ -85,6 +95,24 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Global and application conversations cannot satisfy the historical
+        // NOT NULL project_id constraint. Refuse the rollback while such rows
+        // exist rather than silently destroying conversation history.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM ai_conversations WHERE project_id IS NULL
+                    ) OR EXISTS (
+                        SELECT 1 FROM ai_pending_actions WHERE project_id IS NULL
+                    ) THEN
+                        RAISE EXCEPTION 'cannot roll back user-owned AI conversations while global or application history exists; archive/export or reassign those rows first';
+                    END IF;
+                END $$;"#,
+            )
+            .await?;
         manager
             .get_connection()
             .execute_unprepared(
@@ -98,9 +126,6 @@ impl MigrationTrait for Migration {
                    DROP CONSTRAINT IF EXISTS chk_ai_conversations_single_context;
                  ALTER TABLE ai_conversations
                    DROP CONSTRAINT IF EXISTS fk_ai_conversations_owner;
-
-                 DELETE FROM ai_pending_actions WHERE project_id IS NULL;
-                 DELETE FROM ai_conversations WHERE project_id IS NULL;
                  ALTER TABLE ai_pending_actions
                    ALTER COLUMN project_id SET NOT NULL,
                    ALTER COLUMN created_by DROP NOT NULL;
@@ -136,10 +161,12 @@ mod tests {
             .map(|statement| statement.sql.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(sql.contains("DELETE FROM ai_pending_actions AS pending"));
-        assert!(sql.contains("NOT EXISTS (\n                          SELECT 1 FROM users"));
-        assert!(sql.contains("conversation.created_by IS DISTINCT FROM pending.created_by"));
-        assert!(sql.contains("DELETE FROM ai_conversations AS conversation"));
+        assert!(sql.contains("UPDATE ai_pending_actions AS pending"));
+        assert!(!sql.contains("project.created_by"));
+        assert!(sql.contains("SELECT 1 FROM users"));
+        assert!(sql.contains("RAISE EXCEPTION 'cannot make AI conversations user-owned"));
+        assert!(!sql.contains("DELETE FROM ai_conversations"));
+        assert!(!sql.contains("DELETE FROM ai_pending_actions"));
         assert!(sql.contains("ALTER COLUMN project_id DROP NOT NULL"));
         assert!(sql.contains("ALTER COLUMN created_by SET NOT NULL"));
         assert!(sql.contains("SET project_id = NULL"));
@@ -164,5 +191,34 @@ mod tests {
             null_application_context < add_owner_fk,
             "legacy cleanup and context conversion must finish before constraints are installed"
         );
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_to_delete_unprojected_history() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([Default::default(), Default::default()])
+            .into_connection();
+        let manager = SchemaManager::new(&db);
+
+        Migration.down(&manager).await.expect("rollback succeeds");
+
+        let sql = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("cannot roll back user-owned AI conversations"));
+        assert!(sql.contains("RAISE EXCEPTION"));
+        assert!(!sql.contains("DELETE FROM ai_conversations"));
+        assert!(!sql.contains("DELETE FROM ai_pending_actions"));
+        let refusal = sql
+            .find("RAISE EXCEPTION")
+            .expect("rollback must fail closed before schema changes");
+        let schema_change = sql
+            .find("ALTER COLUMN project_id SET NOT NULL")
+            .expect("rollback should retain the historical schema reversal");
+        assert!(refusal < schema_change);
     }
 }

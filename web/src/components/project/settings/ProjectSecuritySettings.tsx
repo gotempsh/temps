@@ -153,11 +153,9 @@ export function ProjectSecuritySettings({
     syncedProjectId.current = project.id
     reset({
       attack_mode: project.attack_mode ?? false,
-      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? true,
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
-      ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
       vulnerability_scanning_enabled:
         project.vulnerability_scanning_enabled ?? false,
       security: {

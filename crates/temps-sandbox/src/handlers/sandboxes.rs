@@ -288,6 +288,16 @@ async fn validate_seed_url_async(url: &str, kind: &str) -> Result<(), SandboxErr
 }
 
 impl SourceBody {
+    fn uses_stored_git_connection(&self) -> bool {
+        matches!(
+            self,
+            SourceBody::Git {
+                git_connection_id: Some(_),
+                ..
+            }
+        )
+    }
+
     /// Validate the body before converting it into the service-layer
     /// `SandboxSource`. Called by handlers that accept a SourceBody.
     ///
@@ -478,7 +488,8 @@ pub struct CreateSandboxBody {
     /// no explicit `source` is given, and the sandbox is attributed to the
     /// project so it can be listed alongside it.
     ///
-    /// Requires access to the project — the same team/scope rules that
+    /// Requires access to the project and `git_repositories:read` when Temps
+    /// derives the source from the project. The same team/scope rules that
     /// gate every other project-scoped endpoint apply.
     #[serde(default)]
     pub project_id: Option<i32>,
@@ -965,6 +976,17 @@ pub async fn create_sandbox(
     Json(body): Json<CreateSandboxBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    // An implicit project source may resolve a stored provider connection in
+    // the service. Require repository-read permission before that lookup so a
+    // revoked Git grant cannot be bypassed through sandbox creation.
+    if (body.project_id.is_some() && body.source.is_none())
+        || body
+            .source
+            .as_ref()
+            .is_some_and(SourceBody::uses_stored_git_connection)
+    {
+        temps_auth::permission_guard!(auth, GitRepositoriesRead);
+    }
     // Creating a sandbox *from* a project reads that project's repo URL and
     // git credential, so it needs the same access gate as any other
     // project-scoped endpoint — an API key scoped to project A must not be
@@ -1404,6 +1426,9 @@ pub async fn source_sandbox(
     Json(body): Json<SourceBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    if body.uses_stored_git_connection() {
+        temps_auth::permission_guard!(auth, GitRepositoriesRead);
+    }
     body.validate_async().await?;
     let source: SandboxSource = body.into();
     let row = state
@@ -3085,6 +3110,27 @@ mod tests {
             strip_git_metadata: true,
         };
         assert!(body.validate().is_ok());
+        assert!(body.uses_stored_git_connection());
+    }
+
+    #[test]
+    fn source_permission_classification_ignores_anonymous_and_tarball_sources() {
+        let anonymous = SourceBody::Git {
+            url: "https://github.com/foo/bar".into(),
+            revision: None,
+            depth: None,
+            username: None,
+            password: None,
+            git_connection_id: None,
+            destination: None,
+            strip_git_metadata: false,
+        };
+        let tarball = SourceBody::Tarball {
+            url: "https://downloads.example/source.tar.gz".into(),
+        };
+
+        assert!(!anonymous.uses_stored_git_connection());
+        assert!(!tarball.uses_stored_git_connection());
     }
 
     #[test]

@@ -12,9 +12,14 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct SourceDropRequest {
     pub project_id: i32,
-    pub environment_id: i32,
+    /// Explicit target environment. When omitted the service selects the
+    /// project's production environment, then its oldest active environment.
+    pub environment_id: Option<i32>,
     pub archive_path: PathBuf,
     pub original_filename: String,
+    /// Permit a legacy manual project to become an uploaded-source project,
+    /// but only after the deployment workflow has been created successfully.
+    pub promote_manual_source: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +40,8 @@ pub enum SourceDropError {
         environment_id: i32,
         project_id: i32,
     },
+    #[error("project {project_id} has no active environments")]
+    NoEnvironment { project_id: i32 },
     #[error("project {project_id} does not accept uploaded source archives: {reason}")]
     SourceNotAllowed { project_id: i32, reason: String },
     #[error("source archive is invalid: {reason}")]
@@ -49,6 +56,11 @@ pub enum SourceDropError {
     Workflow { reason: String },
     #[error("source deployment queueing failed: {reason}")]
     Queue { reason: String },
+    #[error("source deployment failed ({original}); rollback also failed: {cleanup}")]
+    Compensation {
+        original: Box<SourceDropError>,
+        cleanup: String,
+    },
 }
 
 #[async_trait]

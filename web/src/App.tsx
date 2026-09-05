@@ -1015,8 +1015,6 @@ const AppContent = () => {
   )
 }
 
-const PrototypeAwareAppContent = () => <AppContent />
-
 // Helper to generate friendly error titles from mutation operations
 const getErrorTitle = (
   context: any,
@@ -1133,7 +1131,7 @@ export const TempsConsole = ({
       <ThemeWrapper>
         <QueryClientProvider client={queryClient}>
           <ConsoleExtensionsProvider extensions={extensions}>
-            <PrototypeAwareAppContent />
+            <AppContent />
           </ConsoleExtensionsProvider>
         </QueryClientProvider>
         <Toaster position="top-center" />

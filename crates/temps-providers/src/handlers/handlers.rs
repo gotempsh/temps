@@ -2238,7 +2238,6 @@ async fn unlink_service_from_project(
     );
     project_scope_guard!(auth, project_id);
 
-
     match app_state
         .external_service_manager
         .unlink_service_from_project(id, project_id)
@@ -3408,6 +3407,7 @@ mod tests {
             default_backup_provisioned: false,
             ai_data_access: false,
             container_name: None,
+            created_by_user_id: Some(1),
         };
         let linked_service = project_services::Model {
             id: 1,
@@ -3457,6 +3457,7 @@ mod tests {
             State(state),
             Path(17),
             RequireAuth(test_auth_context_with_role(temps_auth::Role::User)),
+            Extension(test_request_metadata()),
             Json(LinkServiceRequest { project_id: 7 }),
         )
         .await;

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, TransactionTrait,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 use serde_json::Value;
 use temps_ai::HarnessWorkspace;
@@ -22,6 +22,8 @@ use temps_entities::{
 
 const MAX_PROJECTS: usize = 20;
 const MAX_APPLICATIONS_PER_USER: usize = 10;
+const MAX_CHAT_ATTACHMENT_FILES_PER_WORKSPACE: usize = 256;
+const MAX_CHAT_ATTACHMENT_BYTES_PER_WORKSPACE: u64 = 256 * 1024 * 1024;
 const MAX_WORKSPACE_CPU: f64 = 8.0;
 const MAX_WORKSPACE_MEMORY_MB: i64 = 16_384;
 const MAX_WORKSPACE_PIDS: i64 = 2_048;
@@ -30,7 +32,7 @@ const MAX_USER_WORKSPACE_CPU: f64 = 32.0;
 const MAX_USER_WORKSPACE_MEMORY_MB: i64 = 65_536;
 const MAX_USER_WORKSPACE_PIDS: i64 = 8_192;
 const MAX_USER_WORKSPACE_DISK_MB: i64 = 262_144;
-const ALLOWED_ARTIFACT_KINDS: &[&str] = &[
+pub(crate) const ALLOWED_ARTIFACT_KINDS: &[&str] = &[
     "topology",
     "execution_plan",
     "credential_request",
@@ -104,6 +106,12 @@ pub struct ApplicationWithProjects {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ApplicationProjectScope {
+    pub public_id: String,
+    pub project_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProjectEnvironmentStatus {
     pub name: String,
     pub slug: String,
@@ -124,6 +132,15 @@ pub struct ProjectEnvironmentStatus {
 pub struct ApplicationWorkspaceService {
     root: PathBuf,
     import_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// A project tree moved outside the mounted application workspace while its
+/// database link is removed. The opaque paths are only produced by
+/// [`ApplicationWorkspaceService`] after validating server-owned components.
+#[derive(Debug)]
+pub struct StagedProjectRemoval {
+    original_path: PathBuf,
+    staged_path: PathBuf,
 }
 
 impl ApplicationWorkspaceService {
@@ -248,6 +265,85 @@ impl ApplicationWorkspaceService {
         })
     }
 
+    /// Atomically move a linked project's source tree out of the mounted
+    /// workspace before its database link is removed. Callers can restore the
+    /// move if the database mutation fails, or finalize it after commit.
+    pub async fn stage_project_removal(
+        &self,
+        application_public_id: &str,
+        project_slug: &str,
+    ) -> Result<Option<StagedProjectRemoval>, ApplicationError> {
+        validate_workspace_component(application_public_id)?;
+        validate_workspace_component(project_slug)?;
+        let _mutation = self.import_lock.lock().await;
+        ensure_trusted_directory(&self.root, true).await?;
+        let workspace_root = self.root.join(application_public_id);
+        let projects_root = workspace_root.join("projects");
+        ensure_trusted_directory(&workspace_root, false).await?;
+        ensure_trusted_directory(&projects_root, false).await?;
+        let original_path = projects_root.join(project_slug);
+        let metadata = match tokio::fs::symlink_metadata(&original_path).await {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ApplicationError::Workspace {
+                    path: original_path,
+                    source,
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ApplicationError::Workspace {
+                path: original_path,
+                source: std::io::Error::other(
+                    "linked project source path is not a trusted directory",
+                ),
+            });
+        }
+        let staging_root = self.root.join(".unlinked-projects");
+        ensure_trusted_directory(&staging_root, true).await?;
+        let staged_path = staging_root.join(format!(
+            "{application_public_id}-{project_slug}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        tokio::fs::rename(&original_path, &staged_path)
+            .await
+            .map_err(|source| ApplicationError::Workspace {
+                path: original_path.clone(),
+                source,
+            })?;
+        Ok(Some(StagedProjectRemoval {
+            original_path,
+            staged_path,
+        }))
+    }
+
+    pub async fn restore_staged_project(
+        &self,
+        removal: &StagedProjectRemoval,
+    ) -> Result<(), ApplicationError> {
+        let _mutation = self.import_lock.lock().await;
+        tokio::fs::rename(&removal.staged_path, &removal.original_path)
+            .await
+            .map_err(|source| ApplicationError::Workspace {
+                path: removal.original_path.clone(),
+                source,
+            })
+    }
+
+    pub async fn finalize_staged_project(
+        &self,
+        removal: StagedProjectRemoval,
+    ) -> Result<(), ApplicationError> {
+        let _mutation = self.import_lock.lock().await;
+        tokio::fs::remove_dir_all(&removal.staged_path)
+            .await
+            .map_err(|source| ApplicationError::Workspace {
+                path: removal.staged_path,
+                source,
+            })
+    }
+
     /// Persist one uploaded chat file inside the workspace using only
     /// server-generated path components. On Unix every directory and the file
     /// itself are opened relative to trusted descriptors with `NOFOLLOW`, so a
@@ -260,6 +356,7 @@ impl ApplicationWorkspaceService {
         file_name: &str,
         bytes: Vec<u8>,
     ) -> Result<PathBuf, ApplicationError> {
+        let _mutation = self.import_lock.lock().await;
         for component in [workspace_id, conversation_id, attachment_id] {
             validate_workspace_component(component)?;
         }
@@ -272,6 +369,30 @@ impl ApplicationWorkspaceService {
             .join(conversation_id)
             .join(attachment_id)
             .join(file_name);
+        let attachment_root = workspace_root.join(".temps").join("chat-attachments");
+        let usage_path = attachment_root.clone();
+        let (stored_bytes, stored_files) =
+            tokio::task::spawn_blocking(move || chat_attachment_usage(&usage_path))
+                .await
+                .map_err(|source| ApplicationError::Workspace {
+                    path: attachment_root.clone(),
+                    source: std::io::Error::other(format!(
+                        "attachment quota task failed: {source}"
+                    )),
+                })?
+                .map_err(|source| ApplicationError::Workspace {
+                    path: attachment_root,
+                    source,
+                })?;
+        if stored_files >= MAX_CHAT_ATTACHMENT_FILES_PER_WORKSPACE
+            || stored_bytes.saturating_add(bytes.len() as u64)
+                > MAX_CHAT_ATTACHMENT_BYTES_PER_WORKSPACE
+        {
+            return Err(ApplicationError::InvalidAttachment(format!(
+                "workspace attachment quota exceeded (maximum {MAX_CHAT_ATTACHMENT_FILES_PER_WORKSPACE} files and {} MiB)",
+                MAX_CHAT_ATTACHMENT_BYTES_PER_WORKSPACE / 1024 / 1024
+            )));
+        }
 
         #[cfg(unix)]
         {
@@ -694,6 +815,35 @@ fn store_project_files_fd_relative(
     ))
 }
 
+fn chat_attachment_usage(root: &Path) -> std::io::Result<(u64, usize)> {
+    if !root.exists() {
+        return Ok((0, 0));
+    }
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "attachment storage root is not a regular directory",
+        ));
+    }
+    let mut bytes = 0_u64;
+    let mut files = 0_usize;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|error| std::io::Error::other(error.to_string()))?;
+        if entry.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "attachment storage contains a symbolic link",
+            ));
+        }
+        if entry.file_type().is_file() {
+            files = files.saturating_add(1);
+            bytes = bytes.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok((bytes, files))
+}
+
 #[cfg(unix)]
 fn store_chat_attachment_fd_relative(
     root: &Path,
@@ -1027,11 +1177,26 @@ impl ApplicationService {
     pub async fn list(
         &self,
         user_id: i32,
+        page: u64,
+        page_size: u64,
+    ) -> Result<Vec<ApplicationWithProjects>, ApplicationError> {
+        self.list_with_status(user_id, page, page_size, "active")
+            .await
+    }
+
+    pub async fn list_with_status(
+        &self,
+        user_id: i32,
+        page: u64,
+        page_size: u64,
+        status: &str,
     ) -> Result<Vec<ApplicationWithProjects>, ApplicationError> {
         let applications = ai_applications::Entity::find()
             .filter(ai_applications::Column::CreatedBy.eq(user_id))
-            .filter(ai_applications::Column::Status.eq("active"))
+            .filter(ai_applications::Column::Status.eq(status))
             .order_by_desc(ai_applications::Column::UpdatedAt)
+            .offset(page.saturating_sub(1).saturating_mul(page_size))
+            .limit(page_size)
             .all(self.db.as_ref())
             .await?;
         if applications.is_empty() {
@@ -1128,15 +1293,63 @@ impl ApplicationService {
         Ok(())
     }
 
+    /// Archive an application without deleting its projects, conversations, or
+    /// persistent workspace volume. Archived applications disappear from the
+    /// active workspace list and their compute is left in the paused state.
+    pub async fn archive(
+        &self,
+        user_id: i32,
+        public_id: &str,
+    ) -> Result<Vec<i32>, ApplicationError> {
+        let _mutation = self.mutation_lock.lock().await;
+        let application = self.get(user_id, public_id).await?;
+        let project_ids = application
+            .projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        let txn = self.db.begin().await?;
+        let now = Utc::now();
+
+        let application_id = application.application.id;
+        let mut active: ai_applications::ActiveModel = application.application.into();
+        active.status = Set("archived".to_string());
+        active.updated_at = Set(now);
+        active.update(&txn).await?;
+
+        if let Some(workspace) = ai_application_workspaces::Entity::find()
+            .filter(ai_application_workspaces::Column::ApplicationId.eq(application_id))
+            .one(&txn)
+            .await?
+        {
+            let mut workspace: ai_application_workspaces::ActiveModel = workspace.into();
+            workspace.desired_state = Set("paused".to_string());
+            workspace.updated_at = Set(now);
+            workspace.update(&txn).await?;
+        }
+
+        txn.commit().await?;
+        Ok(project_ids)
+    }
+
     pub async fn get(
         &self,
         user_id: i32,
         public_id: &str,
     ) -> Result<ApplicationWithProjects, ApplicationError> {
+        self.get_with_status(user_id, public_id, "active").await
+    }
+
+    pub async fn get_with_status(
+        &self,
+        user_id: i32,
+        public_id: &str,
+        status: &str,
+    ) -> Result<ApplicationWithProjects, ApplicationError> {
         let application = ai_applications::Entity::find()
             .filter(ai_applications::Column::PublicId.eq(public_id))
             .filter(ai_applications::Column::CreatedBy.eq(user_id))
-            .filter(ai_applications::Column::Status.eq("active"))
+            .filter(ai_applications::Column::Status.eq(status))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| ApplicationError::NotFound(public_id.to_string()))?;
@@ -1148,6 +1361,91 @@ impl ApplicationService {
             primary_project_id,
             environment_statuses,
         })
+    }
+
+    /// Restore an archived application and request that its durable workspace
+    /// resume on the next access. Projects, conversations, and files were never
+    /// deleted by archive, so the active topology becomes readable again.
+    pub async fn restore(
+        &self,
+        user_id: i32,
+        public_id: &str,
+    ) -> Result<ApplicationWithProjects, ApplicationError> {
+        let _mutation = self.mutation_lock.lock().await;
+        let application = self.get_with_status(user_id, public_id, "archived").await?;
+        let application_id = application.application.id;
+        let txn = self.db.begin().await?;
+        let now = Utc::now();
+
+        let mut active: ai_applications::ActiveModel = application.application.into();
+        active.status = Set("active".to_string());
+        active.updated_at = Set(now);
+        active.update(&txn).await?;
+
+        if let Some(workspace) = ai_application_workspaces::Entity::find()
+            .filter(ai_application_workspaces::Column::ApplicationId.eq(application_id))
+            .one(&txn)
+            .await?
+        {
+            let mut workspace: ai_application_workspaces::ActiveModel = workspace.into();
+            workspace.desired_state = Set("running".to_string());
+            workspace.updated_at = Set(now);
+            workspace.update(&txn).await?;
+        }
+
+        txn.commit().await?;
+        self.get(user_id, public_id).await
+    }
+
+    /// Batch-load the minimum application topology needed for authorization.
+    /// Conversation rows already carry the application FK, so callers should
+    /// not parse the public id out of `context_id` or hydrate full projects.
+    pub(crate) async fn project_scopes(
+        &self,
+        user_id: i32,
+        application_ids: &[i64],
+    ) -> Result<HashMap<i64, ApplicationProjectScope>, ApplicationError> {
+        let application_ids = application_ids.iter().copied().collect::<HashSet<_>>();
+        if application_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let applications = ai_applications::Entity::find()
+            .filter(ai_applications::Column::Id.is_in(application_ids.iter().copied()))
+            .filter(ai_applications::Column::CreatedBy.eq(user_id))
+            .filter(ai_applications::Column::Status.eq("active"))
+            .all(self.db.as_ref())
+            .await?;
+        let visible_ids = applications
+            .iter()
+            .map(|application| application.id)
+            .collect::<Vec<_>>();
+        let links = if visible_ids.is_empty() {
+            Vec::new()
+        } else {
+            ai_application_projects::Entity::find()
+                .filter(ai_application_projects::Column::ApplicationId.is_in(visible_ids))
+                .order_by_asc(ai_application_projects::Column::Id)
+                .all(self.db.as_ref())
+                .await?
+        };
+        let mut scopes = applications
+            .into_iter()
+            .map(|application| {
+                (
+                    application.id,
+                    ApplicationProjectScope {
+                        public_id: application.public_id,
+                        project_ids: Vec::new(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for link in links {
+            if let Some(scope) = scopes.get_mut(&link.application_id) {
+                scope.project_ids.push(link.project_id);
+            }
+        }
+        Ok(scopes)
     }
 
     pub async fn workspace(
@@ -1391,7 +1689,7 @@ impl ApplicationService {
         application_id: i64,
         user_id: i32,
     ) -> Result<Vec<ai_conversations::Model>, ApplicationError> {
-        self.conversations_with_status(application_id, user_id, "active")
+        self.conversations_with_status(application_id, user_id, "active", 1, 20)
             .await
     }
 
@@ -1400,12 +1698,16 @@ impl ApplicationService {
         application_id: i64,
         user_id: i32,
         status: &str,
+        page: u64,
+        page_size: u64,
     ) -> Result<Vec<ai_conversations::Model>, ApplicationError> {
         Ok(ai_conversations::Entity::find()
             .filter(ai_conversations::Column::ApplicationId.eq(application_id))
             .filter(ai_conversations::Column::CreatedBy.eq(user_id))
             .filter(ai_conversations::Column::Status.eq(status))
             .order_by_desc(ai_conversations::Column::LastActivityAt)
+            .offset(page.saturating_sub(1).saturating_mul(page_size))
+            .limit(page_size)
             .all(self.db.as_ref())
             .await?)
     }
@@ -1836,20 +2138,210 @@ fn validate_secret_free_payload(value: &Value, path: &str) -> Result<(), Applica
 /// schemes must be added deliberately here rather than relying on a suffix in
 /// an untrusted artifact payload.
 fn is_opaque_credential_reference(value: &str) -> bool {
-    static REFERENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static REFERENCE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
     REFERENCE
         .get_or_init(|| {
             regex::Regex::new(
                 r"^(?:vault://connections/conn_|temps://credentials/cred_)[A-Za-z0-9_-]{1,128}$",
             )
-            .expect("static credential reference regex")
+            .ok()
         })
-        .is_match(value)
+        .as_ref()
+        .is_some_and(|reference| reference.is_match(value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn application_service() -> ApplicationService {
+        ApplicationService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn create_rejects_duplicate_and_excessive_project_ids_before_database_access() {
+        let service = application_service();
+        assert!(matches!(
+            service.create(1, "Workspace", None, &[7, 7]).await,
+            Err(ApplicationError::InvalidProjects)
+        ));
+        let too_many = (1..=(MAX_PROJECTS as i32 + 1)).collect::<Vec<_>>();
+        assert!(matches!(
+            service.create(1, "Workspace", None, &too_many).await,
+            Err(ApplicationError::InvalidProjects)
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_and_get_handle_an_empty_application_store() {
+        let list_service = ApplicationService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        ));
+        assert!(list_service
+            .list(1, 1, 20)
+            .await
+            .expect("empty list")
+            .is_empty());
+
+        let get_service = ApplicationService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        ));
+        assert!(matches!(
+            get_service.get(1, "app_missing").await,
+            Err(ApplicationError::NotFound(id)) if id == "app_missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn application_and_conversation_lists_apply_lifecycle_and_pagination_in_sql() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_applications::Model>::new()])
+                .append_query_results([Vec::<ai_conversations::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+
+        assert!(service
+            .list_with_status(7, 3, 5, "archived")
+            .await
+            .expect("archived applications")
+            .is_empty());
+        assert!(service
+            .conversations_with_status(11, 7, "archived", 2, 10)
+            .await
+            .expect("archived conversations")
+            .is_empty());
+
+        drop(service);
+        let transaction_log = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log();
+        let statements = transaction_log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("status"));
+        assert!(statements[0].contains("LIMIT") && statements[0].contains("OFFSET"));
+        assert!(statements[1].contains("status"));
+        assert!(statements[1].contains("LIMIT") && statements[1].contains("OFFSET"));
+    }
+
+    #[tokio::test]
+    async fn archive_and_restore_preserve_the_application_workspace() {
+        let now = Utc::now();
+        let active_application = ai_applications::Model {
+            id: 11,
+            public_id: "app_lifecycle".to_string(),
+            name: "Lifecycle".to_string(),
+            description: None,
+            status: "active".to_string(),
+            created_by: 7,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut archived_application = active_application.clone();
+        archived_application.status = "archived".to_string();
+        let workspace = ai_application_workspaces::Model {
+            id: 17,
+            application_id: 11,
+            sandbox_public_id: Some("sbx_lifecycle".to_string()),
+            desired_state: "running".to_string(),
+            runtime: "full".to_string(),
+            image: None,
+            cpu_limit: 1.0,
+            memory_limit_mb: 1024,
+            pids_limit: 256,
+            disk_limit_mb: 4096,
+            idle_timeout_secs: 900,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut paused_workspace = workspace.clone();
+        paused_workspace.desired_state = "paused".to_string();
+
+        let archive_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![active_application.clone()]])
+                .append_query_results([Vec::<ai_application_projects::Model>::new()])
+                .append_query_results([vec![archived_application.clone()]])
+                .append_query_results([vec![workspace.clone()]])
+                .append_query_results([vec![paused_workspace.clone()]])
+                .into_connection(),
+        );
+        let archive_service = ApplicationService::new(archive_db.clone());
+        assert!(archive_service
+            .archive(7, "app_lifecycle")
+            .await
+            .expect("archive application")
+            .is_empty());
+        drop(archive_service);
+        let archive_sql = Arc::try_unwrap(archive_db)
+            .expect("release archive database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(archive_sql.contains("UPDATE \"ai_applications\""));
+        assert!(archive_sql.contains("UPDATE \"ai_application_workspaces\""));
+        assert!(archive_sql.contains("\"status\" ="));
+        assert!(archive_sql.contains("\"desired_state\" ="));
+        assert!(!archive_sql.contains("DELETE"));
+
+        let restore_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![archived_application]])
+                .append_query_results([Vec::<ai_application_projects::Model>::new()])
+                .append_query_results([vec![active_application.clone()]])
+                .append_query_results([vec![paused_workspace]])
+                .append_query_results([vec![workspace]])
+                .append_query_results([vec![active_application]])
+                .append_query_results([Vec::<ai_application_projects::Model>::new()])
+                .into_connection(),
+        );
+        let restored = ApplicationService::new(restore_db)
+            .restore(7, "app_lifecycle")
+            .await
+            .expect("restore application");
+        assert_eq!(restored.application.status, "active");
+        assert!(restored.projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_artifact_rejects_unknown_kinds_and_secret_payloads_before_database_access() {
+        let service = application_service();
+        assert!(matches!(
+            service
+                .create_artifact(1, "conv_1", 1, "html", None, serde_json::json!({}))
+                .await,
+            Err(ApplicationError::InvalidArtifactKind(kind)) if kind == "html"
+        ));
+        assert!(matches!(
+            service
+                .create_artifact(
+                    1,
+                    "conv_1",
+                    1,
+                    "form",
+                    None,
+                    serde_json::json!({"api_key": "sk-live-secret"}),
+                )
+                .await,
+            Err(ApplicationError::SecretValue(path)) if path == "$.api_key"
+        ));
+    }
 
     #[tokio::test]
     async fn managed_workspace_is_created_beneath_the_instance_data_dir() {
@@ -1867,6 +2359,79 @@ mod tests {
             data_dir.path().join("ai-applications").join("app_safe_123")
         );
         assert!(workspace.host_work_dir.join("projects").is_dir());
+    }
+
+    #[tokio::test]
+    async fn staged_project_removal_can_be_restored_or_finalized() {
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+        tokio::fs::create_dir(workspace.host_work_dir.join("projects/web"))
+            .await
+            .expect("project directory");
+        let source = workspace.host_work_dir.join("projects/web/index.ts");
+        tokio::fs::write(&source, b"export {};")
+            .await
+            .expect("source fixture");
+
+        let staged = service
+            .stage_project_removal("app_safe_123", "web")
+            .await
+            .expect("stage project")
+            .expect("project exists");
+        assert!(
+            !source.exists(),
+            "staged source must leave the mounted tree"
+        );
+        service
+            .restore_staged_project(&staged)
+            .await
+            .expect("restore project");
+        assert_eq!(
+            tokio::fs::read(&source).await.expect("restored source"),
+            b"export {};"
+        );
+
+        let staged = service
+            .stage_project_removal("app_safe_123", "web")
+            .await
+            .expect("stage project again")
+            .expect("project exists again");
+        let staged_path = staged.staged_path.clone();
+        service
+            .finalize_staged_project(staged)
+            .await
+            .expect("finalize project removal");
+        assert!(!source.exists());
+        assert!(!staged_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_project_removal_rejects_symlink_source() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+        let outside = data_dir.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("outside directory");
+        symlink(&outside, workspace.host_work_dir.join("projects/web")).expect("project symlink");
+
+        let error = service
+            .stage_project_removal("app_safe_123", "web")
+            .await
+            .expect_err("symlink source must be rejected");
+        assert!(matches!(error, ApplicationError::Workspace { .. }));
+        assert!(outside.exists());
     }
 
     #[tokio::test]
@@ -1952,6 +2517,44 @@ mod tests {
                 .await
                 .expect_err("bounded reads must reject oversized files"),
             ApplicationError::InvalidAttachment(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_attachment_enforces_workspace_file_quota() {
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+        let existing = workspace
+            .host_work_dir
+            .join(".temps/chat-attachments/conv_existing/att_existing");
+        tokio::fs::create_dir_all(&existing)
+            .await
+            .expect("attachment directory");
+        for index in 0..MAX_CHAT_ATTACHMENT_FILES_PER_WORKSPACE {
+            tokio::fs::write(existing.join(format!("{index}.txt")), b"x")
+                .await
+                .expect("quota fixture");
+        }
+
+        let error = service
+            .store_chat_attachment(
+                "app_safe_123",
+                "conv_safe_123",
+                "att_safe_123",
+                "notes.txt",
+                b"blocked".to_vec(),
+            )
+            .await
+            .expect_err("attachment quota must reject another file");
+
+        assert!(matches!(
+            error,
+            ApplicationError::InvalidAttachment(message)
+                if message.contains("attachment quota exceeded")
         ));
     }
 

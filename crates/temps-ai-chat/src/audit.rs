@@ -103,6 +103,20 @@ pub struct ApplicationCreatedAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ApplicationArchivedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub project_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplicationRestoredAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub project_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadArtifactCreatedAudit {
     pub context: AuditContext,
     pub application_id: String,
@@ -112,6 +126,8 @@ pub struct ThreadArtifactCreatedAudit {
 }
 
 impl_audit_operation!(ApplicationCreatedAudit, "ai.application.created");
+impl_audit_operation!(ApplicationArchivedAudit, "ai.application.archived");
+impl_audit_operation!(ApplicationRestoredAudit, "ai.application.restored");
 impl_audit_operation!(ThreadArtifactCreatedAudit, "ai.thread_artifact.created");
 
 #[derive(Debug, Clone, Serialize)]

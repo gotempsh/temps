@@ -97,6 +97,9 @@ impl TempsPlugin for AiChatPlugin {
             ));
             context.register_service(pending_actions.clone());
 
+            let applications = Arc::new(crate::ApplicationService::new(db.clone()));
+            context.register_service(applications.clone());
+
             // Built-in providers (one per context_type). Future context types add
             // their provider here (or via a registry once there are many).
             let providers: Vec<Arc<dyn ConversationContextProvider>> = vec![
@@ -106,6 +109,7 @@ impl TempsPlugin for AiChatPlugin {
                 Arc::new(ApplicationChatProvider::new(
                     db.clone(),
                     audit_service.clone(),
+                    applications.clone(),
                 )),
                 Arc::new(crate::GlobalChatProvider),
                 Arc::new(ProjectChatProvider::new(db.clone())),
@@ -129,9 +133,6 @@ impl TempsPlugin for AiChatPlugin {
                 config_service.data_dir(),
             ));
             context.register_service(application_workspaces.clone());
-            let applications = Arc::new(crate::ApplicationService::new(db.clone()));
-            context.register_service(applications.clone());
-
             // Optional: operator-tuned chat limits (turn timeout). Absent in
             // minimal wirings, where the compiled defaults apply.
             let config_service = context.get_service::<temps_config::ConfigService>();

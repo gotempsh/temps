@@ -472,7 +472,68 @@ fn idle_deadline(
 /// - **Embedded credentials.** A `user:password@` in the URL would be
 ///   persisted to `sandboxes.source_repo_url` and echoed back out of the
 ///   API. Rows predating the project-side guard can still carry one.
-async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxError> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceNetworkPin {
+    host: String,
+    port: u16,
+    address: std::net::IpAddr,
+}
+
+impl SourceNetworkPin {
+    fn curl_resolve_value(&self) -> String {
+        match self.address {
+            std::net::IpAddr::V4(address) => {
+                format!("{}:{}:{}", self.host, self.port, address)
+            }
+            std::net::IpAddr::V6(address) => {
+                format!("{}:{}:[{}]", self.host, self.port, address)
+            }
+        }
+    }
+}
+
+fn tarball_extract_command(
+    url: &str,
+    staging_dir: &str,
+    network_pin: Option<&SourceNetworkPin>,
+) -> String {
+    let resolve = network_pin
+        .map(|pin| {
+            format!(
+                " --resolve {}",
+                shell_escape_service(&pin.curl_resolve_value())
+            )
+        })
+        .unwrap_or_default();
+    let network_environment = format!(
+        "env -i PATH={} HOME=/var/empty/temps-source-import CURL_HOME=/var/empty/temps-source-import XDG_CONFIG_HOME=/var/empty/temps-source-import NO_PROXY='*'",
+        shell_escape_service(SOURCE_IMPORT_SYSTEM_PATH),
+    );
+    format!(
+        "{network_environment} curl -q --noproxy '*' --proxy '' -fsS --max-redirs 0{resolve} {url} | {network_environment} tar --no-same-owner --no-same-permissions -C {stage} -xzf -",
+        url = shell_escape_service(url),
+        stage = shell_escape_service(staging_dir),
+    )
+}
+
+fn clean_git_environment(auth_dir: &str, askpass_path: Option<&str>) -> String {
+    let mut environment = format!(
+        "env -i PATH={} HOME={} GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_COUNT=0 GIT_SSL_NO_VERIFY=false GIT_TERMINAL_PROMPT=0",
+        shell_escape_service(SOURCE_IMPORT_SYSTEM_PATH),
+        shell_escape_service(auth_dir),
+    );
+    if let Some(askpass_path) = askpass_path {
+        environment.push_str(&format!(
+            " GIT_ASKPASS={}",
+            shell_escape_service(askpass_path)
+        ));
+    }
+    environment
+}
+
+async fn validate_resolved_source(
+    source: &SandboxSource,
+) -> Result<Option<SourceNetworkPin>, SandboxError> {
     let (url, kind) = match source {
         SandboxSource::Git { url, .. } => (url.as_str(), "git"),
         SandboxSource::Tarball { url } => (url.as_str(), "tarball"),
@@ -522,7 +583,8 @@ async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxE
     // Then resolve: an IP literal is already covered above, but a *name*
     // pointing at 169.254.169.254 is only caught here.
     if let Some(url::Host::Domain(domain)) = parsed.host() {
-        temps_core::url_validation::validate_domain_async(domain)
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let addresses = temps_core::url_validation::resolve_and_validate_domain(domain, port)
             .await
             .map_err(|_| SandboxError::Validation {
                 message: format!(
@@ -530,8 +592,21 @@ async fn validate_resolved_source(source: &SandboxSource) -> Result<(), SandboxE
                      metadata address"
                 ),
             })?;
+        let address = addresses
+            .iter()
+            .find(|address| address.is_ipv4())
+            .or_else(|| addresses.first())
+            .map(std::net::SocketAddr::ip)
+            .ok_or_else(|| SandboxError::Validation {
+                message: format!("{kind} source: host did not resolve to a usable address"),
+            })?;
+        return Ok(Some(SourceNetworkPin {
+            host: domain.to_string(),
+            port,
+            address,
+        }));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Does the URL carry any userinfo before the host?
@@ -543,6 +618,76 @@ pub(crate) fn url_has_embedded_credentials(url: &str) -> bool {
     url::Url::parse(url)
         .map(|parsed| !parsed.username().is_empty() || parsed.password().is_some())
         .unwrap_or(false)
+}
+
+/// A credential passed to a process inside a custom image is already disclosed
+/// to that image: it controls `/bin/sh`, `git`, dynamic-loader configuration,
+/// and the network stack. Until credentialed clones move to a host-owned
+/// staging helper, allow them only in the versioned images built by Temps.
+fn sandbox_image_is_trusted_for_credentials(handle: &temps_agents::sandbox::SandboxHandle) -> bool {
+    handle.backend == temps_agents::sandbox::SandboxBackend::Docker
+        && handle.image.starts_with("ghcr.io/gotempsh/temps-sandbox-")
+}
+
+/// Docker exec inherits the image's configured environment. A custom image
+/// could otherwise preload code or ask the shell to source a workspace file
+/// before a root-owned import command begins. Explicitly neutralize the
+/// interpreter, loader, Git, and language startup hooks relevant to the fixed
+/// import toolchain.
+fn sanitize_privileged_import_environment(environment: &mut HashMap<String, String>) {
+    for name in [
+        "BASH_ENV",
+        "ENV",
+        "GIT_EXEC_PATH",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "NODE_OPTIONS",
+        "PERL5LIB",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "RUBYLIB",
+    ] {
+        environment.insert(name.to_string(), String::new());
+    }
+    for name in [
+        "ALL_PROXY",
+        "FTP_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ftp_proxy",
+        "http_proxy",
+        "https_proxy",
+        "CURL_CA_BUNDLE",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_PROXY_COMMAND",
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+    ] {
+        environment.insert(name.to_string(), String::new());
+    }
+    environment.insert("NO_PROXY".to_string(), "*".to_string());
+    environment.insert("no_proxy".to_string(), "*".to_string());
+    environment.insert("GIT_CONFIG_COUNT".to_string(), "0".to_string());
+    environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
+    environment.insert("GIT_CONFIG_SYSTEM".to_string(), "/dev/null".to_string());
+    environment.insert("GIT_SSL_NO_VERIFY".to_string(), "false".to_string());
+    // Root-owned import helpers must not inherit image-provided user config.
+    // `curl -q` remains the primary defense because a custom image can ship
+    // files at any path, while these values also keep other tooling away from
+    // the sandbox user's writable home directory.
+    for name in ["HOME", "CURL_HOME", "XDG_CONFIG_HOME"] {
+        environment.insert(
+            name.to_string(),
+            "/var/empty/temps-source-import".to_string(),
+        );
+    }
 }
 
 fn default_git_provider_base_url(provider_type: &str) -> Option<&'static str> {
@@ -1482,12 +1627,14 @@ impl SandboxService {
         project_id: Option<i32>,
         host_work_dir: PathBuf,
     ) -> Result<ApplicationWorkspaceSandbox, SandboxError> {
+        let authorized_project_ids = project_id.into_iter().collect::<Vec<_>>();
         self.get_or_create_application_workspace_with_config(
             user_id,
             application_public_id,
             project_id,
             host_work_dir,
             ApplicationWorkspaceConfig::default(),
+            &authorized_project_ids,
         )
         .await
     }
@@ -1499,6 +1646,7 @@ impl SandboxService {
         project_id: Option<i32>,
         host_work_dir: PathBuf,
         config: ApplicationWorkspaceConfig,
+        authorized_project_ids: &[i32],
     ) -> Result<ApplicationWorkspaceSandbox, SandboxError> {
         let _workspace_mutation = self.application_workspace_lock.lock().await;
         if application_public_id.is_empty()
@@ -1566,23 +1714,6 @@ impl SandboxService {
                     config.clone(),
                 )
                 .await?;
-            } else if existing.status == "stopped" && config.desired_state == "running" {
-                // Idle suspension parks compute but never changes application
-                // desired state. Wake it on demand. If the parked container was
-                // removed externally, rebuild it from the same durable files.
-                match self.resume_sandbox(&existing.public_id, user_id).await {
-                    Ok(_) => {}
-                    Err(SandboxError::NotFound { .. }) => {
-                        self.rebuild_application_workspace_locked(
-                            user_id,
-                            &existing.public_id,
-                            host_work_dir.clone(),
-                            config.clone(),
-                        )
-                        .await?;
-                    }
-                    Err(error) => return Err(error),
-                }
             }
             ApplicationWorkspaceSandbox {
                 public_id: existing.public_id,
@@ -1618,6 +1749,29 @@ impl SandboxService {
             }
         };
 
+        // Reconcile the complete authorized data plane while stopped compute
+        // cannot use stale memberships. Only after this succeeds may an idle
+        // workspace be resumed. New/rebuilt compute starts with no application
+        // data network; if reconciliation fails, stop it before returning.
+        let row = self.find_by_public_id(&sandbox.public_id, user_id).await?;
+        let configure_result = self
+            .configure_application_data_network_locked(&row, authorized_project_ids)
+            .await;
+        if let Err(error) = configure_result {
+            if row.status == "running" {
+                if let Err(stop_error) = self.pause_sandbox(&row.public_id, user_id).await {
+                    tracing::error!(
+                        sandbox_id = %row.public_id,
+                        %stop_error,
+                        "failed to stop application workspace after data-network reconciliation failed"
+                    );
+                }
+            }
+            return Err(error);
+        }
+        if row.status == "stopped" && config.desired_state == "running" {
+            self.resume_sandbox(&sandbox.public_id, user_id).await?;
+        }
         if config.desired_state == "running" {
             self.prepare_application_git_workspace(&sandbox.public_id, user_id)
                 .await?;
@@ -1816,14 +1970,23 @@ impl SandboxService {
     ) -> Result<Vec<String>, SandboxError> {
         let _workspace_mutation = self.application_workspace_lock.lock().await;
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        self.configure_application_data_network_locked(&row, project_ids)
+            .await
+    }
+
+    async fn configure_application_data_network_locked(
+        &self,
+        row: &sandboxes::Model,
+        project_ids: &[i32],
+    ) -> Result<Vec<String>, SandboxError> {
         let containers = self
             .application_data_service_containers(project_ids)
             .await?;
-        let network_name = sandbox_data_network_name(sandbox_public_id)?;
+        let network_name = sandbox_data_network_name(&row.public_id)?;
         self.registry
-            .configure_application_network(row.id, sandbox_public_id, &network_name, &containers)
+            .configure_application_network(row.id, &row.public_id, &network_name, &containers)
             .await
-            .map_err(|error| from_agent_error(sandbox_public_id, error))?;
+            .map_err(|error| from_agent_error(&row.public_id, error))?;
         Ok(containers)
     }
 
@@ -2160,6 +2323,11 @@ impl SandboxService {
         user_id: i32,
         source: &SandboxSource,
     ) -> Result<(), SandboxError> {
+        // Resolve once immediately before the network operation and force the
+        // client to dial that validated address. Validation performed earlier
+        // in request handling is useful for fast failure, but cannot prevent a
+        // DNS answer from changing before this command actually connects.
+        let network_pin = validate_resolved_source(source).await?;
         let handle = self
             .registry
             .get(internal_id, public_id)
@@ -2182,6 +2350,16 @@ impl SandboxService {
                 destination,
                 strip_git_metadata,
             } => {
+                let credentialed = git_connection_id.is_some()
+                    || (username.as_deref().is_some() && password.as_deref().is_some());
+                if credentialed && !sandbox_image_is_trusted_for_credentials(&handle) {
+                    return Err(SandboxError::Validation {
+                        message: format!(
+                            "credentialed Git imports require a Temps-managed sandbox image; sandbox '{}' uses an untrusted custom or local runtime",
+                            public_id
+                        ),
+                    });
+                }
                 // Resolve credentials. Priority: explicit (username,password)
                 // pair > git_connection_id > anonymous. The validator rejects
                 // the "both set" combination before we get here.
@@ -2219,6 +2397,7 @@ impl SandboxService {
                     *depth,
                     creds,
                     *strip_git_metadata,
+                    network_pin.as_ref(),
                 )
                 .await
             }
@@ -2229,18 +2408,16 @@ impl SandboxService {
                 let staging_dir = source_import_staging_dir(handle.backend, internal_id);
                 let target_guard = source_target_guard_script(&work_dir, &work_dir);
                 let staging_prepare = source_import_staging_prepare_script(&staging_dir);
-                let extract = format!(
-                    "curl -fsS --max-redirs 0 {url} | tar --no-same-owner --no-same-permissions -C {stage} -xzf -",
-                    url = shell_escape_service(url),
-                    stage = shell_escape_service(&staging_dir),
-                );
+                let extract = tarball_extract_command(url, &staging_dir, network_pin.as_ref());
                 let bounded_extract = source_import_command_script(&staging_dir, &extract);
                 let bounds = source_import_bounds_script(&staging_dir);
+                let aggregate_bounds =
+                    source_import_aggregate_bounds_script(&work_dir, &staging_dir);
                 let finalize = source_import_staging_finalize_script(&staging_dir);
                 let restore_target = source_target_restore_script();
                 let script = format!(
                     "set -eu; {target_guard} trap '{restore_target}' EXIT; {staging_prepare} \
-                     {bounded_extract}{bounds}; {finalize}",
+                     {bounded_extract}{bounds}{aggregate_bounds}; {finalize}",
                 );
                 self.exec_seed_script_as_root(&handle, internal_id, script)
                     .await
@@ -2332,6 +2509,7 @@ impl SandboxService {
         depth: Option<u32>,
         creds: Option<(String, String)>,
         strip_git_metadata: bool,
+        network_pin: Option<&SourceNetworkPin>,
     ) -> Result<(), SandboxError> {
         // Destination creation is deliberately performed as the sandbox user.
         // The privileged phase only opens and validates an already-existing
@@ -2341,10 +2519,15 @@ impl SandboxService {
             .await?;
         let private_root = match handle.backend {
             temps_agents::sandbox::SandboxBackend::Local => "/tmp",
-            _ => "/root",
+            // Docker mounts /run/secrets as tmpfs. Credential material must
+            // never enter the writable layer where a concurrent `commit`
+            // snapshot could retain it.
+            _ => "/run/secrets",
         };
         let auth_dir = format!("{private_root}/.temps-source-auth-{internal_id}");
         let askpass_path = format!("{auth_dir}/askpass.sh");
+        let askpass_user_path = format!("{auth_dir}/username");
+        let askpass_password_path = format!("{auth_dir}/password");
         let staging_dir = source_import_staging_dir(handle.backend, internal_id);
 
         // Build the clone command. `-c credential.helper=` disables any
@@ -2353,7 +2536,19 @@ impl SandboxService {
         // Redirects are disabled for anonymous and authenticated clones. The
         // source host was DNS-validated before this point; following a new
         // location would otherwise bypass that decision.
-        let mut clone_cmd = String::from("git -c credential.helper= -c http.followRedirects=false");
+        let git_network_config = network_pin
+            .map(|pin| {
+                format!(
+                    " -c http.curloptResolve={}",
+                    shell_escape_service(&pin.curl_resolve_value())
+                )
+            })
+            .unwrap_or_default();
+        let git_environment =
+            clean_git_environment(&auth_dir, creds.is_some().then_some(askpass_path.as_str()));
+        let mut clone_cmd = format!(
+            "{git_environment} git -c credential.helper= -c http.followRedirects=false{git_network_config}"
+        );
         clone_cmd.push_str(&format!(
             " clone --depth {} --filter=blob:limit=33554432",
             depth.unwrap_or(1)
@@ -2377,9 +2572,9 @@ impl SandboxService {
         // already did the right thing.
         let checkout_cmd = match revision {
             Some(r) if !r.is_empty() => format!(
-                " || (git -C {wd} -c credential.helper= -c http.followRedirects=false fetch origin {rev} && git -C {wd} checkout {rev})",
+                " || ({git_environment} git -C {wd} -c credential.helper= -c http.followRedirects=false{git_network_config} fetch origin {rev} && {git_environment} git -C {wd} checkout {rev})",
                 wd = shell_escape_service(&staging_dir),
-                rev = shell_escape_service(r)
+                rev = shell_escape_service(r),
             ),
             _ => String::new(),
         };
@@ -2390,44 +2585,50 @@ impl SandboxService {
             source_import_command_script(&staging_dir, &format!("{clone_cmd}{checkout_cmd}"));
         let cleanup = git_metadata_cleanup_script(&staging_dir, strip_git_metadata);
         let bounds = source_import_bounds_script(&staging_dir);
+        let aggregate_bounds = source_import_aggregate_bounds_script(work_dir, &staging_dir);
         let finalize = source_import_staging_finalize_script(&staging_dir);
         let restore_target = source_target_restore_script();
 
         // Compose the shell script. When creds are present we write the
-        // askpass shim, chmod it, and point git at it via env; the shim
-        // reads GIT_USER/GIT_PASS from its environment. We always
-        // `shred`/`rm -f` the shim before returning so a subsequent user
+        // root-only credential files plus an askpass shim. Git itself runs
+        // under `env -i`; the shim reads those files, so secrets enter neither
+        // Git's argv nor its inherited environment. We always shred/remove the
+        // whole auth directory before returning so a subsequent user
         // shell in the sandbox can't read stale state.
         let script = if creds.is_some() {
             format!(
-                "set -eu; \
+                "set +x; set -eu; \
                  {target_guard} {staging_prepare} {auth_prepare} \
+                 trap 'find {auth_dir} -type f -exec shred -u {{}} \\; 2>/dev/null || true; find {auth_dir} -depth -delete 2>/dev/null || true; {restore_target}' EXIT; \
+                 umask 077; printf '%s' \"$GIT_USER\" > {user_file}; printf '%s' \"$GIT_PASS\" > {password_file}; \
                  cat > {ask} <<'TEMPS_ASKPASS_EOF'\n\
 #!/bin/sh\n\
 case \"$1\" in\n\
-  Username*) printf '%s' \"$GIT_USER\" ;;\n\
-  *)         printf '%s' \"$GIT_PASS\" ;;\n\
+  Username*) cat {user_file} ;;\n\
+  *)         cat {password_file} ;;\n\
 esac\n\
 TEMPS_ASKPASS_EOF\n\
                  chmod 700 {ask}; \
-                 trap 'shred -u {ask} 2>/dev/null || rm -f {ask}; find {auth_dir} -depth -delete 2>/dev/null || true; {restore_target}' EXIT; \
-                 GIT_ASKPASS={ask} GIT_TERMINAL_PROMPT=0 {bounded_clone}{cleanup}{bounds}; {finalize}",
+                 {bounded_clone}{cleanup}{bounds}{aggregate_bounds}; {finalize}",
                 target_guard = target_guard,
                 staging_prepare = staging_prepare,
                 auth_prepare = auth_prepare,
                 ask = askpass_path,
+                user_file = shell_escape_service(&askpass_user_path),
+                password_file = shell_escape_service(&askpass_password_path),
                 auth_dir = shell_escape_service(&auth_dir),
                 restore_target = restore_target,
                 bounded_clone = bounded_clone,
                 cleanup = cleanup,
                 bounds = bounds,
+                aggregate_bounds = aggregate_bounds,
                 finalize = finalize,
             )
         } else {
             format!(
                 "set -eu; {target_guard} {staging_prepare} {auth_prepare} \
                  trap 'find {auth_dir} -depth -delete 2>/dev/null || true; {restore_target}' EXIT; \
-                 GIT_TERMINAL_PROMPT=0 {bounded_clone}{cleanup}{bounds}; {finalize}",
+                 GIT_TERMINAL_PROMPT=0 {bounded_clone}{cleanup}{bounds}{aggregate_bounds}; {finalize}",
                 target_guard = target_guard,
                 staging_prepare = staging_prepare,
                 auth_prepare = auth_prepare,
@@ -2436,6 +2637,7 @@ TEMPS_ASKPASS_EOF\n\
                 bounded_clone = bounded_clone,
                 cleanup = cleanup,
                 bounds = bounds,
+                aggregate_bounds = aggregate_bounds,
                 finalize = finalize,
             )
         };
@@ -2513,6 +2715,7 @@ TEMPS_ASKPASS_EOF\n\
         script: String,
         mut env_map: HashMap<String, String>,
     ) -> Result<(), SandboxError> {
+        sanitize_privileged_import_environment(&mut env_map);
         env_map.insert("PATH".into(), SOURCE_IMPORT_SYSTEM_PATH.into());
         let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
         let execution = self
@@ -3592,6 +3795,28 @@ fn source_import_bounds_script(target_dir: &str) -> String {
     )
 }
 
+/// Enforce the quota across the durable workspace plus the staged import.
+/// Checking before finalization lets us reject only the new staging tree and
+/// preserve files that already belong to the workspace.
+fn source_import_aggregate_bounds_script(work_dir: &str, staging_dir: &str) -> String {
+    let work_dir = shell_escape_service(work_dir);
+    let staging_dir = shell_escape_service(staging_dir);
+    format!(
+        "; existing_count=$(find {work_dir} -mindepth 1 -print | head -n {entry_probe} | wc -l | tr -d ' '); \
+         staged_count=$(find {staging_dir} -mindepth 1 -print | head -n {entry_probe} | wc -l | tr -d ' '); \
+         existing_bytes=$(du -sk {work_dir} | awk '{{print $1 * 1024}}'); \
+         staged_bytes=$(du -sk {staging_dir} | awk '{{print $1 * 1024}}'); \
+         if [ $((existing_count + staged_count)) -gt {max_entries} ] || \
+            [ $((existing_bytes + staged_bytes)) -gt {max_bytes} ]; then \
+           find {staging_dir} -depth -delete 2>/dev/null || true; \
+           echo 'source import would exceed the aggregate 5000 entry or 256 MiB workspace limit' >&2; exit 65; \
+         fi",
+        entry_probe = SOURCE_IMPORT_MAX_FILES + 1,
+        max_entries = SOURCE_IMPORT_MAX_FILES,
+        max_bytes = SOURCE_IMPORT_MAX_BYTES,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3645,6 +3870,15 @@ mod tests {
         let bounds = source_import_bounds_script(&nested_stage);
         assert!(bounds.contains("-mindepth 1"));
         assert!(!bounds.contains("-type f"));
+    }
+
+    #[test]
+    fn source_import_quota_includes_existing_workspace_content() {
+        let bounds =
+            source_import_aggregate_bounds_script("/workspace", "/root/.temps-source-import-7");
+        assert!(bounds.contains("existing_count + staged_count"));
+        assert!(bounds.contains("existing_bytes + staged_bytes"));
+        assert!(bounds.contains("aggregate 5000 entry or 256 MiB"));
     }
 
     #[test]
@@ -4230,6 +4464,7 @@ mod storage_cleanup_tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use temps_agents::error::AgentError;
     use temps_agents::sandbox::{
         SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
@@ -4247,9 +4482,12 @@ mod storage_cleanup_tests {
         fail_destroy: bool,
         /// `start` errors — the wake-on-access failure path.
         fail_start: bool,
+        /// `configure_application_network` errors before compute may start.
+        fail_network_config: bool,
         destroys: AtomicUsize,
         creates: Arc<AtomicUsize>,
         starts: Arc<AtomicUsize>,
+        lifecycle_calls: Arc<Mutex<Vec<&'static str>>>,
         /// Provider truth can differ from the database after an out-of-band
         /// container kill. `start` flips this back to true so the complete
         /// wake-and-retry path can be exercised without Docker.
@@ -4263,9 +4501,11 @@ mod storage_cleanup_tests {
                 fail_exec: false,
                 fail_destroy: false,
                 fail_start: false,
+                fail_network_config: false,
                 destroys: AtomicUsize::new(0),
                 creates: Arc::new(AtomicUsize::new(0)),
                 starts: Arc::new(AtomicUsize::new(0)),
+                lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 alive: Arc::new(AtomicBool::new(true)),
             }
         }
@@ -4318,6 +4558,25 @@ mod storage_cleanup_tests {
 
         async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
             Ok(self.alive.load(Ordering::SeqCst))
+        }
+
+        async fn configure_application_network(
+            &self,
+            handle: &SandboxHandle,
+            _network_name: &str,
+            _service_containers: &[String],
+        ) -> Result<(), AgentError> {
+            self.lifecycle_calls
+                .lock()
+                .expect("lifecycle call mutex")
+                .push("configure");
+            if self.fail_network_config {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "fake".into(),
+                    reason: format!("network reconciliation failed for {}", handle.sandbox_name),
+                });
+            }
+            Ok(())
         }
 
         async fn write_file(
@@ -4377,6 +4636,10 @@ mod storage_cleanup_tests {
         /// The trait's default `start` returns "not supported", so the
         /// wake path needs a real implementation here.
         async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+            self.lifecycle_calls
+                .lock()
+                .expect("lifecycle call mutex")
+                .push("start");
             self.starts.fetch_add(1, Ordering::SeqCst);
             if self.fail_start {
                 return Err(AgentError::SandboxProviderUnavailable {
@@ -4550,6 +4813,114 @@ mod storage_cleanup_tests {
 
     const PUBLIC_ID: &str = "sbx_deadbeef01234567";
 
+    fn attested_application_workspace(
+        status: &str,
+        application_work_dir: &Path,
+    ) -> sandboxes::Model {
+        sandboxes::Model {
+            name: "ai-application:app_example".to_string(),
+            status: status.to_string(),
+            lifecycle: "workspace".to_string(),
+            work_dir: temps_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+            image: ApplicationWorkspaceConfig::default().image,
+            metadata: Some(serde_json::json!({
+                "managed_application_id": "app_example",
+                "managed_host_work_dir": application_work_dir,
+            })),
+            ..row(PUBLIC_ID, None)
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_application_workspace_reconciles_network_before_start() {
+        let data_root = unique_data_root("application-network-before-start");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let application_work_dir = data_root.join("app_example");
+        let stopped = attested_application_workspace("stopped", &application_work_dir);
+        let running = attested_application_workspace("running", &application_work_dir);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Existing workspace lookup and the re-read used for network
+            // preparation, then the authorized project's empty topology.
+            .append_query_results([vec![stopped.clone()]])
+            .append_query_results([vec![stopped.clone()]])
+            .append_query_results([Vec::<project_services::Model>::new()])
+            // Resume re-reads the stopped row.
+            .append_query_results([vec![stopped]])
+            // Resume update returns the running row.
+            .append_query_results([vec![running.clone()]])
+            // Resume bookkeeping and Git bootstrap re-resolve the now-running
+            // workspace through the same durable identity.
+            .append_query_results([vec![running.clone()]])
+            .append_query_results([vec![running.clone()]])
+            .append_query_results([vec![running]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let lifecycle_calls = provider.lifecycle_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        service
+            .get_or_create_application_workspace_with_config(
+                1,
+                "app_example",
+                None,
+                application_work_dir,
+                ApplicationWorkspaceConfig::default(),
+                &[42],
+            )
+            .await
+            .expect("network reconciliation must complete before the stopped workspace starts");
+
+        assert_eq!(
+            *lifecycle_calls.lock().expect("lifecycle call mutex"),
+            vec!["configure", "start"]
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn failed_network_reconciliation_never_starts_stopped_application_workspace() {
+        let data_root = unique_data_root("application-network-failure");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let application_work_dir = data_root.join("app_example");
+        let stopped = attested_application_workspace("stopped", &application_work_dir);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stopped.clone()]])
+            .append_query_results([vec![stopped]])
+            .append_query_results([Vec::<project_services::Model>::new()])
+            .into_connection();
+        let provider = FakeProvider {
+            fail_network_config: true,
+            ..FakeProvider::new()
+        };
+        let starts = provider.starts.clone();
+        let lifecycle_calls = provider.lifecycle_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let error = service
+            .get_or_create_application_workspace_with_config(
+                1,
+                "app_example",
+                None,
+                application_work_dir,
+                ApplicationWorkspaceConfig::default(),
+                &[42],
+            )
+            .await
+            .expect_err("failed network reconciliation must abort workspace preparation");
+
+        assert!(error.to_string().contains("network reconciliation failed"));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *lifecycle_calls.lock().expect("lifecycle call mutex"),
+            vec!["configure"]
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
     #[tokio::test]
     async fn application_workspace_fails_when_in_sandbox_git_bootstrap_fails() {
         let data_root = unique_data_root("application-git-bootstrap");
@@ -4569,6 +4940,10 @@ mod storage_cleanup_tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // Existing application sandbox lookup.
             .append_query_results([vec![existing.clone()]])
+            // Network preparation re-reads the row and resolves the empty
+            // authorized service topology before Git bootstrap may execute.
+            .append_query_results([vec![existing.clone()]])
+            .append_query_results([Vec::<project_services::Model>::new()])
             // `exec` ownership lookup.
             .append_query_results([vec![existing]])
             // Activity touch performed before provider exec.
@@ -4612,13 +4987,15 @@ mod storage_cleanup_tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // Existing application sandbox lookup.
             .append_query_results([vec![existing.clone()]])
-            // Git-bootstrap exec ownership lookup sees the stale running row.
+            // Rebuild lookup and update return the same durable identity.
             .append_query_results([vec![existing.clone()]])
-            // Provider wake reconciles the row before exec is attempted.
             .append_query_results([vec![existing.clone()]])
-            // Event/runtime reconciliation may re-resolve the durable row;
-            // every resolution must keep returning the same identity.
+            // Rebuild bookkeeping and network preparation re-read the durable
+            // row, then resolve no data services for the empty authorized set.
             .append_query_results([vec![existing.clone()]])
+            .append_query_results([vec![existing.clone()]])
+            .append_query_results([Vec::<project_services::Model>::new()])
+            // Git-bootstrap exec ownership lookup sees the rebuilt row.
             .append_query_results([vec![existing]])
             // Activity touch performed before provider exec.
             .append_exec_results([sea_orm::MockExecResult {
@@ -5038,6 +5415,119 @@ mod storage_cleanup_tests {
         ));
     }
 
+    #[test]
+    fn credentials_only_enter_temps_managed_sandbox_images() {
+        let mut managed = handle_for("managed");
+        managed.image = "ghcr.io/gotempsh/temps-sandbox-node:v1".to_string();
+        assert!(sandbox_image_is_trusted_for_credentials(&managed));
+
+        let mut custom = handle_for("custom");
+        custom.image = "registry.example/customer/image:latest".to_string();
+        assert!(!sandbox_image_is_trusted_for_credentials(&custom));
+
+        let mut local = handle_for("local");
+        local.backend = SandboxBackend::Local;
+        local.image = managed.image;
+        assert!(!sandbox_image_is_trusted_for_credentials(&local));
+    }
+
+    #[test]
+    fn privileged_imports_clear_image_startup_hooks() {
+        let mut environment = HashMap::from([
+            ("LD_PRELOAD".to_string(), "/workspace/steal.so".to_string()),
+            ("BASH_ENV".to_string(), "/workspace/startup.sh".to_string()),
+            ("GIT_PASS".to_string(), "ephemeral".to_string()),
+        ]);
+
+        sanitize_privileged_import_environment(&mut environment);
+
+        assert_eq!(environment.get("LD_PRELOAD").map(String::as_str), Some(""));
+        assert_eq!(environment.get("BASH_ENV").map(String::as_str), Some(""));
+        assert_eq!(
+            environment.get("GIT_PASS").map(String::as_str),
+            Some("ephemeral")
+        );
+        for name in ["HOME", "CURL_HOME", "XDG_CONFIG_HOME"] {
+            assert_eq!(
+                environment.get(name).map(String::as_str),
+                Some("/var/empty/temps-source-import")
+            );
+        }
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_SSL_CAINFO",
+        ] {
+            assert_eq!(environment.get(name).map(String::as_str), Some(""));
+        }
+        assert_eq!(environment.get("NO_PROXY").map(String::as_str), Some("*"));
+        assert_eq!(environment.get("no_proxy").map(String::as_str), Some("*"));
+        assert_eq!(
+            environment.get("GIT_CONFIG_COUNT").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            environment.get("GIT_SSL_NO_VERIFY").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn source_network_pin_formats_curl_resolve_values() {
+        let ipv4 = SourceNetworkPin {
+            host: "git.example".to_string(),
+            port: 443,
+            address: "203.0.113.8".parse().expect("IPv4 fixture"),
+        };
+        assert_eq!(ipv4.curl_resolve_value(), "git.example:443:203.0.113.8");
+
+        let ipv6 = SourceNetworkPin {
+            host: "git.example".to_string(),
+            port: 443,
+            address: "2001:db8::8".parse().expect("IPv6 fixture"),
+        };
+        assert_eq!(ipv6.curl_resolve_value(), "git.example:443:[2001:db8::8]");
+    }
+
+    #[test]
+    fn tarball_import_disables_image_curl_configuration_before_other_flags() {
+        let command = tarball_extract_command(
+            "https://downloads.example/source.tar.gz",
+            "/tmp/staging",
+            None,
+        );
+
+        assert!(
+            command.contains(" curl -q "),
+            "unexpected command: {command}"
+        );
+        assert!(command.starts_with("env -i "));
+        assert!(command.contains("--noproxy '*' --proxy ''"));
+        assert!(command.contains("--max-redirs 0"));
+        assert!(command.contains("| env -i "));
+    }
+
+    #[test]
+    fn git_import_uses_an_allowlisted_environment_without_secret_values() {
+        let environment = clean_git_environment(
+            "/root/.temps-source-auth-7",
+            Some("/root/.temps-source-auth-7/askpass.sh"),
+        );
+
+        assert!(environment.starts_with("env -i "));
+        assert!(environment.contains("GIT_CONFIG_COUNT=0"));
+        assert!(environment.contains("GIT_SSL_NO_VERIFY=false"));
+        assert!(environment.contains("GIT_ASKPASS="));
+        assert!(!environment.contains("GIT_PASS="));
+        assert!(!environment.contains("GIT_USER="));
+        assert!(!environment.contains("GIT_TRACE"));
+    }
+
     fn git_provider(
         provider_type: &str,
         base_url: Option<&str>,
@@ -5309,7 +5799,10 @@ mod storage_cleanup_tests {
 
         let req = CreateSandboxRequest {
             source: Some(SandboxSource::Tarball {
-                url: "https://example.invalid/src.tar.gz".into(),
+                // A public IP literal keeps this cleanup regression test
+                // deterministic: source validation succeeds without DNS and
+                // the fake provider remains the intended seed failure.
+                url: "https://93.184.216.34/src.tar.gz".into(),
             }),
             ..Default::default()
         };

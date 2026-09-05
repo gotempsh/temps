@@ -11,9 +11,9 @@ function DiffLine({ line }: { line: ParsedDiffLine }) {
     return (
       <div
         data-diff-line="true"
-        className="border-y border-sky-400/15 bg-sky-400/[0.07] px-3 py-1.5 font-mono text-[9px] leading-4 text-sky-300"
+        className="border-y border-border bg-muted/60 px-3 py-1.5 font-mono text-[9px] leading-4 text-muted-foreground"
       >
-        <span className="mr-2 text-sky-400/60">•••</span>
+        <span className="mr-2 text-muted-foreground/60">•••</span>
         {line.content}
       </div>
     )
@@ -23,7 +23,7 @@ function DiffLine({ line }: { line: ParsedDiffLine }) {
     return (
       <div
         data-diff-line="true"
-        className="border-y border-white/[0.06] bg-white/[0.025] px-3 py-1 font-mono text-[9px] italic leading-4 text-[#8b949e]"
+        className="border-y border-border bg-muted/30 px-3 py-1 font-mono text-[9px] italic leading-4 text-muted-foreground"
       >
         {line.content}
       </div>
@@ -39,24 +39,24 @@ function DiffLine({ line }: { line: ParsedDiffLine }) {
       className={cn(
         'grid grid-cols-[2.5rem_2.5rem_1.15rem_minmax(0,1fr)] border-l-2 font-mono text-[10px] leading-5',
         line.kind === 'added' &&
-          'border-l-emerald-400 bg-emerald-400/[0.09] text-emerald-50',
+          'border-l-emerald-500 bg-emerald-500/10 text-foreground',
         line.kind === 'removed' &&
-          'border-l-rose-400 bg-rose-400/[0.09] text-rose-50',
+          'border-l-red-500 bg-red-500/10 text-foreground',
         line.kind === 'context' &&
-          'border-l-transparent text-[#c9d1d9] hover:bg-white/[0.025]'
+          'border-l-transparent text-foreground hover:bg-muted/30'
       )}
     >
-      <span className="select-none border-r border-white/[0.06] px-1.5 text-right text-[#6e7681]">
+      <span className="select-none border-r border-border px-1.5 text-right text-muted-foreground">
         {line.oldLine ?? ''}
       </span>
-      <span className="select-none border-r border-white/[0.06] px-1.5 text-right text-[#6e7681]">
+      <span className="select-none border-r border-border px-1.5 text-right text-muted-foreground">
         {line.newLine ?? ''}
       </span>
       <span
         className={cn(
           'select-none text-center font-semibold',
           line.kind === 'added' && 'text-emerald-400',
-          line.kind === 'removed' && 'text-rose-400'
+          line.kind === 'removed' && 'text-red-600 dark:text-red-400'
         )}
       >
         {marker}
@@ -80,12 +80,12 @@ export function WorkspaceDiffViewer({
   const parsed = useMemo(() => parseUnifiedDiff(diff), [diff])
 
   return (
-    <section className="overflow-hidden rounded-lg border border-border bg-[#0d1117] text-[#c9d1d9] shadow-inner">
-      <div className="flex flex-wrap items-center gap-2 border-b border-white/10 bg-white/[0.025] px-3 py-2.5">
+    <section className="overflow-hidden rounded-lg border border-border bg-muted/30 text-foreground shadow-inner">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/50 px-3 py-2.5">
         {parsed.isNewFile ? (
           <FilePlus2 className="size-3.5 shrink-0 text-emerald-400" />
         ) : (
-          <FileCode2 className="size-3.5 shrink-0 text-[#7ee787]" />
+          <FileCode2 className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
         )}
         <span
           className="min-w-0 flex-1 truncate font-mono text-[10px]"
@@ -101,7 +101,7 @@ export function WorkspaceDiffViewer({
         <span className="font-mono text-[9px] font-semibold text-emerald-400">
           +{parsed.additions}
         </span>
-        <span className="font-mono text-[9px] font-semibold text-rose-400">
+        <span className="font-mono text-[9px] font-semibold text-red-600 dark:text-red-400">
           −{parsed.deletions}
         </span>
       </div>

@@ -22,10 +22,12 @@ import {
   TerminalSquare,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   archiveUserConversation,
+  archiveApplication,
   createApplication,
   createApplicationConversation,
   createApplicationPreviewLink,
@@ -34,15 +36,14 @@ import {
   getApplicationWorkspace,
   getApplicationWorkspaceChanges,
   getApplicationWorkspaceDiff,
-  getGlobalAiWorkspace,
   listAiProviders,
   listAllConversations,
   listApplicationConversations,
   listApplications,
   listConnections,
   listGitProviders,
-  listThreadArtifacts,
   restoreUserConversation,
+  restoreApplication,
   importApplicationWorkspaceGit,
   writeApplicationWorkspaceFiles,
   type ApplicationResponse,
@@ -53,8 +54,15 @@ import {
   type ConnectionResponse,
   type GlobalConversationResponse,
   type ProviderResponse,
-  type ThreadArtifactResponse,
 } from '@/api/client'
+import {
+  getApplicationWorkspaceOptions,
+  getGlobalAiWorkspaceOptions,
+  listAllConversationsOptions,
+  listApplicationConversationsOptions,
+  listApplicationsOptions,
+  listThreadArtifactsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { DebugChatPanel } from '@/components/ai/DebugChatPanel'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Button } from '@/components/ui/button'
@@ -69,6 +77,13 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
 import { ArtifactRenderer } from './ArtifactRenderer'
 import { ApplicationPreviewPanel } from './ApplicationPreviewPanel'
@@ -100,9 +115,11 @@ import {
 
 const WORKSPACE_FILES_PAGE_SIZE = 100
 const WORKSPACE_CLIENT_TIMEOUT_MS = 35_000
+const THREADS_PAGE_SIZE = 50
 
 type RightView = 'generated' | 'files' | 'preview' | 'projects' | 'workspace'
 type ThreadListMode = 'active' | 'archived'
+type ApplicationListMode = 'active' | 'archived'
 type WorkspaceLoadPhase =
   'idle' | 'checking' | 'waking' | 'recovering' | 'inspecting'
 
@@ -131,24 +148,67 @@ function threadRuntimeLabel(
   }`
 }
 
+export function mergeConversationPages<T extends { public_id: string }>(
+  firstPage: T[],
+  additionalPages: T[]
+): T[] {
+  const seen = new Set<string>()
+  return [...firstPage, ...additionalPages].filter((conversation) => {
+    if (seen.has(conversation.public_id)) return false
+    seen.add(conversation.public_id)
+    return true
+  })
+}
+
 export function AiFirstWorkspace() {
   const [searchParams, setSearchParams] = useSearchParams()
+  const queryClient = useQueryClient()
   const applicationFromUrl = searchParams.get('application')
   const threadFromUrl = searchParams.get('thread')
   const globalScopeFromUrl = searchParams.get('scope') === 'global'
-  const [applications, setApplications] = useState<ApplicationResponse[]>([])
   const [activeApplicationId, setActiveApplicationId] = useState<string | null>(
     applicationFromUrl
   )
-  const [conversations, setConversations] = useState<ConversationResponse[]>([])
-  const [globalConversations, setGlobalConversations] = useState<
-    GlobalConversationResponse[]
-  >([])
   const [archivedConversations, setArchivedConversations] = useState<
     ConversationResponse[]
   >([])
   const [archivedGlobalConversations, setArchivedGlobalConversations] =
     useState<GlobalConversationResponse[]>([])
+  const [
+    activeApplicationConversationPages,
+    setActiveApplicationConversationPages,
+  ] = useState<ConversationResponse[]>([])
+  const [activeGlobalConversationPages, setActiveGlobalConversationPages] =
+    useState<GlobalConversationResponse[]>([])
+  const [
+    activeApplicationConversationPage,
+    setActiveApplicationConversationPage,
+  ] = useState(1)
+  const [activeGlobalConversationPage, setActiveGlobalConversationPage] =
+    useState(1)
+  const [
+    archivedApplicationConversationPage,
+    setArchivedApplicationConversationPage,
+  ] = useState(1)
+  const [archivedGlobalConversationPage, setArchivedGlobalConversationPage] =
+    useState(1)
+  const [activeApplicationHasMore, setActiveApplicationHasMore] = useState(true)
+  const [activeGlobalHasMore, setActiveGlobalHasMore] = useState(true)
+  const [archivedApplicationHasMore, setArchivedApplicationHasMore] =
+    useState(true)
+  const [archivedGlobalHasMore, setArchivedGlobalHasMore] = useState(true)
+  const [threadPageLoading, setThreadPageLoading] = useState(false)
+  const [archivedApplications, setArchivedApplications] = useState<
+    ApplicationResponse[]
+  >([])
+  const [applicationListMode, setApplicationListMode] =
+    useState<ApplicationListMode>('active')
+  const [applicationActionPending, setApplicationActionPending] = useState<
+    string | null
+  >(null)
+  const [applicationActionError, setApplicationActionError] = useState<
+    string | null
+  >(null)
   const [threadListMode, setThreadListMode] = useState<ThreadListMode>('active')
   const [threadActionPending, setThreadActionPending] = useState<string | null>(
     null
@@ -159,20 +219,14 @@ export function AiFirstWorkspace() {
   const [activeConversationId, setActiveConversationId] = useState<
     string | null
   >(null)
-  const [artifacts, setArtifacts] = useState<ThreadArtifactResponse[]>([])
   const [harnesses, setHarnesses] = useState<HarnessOption[]>([])
   const [harnessesLoading, setHarnessesLoading] = useState(true)
-  const [activeWorkspaceStatus, setActiveWorkspaceStatus] =
-    useState<ApplicationWorkspaceResponse | null>(null)
-  const [activeWorkspaceStatusLoading, setActiveWorkspaceStatusLoading] =
-    useState(true)
   const [activeWorkspaceWaking, setActiveWorkspaceWaking] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
   const [applicationDialogOpen, setApplicationDialogOpen] = useState(false)
   const [threadDialogOpen, setThreadDialogOpen] = useState(false)
   const [globalStartOpen, setGlobalStartOpen] = useState(false)
   const [rightView, setRightView] = useState<RightView>('generated')
+  const [rightPanelOpen, setRightPanelOpen] = useState(false)
   const [workspaceChanges, setWorkspaceChanges] =
     useState<ApplicationWorkspaceChangesResponse | null>(null)
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
@@ -186,48 +240,285 @@ export function AiFirstWorkspace() {
   const [workspaceDiff, setWorkspaceDiff] =
     useState<ApplicationWorkspaceDiffResponse | null>(null)
   const [workspaceDiffLoading, setWorkspaceDiffLoading] = useState(false)
-  const artifactRequestGeneration = useRef(0)
   const workspaceRequestGeneration = useRef(0)
   const workspaceAbortController = useRef<AbortController | null>(null)
   const workspaceDiffGeneration = useRef(0)
   const harnessRequestGeneration = useRef(0)
-  const visibleConversationRequestGeneration = useRef(0)
-  const activeWorkspaceStatusRequestGeneration = useRef(0)
-  const activeWorkspaceStatusRef = useRef<ApplicationWorkspaceResponse | null>(
-    null
-  )
   const workspaceWakeInFlight = useRef<string | null>(null)
+
+  const applicationsOptions = listApplicationsOptions({
+    query: { page: 1, page_size: 100, status: 'active' },
+  })
+  const applicationConversationsOptions = listApplicationConversationsOptions({
+    path: { application_public_id: activeApplicationId ?? '' },
+    query: { page: 1, page_size: THREADS_PAGE_SIZE, status: 'active' },
+  })
+  const globalConversationsOptions = listAllConversationsOptions({
+    query: {
+      page: 1,
+      page_size: THREADS_PAGE_SIZE,
+      scope: 'global',
+      status: 'active',
+    },
+  })
+  const applicationWorkspaceOptions = getApplicationWorkspaceOptions({
+    path: { application_public_id: activeApplicationId ?? '' },
+  })
+  const globalWorkspaceOptions = getGlobalAiWorkspaceOptions()
+  const artifactsOptions = listThreadArtifactsOptions({
+    path: {
+      application_public_id: activeApplicationId ?? '',
+      conversation_public_id: activeConversationId ?? '',
+    },
+  })
+
+  const applicationsQuery = useQuery(applicationsOptions)
+  const applicationConversationsQuery = useQuery({
+    ...applicationConversationsOptions,
+    enabled: Boolean(activeApplicationId),
+    refetchInterval: (query) =>
+      query.state.data?.some(
+        (conversation) => conversation.turn_status === 'running'
+      )
+        ? 2_000
+        : false,
+  })
+  const globalConversationsQuery = useQuery({
+    ...globalConversationsOptions,
+    refetchInterval: (query) =>
+      query.state.data?.some(
+        (conversation) =>
+          conversation.context_type === 'global' &&
+          conversation.project_id == null &&
+          conversation.turn_status === 'running'
+      )
+        ? 2_000
+        : false,
+  })
+  const applicationWorkspaceQuery = useQuery({
+    ...applicationWorkspaceOptions,
+    enabled: Boolean(activeApplicationId),
+    refetchInterval: 5_000,
+  })
+  const globalWorkspaceQuery = useQuery({
+    ...globalWorkspaceOptions,
+    enabled: !activeApplicationId,
+    refetchInterval: 5_000,
+  })
+  const artifactsQuery = useQuery({
+    ...artifactsOptions,
+    enabled: Boolean(activeApplicationId && activeConversationId),
+  })
+
+  const applications = applicationsQuery.data ?? []
+  const conversations = useMemo(
+    () =>
+      mergeConversationPages(
+        applicationConversationsQuery.data ?? [],
+        activeApplicationConversationPages
+      ),
+    [applicationConversationsQuery.data, activeApplicationConversationPages]
+  )
+  const globalConversations = useMemo(
+    () =>
+      mergeConversationPages(
+        (globalConversationsQuery.data ?? []).filter(
+          (conversation) =>
+            conversation.context_type === 'global' &&
+            conversation.project_id == null
+        ),
+        activeGlobalConversationPages
+      ),
+    [activeGlobalConversationPages, globalConversationsQuery.data]
+  )
+  const artifacts =
+    activeApplicationId && activeConversationId
+      ? (artifactsQuery.data ?? [])
+      : []
+  const activeWorkspaceStatus = activeApplicationId
+    ? (applicationWorkspaceQuery.data ?? null)
+    : (globalWorkspaceQuery.data ?? null)
+  const activeWorkspaceStatusLoading = activeApplicationId
+    ? applicationWorkspaceQuery.isLoading
+    : globalWorkspaceQuery.isLoading
+  const loading = applicationsQuery.isLoading
+  const queryError =
+    applicationsQuery.error ??
+    applicationConversationsQuery.error ??
+    globalConversationsQuery.error
+  const error = queryError
+    ? queryError instanceof Error
+      ? queryError.message
+      : 'Could not load the AI workspace.'
+    : null
 
   const activeApplication = applications.find(
     (application) => application.public_id === activeApplicationId
   )
 
-  const handleApplicationChange = useCallback((next: ApplicationResponse) => {
-    setApplications((current) =>
-      current.map((application) =>
-        application.public_id === next.public_id ? next : application
+  const handleApplicationChange = useCallback(
+    (next: ApplicationResponse) => {
+      queryClient.setQueryData<ApplicationResponse[]>(
+        applicationsOptions.queryKey,
+        (current = []) =>
+          current.map((application) =>
+            application.public_id === next.public_id ? next : application
+          )
       )
-    )
-  }, [])
+    },
+    [applicationsOptions.queryKey, queryClient]
+  )
   const handleWorkspaceStatusChange = useCallback(
     (workspace: ApplicationWorkspaceResponse) => {
-      activeWorkspaceStatusRef.current = workspace
-      setActiveWorkspaceStatus(workspace)
+      if (!activeApplicationId) return
+      queryClient.setQueryData<ApplicationWorkspaceResponse>(
+        applicationWorkspaceOptions.queryKey,
+        workspace
+      )
     },
-    []
+    [activeApplicationId, applicationWorkspaceOptions.queryKey, queryClient]
   )
-  const activeConversation = conversations.find(
-    (conversation) => conversation.public_id === activeConversationId
-  )
-  const activeGlobalConversation = globalConversations.find(
-    (conversation) => conversation.public_id === activeConversationId
-  )
+  const activeConversation = (
+    threadListMode === 'archived' ? archivedConversations : conversations
+  ).find((conversation) => conversation.public_id === activeConversationId)
+  const activeGlobalConversation = (
+    threadListMode === 'archived'
+      ? archivedGlobalConversations
+      : globalConversations
+  ).find((conversation) => conversation.public_id === activeConversationId)
+
+  const { refetch: refetchApplications } = applicationsQuery
+  const { refetch: refetchApplicationConversations } =
+    applicationConversationsQuery
+  const { refetch: refetchGlobalConversations } = globalConversationsQuery
+  const { refetch: refetchApplicationWorkspace } = applicationWorkspaceQuery
+  const { refetch: refetchGlobalWorkspace } = globalWorkspaceQuery
+  const { refetch: refetchArtifacts } = artifactsQuery
+
+  useEffect(() => {
+    setActiveApplicationConversationPages([])
+    setActiveApplicationConversationPage(1)
+    setActiveApplicationHasMore(true)
+    setArchivedConversations([])
+    setArchivedApplicationConversationPage(1)
+    setArchivedApplicationHasMore(true)
+  }, [activeApplicationId])
+
+  useEffect(() => {
+    if (
+      activeApplicationConversationPage !== 1 ||
+      !applicationConversationsQuery.data
+    )
+      return
+    setActiveApplicationHasMore(
+      applicationConversationsQuery.data.length === THREADS_PAGE_SIZE
+    )
+  }, [
+    activeApplicationConversationPage,
+    activeApplicationId,
+    applicationConversationsQuery.data,
+  ])
+
+  useEffect(() => {
+    if (activeGlobalConversationPage !== 1 || !globalConversationsQuery.data)
+      return
+    setActiveGlobalHasMore(
+      globalConversationsQuery.data.length === THREADS_PAGE_SIZE
+    )
+  }, [activeGlobalConversationPage, globalConversationsQuery.data])
 
   const loadApplications = useCallback(async () => {
+    await refetchApplications()
+  }, [refetchApplications])
+
+  const loadArchivedApplications = useCallback(async () => {
+    setApplicationActionError(null)
     try {
-      const { data } = await listApplications({ throwOnError: true })
-      const next = data
-      setApplications(next)
+      const { data } = await listApplications({
+        query: { status: 'archived', page: 1, page_size: 100 },
+        throwOnError: true,
+      })
+      setArchivedApplications(data)
+    } catch (cause) {
+      setApplicationActionError(
+        cause instanceof Error
+          ? cause.message
+          : 'Could not load archived workspaces.'
+      )
+    }
+  }, [])
+
+  useEffect(() => {
+    if (applicationListMode !== 'archived') return
+    const timer = window.setTimeout(() => void loadArchivedApplications(), 0)
+    return () => window.clearTimeout(timer)
+  }, [applicationListMode, loadArchivedApplications])
+
+  const handleApplicationArchive = useCallback(
+    async (application: ApplicationResponse) => {
+      setApplicationActionPending(application.public_id)
+      setApplicationActionError(null)
+      try {
+        await archiveApplication({
+          path: { application_public_id: application.public_id },
+          throwOnError: true,
+        })
+        if (activeApplicationId === application.public_id) {
+          setActiveApplicationId(null)
+          setActiveConversationId(null)
+          setRightView('generated')
+          setSearchParams(
+            (current) => {
+              const next = new URLSearchParams(current)
+              next.delete('application')
+              next.delete('thread')
+              next.set('scope', 'global')
+              return next
+            },
+            { replace: true }
+          )
+        }
+        await refetchApplications()
+      } catch (cause) {
+        setApplicationActionError(
+          cause instanceof Error
+            ? cause.message
+            : 'Could not archive the workspace.'
+        )
+      } finally {
+        setApplicationActionPending(null)
+      }
+    },
+    [activeApplicationId, refetchApplications, setSearchParams]
+  )
+
+  const handleApplicationRestore = useCallback(
+    async (application: ApplicationResponse) => {
+      setApplicationActionPending(application.public_id)
+      setApplicationActionError(null)
+      try {
+        await restoreApplication({
+          path: { application_public_id: application.public_id },
+          throwOnError: true,
+        })
+        await Promise.all([refetchApplications(), loadArchivedApplications()])
+      } catch (cause) {
+        setApplicationActionError(
+          cause instanceof Error
+            ? cause.message
+            : 'Could not restore the workspace.'
+        )
+      } finally {
+        setApplicationActionPending(null)
+      }
+    },
+    [loadArchivedApplications, refetchApplications]
+  )
+
+  useEffect(() => {
+    const next = applicationsQuery.data
+    if (!next) return
+    const syncTimer = window.setTimeout(() => {
       setActiveApplicationId((current) =>
         globalScopeFromUrl
           ? null
@@ -241,25 +532,14 @@ export function AiFirstWorkspace() {
               ? applicationFromUrl
               : (next[0]?.public_id ?? null)
       )
-      setError(null)
-    } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : 'Could not load applications.'
-      )
-    } finally {
-      setLoading(false)
-    }
-  }, [applicationFromUrl, globalScopeFromUrl])
+    }, 0)
+    return () => window.clearTimeout(syncTimer)
+  }, [applicationFromUrl, applicationsQuery.data, globalScopeFromUrl])
 
-  const loadGlobalConversations = useCallback(async () => {
-    try {
-      const { data } = await listAllConversations({ throwOnError: true })
-      const next = data.filter(
-        (conversation) =>
-          conversation.context_type === 'global' &&
-          conversation.project_id == null
-      )
-      setGlobalConversations(next)
+  useEffect(() => {
+    if (!globalConversationsQuery.data) return
+    const next = globalConversations
+    const syncTimer = window.setTimeout(() => {
       if (globalScopeFromUrl) {
         setActiveConversationId((current) =>
           current &&
@@ -273,14 +553,14 @@ export function AiFirstWorkspace() {
               : (next[0]?.public_id ?? null)
         )
       }
-    } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : 'Could not load workspace chats.'
-      )
-    }
-  }, [globalScopeFromUrl, threadFromUrl])
+    }, 0)
+    return () => window.clearTimeout(syncTimer)
+  }, [
+    globalConversations,
+    globalConversationsQuery.data,
+    globalScopeFromUrl,
+    threadFromUrl,
+  ])
 
   const loadArchivedConversations = useCallback(async () => {
     setThreadActionError(null)
@@ -288,14 +568,25 @@ export function AiFirstWorkspace() {
       if (activeApplicationId) {
         const { data } = await listApplicationConversations({
           path: { application_public_id: activeApplicationId },
-          query: { status: 'archived' },
+          query: {
+            page: 1,
+            page_size: THREADS_PAGE_SIZE,
+            status: 'archived',
+          },
           throwOnError: true,
         })
         setArchivedConversations(data)
+        setArchivedApplicationConversationPage(1)
+        setArchivedApplicationHasMore(data.length === THREADS_PAGE_SIZE)
         return
       }
       const { data } = await listAllConversations({
-        query: { status: 'archived' },
+        query: {
+          page: 1,
+          page_size: THREADS_PAGE_SIZE,
+          status: 'archived',
+          scope: 'global',
+        },
         throwOnError: true,
       })
       setArchivedGlobalConversations(
@@ -305,6 +596,8 @@ export function AiFirstWorkspace() {
             conversation.project_id == null
         )
       )
+      setArchivedGlobalConversationPage(1)
+      setArchivedGlobalHasMore(data.length === THREADS_PAGE_SIZE)
     } catch (cause) {
       setThreadActionError(
         cause instanceof Error
@@ -314,6 +607,87 @@ export function AiFirstWorkspace() {
     }
   }, [activeApplicationId])
 
+  const loadMoreConversations = useCallback(async () => {
+    setThreadPageLoading(true)
+    setThreadActionError(null)
+    try {
+      if (activeApplicationId) {
+        const archived = threadListMode === 'archived'
+        const nextPage = archived
+          ? archivedApplicationConversationPage + 1
+          : activeApplicationConversationPage + 1
+        const { data } = await listApplicationConversations({
+          path: { application_public_id: activeApplicationId },
+          query: {
+            page: nextPage,
+            page_size: THREADS_PAGE_SIZE,
+            status: archived ? 'archived' : 'active',
+          },
+          throwOnError: true,
+        })
+        if (archived) {
+          setArchivedConversations((current) =>
+            mergeConversationPages(current, data)
+          )
+          setArchivedApplicationConversationPage(nextPage)
+          setArchivedApplicationHasMore(data.length === THREADS_PAGE_SIZE)
+        } else {
+          setActiveApplicationConversationPages((current) =>
+            mergeConversationPages(current, data)
+          )
+          setActiveApplicationConversationPage(nextPage)
+          setActiveApplicationHasMore(data.length === THREADS_PAGE_SIZE)
+        }
+        return
+      }
+
+      const archived = threadListMode === 'archived'
+      const nextPage = archived
+        ? archivedGlobalConversationPage + 1
+        : activeGlobalConversationPage + 1
+      const { data } = await listAllConversations({
+        query: {
+          page: nextPage,
+          page_size: THREADS_PAGE_SIZE,
+          status: archived ? 'archived' : 'active',
+          scope: 'global',
+        },
+        throwOnError: true,
+      })
+      const globalPage = data.filter(
+        (conversation) =>
+          conversation.context_type === 'global' &&
+          conversation.project_id == null
+      )
+      if (archived) {
+        setArchivedGlobalConversations((current) =>
+          mergeConversationPages(current, globalPage)
+        )
+        setArchivedGlobalConversationPage(nextPage)
+        setArchivedGlobalHasMore(data.length === THREADS_PAGE_SIZE)
+      } else {
+        setActiveGlobalConversationPages((current) =>
+          mergeConversationPages(current, globalPage)
+        )
+        setActiveGlobalConversationPage(nextPage)
+        setActiveGlobalHasMore(data.length === THREADS_PAGE_SIZE)
+      }
+    } catch (cause) {
+      setThreadActionError(
+        cause instanceof Error ? cause.message : 'Could not load more threads.'
+      )
+    } finally {
+      setThreadPageLoading(false)
+    }
+  }, [
+    activeApplicationConversationPage,
+    activeApplicationId,
+    activeGlobalConversationPage,
+    archivedApplicationConversationPage,
+    archivedGlobalConversationPage,
+    threadListMode,
+  ])
+
   useEffect(() => {
     if (threadListMode !== 'archived') return
     const timer = window.setTimeout(() => void loadArchivedConversations(), 0)
@@ -321,37 +695,21 @@ export function AiFirstWorkspace() {
   }, [loadArchivedConversations, threadListMode])
 
   const refreshVisibleConversations = useCallback(async () => {
-    const requestGeneration = ++visibleConversationRequestGeneration.current
     try {
       if (activeApplicationId) {
-        const { data: next } = await listApplicationConversations({
-          path: { application_public_id: activeApplicationId },
-          throwOnError: true,
-        })
-        if (
-          requestGeneration === visibleConversationRequestGeneration.current
-        ) {
-          setConversations(next)
-        }
+        await refetchApplicationConversations()
         return
       }
-
-      const { data } = await listAllConversations({ throwOnError: true })
-      if (requestGeneration !== visibleConversationRequestGeneration.current) {
-        return
-      }
-      setGlobalConversations(
-        data.filter(
-          (conversation) =>
-            conversation.context_type === 'global' &&
-            conversation.project_id == null
-        )
-      )
+      await refetchGlobalConversations()
     } catch {
       // The active WebSocket and the next refresh remain authoritative. A
       // sidebar-only refresh failure must not interrupt the open conversation.
     }
-  }, [activeApplicationId])
+  }, [
+    activeApplicationId,
+    refetchApplicationConversations,
+    refetchGlobalConversations,
+  ])
 
   // Provider credentials can be saved in Agent Sandbox while this workspace
   // remains open. Re-read the inventory whenever an application/thread
@@ -378,23 +736,10 @@ export function AiFirstWorkspace() {
   }, [])
 
   const loadActiveWorkspaceStatus = useCallback(async () => {
-    const requestGeneration = ++activeWorkspaceStatusRequestGeneration.current
-    if (!activeWorkspaceStatusRef.current) {
-      setActiveWorkspaceStatusLoading(true)
-    }
     try {
       if (activeApplicationId) {
-        const { data } = await getApplicationWorkspace({
-          path: { application_public_id: activeApplicationId },
-          throwOnError: true,
-        })
-        if (
-          requestGeneration !== activeWorkspaceStatusRequestGeneration.current
-        ) {
-          return
-        }
-        activeWorkspaceStatusRef.current = data
-        setActiveWorkspaceStatus(data)
+        const { data } = await refetchApplicationWorkspace()
+        if (!data) return
         if (
           data.desired_state === 'running' &&
           data.state === 'sleeping' &&
@@ -408,14 +753,10 @@ export function AiFirstWorkspace() {
               body: { action: 'resume' },
               throwOnError: true,
             })
-            if (
-              requestGeneration !==
-              activeWorkspaceStatusRequestGeneration.current
-            ) {
-              return
-            }
-            activeWorkspaceStatusRef.current = resumed
-            setActiveWorkspaceStatus(resumed)
+            queryClient.setQueryData<ApplicationWorkspaceResponse>(
+              applicationWorkspaceOptions.queryKey,
+              resumed
+            )
           } finally {
             if (workspaceWakeInFlight.current === activeApplicationId) {
               workspaceWakeInFlight.current = null
@@ -424,91 +765,70 @@ export function AiFirstWorkspace() {
           }
         }
       } else {
-        const { data } = await getGlobalAiWorkspace({ throwOnError: true })
-        if (
-          requestGeneration !== activeWorkspaceStatusRequestGeneration.current
-        ) {
-          return
-        }
-        activeWorkspaceStatusRef.current = data
-        setActiveWorkspaceStatus(data)
+        await refetchGlobalWorkspace()
       }
     } catch {
-      if (!activeWorkspaceStatusRef.current) {
-        setActiveWorkspaceStatus(null)
-      }
-    } finally {
-      setActiveWorkspaceStatusLoading(false)
+      // Polling will retry. Preserve the last successful workspace snapshot.
     }
-  }, [activeApplicationId])
+  }, [
+    activeApplicationId,
+    applicationWorkspaceOptions.queryKey,
+    queryClient,
+    refetchApplicationWorkspace,
+    refetchGlobalWorkspace,
+  ])
+
+  const queriedWorkspace = activeApplicationId
+    ? applicationWorkspaceQuery.data
+    : globalWorkspaceQuery.data
+  useEffect(() => {
+    if (!queriedWorkspace) return
+    const syncTimer = window.setTimeout(() => {
+      if (
+        activeApplicationId &&
+        queriedWorkspace.desired_state === 'running' &&
+        queriedWorkspace.state === 'sleeping' &&
+        workspaceWakeInFlight.current !== activeApplicationId
+      ) {
+        void loadActiveWorkspaceStatus()
+      }
+    }, 0)
+    return () => window.clearTimeout(syncTimer)
+  }, [activeApplicationId, loadActiveWorkspaceStatus, queriedWorkspace])
 
   useEffect(() => {
     const resetTimer = window.setTimeout(() => {
-      activeWorkspaceStatusRef.current = null
-      activeWorkspaceStatusRequestGeneration.current += 1
       workspaceWakeInFlight.current = null
-      setActiveWorkspaceStatus(null)
-      setActiveWorkspaceStatusLoading(true)
       setActiveWorkspaceWaking(false)
     }, 0)
     return () => window.clearTimeout(resetTimer)
   }, [activeApplicationId])
 
   useEffect(() => {
-    const loadTimer = window.setTimeout(() => void loadApplications(), 0)
-    const globalLoadTimer = window.setTimeout(
-      () => void loadGlobalConversations(),
-      0
-    )
     const harnessLoadTimer = window.setTimeout(() => void loadHarnesses(), 0)
     return () => {
-      window.clearTimeout(loadTimer)
-      window.clearTimeout(globalLoadTimer)
       window.clearTimeout(harnessLoadTimer)
     }
-  }, [loadApplications, loadGlobalConversations, loadHarnesses])
+  }, [loadHarnesses])
 
   useEffect(() => {
-    const initial = window.setTimeout(() => void loadActiveWorkspaceStatus(), 0)
-    const interval = window.setInterval(
-      () => void loadActiveWorkspaceStatus(),
-      5_000
-    )
-    return () => {
-      window.clearTimeout(initial)
-      window.clearInterval(interval)
-    }
-  }, [loadActiveWorkspaceStatus])
-
-  useEffect(() => {
-    if (!activeApplicationId) {
-      return
-    }
-    let cancelled = false
-    listApplicationConversations({
-      path: { application_public_id: activeApplicationId },
-      throwOnError: true,
-    })
-      .then(({ data: next }) => {
-        if (cancelled) return
-        setConversations(next)
-        setActiveConversationId((current) =>
-          current &&
-          next.some((conversation) => conversation.public_id === current)
-            ? current
-            : initialApplicationThreadId(next, threadFromUrl)
-        )
-      })
-      .catch((cause) => {
-        if (!cancelled)
-          setError(
-            cause instanceof Error ? cause.message : 'Could not load threads.'
-          )
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [activeApplicationId, threadFromUrl])
+    if (!activeApplicationId || !applicationConversationsQuery.data) return
+    const next = conversations
+    const syncTimer = window.setTimeout(() => {
+      setActiveConversationId((current) =>
+        current &&
+        next.some((conversation) => conversation.public_id === current)
+          ? current
+          : initialApplicationThreadId(next, threadFromUrl)
+      )
+    }, 0)
+    return () => window.clearTimeout(syncTimer)
+  }, [
+    activeApplicationId,
+    applicationConversationsQuery.data,
+    conversations,
+    threadFromUrl,
+  ])
 
   const visibleConversations =
     threadListMode === 'archived'
@@ -518,51 +838,24 @@ export function AiFirstWorkspace() {
       : activeApplication
         ? conversations
         : globalConversations
-  const hasPendingConversation = (
-    activeApplication ? conversations : globalConversations
-  ).some((conversation) => conversation.turn_status === 'running')
-
-  // A different tab or thread may start work in the same workspace. Poll only
-  // while at least one row is active, then stop immediately at a terminal
-  // state so idle workspaces create no background request traffic.
-  useEffect(() => {
-    if (!hasPendingConversation) return
-    const refreshTimer = window.setInterval(
-      () => void refreshVisibleConversations(),
-      2000
-    )
-    return () => window.clearInterval(refreshTimer)
-  }, [hasPendingConversation, refreshVisibleConversations])
+  const visibleConversationsHaveMore = activeApplication
+    ? threadListMode === 'archived'
+      ? archivedApplicationHasMore
+      : activeApplicationHasMore
+    : threadListMode === 'archived'
+      ? archivedGlobalHasMore
+      : activeGlobalHasMore
 
   const refreshArtifacts = useCallback(async () => {
-    const requestGeneration = ++artifactRequestGeneration.current
     if (!activeApplicationId || !activeConversationId) {
-      setArtifacts([])
       return
     }
     try {
-      const { data: next } = await listThreadArtifacts({
-        path: {
-          application_public_id: activeApplicationId,
-          conversation_public_id: activeConversationId,
-        },
-        throwOnError: true,
-      })
-      if (requestGeneration === artifactRequestGeneration.current) {
-        setArtifacts(next)
-      }
+      await refetchArtifacts()
     } catch {
       // Chat remains useful if an event-driven artifact refresh fails.
     }
-  }, [activeApplicationId, activeConversationId])
-
-  useEffect(() => {
-    const refreshTimer = window.setTimeout(() => void refreshArtifacts(), 0)
-    return () => {
-      window.clearTimeout(refreshTimer)
-      artifactRequestGeneration.current += 1
-    }
-  }, [refreshArtifacts])
+  }, [activeApplicationId, activeConversationId, refetchArtifacts])
 
   const loadWorkspacePage = useCallback(
     async (cursor: number) => {
@@ -698,19 +991,23 @@ export function AiFirstWorkspace() {
     (eventName: string, data: string) => {
       const title = threadTitleFromLiveEvent(eventName, data)
       if (title && activeConversationId) {
-        setConversations((current) =>
-          current.map((conversation) =>
-            conversation.public_id === activeConversationId
-              ? { ...conversation, title }
-              : conversation
-          )
+        queryClient.setQueryData<ConversationResponse[]>(
+          applicationConversationsOptions.queryKey,
+          (current = []) =>
+            current.map((conversation) =>
+              conversation.public_id === activeConversationId
+                ? { ...conversation, title }
+                : conversation
+            )
         )
-        setGlobalConversations((current) =>
-          current.map((conversation) =>
-            conversation.public_id === activeConversationId
-              ? { ...conversation, title }
-              : conversation
-          )
+        queryClient.setQueryData<GlobalConversationResponse[]>(
+          globalConversationsOptions.queryKey,
+          (current = []) =>
+            current.map((conversation) =>
+              conversation.public_id === activeConversationId
+                ? { ...conversation, title }
+                : conversation
+            )
         )
       }
       if (shouldRefreshArtifactsForLiveEvent(eventName)) {
@@ -728,19 +1025,23 @@ export function AiFirstWorkspace() {
         }
       }
       if (turnStatus && activeConversationId) {
-        setConversations((current) =>
-          current.map((conversation) =>
-            conversation.public_id === activeConversationId
-              ? { ...conversation, turn_status: turnStatus }
-              : conversation
-          )
+        queryClient.setQueryData<ConversationResponse[]>(
+          applicationConversationsOptions.queryKey,
+          (current = []) =>
+            current.map((conversation) =>
+              conversation.public_id === activeConversationId
+                ? { ...conversation, turn_status: turnStatus }
+                : conversation
+            )
         )
-        setGlobalConversations((current) =>
-          current.map((conversation) =>
-            conversation.public_id === activeConversationId
-              ? { ...conversation, turn_status: turnStatus }
-              : conversation
-          )
+        queryClient.setQueryData<GlobalConversationResponse[]>(
+          globalConversationsOptions.queryKey,
+          (current = []) =>
+            current.map((conversation) =>
+              conversation.public_id === activeConversationId
+                ? { ...conversation, turn_status: turnStatus }
+                : conversation
+            )
         )
       }
       if (eventName === 'tool_result' || eventName === 'turn_complete') {
@@ -760,7 +1061,10 @@ export function AiFirstWorkspace() {
     },
     [
       activeConversationId,
+      applicationConversationsOptions.queryKey,
+      globalConversationsOptions.queryKey,
       loadApplications,
+      queryClient,
       refreshArtifacts,
       refreshVisibleConversations,
       refreshWorkspace,
@@ -772,9 +1076,18 @@ export function AiFirstWorkspace() {
     application: ApplicationResponse,
     conversation: ConversationResponse
   ) => {
-    setApplications((current) => [application, ...current])
+    queryClient.setQueryData<ApplicationResponse[]>(
+      applicationsOptions.queryKey,
+      (current = []) => [application, ...current]
+    )
+    const nextConversationOptions = listApplicationConversationsOptions({
+      path: { application_public_id: application.public_id },
+    })
+    queryClient.setQueryData<ConversationResponse[]>(
+      nextConversationOptions.queryKey,
+      [conversation]
+    )
     setActiveApplicationId(application.public_id)
-    setConversations([conversation])
     setActiveConversationId(conversation.public_id)
     setSearchParams(
       (current) => {
@@ -793,9 +1106,7 @@ export function AiFirstWorkspace() {
     setApplicationDialogOpen(false)
     setThreadDialogOpen(false)
     setActiveApplicationId(applicationId)
-    setConversations([])
     setActiveConversationId(null)
-    setArtifacts([])
     setWorkspaceChanges(null)
     setSelectedWorkspacePath(null)
     setWorkspaceDiff(null)
@@ -816,8 +1127,6 @@ export function AiFirstWorkspace() {
     setApplicationDialogOpen(false)
     setThreadDialogOpen(false)
     setActiveApplicationId(null)
-    setConversations([])
-    setArtifacts([])
     setRightView('generated')
     setWorkspaceChanges(null)
     setActiveConversationId(conversationId)
@@ -851,13 +1160,19 @@ export function AiFirstWorkspace() {
       title: conversation.title,
       turn_status: conversation.turn_status,
     }
-    setGlobalConversations((current) => [globalConversation, ...current])
+    queryClient.setQueryData<GlobalConversationResponse[]>(
+      globalConversationsOptions.queryKey,
+      (current = []) => [globalConversation, ...current]
+    )
     setGlobalStartOpen(false)
     selectGlobalConversation(conversation.public_id)
   }
 
   const handleThreadCreated = (conversation: ConversationResponse) => {
-    setConversations((current) => [conversation, ...current])
+    queryClient.setQueryData<ConversationResponse[]>(
+      applicationConversationsOptions.queryKey,
+      (current = []) => [conversation, ...current]
+    )
     setActiveConversationId(conversation.public_id)
     setSearchParams(
       (current) => {
@@ -884,8 +1199,6 @@ export function AiFirstWorkspace() {
     void loadHarnesses()
     const selection = defaultWorkspaceSelection([])
     setActiveApplicationId(selection.applicationId)
-    setConversations([])
-    setArtifacts([])
     setRightView('generated')
     setWorkspaceChanges(null)
     setSelectedWorkspacePath(null)
@@ -944,10 +1257,16 @@ export function AiFirstWorkspace() {
         throwOnError: true,
       })
       if (activeApplication) {
+        setActiveApplicationConversationPages((current) =>
+          current.filter((item) => item.public_id !== conversation.public_id)
+        )
         const remaining = conversations.filter(
           (item) => item.public_id !== conversation.public_id
         )
-        setConversations(remaining)
+        queryClient.setQueryData<ConversationResponse[]>(
+          applicationConversationsOptions.queryKey,
+          remaining
+        )
         setArchivedConversations((current) => [
           { ...conversation, status: 'archived' },
           ...current,
@@ -970,10 +1289,16 @@ export function AiFirstWorkspace() {
           )
         }
       } else {
+        setActiveGlobalConversationPages((current) =>
+          current.filter((item) => item.public_id !== conversation.public_id)
+        )
         const remaining = globalConversations.filter(
           (item) => item.public_id !== conversation.public_id
         )
-        setGlobalConversations(remaining)
+        queryClient.setQueryData<GlobalConversationResponse[]>(
+          globalConversationsOptions.queryKey,
+          remaining
+        )
         setArchivedGlobalConversations((current) => [
           { ...conversation, status: 'archived' },
           ...current,
@@ -1019,18 +1344,18 @@ export function AiFirstWorkspace() {
         setArchivedConversations((current) =>
           current.filter((item) => item.public_id !== conversation.public_id)
         )
-        setConversations((current) => [
-          { ...conversation, status: 'active' },
-          ...current,
-        ])
+        queryClient.setQueryData<ConversationResponse[]>(
+          applicationConversationsOptions.queryKey,
+          (current = []) => [{ ...conversation, status: 'active' }, ...current]
+        )
       } else {
         setArchivedGlobalConversations((current) =>
           current.filter((item) => item.public_id !== conversation.public_id)
         )
-        setGlobalConversations((current) => [
-          { ...conversation, status: 'active' },
-          ...current,
-        ])
+        queryClient.setQueryData<GlobalConversationResponse[]>(
+          globalConversationsOptions.queryKey,
+          (current = []) => [{ ...conversation, status: 'active' }, ...current]
+        )
       }
     } catch (cause) {
       setThreadActionError(
@@ -1057,7 +1382,14 @@ export function AiFirstWorkspace() {
           <WorkspaceStatusIndicator
             loading={activeWorkspaceStatusLoading}
             onClick={
-              activeApplication ? () => setRightView('workspace') : undefined
+              activeApplication
+                ? () => {
+                    setRightView('workspace')
+                    if (window.innerWidth < 1280) {
+                      setRightPanelOpen(true)
+                    }
+                  }
+                : undefined
             }
             waking={activeWorkspaceWaking}
             workspace={activeWorkspaceStatus}
@@ -1101,53 +1433,135 @@ export function AiFirstWorkspace() {
         <aside className="hidden min-h-0 border-r border-border bg-card md:block">
           <div className="flex items-center justify-between border-b border-border px-3 py-3">
             <span className="font-mono text-[10px] font-semibold tracking-wide text-muted-foreground">
-              Workspaces
+              {applicationListMode === 'archived'
+                ? 'Archived workspaces'
+                : 'Workspaces'}
             </span>
-            <button
-              type="button"
-              onClick={openApplicationDialog}
-              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-              aria-label="New workspace"
-            >
-              <Plus className="size-4" />
-            </button>
+            <span className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setApplicationActionError(null)
+                  setApplicationListMode((current) =>
+                    current === 'active' ? 'archived' : 'active'
+                  )
+                }}
+                className={cn(
+                  'rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+                  applicationListMode === 'archived' &&
+                    'bg-accent text-accent-foreground'
+                )}
+                aria-label={
+                  applicationListMode === 'archived'
+                    ? 'Show active workspaces'
+                    : 'Show archived workspaces'
+                }
+                title={
+                  applicationListMode === 'archived'
+                    ? 'Active workspaces'
+                    : 'Archived workspaces'
+                }
+              >
+                {applicationListMode === 'archived' ? (
+                  <ArchiveRestore className="size-4" />
+                ) : (
+                  <Archive className="size-4" />
+                )}
+              </button>
+              {applicationListMode === 'active' && (
+                <button
+                  type="button"
+                  onClick={openApplicationDialog}
+                  className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                  aria-label="New workspace"
+                >
+                  <Plus className="size-4" />
+                </button>
+              )}
+            </span>
           </div>
           <div className="space-y-1 p-2">
-            <button
-              type="button"
-              onClick={selectDefaultWorkspace}
-              className={cn(
-                'w-full rounded-md px-3 py-2 text-left',
-                !activeApplicationId
-                  ? 'bg-accent text-accent-foreground'
-                  : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
-              )}
-            >
-              <p className="truncate text-sm">Default workspace</p>
-              <p className="mt-0.5 text-[10px]">
-                {globalConversations.length} thread
-                {globalConversations.length === 1 ? '' : 's'} · persistent
-              </p>
-            </button>
-            {applications.map((application) => (
+            {applicationListMode === 'active' && (
               <button
-                key={application.public_id}
                 type="button"
-                onClick={() => selectApplication(application.public_id)}
+                onClick={selectDefaultWorkspace}
                 className={cn(
                   'w-full rounded-md px-3 py-2 text-left',
-                  application.public_id === activeApplicationId
+                  !activeApplicationId
                     ? 'bg-accent text-accent-foreground'
                     : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
                 )}
               >
-                <p className="truncate text-sm">{application.name}</p>
+                <p className="truncate text-sm">Default workspace</p>
                 <p className="mt-0.5 text-[10px]">
-                  {application.projects.length} project
-                  {application.projects.length === 1 ? '' : 's'}
+                  {globalConversations.length} thread
+                  {globalConversations.length === 1 ? '' : 's'} · persistent
                 </p>
               </button>
+            )}
+            {applicationActionError && (
+              <p className="rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-[10px] leading-4 text-destructive">
+                {applicationActionError}
+              </p>
+            )}
+            {(applicationListMode === 'archived'
+              ? archivedApplications
+              : applications
+            ).map((application) => (
+              <div
+                className={cn(
+                  'group flex items-stretch rounded-md',
+                  application.public_id === activeApplicationId &&
+                    applicationListMode === 'active'
+                    ? 'bg-accent text-accent-foreground'
+                    : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
+                )}
+                key={application.public_id}
+              >
+                <button
+                  type="button"
+                  disabled={applicationListMode === 'archived'}
+                  onClick={() => selectApplication(application.public_id)}
+                  className="min-w-0 flex-1 px-3 py-2 text-left disabled:cursor-default"
+                >
+                  <p className="truncate text-sm">{application.name}</p>
+                  <p className="mt-0.5 text-[10px]">
+                    {application.projects.length} project
+                    {application.projects.length === 1 ? '' : 's'}
+                  </p>
+                </button>
+                <button
+                  type="button"
+                  aria-label={`${applicationListMode === 'archived' ? 'Restore' : 'Archive'} ${application.name}`}
+                  className="w-8 shrink-0 rounded-r-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus:opacity-100 group-hover:opacity-100 disabled:cursor-wait"
+                  disabled={applicationActionPending === application.public_id}
+                  onClick={() =>
+                    void (applicationListMode === 'archived'
+                      ? handleApplicationRestore(application)
+                      : handleApplicationArchive(application))
+                  }
+                  title={
+                    applicationListMode === 'archived'
+                      ? 'Restore workspace'
+                      : 'Archive workspace'
+                  }
+                >
+                  {applicationActionPending === application.public_id ? (
+                    <Loader2 className="mx-auto size-3.5 animate-spin" />
+                  ) : applicationListMode === 'archived' ? (
+                    <ArchiveRestore className="mx-auto size-3.5" />
+                  ) : (
+                    <Archive className="mx-auto size-3.5" />
+                  )}
+                </button>
+              </div>
             ))}
+            {applicationListMode === 'archived' &&
+              archivedApplications.length === 0 && (
+                <p className="px-3 py-5 text-center text-[10px] leading-4 text-muted-foreground">
+                  No archived workspaces.
+                </p>
+              )}
           </div>
           <>
             <div className="mx-3 my-2 border-t border-border" />
@@ -1210,8 +1624,7 @@ export function AiFirstWorkspace() {
                 <div
                   className={cn(
                     'group flex items-stretch rounded-md',
-                    conversation.public_id === activeConversationId &&
-                      threadListMode === 'active'
+                    conversation.public_id === activeConversationId
                       ? 'bg-accent text-accent-foreground'
                       : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
                   )}
@@ -1219,7 +1632,6 @@ export function AiFirstWorkspace() {
                 >
                   <button
                     className="min-w-0 flex-1 px-3 py-2 text-left"
-                    disabled={threadListMode === 'archived'}
                     onClick={() =>
                       activeApplication
                         ? selectApplicationConversation(conversation.public_id)
@@ -1286,6 +1698,19 @@ export function AiFirstWorkspace() {
                     : 'No threads yet.'}
                 </p>
               )}
+              {visibleConversationsHaveMore && (
+                <button
+                  className="flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-2 text-[10px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-wait disabled:opacity-60"
+                  disabled={threadPageLoading}
+                  onClick={() => void loadMoreConversations()}
+                  type="button"
+                >
+                  {threadPageLoading && (
+                    <Loader2 className="size-3 animate-spin" />
+                  )}
+                  Load more
+                </button>
+              )}
             </div>
           </>
         </aside>
@@ -1344,6 +1769,7 @@ export function AiFirstWorkspace() {
                   placeholder="Ask Temps to inspect or operate your workspace…"
                   onLiveEvent={handleChatLiveEvent}
                   onConversationStatusInvalidated={refreshVisibleConversations}
+                  readOnly={threadListMode === 'archived'}
                 />
               </div>
             </div>
@@ -1394,6 +1820,7 @@ export function AiFirstWorkspace() {
                   placeholder="Tell Temps what you want to ship…"
                   onLiveEvent={handleChatLiveEvent}
                   onConversationStatusInvalidated={refreshVisibleConversations}
+                  readOnly={threadListMode === 'archived'}
                 />
               </div>
             </div>
@@ -1476,6 +1903,94 @@ export function AiFirstWorkspace() {
           </div>
         </aside>
       </div>
+
+      <Sheet open={rightPanelOpen} onOpenChange={setRightPanelOpen}>
+        <SheetContent
+          className="flex w-full flex-col gap-0 p-0 sm:max-w-lg xl:hidden"
+          side="right"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>Application workspace</SheetTitle>
+            <SheetDescription>
+              Inspect the application workspace, preview, projects, files, and
+              generated output.
+            </SheetDescription>
+          </SheetHeader>
+          <WorkspaceViewTabs
+            activeView={rightView}
+            changedFileCount={workspaceChanges?.changes.length ?? 0}
+            hasApplication={Boolean(activeApplication)}
+            onChange={setRightView}
+          />
+          <div className="min-h-0 flex-1 overflow-y-auto p-4">
+            {rightView === 'preview' && activeApplication ? (
+              <ApplicationPreviewPanel
+                applicationPublicId={activeApplication.public_id}
+                key={activeApplication.public_id}
+              />
+            ) : rightView === 'files' && activeApplication ? (
+              <WorkspaceFilesPanel
+                changes={workspaceChanges}
+                diff={workspaceDiff}
+                diffLoading={workspaceDiffLoading}
+                error={workspaceError}
+                loading={workspaceLoading}
+                loadPhase={workspaceLoadPhase}
+                fileCursor={workspaceFileCursor}
+                onNextPage={() => {
+                  if (workspaceChanges?.next_cursor != null) {
+                    void loadWorkspacePage(workspaceChanges.next_cursor)
+                  }
+                }}
+                onPreviousPage={() =>
+                  void loadWorkspacePage(
+                    Math.max(0, workspaceFileCursor - WORKSPACE_FILES_PAGE_SIZE)
+                  )
+                }
+                onRefresh={() => void refreshWorkspace()}
+                onOpenSettings={() => setRightView('workspace')}
+                onSelect={setSelectedWorkspacePath}
+                selectedPath={selectedWorkspacePath}
+              />
+            ) : rightView === 'projects' && activeApplication ? (
+              <ApplicationProjectsPanel
+                application={activeApplication}
+                onApplicationChange={handleApplicationChange}
+              />
+            ) : rightView === 'workspace' && activeApplication ? (
+              <ApplicationWorkspaceSettingsPanel
+                applicationPublicId={activeApplication.public_id}
+                initialWorkspace={activeWorkspaceStatus}
+                key={activeApplication.public_id}
+                onWorkspaceChange={handleWorkspaceStatusChange}
+                waking={activeWorkspaceWaking}
+              />
+            ) : (
+              <div className="space-y-3">
+                <div className="mb-4 flex items-center gap-2">
+                  <Boxes className="size-4 stroke-success" />
+                  <div>
+                    <p className="text-xs font-medium">Generated view</p>
+                    <p className="text-[10px] text-muted-foreground">
+                      Typed artifacts, never executable UI
+                    </p>
+                  </div>
+                </div>
+                {artifacts.map((artifact) => (
+                  <ArtifactRenderer
+                    key={artifact.public_id}
+                    artifact={artifact}
+                  />
+                ))}
+                {activeApplication && (
+                  <ApplicationBoundary application={activeApplication} />
+                )}
+                {activeGlobalConversation && <GlobalChatBoundary />}
+              </div>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
 
       {activeApplication && (
         <CreateThreadDialog
@@ -1804,14 +2319,14 @@ export function WorkspaceFilesPanel({
           {selectedPath && (
             <>
               {diffLoading ? (
-                <section className="overflow-hidden rounded-lg border border-border bg-[#0d1117] text-[#c9d1d9] shadow-inner">
-                  <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2 font-mono text-[10px]">
-                    <FileCode2 className="size-3.5 text-[#7ee787]" />
+                <section className="overflow-hidden rounded-lg border border-border bg-muted/30 text-foreground shadow-inner">
+                  <div className="flex items-center gap-2 border-b border-border px-3 py-2 font-mono text-[10px]">
+                    <FileCode2 className="size-3.5 text-emerald-600 dark:text-emerald-400" />
                     <span className="min-w-0 flex-1 truncate">
                       {selectedPath}
                     </span>
                   </div>
-                  <div className="flex items-center gap-2 px-3 py-5 text-[10px] text-[#8b949e]">
+                  <div className="flex items-center gap-2 px-3 py-5 text-[10px] text-muted-foreground">
                     <Loader2 className="size-3 animate-spin" /> Loading diff…
                   </div>
                 </section>
@@ -1822,14 +2337,14 @@ export function WorkspaceFilesPanel({
                   truncated={diff.truncated}
                 />
               ) : (
-                <section className="overflow-hidden rounded-lg border border-border bg-[#0d1117] text-[#c9d1d9] shadow-inner">
-                  <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2 font-mono text-[10px]">
-                    <FileCode2 className="size-3.5 text-[#7ee787]" />
+                <section className="overflow-hidden rounded-lg border border-border bg-muted/30 text-foreground shadow-inner">
+                  <div className="flex items-center gap-2 border-b border-border px-3 py-2 font-mono text-[10px]">
+                    <FileCode2 className="size-3.5 text-emerald-600 dark:text-emerald-400" />
                     <span className="min-w-0 flex-1 truncate">
                       {selectedPath}
                     </span>
                   </div>
-                  <p className="px-3 py-5 text-[10px] text-[#8b949e]">
+                  <p className="px-3 py-5 text-[10px] text-muted-foreground">
                     No textual diff is available for this file.
                   </p>
                 </section>

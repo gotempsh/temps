@@ -4427,7 +4427,7 @@ mod ai_tool_allowlist_tests {
             InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
         let scope = ApiCallScope {
             auth: admin_auth(),
-            project_ids: vec![1],
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
         };
 
         let recovery = caller

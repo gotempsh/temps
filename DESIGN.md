@@ -71,6 +71,11 @@ Colors are defined in `src/globals.css` as OKLCH CSS variables, exposed to
 Tailwind as `bg-*`, `text-*`, `border-*`. **Never use literal colors** except
 for the sanctioned status hues in §3.2.
 
+The only branding exception is an official third-party logo whose SVG uses
+`currentColor`: its icon wrapper may use the vendor's documented light/dark
+brand color. The exception applies to the mark only, never to text, borders,
+backgrounds, status, or decorative accents.
+
 ### 3.1 Semantic surfaces
 
 | Token                | Use                                                 |

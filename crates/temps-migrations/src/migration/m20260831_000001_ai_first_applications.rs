@@ -129,11 +129,10 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
-            .alter_table(
-                Table::alter()
-                    .table(AiConversations::Table)
-                    .add_column(ColumnDef::new(AiConversations::ApplicationId).big_integer())
-                    .to_owned(),
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE ai_conversations
+                   ADD COLUMN IF NOT EXISTS application_id BIGINT;",
             )
             .await?;
         manager
@@ -246,7 +245,9 @@ impl MigrationTrait for Migration {
                 "CREATE INDEX IF NOT EXISTS idx_ai_applications_creator_activity ON ai_applications (created_by, updated_at DESC); \
                  CREATE INDEX IF NOT EXISTS idx_ai_application_projects_project ON ai_application_projects (project_id); \
                  CREATE INDEX IF NOT EXISTS idx_ai_conversations_application_activity ON ai_conversations (application_id, last_activity_at DESC) WHERE application_id IS NOT NULL; \
-                 CREATE INDEX IF NOT EXISTS idx_ai_thread_artifacts_conversation ON ai_thread_artifacts (conversation_id, created_at);",
+                 CREATE INDEX IF NOT EXISTS idx_ai_thread_artifacts_conversation ON ai_thread_artifacts (conversation_id, created_at); \
+                 CREATE INDEX IF NOT EXISTS idx_ai_thread_artifacts_application ON ai_thread_artifacts (application_id); \
+                 CREATE INDEX IF NOT EXISTS idx_ai_thread_artifacts_created_by ON ai_thread_artifacts (created_by);",
             )
             .await?;
 
@@ -266,11 +267,10 @@ impl MigrationTrait for Migration {
             )
             .await?;
         manager
-            .alter_table(
-                Table::alter()
-                    .table(AiConversations::Table)
-                    .drop_column(AiConversations::ApplicationId)
-                    .to_owned(),
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE ai_conversations
+                   DROP COLUMN IF EXISTS application_id;",
             )
             .await?;
         manager
