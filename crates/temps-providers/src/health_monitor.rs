@@ -307,7 +307,18 @@ impl ExternalServiceHealthMonitor {
             wal_snapshot.as_ref(),
         );
 
-        let mut active: external_services::ActiveModel = service.clone().into();
+        // Partial update, not `service.clone().into()`: that stamps every
+        // column from this cycle's snapshot, including
+        // `continuous_archive_s3_source_id`/`continuous_archive_pinned_at`.
+        // Since those can be written concurrently (by this same tick's own
+        // binlog-archive step below, by a backup run's pin, or by a
+        // deliberate repoint), a full-model save here would silently revert
+        // a pin set after this cycle's snapshot was fetched but before this
+        // update runs.
+        let mut active = external_services::ActiveModel {
+            id: Set(service.id),
+            ..Default::default()
+        };
         active.health_status = Set(Some(status.as_str().to_string()));
         active.last_health_check_at = Set(Some(now));
         active.last_health_error = Set(error_message.clone());
