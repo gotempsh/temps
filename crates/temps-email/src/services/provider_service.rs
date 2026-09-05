@@ -1794,8 +1794,38 @@ mod tests {
             let port = container.get_host_port_ipv4(4566).await?;
             let endpoint_url = format!("http://localhost:{}", port);
 
-            // Wait for LocalStack to be ready
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            // Poll LocalStack's health endpoint until the SES service reports
+            // ready, rather than a fixed sleep: a blind delay let a container
+            // that starts but never actually serves SES (e.g. `latest` now
+            // gates the `ses` service behind a Pro license and the container
+            // exits within ~2-3s of boot) look "ready" anyway, producing a
+            // connection-refused panic deep in the test instead of the
+            // graceful "Failed to start LocalStack" skip this error type
+            // exists for. 10s comfortably covers a genuine slow start while
+            // failing fast on the always-broken case above.
+            let health_url = format!("{}/_localstack/health", endpoint_url);
+            let client = reqwest::Client::new();
+            let ready_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+            loop {
+                if let Ok(response) = client.get(&health_url).send().await {
+                    if let Ok(body) = response.json::<serde_json::Value>().await {
+                        let ses_status = body
+                            .get("services")
+                            .and_then(|s| s.get("ses"))
+                            .and_then(|v| v.as_str());
+                        if matches!(ses_status, Some("running") | Some("available")) {
+                            break;
+                        }
+                    }
+                }
+                if tokio::time::Instant::now() >= ready_deadline {
+                    anyhow::bail!(
+                        "LocalStack SES service did not become ready within 10s (health check: {})",
+                        health_url
+                    );
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
 
             Ok(Self {
                 _container: container,
