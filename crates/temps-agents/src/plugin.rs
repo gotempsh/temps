@@ -526,6 +526,14 @@ impl TempsPlugin for AgentsPlugin {
                                 };
                                 let provider =
                                     Arc::new(DockerSandboxProvider::new(docker.clone(), config));
+                                provider
+                                    .quarantine_stale_sandboxes()
+                                    .await
+                                    .map_err(|error| {
+                                        PluginError::InitializationFailed(format!(
+                                            "validate existing sandbox isolation: {error}"
+                                        ))
+                                    })?;
                                 tracing::info!(
                                     "Docker sandbox provider initialized (image built on demand at first agent run)"
                                 );

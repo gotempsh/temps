@@ -127,8 +127,12 @@ pub fn ensure_shared_secret(data_dir: &std::path::Path) -> Result<String> {
 /// Container name for the singleton gateway on this host.
 pub const PREVIEW_GATEWAY_CONTAINER: &str = "temps-preview-gateway";
 
-/// Shared docker network used for sandbox <-> gateway DNS resolution.
-pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-sandbox-net";
+/// Internal-only Docker network used for sandbox <-> gateway DNS resolution.
+/// The version separates upgraded hosts from the legacy external bridge,
+/// which Docker cannot safely convert in place.
+pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-preview-gateway-control-v3";
+const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
+const SANDBOX_NETWORK_OWNER_LABEL: &str = "sh.temps.sandbox-network-for";
 
 /// The container name this instance's gateway uses: the configured one, or
 /// the default. Every code path that names the container goes through here,
@@ -312,10 +316,45 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
         }
     }
 
+    connect_sandbox_networks(&docker, &spec.container_name).await?;
+
     info!(
         "preview gateway ready on 127.0.0.1:{} → {}:{}",
         spec.host_port, spec.container_name, GATEWAY_CONTAINER_PORT
     );
+    Ok(())
+}
+
+async fn connect_sandbox_networks(docker: &Docker, container_name: &str) -> Result<()> {
+    let networks = docker
+        .list_networks(None::<ListNetworksOptions>)
+        .await
+        .context("failed to discover isolated sandbox networks")?;
+    for network in networks {
+        let managed = network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+            .is_some();
+        if !managed {
+            continue;
+        }
+        let Some(network_name) = network.name.as_deref() else {
+            continue;
+        };
+        let request = bollard::models::NetworkConnectRequest {
+            container: container_name.to_string(),
+            endpoint_config: None,
+        };
+        if let Err(error) = docker.connect_network(network_name, request).await {
+            let message = error.to_string();
+            if !message.contains("already exists") && !message.contains("already connected") {
+                return Err(anyhow!(
+                    "failed to attach preview gateway to isolated sandbox network {network_name}: {message}"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -324,14 +363,33 @@ async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
         .list_networks(None::<ListNetworksOptions>)
         .await
         .context("failed to list docker networks")?;
-    if networks.iter().any(|n| n.name.as_deref() == Some(name)) {
+    if let Some(network) = networks.iter().find(|n| n.name.as_deref() == Some(name)) {
+        let policy_label = network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("sh.temps.sandbox-egress-policy"));
+        if network.driver.as_deref() != Some("bridge")
+            || network.internal != Some(true)
+            || network.enable_ipv6 != Some(false)
+            || policy_label.map(String::as_str) != Some("1")
+        {
+            return Err(anyhow!(
+                "existing preview network {name} does not match the managed internal, IPv6-disabled bridge policy"
+            ));
+        }
         return Ok(());
     }
-    info!(network = %name, "creating shared sandbox network");
+    info!(network = %name, "creating internal shared sandbox network");
     docker
         .create_network(NetworkCreateRequest {
             name: name.to_string(),
             driver: Some("bridge".to_string()),
+            internal: Some(true),
+            enable_ipv6: Some(false),
+            labels: Some(HashMap::from([(
+                "sh.temps.sandbox-egress-policy".to_string(),
+                "1".to_string(),
+            )])),
             ..Default::default()
         })
         .await
@@ -515,6 +573,10 @@ async fn create_and_start(docker: &Docker, spec: &PreviewGatewaySpec) -> Result<
         image: Some(spec.image.clone()),
         exposed_ports: Some(exposed_ports),
         host_config: Some(host_config),
+        labels: Some(HashMap::from([(
+            PREVIEW_GATEWAY_LABEL.to_string(),
+            "true".to_string(),
+        )])),
         env: Some({
             let mut e = vec![
                 // Inside the container we MUST bind 0.0.0.0 — the host loopback
@@ -773,7 +835,8 @@ pub struct GatewayStatus {
     pub image_digest: Option<String>,
     /// Container name.
     pub container_name: String,
-    /// Network the container is attached to (should be `temps-sandbox-net`).
+    /// Trusted control network the gateway starts on. It is additionally attached
+    /// to each per-sandbox isolated network during reconciliation.
     pub network: Option<String>,
     /// Host port that the container's :8080 is published on.
     pub host_port: Option<u16>,

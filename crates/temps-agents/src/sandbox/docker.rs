@@ -108,6 +108,127 @@ fn docker_network_matches_policy(
         && (!require_sandbox_data_label || managed_sandbox_data_network)
 }
 
+fn sandbox_container_environment(
+    mut environment: HashMap<String, String>,
+    docker_network: &str,
+) -> Vec<String> {
+    if is_managed_sandbox_network(docker_network) {
+        let proxy = format!("http://{SANDBOX_EGRESS_PROXY_ALIAS}:{SANDBOX_EGRESS_PROXY_PORT}");
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            environment.insert(key.to_string(), proxy.clone());
+        }
+        let no_proxy = "localhost,127.0.0.1,::1,temps-sandbox-egress-proxy";
+        environment.insert("NO_PROXY".to_string(), no_proxy.to_string());
+        environment.insert("no_proxy".to_string(), no_proxy.to_string());
+    }
+
+    let mut entries = environment
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries
+}
+
+/// Resolve every network-enabled product setting to the one managed sandbox
+/// data-plane. Historical rows contain values such as `full`, `restricted`,
+/// `host`, or the old bridge name. None of those may become a literal Docker
+/// network: doing so would either fail startup or silently restore unfiltered
+/// egress. `none` remains the explicit no-network mode.
+fn managed_sandbox_network(network_mode: &str, container_name: &str) -> String {
+    if network_mode == "none" {
+        "none".to_string()
+    } else {
+        sandbox_network_name(container_name)
+    }
+}
+
+fn effective_sandbox_network(
+    provider_network_mode: &str,
+    requested_network_mode: Option<&str>,
+    container_name: &str,
+) -> String {
+    managed_sandbox_network(
+        requested_network_mode.unwrap_or(provider_network_mode),
+        container_name,
+    )
+}
+
+pub(crate) fn sandbox_network_name(container_name: &str) -> String {
+    format!("{SANDBOX_NETWORK_PREFIX}{container_name}")
+}
+
+pub(crate) fn is_managed_sandbox_network(name: &str) -> bool {
+    name.starts_with(SANDBOX_NETWORK_PREFIX)
+}
+
+fn sandbox_egress_proxy_name(container_name: &str) -> String {
+    format!("{SANDBOX_EGRESS_PROXY_PREFIX}{container_name}")
+}
+
+fn container_has_environment_value(
+    container: &bollard::models::ContainerInspectResponse,
+    expected_key: &str,
+    expected_value: &str,
+) -> bool {
+    container
+        .config
+        .as_ref()
+        .and_then(|config| config.env.as_ref())
+        .is_some_and(|environment| {
+            environment.iter().any(|entry| {
+                entry
+                    .split_once('=')
+                    .is_some_and(|(key, value)| key == expected_key && value == expected_value)
+            })
+        })
+}
+
+/// A recovered network-enabled container must satisfy the current policy,
+/// not merely still be running. This makes upgrades fail closed: a container
+/// left on the legacy outward-routed bridge is recreated by the registry and
+/// retains its named home/workspace volumes, instead of bypassing the new
+/// boundary for the rest of its lifetime.
+fn recovered_container_matches_egress_policy(
+    container: &bollard::models::ContainerInspectResponse,
+    container_name: &str,
+) -> bool {
+    let network_mode = container
+        .host_config
+        .as_ref()
+        .and_then(|config| config.network_mode.as_deref());
+    let networks = container
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref());
+    if network_mode == Some("none") {
+        return networks.is_none_or(HashMap::is_empty);
+    }
+
+    let expected_network = sandbox_network_name(container_name);
+    let networks_match = networks.is_some_and(|networks| {
+        networks.contains_key(&expected_network)
+            && networks
+                .keys()
+                .all(|name| name == &expected_network || name.starts_with("temps-sandbox-data-"))
+    });
+    if !networks_match {
+        return false;
+    }
+
+    let proxy = format!("http://{SANDBOX_EGRESS_PROXY_ALIAS}:{SANDBOX_EGRESS_PROXY_PORT}");
+    ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+        .into_iter()
+        .all(|key| container_has_environment_value(container, key, &proxy))
+        && ["NO_PROXY", "no_proxy"].into_iter().all(|key| {
+            container_has_environment_value(
+                container,
+                key,
+                "localhost,127.0.0.1,::1,temps-sandbox-egress-proxy",
+            )
+        })
+}
+
 /// Grant service endpoints before reconnecting application compute. Keeping
 /// the sandbox last makes a partial reconciliation fail closed: application
 /// code cannot observe a half-applied data-plane topology.
@@ -406,12 +527,140 @@ pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Shared Docker network for all workspace/agent sandboxes AND the preview
-/// gateway. The gateway resolves `temps-sandbox-<sid>:<port>` via Docker's
-/// embedded DNS — both sides must share this user-defined network for that
-/// to work. Keep in sync with
-/// `temps-cli/src/commands/serve/preview_gateway.rs::PREVIEW_GATEWAY_NETWORK`.
-const SANDBOX_NETWORK: &str = "temps-sandbox-net";
+/// Internal-only Docker network for workspace/agent sandboxes, the preview
+/// gateway, and the managed egress proxy. The versioned name is intentional:
+/// Docker cannot change an existing bridge from external to internal, and
+/// reusing the legacy `temps-sandbox-net` would silently preserve direct
+/// internet access on upgraded hosts.
+///
+/// Keep in sync with `preview_gateway::PREVIEW_GATEWAY_NETWORK`.
+const SANDBOX_NETWORK_PREFIX: &str = "temps-sandbox-net-v3-";
+const SANDBOX_NETWORK_OWNER_LABEL: &str = "sh.temps.sandbox-network-for";
+const SANDBOX_ISOLATED_GATEWAY_OPTION: &str = "com.docker.network.bridge.gateway_mode_ipv4";
+const SANDBOX_ISOLATED_GATEWAY_VALUE: &str = "isolated";
+
+/// The egress proxy is the only container with a NIC on both the internal
+/// sandbox network and this ordinary outbound bridge.
+const SANDBOX_EGRESS_NETWORK: &str = "temps-sandbox-egress-v1";
+const SANDBOX_EGRESS_PROXY_PREFIX: &str = "temps-sandbox-egress-proxy-v2-";
+const SANDBOX_EGRESS_PROXY_ALIAS: &str = "temps-sandbox-egress-proxy";
+const SANDBOX_EGRESS_PROXY_PORT: u16 = 3128;
+const SANDBOX_EGRESS_POLICY_LABEL: &str = "sh.temps.sandbox-egress-policy";
+const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
+
+/// Small CONNECT/HTTP forward proxy used as the sandbox's only internet
+/// route. It resolves the destination itself, rejects the request when *any*
+/// answer is private/non-routable (which closes DNS-rebinding fallbacks),
+/// connects to the already-validated IP rather than resolving the hostname a
+/// second time, and permits only normal web ports.
+///
+/// The process runs non-root in a read-only, capability-free container. It
+/// carries no credentials and does not terminate TLS.
+const SANDBOX_EGRESS_PROXY_SCRIPT: &str = r#"
+const http = require("http");
+const net = require("net");
+const dns = require("dns").promises;
+
+function isPrivateAddress(address) {
+  if (address.startsWith("::ffff:")) address = address.slice(7);
+  if (net.isIPv4(address)) {
+    const octets = address.split(".").map(Number);
+    return octets[0] === 0 || octets[0] === 10 || octets[0] === 127 ||
+      (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 0 && octets[2] === 0) ||
+      (octets[0] === 192 && octets[1] === 0 && octets[2] === 2) ||
+      (octets[0] === 192 && octets[1] === 88 && octets[2] === 99) ||
+      (octets[0] === 192 && octets[1] === 168) ||
+      (octets[0] === 198 && (octets[1] === 18 || octets[1] === 19)) ||
+      (octets[0] === 198 && octets[1] === 51 && octets[2] === 100) ||
+      (octets[0] === 203 && octets[1] === 0 && octets[2] === 113) ||
+      octets[0] >= 224;
+  }
+  const normalized = address.toLowerCase();
+  // Only the global-unicast 2000::/3 range is eligible. This conservative
+  // rule also rejects IPv4-mapped, loopback, link-local, ULA, multicast,
+  // documentation, and transition ranges.
+  return (!normalized.startsWith("2") && !normalized.startsWith("3")) ||
+    normalized.startsWith("2001:2:") || normalized.startsWith("2001:db8:");
+}
+
+async function resolvePublic(hostname) {
+  const answers = await dns.lookup(hostname, { all: true, verbatim: true });
+  if (answers.length === 0 || answers.some(({ address }) => isPrivateAddress(address))) {
+    throw new Error("destination is private or non-routable");
+  }
+  return answers.find(({ family }) => family === 4) || answers[0];
+}
+
+function parseAuthority(value, defaultPort) {
+  const parsed = new URL(`http://${value}`);
+  const port = Number(parsed.port || defaultPort);
+  if (parsed.username || parsed.password || ![80, 443].includes(port)) {
+    throw new Error("destination port is not allowed");
+  }
+  return { hostname: parsed.hostname, port };
+}
+
+const server = http.createServer(async (request, response) => {
+  try {
+    const target = new URL(request.url);
+    const port = Number(target.port || (target.protocol === "http:" ? 80 : 443));
+    if (target.protocol !== "http:" || target.username || target.password ||
+        ![80, 443].includes(port)) {
+      throw new Error("request target is not allowed");
+    }
+    const { address } = await resolvePublic(target.hostname);
+    const headers = { ...request.headers, host: target.host };
+    delete headers["proxy-authorization"];
+    delete headers["proxy-connection"];
+    const upstream = http.request({
+      host: address,
+      port,
+      method: request.method,
+      path: `${target.pathname}${target.search}`,
+      headers,
+    }, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    });
+    upstream.on("error", () => {
+      if (!response.headersSent) response.writeHead(502);
+      response.end();
+    });
+    request.pipe(upstream);
+  } catch (_) {
+    response.writeHead(403, { "content-type": "text/plain" });
+    response.end("destination denied\n");
+  }
+});
+
+server.on("connect", async (request, client, head) => {
+  try {
+    const { hostname, port } = parseAuthority(request.url, 443);
+    const { address } = await resolvePublic(hostname);
+    const upstream = net.connect({ host: address, port }, () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length) upstream.write(head);
+      client.pipe(upstream);
+      upstream.pipe(client);
+    });
+    client.setTimeout(60_000, () => client.destroy());
+    upstream.setTimeout(60_000, () => upstream.destroy());
+    client.on("error", () => upstream.destroy());
+    upstream.on("error", () => client.destroy());
+  } catch (_) {
+    client.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+  }
+});
+
+server.headersTimeout = 10_000;
+server.requestTimeout = 30_000;
+server.keepAliveTimeout = 5_000;
+server.on("clientError", (_, socket) => socket.destroy());
+server.listen(3128, "0.0.0.0");
+"#;
 
 /// Path inside the container where the repository is mounted. Aliased to the
 /// shared `SANDBOX_WORK_DIR` constant so a future image with a different
@@ -882,7 +1131,7 @@ impl Default for DockerSandboxConfig {
             custom_image: String::new(),
             default_cpu_limit: 4.0,
             default_memory_limit_mb: 8192,
-            network_mode: SANDBOX_NETWORK.to_string(),
+            network_mode: "full".to_string(),
         }
     }
 }
@@ -905,6 +1154,7 @@ impl DockerSandboxConfig {
 pub struct DockerSandboxProvider {
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
+    network_lock: tokio::sync::Mutex<()>,
 }
 
 /// PATH used for every command Temps runs as root inside a sandbox.
@@ -934,7 +1184,11 @@ fn exec_runs_as_root(user: Option<&str>) -> bool {
 
 impl DockerSandboxProvider {
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
-        Self { docker, config }
+        Self {
+            docker,
+            config,
+            network_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Run a command as root inside a freshly-started sandbox container,
@@ -1555,100 +1809,615 @@ impl DockerSandboxProvider {
         Ok(())
     }
 
-    /// Ensure the sandbox bridge network exists and apply iptables egress filtering.
+    /// Ensure a platform-independent, fail-closed sandbox network.
     ///
-    /// After Docker creates the `temps-sandbox-net` bridge, this method installs a
-    /// dedicated `TEMPS_SANDBOX_EGRESS` iptables chain that blocks outbound traffic
-    /// from sandbox containers to RFC-1918 ranges (10/8, 172.16/12, 192.168/16),
-    /// link-local (169.254/16), and loopback (127/8).  This prevents a compromised
-    /// sandbox from reaching the host gateway, the control plane API (`:8080`), the
-    /// database (`:5432`), or cloud-metadata endpoints while still allowing full
-    /// public-internet access needed for npm, pip, cargo, and GitHub.
-    ///
-    /// On Linux this is a mandatory isolation boundary: sandbox creation fails
-    /// when the filter cannot be installed. On Docker Desktop the daemon lives in
-    /// its own VM, so host iptables is not the applicable enforcement point.
-    async fn ensure_network(&self) -> Result<(), AgentError> {
-        let networks = self
+    /// Sandboxes and the preview gateway live on an internal Docker bridge with
+    /// no default internet route. A hardened proxy is the only member that also
+    /// joins an ordinary outbound bridge. This provides the same security
+    /// boundary on native Linux, Docker Desktop, Colima, and remote daemons
+    /// without asking an operator to install host firewall rules or enable an
+    /// insecure environment-variable escape hatch.
+    async fn ensure_network(
+        &self,
+        container_name: &str,
+        sandbox_network: &str,
+    ) -> Result<(), AgentError> {
+        if sandbox_network == "none" {
+            return Ok(());
+        }
+
+        let _guard = self.network_lock.lock().await;
+        self.ensure_managed_bridge(SANDBOX_EGRESS_NETWORK, false)
+            .await?;
+        self.ensure_isolated_sandbox_bridge(sandbox_network, container_name)
+            .await?;
+        self.ensure_egress_proxy(container_name, sandbox_network)
+            .await?;
+        self.connect_preview_gateways(sandbox_network).await
+    }
+
+    /// Stop every running managed sandbox whose immutable container config
+    /// predates the current isolation policy. This runs during provider
+    /// startup, before any DB row or in-memory handle can make the container
+    /// reachable again. Recreation is intentionally deferred until the user
+    /// accesses that sandbox so persistent volumes remain untouched.
+    pub async fn quarantine_stale_sandboxes(&self) -> Result<(), AgentError> {
+        let containers = self
             .docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
-            .map_err(|e| AgentError::SandboxProviderUnavailable {
-                provider: "docker".to_string(),
-                reason: format!("Failed to list networks: {}", e),
-            })?;
-
-        let existing = networks
-            .iter()
-            .find(|n| n.name.as_ref() == Some(&self.config.network_mode));
-
-        let network_id: Option<String> = if existing.is_none()
-            && self.config.network_mode != "none"
-            && self.config.network_mode != "host"
-        {
-            tracing::info!("Creating sandbox network: {}", self.config.network_mode);
-            let create_opts = bollard::models::NetworkCreateRequest {
-                name: self.config.network_mode.clone(),
-                driver: Some("bridge".to_string()),
-                internal: Some(false), // Allow outbound (Claude CLI needs API access)
-                enable_ipv6: Some(false),
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "label".to_string(),
+                    vec!["sh.temps.sandbox=true".to_string()],
+                )])),
                 ..Default::default()
-            };
-            let resp = self.docker.create_network(create_opts).await.map_err(|e| {
-                AgentError::SandboxProviderUnavailable {
-                    provider: "docker".to_string(),
-                    reason: format!("Failed to create network: {}", e),
-                }
+            }))
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("list managed sandboxes for isolation validation: {source}"),
             })?;
-            Some(resp.id)
-        } else {
-            existing.and_then(|n| n.id.clone())
-        };
-
-        if existing.is_some()
-            && self.config.network_mode != "none"
-            && self.config.network_mode != "host"
-        {
-            let network = self
+        for summary in containers {
+            let Some(id) = summary.id.as_deref() else {
+                continue;
+            };
+            let container_name = summary
+                .names
+                .as_ref()
+                .and_then(|names| names.first())
+                .map(|name| name.trim_start_matches('/'))
+                .unwrap_or(id);
+            let info = self
                 .docker
-                .inspect_network(
-                    &self.config.network_mode,
-                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                .inspect_container(
+                    id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
                 )
                 .await
-                .map_err(|error| AgentError::SandboxProviderUnavailable {
+                .map_err(|source| AgentError::SandboxProviderUnavailable {
                     provider: "docker".to_string(),
                     reason: format!(
-                        "inspect existing sandbox network '{}': {error}",
-                        self.config.network_mode
+                        "inspect managed sandbox '{container_name}' during isolation validation: {source}"
                     ),
                 })?;
-            if !docker_network_matches_policy(&network, false, false) {
+            if !recovered_container_matches_egress_policy(&info, container_name) {
+                self.quarantine_container(id, container_name).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_isolated_sandbox_bridge(
+        &self,
+        name: &str,
+        container_name: &str,
+    ) -> Result<(), AgentError> {
+        let inspected = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let network = match inspected {
+            Ok(network) => network,
+            Err(error) if docker_error_is_not_found(&error) => {
+                self.docker
+                    .create_network(bollard::models::NetworkCreateRequest {
+                        name: name.to_string(),
+                        driver: Some("bridge".to_string()),
+                        internal: Some(true),
+                        enable_ipv6: Some(false),
+                        labels: Some(HashMap::from([
+                            (
+                                SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                                SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+                            ),
+                            (
+                                SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                                container_name.to_string(),
+                            ),
+                        ])),
+                        options: Some(HashMap::from([(
+                            SANDBOX_ISOLATED_GATEWAY_OPTION.to_string(),
+                            SANDBOX_ISOLATED_GATEWAY_VALUE.to_string(),
+                        )])),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|source| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "create isolated network for sandbox '{container_name}': {source}"
+                        ),
+                    })?;
+                self.docker
+                    .inspect_network(
+                        name,
+                        None::<bollard::query_parameters::InspectNetworkOptions>,
+                    )
+                    .await
+                    .map_err(|source| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "inspect isolated network for sandbox '{container_name}': {source}"
+                        ),
+                    })?
+            }
+            Err(source) => {
                 return Err(AgentError::SandboxProviderUnavailable {
                     provider: "docker".to_string(),
                     reason: format!(
-                        "existing sandbox network '{}' does not match the required bridge, external, IPv6-disabled policy",
-                        self.config.network_mode
+                        "inspect isolated network for sandbox '{container_name}': {source}"
                     ),
+                })
+            }
+        };
+
+        let labels = network.labels.as_ref();
+        let policy_matches = labels
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+            .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION);
+        let owner_matches = labels
+            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+            .is_some_and(|value| value == container_name);
+        let isolated_gateway = network
+            .options
+            .as_ref()
+            .and_then(|options| options.get(SANDBOX_ISOLATED_GATEWAY_OPTION))
+            .is_some_and(|value| value == SANDBOX_ISOLATED_GATEWAY_VALUE);
+        if !docker_network_matches_policy(&network, true, false)
+            || !policy_matches
+            || !owner_matches
+            || !isolated_gateway
+        {
+            return Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "sandbox isolation is unavailable because Docker did not preserve the required isolated-gateway policy for '{name}'"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn connect_container_to_network(
+        &self,
+        container: &str,
+        network: &str,
+        alias: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let request = bollard::models::NetworkConnectRequest {
+            container: container.to_string(),
+            endpoint_config: Some(bollard::models::EndpointSettings {
+                aliases: alias.map(|value| vec![value.to_string()]),
+                ..Default::default()
+            }),
+        };
+        match self.docker.connect_network(network, request).await {
+            Ok(()) => Ok(()),
+            Err(source)
+                if source.to_string().contains("already exists")
+                    || source.to_string().contains("already connected") =>
+            {
+                Ok(())
+            }
+            Err(source) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "attach managed container '{container}' to sandbox network '{network}': {source}"
+                ),
+            }),
+        }
+    }
+
+    async fn connect_preview_gateways(&self, network: &str) -> Result<(), AgentError> {
+        let gateways = self
+            .docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "label".to_string(),
+                    vec!["sh.temps.preview-gateway=true".to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("discover managed preview gateway: {source}"),
+            })?;
+        for gateway in gateways {
+            if let Some(id) = gateway.id.as_deref() {
+                self.connect_container_to_network(id, network, None).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn remove_isolated_sandbox_network(&self, container_name: &str) -> Vec<String> {
+        let mut cleanup_errors = Vec::new();
+        let proxy_name = sandbox_egress_proxy_name(container_name);
+        if let Err(error) = self
+            .docker
+            .remove_container(
+                &proxy_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if !docker_error_is_not_found(&error) {
+                cleanup_errors.push(format!(
+                    "remove per-sandbox egress proxy '{proxy_name}': {error}"
+                ));
+                tracing::warn!(
+                    container = proxy_name,
+                    "Failed to remove per-sandbox egress proxy: {error}"
+                );
+            }
+        }
+        let network_name = sandbox_network_name(container_name);
+        let network = match self
+            .docker
+            .inspect_network(
+                &network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            Ok(network) => network,
+            Err(error) if docker_error_is_not_found(&error) => return cleanup_errors,
+            Err(error) => {
+                cleanup_errors.push(format!(
+                    "inspect isolated sandbox network '{network_name}': {error}"
+                ));
+                tracing::warn!(
+                    network = network_name,
+                    "Failed to inspect isolated sandbox network during cleanup: {error}"
+                );
+                return cleanup_errors;
+            }
+        };
+        let owned = network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+            .is_some_and(|owner| owner == container_name);
+        if !owned {
+            cleanup_errors.push(format!(
+                "refused to remove sandbox network '{network_name}' without the expected ownership label"
+            ));
+            tracing::warn!(
+                network = network_name,
+                "Refusing to remove sandbox network without the expected ownership label"
+            );
+            return cleanup_errors;
+        }
+        for container_id in network.containers.unwrap_or_default().into_keys() {
+            if let Err(error) = self
+                .docker
+                .disconnect_network(
+                    &network_name,
+                    bollard::models::NetworkDisconnectRequest {
+                        container: container_id,
+                        force: Some(true),
+                    },
+                )
+                .await
+            {
+                cleanup_errors.push(format!(
+                    "disconnect managed sidecar from sandbox network '{network_name}': {error}"
+                ));
+                tracing::warn!(
+                    network = network_name,
+                    "Failed to disconnect managed sidecar during sandbox network cleanup: {error}"
+                );
+            }
+        }
+        if let Err(error) = self.docker.remove_network(&network_name).await {
+            cleanup_errors.push(format!(
+                "remove isolated sandbox network '{network_name}': {error}"
+            ));
+            tracing::warn!(
+                network = network_name,
+                "Failed to remove isolated sandbox network: {error}"
+            );
+        }
+        cleanup_errors
+    }
+
+    /// Roll back every resource whose ownership was established during
+    /// `create`. This is deliberately explicit instead of relying on an async
+    /// `Drop`: Docker cleanup must finish before the caller can retry with the
+    /// same name, and any cleanup failure must be attached to the primary
+    /// creation error rather than silently leaking capacity.
+    async fn rollback_failed_create(
+        &self,
+        container_name: &str,
+        primary_error: AgentError,
+    ) -> AgentError {
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = self
+            .docker
+            .remove_container(
+                container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if !docker_error_is_not_found(&error) {
+                cleanup_errors.push(format!(
+                    "remove partially created sandbox container '{container_name}': {error}"
+                ));
+            }
+        }
+        cleanup_errors.extend(self.remove_isolated_sandbox_network(container_name).await);
+
+        if cleanup_errors.is_empty() {
+            return primary_error;
+        }
+        let cleanup_context = cleanup_errors.join("; ");
+        tracing::error!(
+            sandbox = container_name,
+            error = %cleanup_context,
+            "Sandbox creation rollback was incomplete"
+        );
+        match primary_error {
+            AgentError::SandboxCreationFailed {
+                run_id,
+                provider,
+                reason,
+            } => AgentError::SandboxCreationFailed {
+                run_id,
+                provider,
+                reason: format!("{reason}; rollback incomplete: {cleanup_context}"),
+            },
+            other => AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("{other}; sandbox creation rollback incomplete: {cleanup_context}"),
+            },
+        }
+    }
+
+    async fn ensure_managed_bridge(&self, name: &str, internal: bool) -> Result<(), AgentError> {
+        let inspected = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let network = match inspected {
+            Ok(network) => network,
+            Err(error) if docker_error_is_not_found(&error) => {
+                tracing::info!(network = name, internal, "Creating managed sandbox network");
+                self.docker
+                    .create_network(bollard::models::NetworkCreateRequest {
+                        name: name.to_string(),
+                        driver: Some("bridge".to_string()),
+                        internal: Some(internal),
+                        enable_ipv6: Some(false),
+                        labels: Some(HashMap::from([(
+                            SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                            SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+                        )])),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|source| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!("create managed sandbox network '{name}': {source}"),
+                    })?;
+                self.docker
+                    .inspect_network(
+                        name,
+                        None::<bollard::query_parameters::InspectNetworkOptions>,
+                    )
+                    .await
+                    .map_err(|source| AgentError::SandboxProviderUnavailable {
+                        provider: "docker".to_string(),
+                        reason: format!("inspect newly created sandbox network '{name}': {source}"),
+                    })?
+            }
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("inspect sandbox network '{name}': {source}"),
+                })
+            }
+        };
+
+        let policy_label_matches = network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+            .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION);
+        if !docker_network_matches_policy(&network, internal, false) || !policy_label_matches {
+            return Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "managed sandbox network '{name}' does not match the required internal={internal}, IPv6-disabled bridge policy"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn ensure_egress_proxy(
+        &self,
+        sandbox_container_name: &str,
+        sandbox_network: &str,
+    ) -> Result<(), AgentError> {
+        let image = image_name_for_runtime("node");
+        self.ensure_image_for_runtime("node").await?;
+        let proxy_name = sandbox_egress_proxy_name(sandbox_container_name);
+
+        let inspected = self
+            .docker
+            .inspect_container(
+                &proxy_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+        if let Ok(info) = &inspected {
+            let image_matches = info
+                .config
+                .as_ref()
+                .and_then(|config| config.image.as_deref())
+                == Some(image.as_str());
+            let policy_matches = info
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref())
+                .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+                .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION);
+            let networks = info
+                .network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref());
+            let networks_match = networks.is_some_and(|networks| {
+                networks.contains_key(SANDBOX_EGRESS_NETWORK)
+                    && networks.contains_key(sandbox_network)
+                    && networks.len() == 2
+            });
+            if image_matches && policy_matches && networks_match {
+                if info.state.as_ref().and_then(|state| state.running) != Some(true) {
+                    self.docker
+                        .start_container(
+                            &proxy_name,
+                            None::<bollard::query_parameters::StartContainerOptions>,
+                        )
+                        .await
+                        .map_err(|source| AgentError::SandboxProviderUnavailable {
+                            provider: "docker".to_string(),
+                            reason: format!("start managed sandbox egress proxy: {source}"),
+                        })?;
+                }
+                return Ok(());
+            }
+
+            self.docker
+                .remove_container(
+                    &proxy_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|source| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("replace drifted sandbox egress proxy: {source}"),
+                })?;
+        } else if let Err(error) = inspected {
+            if !docker_error_is_not_found(&error) {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("inspect managed sandbox egress proxy: {error}"),
                 });
             }
         }
 
-        // Apply iptables egress filter to block sandbox access to RFC-1918 ranges,
-        // link-local (169.254/16), and loopback (127/8).  This prevents a compromised
-        // sandbox from reaching the host gateway, the control plane API, the database,
-        // or cloud-metadata endpoints while still allowing full public-internet access
-        // needed for npm, pip, cargo, and GitHub.
-        //
-        // Operator note: on systems using iptables-nft (Debian 12+, Ubuntu 22.04+)
-        // the kernel module name is `iptables` but the userspace binary may be
-        // `iptables-legacy`; ensure the `iptables` command resolves to the nft-compat
-        // shim or install `iptables-legacy` if this step reports permission errors
-        // despite CAP_NET_ADMIN being present.
-        if let Some(ref id) = network_id {
-            apply_sandbox_egress_filter(&self.docker, id).await?;
+        let mut tmpfs = HashMap::new();
+        tmpfs.insert("/tmp".to_string(), "size=16m,mode=1777".to_string());
+        let body = bollard::models::ContainerCreateBody {
+            image: Some(image),
+            user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
+            entrypoint: Some(vec!["node".to_string()]),
+            cmd: Some(vec![
+                "-e".to_string(),
+                SANDBOX_EGRESS_PROXY_SCRIPT.to_string(),
+            ]),
+            labels: Some(HashMap::from([
+                (
+                    SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                    SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+                ),
+                (
+                    SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                    sandbox_container_name.to_string(),
+                ),
+            ])),
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some(SANDBOX_EGRESS_NETWORK.to_string()),
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+                readonly_rootfs: Some(true),
+                tmpfs: Some(tmpfs),
+                memory: Some(128 * 1024 * 1024),
+                memory_swap: Some(128 * 1024 * 1024),
+                pids_limit: Some(64),
+                nano_cpus: Some(250_000_000),
+                ulimits: Some(vec![bollard::models::ResourcesUlimits {
+                    name: Some("nofile".to_string()),
+                    soft: Some(256),
+                    hard: Some(256),
+                }]),
+                init: Some(true),
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                    maximum_retry_count: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&proxy_name)
+                        .build(),
+                ),
+                body,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("create managed sandbox egress proxy: {source}"),
+            })?;
+
+        if let Err(source) = self
+            .connect_container_to_network(
+                &proxy_name,
+                sandbox_network,
+                Some(SANDBOX_EGRESS_PROXY_ALIAS),
+            )
+            .await
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &proxy_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(source);
         }
 
+        self.docker
+            .start_container(
+                &proxy_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("start managed sandbox egress proxy: {source}"),
+            })?;
+        tracing::info!(
+            container = proxy_name,
+            "Managed sandbox egress proxy is ready"
+        );
         Ok(())
     }
 
@@ -1688,6 +2457,71 @@ impl DockerSandboxProvider {
             format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
             format!("{}:{}", home_volume_name, SANDBOX_HOME),
         ]
+    }
+
+    async fn quarantine_container(
+        &self,
+        container_reference: &str,
+        container_name: &str,
+    ) -> Result<(), AgentError> {
+        tracing::warn!(
+            container = container_name,
+            "Stopping sandbox because its network policy is stale or invalid"
+        );
+        match self
+            .docker
+            .stop_container(
+                container_reference,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(0),
+                    signal: None,
+                }),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if docker_error_is_not_found(&error) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304,
+                ..
+            }) => Ok(()),
+            Err(source) => Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "stop sandbox '{container_name}' after its isolation policy failed validation: {source}"
+                ),
+            }),
+        }
+    }
+
+    async fn inspect_handle_policy(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<bollard::models::ContainerInspectResponse, AgentError> {
+        let info = self
+            .docker
+            .inspect_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("inspect sandbox isolation policy: {source}"),
+            })?;
+        if recovered_container_matches_egress_policy(&info, &handle.sandbox_name) {
+            return Ok(info);
+        }
+        self.quarantine_container(&handle.sandbox_id, &handle.sandbox_name)
+            .await?;
+        Err(AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason: format!(
+                "sandbox '{}' was safely stopped because its network isolation policy is stale; retry to recreate it automatically",
+                handle.sandbox_name
+            ),
+        })
     }
 
     /// Name of the named volume holding a sandbox's `/home/temps`.
@@ -1748,6 +2582,16 @@ impl DockerSandboxProvider {
             .await
         {
             Ok(info) => {
+                if !recovered_container_matches_egress_policy(&info, container_name) {
+                    tracing::warn!(
+                        container = container_name,
+                        "Refusing to recover sandbox that predates the managed egress policy; it will be recreated with its persistent volumes"
+                    );
+                    let container_reference = info.id.as_deref().unwrap_or(container_name);
+                    self.quarantine_container(container_reference, container_name)
+                        .await?;
+                    return Ok(None);
+                }
                 let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                 let container_id = info.id.unwrap_or_default();
                 tracing::info!("Recovered sandbox {} (running={})", container_name, running);
@@ -1807,6 +2651,7 @@ impl DockerSandboxProvider {
         on_event: Option<OnStreamEventCallback>,
         user: Option<String>,
     ) -> Result<SandboxExecResult, AgentError> {
+        self.inspect_handle_policy(handle).await?;
         // Pin PATH for every root exec, not just the one in `run_root_exec`.
         //
         // The image's own PATH puts sandbox-user-writable directories
@@ -1969,9 +2814,16 @@ impl DockerSandboxProvider {
 #[async_trait]
 impl SandboxProvider for DockerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
-        self.ensure_network().await?;
-
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
+        // Resolve the request override exactly once. Provisioning, proxy
+        // environment, and HostConfig must all use this same effective value;
+        // otherwise `none -> full` references a bridge that was never created
+        // and `full -> none` needlessly leaves a proxy/network behind.
+        let docker_network = effective_sandbox_network(
+            &self.config.network_mode,
+            config.network_mode.as_deref(),
+            &container_name,
+        );
 
         // Remove existing container with the same name if any (leftover from crash)
         let _ = self
@@ -2020,43 +2872,35 @@ impl SandboxProvider for DockerSandboxProvider {
                 }
             }
         }
+
+        if let Err(error) = self.ensure_network(&container_name, &docker_network).await {
+            return Err(self.rollback_failed_create(&container_name, error).await);
+        }
+
         let cpu_limit = config.cpu_limit.unwrap_or(self.config.default_cpu_limit);
         let memory_limit_mb = config
             .memory_limit_mb
             .unwrap_or(self.config.default_memory_limit_mb);
-        let network = config
-            .network_mode
-            .as_deref()
-            .unwrap_or(&self.config.network_mode);
         // Map user-friendly names to Docker network modes.
         //
         // IMPORTANT: "full" used to map to docker `host` mode, which bypassed
         // container network isolation entirely and prevented sandboxes from
-        // joining the shared `temps-sandbox-net` user-defined network. That
+        // joining the shared sandbox user-defined network. That
         // broke workspace preview routing because the preview gateway resolves
         // sandbox containers via Docker's embedded DNS, which only works on
-        // user-defined networks. We now route "full" through the shared bridge
-        // network (`SANDBOX_NETWORK`) — sandboxes still get full outbound
-        // internet (the network is created with `internal: false`) but they
-        // also get a real container IP and DNS name that the gateway can hit.
+        // user-defined networks. We now route every network-enabled mode
+        // through a per-sandbox isolated bridge. Public web access is available
+        // exclusively through the managed egress proxy.
         //
-        // `host` is still accepted as an explicit opt-out for callers that
-        // really need the host stack (e.g. legacy autofixer flows).
-        let docker_network = match network {
-            "none" => "none".to_string(),
-            "host" => "host".to_string(),
-            "full" | "restricted" => SANDBOX_NETWORK.to_string(),
-            other => other.to_string(),
-        };
-
+        // All network-enabled legacy/product values resolve to the managed
+        // internal bridge. There is deliberately no host-network escape hatch.
         let host_work_dir = config.host_work_dir.to_string_lossy().to_string();
 
-        // Build environment variables
-        let env_vars: Vec<String> = config
-            .env_vars
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        // The proxy variables are enforced after caller-provided values so a
+        // stale or malicious configuration cannot route around the managed
+        // chokepoint. Direct egress is absent at the network layer anyway;
+        // these variables only tell compliant tooling how to reach the proxy.
+        let env_vars = sandbox_container_environment(config.env_vars.clone(), &docker_network);
 
         // Bind mount: only the work directory. Auth is handled via env vars
         // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY) — no host config mounting.
@@ -2199,7 +3043,7 @@ impl SandboxProvider for DockerSandboxProvider {
             );
         }
 
-        let container = self
+        let container = match self
             .docker
             .create_container(
                 Some(
@@ -2210,23 +3054,37 @@ impl SandboxProvider for DockerSandboxProvider {
                 container_config,
             )
             .await
-            .map_err(|e| AgentError::SandboxCreationFailed {
-                run_id: config.run_id,
-                provider: "docker".to_string(),
-                reason: format!("Failed to create container: {}", e),
-            })?;
+        {
+            Ok(container) => container,
+            Err(error) => {
+                let primary_error = AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!("Failed to create container: {error}"),
+                };
+                return Err(self
+                    .rollback_failed_create(&container_name, primary_error)
+                    .await);
+            }
+        };
 
-        self.docker
+        if let Err(error) = self
+            .docker
             .start_container(
                 &container.id,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| AgentError::SandboxCreationFailed {
+        {
+            let primary_error = AgentError::SandboxCreationFailed {
                 run_id: config.run_id,
                 provider: "docker".to_string(),
-                reason: format!("Failed to start container: {}", e),
-            })?;
+                reason: format!("Failed to start container: {error}"),
+            };
+            return Err(self
+                .rollback_failed_create(&container_name, primary_error)
+                .await);
+        }
 
         // Normalize ownership of /home/temps (named volume) and
         // /home/temps/workspace (bind-mount). Both inherit uids from outside
@@ -2236,8 +3094,9 @@ impl SandboxProvider for DockerSandboxProvider {
         // tree and every subsequent command fails. Strict variant: a chown
         // failure aborts container creation rather than leaving a broken
         // sandbox that mints "Permission denied" for the rest of the run.
-        self.normalize_ownership(&container.id, config.run_id)
-            .await?;
+        if let Err(error) = self.normalize_ownership(&container.id, config.run_id).await {
+            return Err(self.rollback_failed_create(&container_name, error).await);
+        }
 
         // Ensure AI CLIs are present in the home volume. Named volumes
         // persist across image rebuilds and mask the image's home dir,
@@ -2561,8 +3420,17 @@ impl SandboxProvider for DockerSandboxProvider {
             .await
         {
             Ok(info) => {
-                let running = info.state.and_then(|s| s.running).unwrap_or(false);
-                Ok(running)
+                let running = info
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.running)
+                    .unwrap_or(false);
+                if recovered_container_matches_egress_policy(&info, &handle.sandbox_name) {
+                    return Ok(running);
+                }
+                self.quarantine_container(&handle.sandbox_id, &handle.sandbox_name)
+                    .await?;
+                Ok(false)
             }
             Err(_) => Ok(false),
         }
@@ -2617,6 +3485,10 @@ impl SandboxProvider for DockerSandboxProvider {
                 });
             }
         }
+
+        let _ = self
+            .remove_isolated_sandbox_network(&handle.sandbox_name)
+            .await;
 
         // Only remove the named home volume when the caller asks for a
         // full purge (session *delete*, or ephemeral agent runs). On a
@@ -2673,6 +3545,7 @@ impl SandboxProvider for DockerSandboxProvider {
 
     async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
         tracing::info!("Starting sandbox container {}", handle.sandbox_name);
+        self.inspect_handle_policy(handle).await?;
         let result = self
             .docker
             .start_container(
@@ -2693,6 +3566,7 @@ impl SandboxProvider for DockerSandboxProvider {
 
     async fn restart(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
         tracing::info!("Restarting sandbox container {}", handle.sandbox_name);
+        self.inspect_handle_policy(handle).await?;
         self.docker
             .restart_container(
                 &handle.sandbox_id,
@@ -4136,12 +5010,9 @@ impl SandboxProvider for DockerSandboxProvider {
 /// interface, dropping traffic to the five private ranges while leaving all
 /// public-internet egress (npm, pip, cargo, GitHub, …) unrestricted.
 ///
-/// # Platform behaviour
-///
-/// - **Linux** (production): full iptables filtering applied.
-/// - **macOS / non-Linux** (developer laptops): creation fails unless the
-///   operator explicitly opts into insecure development networking with
-///   `TEMPS_ALLOW_INSECURE_SANDBOX_NETWORKING=1`.
+/// Legacy Linux-only defense-in-depth helper. New sandboxes use the portable
+/// internal-network + managed-proxy boundary above; this remains available to
+/// Linux-specific deployments while that migration settles.
 ///
 /// # Permissions
 ///
@@ -4154,27 +5025,9 @@ impl SandboxProvider for DockerSandboxProvider {
 /// The function flushes and recreates the `TEMPS_SANDBOX_EGRESS` chain on
 /// every call and uses `-D` before `-I` for the FORWARD hook, so running on
 /// every server start is safe and never accumulates duplicate rules.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 async fn apply_sandbox_egress_filter(docker: &Docker, network_id: &str) -> Result<(), AgentError> {
-    // This is a Linux-only operation. Docker Desktop hides its forwarding
-    // plane inside a VM, so Temps cannot prove the isolation policy there.
-    // Require an explicit development-only opt-out instead of silently
-    // claiming a boundary that was never installed.
-    if !cfg!(target_os = "linux") {
-        let allowed = std::env::var("TEMPS_ALLOW_INSECURE_SANDBOX_NETWORKING")
-            .is_ok_and(|value| value == "1");
-        if !allowed {
-            return Err(AgentError::SandboxProviderUnavailable {
-                provider: "docker".to_string(),
-                reason: "mandatory sandbox egress filtering is unavailable on this platform; set TEMPS_ALLOW_INSECURE_SANDBOX_NETWORKING=1 only for an explicitly trusted development host".to_string(),
-            });
-        }
-        tracing::warn!(
-            network_id = network_id,
-            "INSECURE DEVELOPMENT MODE: sandbox egress filtering is not enforced on this platform"
-        );
-        return Ok(());
-    }
-
     // Resolve the bridge interface name.  Docker stores it under the
     // "com.docker.network.bridge.name" option.  If that key is absent (e.g.
     // for overlay drivers) we fall back to the `br-<first 12 chars of id>`
@@ -4930,7 +5783,7 @@ mod tests {
         assert_eq!(config.custom_image, "");
         assert_eq!(config.default_cpu_limit, 4.0);
         assert_eq!(config.default_memory_limit_mb, 8192);
-        assert_eq!(config.network_mode, SANDBOX_NETWORK);
+        assert_eq!(config.network_mode, "full");
     }
 
     #[test]
@@ -6064,7 +6917,181 @@ mod tests {
         );
     }
 
-    // ---- egress filter tests (no Docker / iptables required) ----------------
+    // ---- managed egress policy tests (no Docker required) -------------------
+
+    #[test]
+    fn sandbox_proxy_environment_overrides_caller_routes() {
+        let environment = HashMap::from([
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://attacker.invalid:8080".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "*".to_string()),
+            ("SAFE_VALUE".to_string(), "preserved".to_string()),
+        ]);
+
+        let network = sandbox_network_name("temps-sandbox-test");
+        let result = sandbox_container_environment(environment, &network);
+        let expected_proxy =
+            format!("http://{SANDBOX_EGRESS_PROXY_ALIAS}:{SANDBOX_EGRESS_PROXY_PORT}");
+
+        assert!(result.contains(&format!("HTTPS_PROXY={expected_proxy}")));
+        assert!(result.contains(&format!("HTTP_PROXY={expected_proxy}")));
+        assert!(result.contains(&format!("https_proxy={expected_proxy}")));
+        assert!(result.contains(&format!("http_proxy={expected_proxy}")));
+        assert!(result
+            .contains(&"NO_PROXY=localhost,127.0.0.1,::1,temps-sandbox-egress-proxy".to_string()));
+        assert!(result.contains(&"SAFE_VALUE=preserved".to_string()));
+        assert!(!result
+            .iter()
+            .any(|entry| entry.contains("attacker.invalid")));
+        assert!(!result.iter().any(|entry| entry == "NO_PROXY=*"));
+    }
+
+    #[test]
+    fn sandbox_proxy_environment_is_not_injected_for_no_network() {
+        let result = sandbox_container_environment(HashMap::new(), "none");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn requested_network_mode_overrides_provider_default_for_all_create_steps() {
+        let container_name = "temps-sandbox-override-test";
+
+        assert_eq!(
+            effective_sandbox_network("none", Some("full"), container_name),
+            sandbox_network_name(container_name)
+        );
+        assert_eq!(
+            effective_sandbox_network("full", Some("none"), container_name),
+            "none"
+        );
+        assert_eq!(
+            effective_sandbox_network("restricted", None, container_name),
+            sandbox_network_name(container_name)
+        );
+    }
+
+    fn inspected_sandbox(
+        container_name: &str,
+        network_names: &[&str],
+        environment: Vec<String>,
+        network_mode: &str,
+    ) -> bollard::models::ContainerInspectResponse {
+        bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(environment),
+                ..Default::default()
+            }),
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some(network_mode.to_string()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(
+                    network_names
+                        .iter()
+                        .map(|name| {
+                            (
+                                (*name).to_string(),
+                                bollard::models::EndpointSettings::default(),
+                            )
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            name: Some(container_name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn recovered_sandbox_requires_exact_network_and_proxy_policy() {
+        let container_name = "temps-sandbox-policy-test";
+        let network = sandbox_network_name(container_name);
+        let environment = sandbox_container_environment(HashMap::new(), &network);
+        let compliant =
+            inspected_sandbox(container_name, &[&network], environment.clone(), &network);
+        assert!(recovered_container_matches_egress_policy(
+            &compliant,
+            container_name
+        ));
+
+        let dual_attached = inspected_sandbox(
+            container_name,
+            &[&network, "temps-sandbox-net"],
+            environment.clone(),
+            &network,
+        );
+        assert!(!recovered_container_matches_egress_policy(
+            &dual_attached,
+            container_name
+        ));
+
+        let bad_no_proxy = inspected_sandbox(
+            container_name,
+            &[&network],
+            environment
+                .iter()
+                .map(|entry| {
+                    if entry.starts_with("NO_PROXY=") {
+                        "NO_PROXY=*".to_string()
+                    } else {
+                        entry.clone()
+                    }
+                })
+                .collect(),
+            &network,
+        );
+        assert!(!recovered_container_matches_egress_policy(
+            &bad_no_proxy,
+            container_name
+        ));
+
+        let none_with_attachment =
+            inspected_sandbox(container_name, &["bridge"], Vec::new(), "none");
+        assert!(!recovered_container_matches_egress_policy(
+            &none_with_attachment,
+            container_name
+        ));
+    }
+
+    #[test]
+    fn sandbox_proxy_policy_is_fail_closed_and_blocks_private_destinations() {
+        for required_guard in [
+            "octets[0] === 10",
+            "octets[0] === 127",
+            "octets[0] === 169 && octets[1] === 254",
+            "octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31",
+            "octets[0] === 192 && octets[1] === 168",
+            "answers.some(({ address }) => isPrivateAddress(address))",
+            "![80, 443].includes(port)",
+            "HTTP/1.1 403 Forbidden",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "managed proxy is missing security guard: {required_guard}"
+            );
+        }
+        assert!(!SANDBOX_EGRESS_PROXY_SCRIPT.contains("TEMPS_ALLOW_INSECURE"));
+        assert!(SANDBOX_NETWORK_PREFIX.starts_with("temps-sandbox-net-v3-"));
+        assert_eq!(
+            managed_sandbox_network("full", "temps-sandbox-test"),
+            sandbox_network_name("temps-sandbox-test")
+        );
+        assert_eq!(
+            managed_sandbox_network("restricted", "temps-sandbox-test"),
+            sandbox_network_name("temps-sandbox-test")
+        );
+        assert_eq!(
+            managed_sandbox_network("host", "temps-sandbox-test"),
+            sandbox_network_name("temps-sandbox-test")
+        );
+        assert_eq!(managed_sandbox_network("none", "ignored"), "none");
+    }
+
+    // ---- legacy Linux iptables helper tests ---------------------------------
 
     /// Verify the DROP-range list covers all five required CIDR blocks.
     /// This test does NOT invoke iptables — it validates the command set that
