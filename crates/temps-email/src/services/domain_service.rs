@@ -139,7 +139,9 @@ impl DomainService {
     /// Errors if:
     /// - The provider is not found.
     /// - `get_identity_details` fails (e.g. the identity doesn't exist provider-side).
-    /// - A row for the same `domain` + `provider_id` pair already exists in temps.
+    /// - `domain` is already registered in temps, for this or any other provider
+    ///   (`email_domains.domain` has a global unique index — a domain can only
+    ///   be registered once, period).
     pub async fn import(
         &self,
         request: ImportDomainRequest,
@@ -149,10 +151,13 @@ impl DomainService {
             request.domain, request.provider_id
         );
 
-        // Guard: reject if this domain is already registered for this provider.
+        // Guard: reject if this domain is already registered, under any provider.
+        // Matches the `idx_email_domains_domain_unique` index, which is on
+        // `domain` alone rather than `(domain, provider_id)` — checking only
+        // this provider would let the insert below hit that constraint and
+        // surface as a generic 500 instead of a 409.
         let existing = email_domains::Entity::find()
             .filter(email_domains::Column::Domain.eq(request.domain.as_str()))
-            .filter(email_domains::Column::ProviderId.eq(request.provider_id))
             .one(self.db.as_ref())
             .await?;
         if existing.is_some() {
@@ -251,7 +256,18 @@ impl DomainService {
             ..Default::default()
         };
 
-        let result = active_model.insert(self.db.as_ref()).await?;
+        let result = active_model.insert(self.db.as_ref()).await.map_err(|e| {
+            if is_unique_violation(&e) {
+                // The pre-check above already covers the common case; this
+                // catches a concurrent import of the same domain racing past it.
+                EmailError::DomainAlreadyExists {
+                    domain: request.domain.clone(),
+                    provider_id: request.provider_id,
+                }
+            } else {
+                EmailError::from(e)
+            }
+        })?;
 
         info!(
             "Imported email domain '{}' with id: {} (status: {})",
@@ -513,18 +529,29 @@ impl DomainService {
     ///
     /// DMARC is also excluded — see `dmarc_record_template`'s doc comment.
     fn are_all_records_verified(details: &DomainIdentityDetails) -> bool {
-        // Check SPF record
-        if let Some(ref spf) = details.spf_record {
-            if spf.status != DnsRecordStatus::Verified {
-                return false;
-            }
+        // SPF must be present AND verified — `None` means the provider never
+        // returned an SPF record at all, which must not vacuously pass.
+        let spf_verified = matches!(
+            &details.spf_record,
+            Some(spf) if spf.status == DnsRecordStatus::Verified
+        );
+        if !spf_verified {
+            return false;
         }
 
-        // Check DKIM records
-        for dkim in &details.dkim_records {
-            if dkim.status != DnsRecordStatus::Verified {
-                return false;
-            }
+        // DKIM must have at least one record AND all of them verified — an
+        // empty `dkim_records` list must not vacuously pass an `all()`/loop
+        // check, since that would let a domain with no DKIM record at all
+        // through the sending gate.
+        if details.dkim_records.is_empty() {
+            return false;
+        }
+        if details
+            .dkim_records
+            .iter()
+            .any(|dkim| dkim.status != DnsRecordStatus::Verified)
+        {
+            return false;
         }
 
         // MX is optional — excluded from this gate intentionally.
@@ -780,6 +807,19 @@ impl DomainService {
 
         records
     }
+}
+
+/// True only for a Postgres unique-constraint violation (SQLSTATE 23505).
+///
+/// `DbErr::Exec`/`Query`/`RecordNotInserted` also cover connection resets,
+/// statement timeouts and permission-denied-on-table. Mapping that whole
+/// class to "already exists" tells an operator debugging an outage to go
+/// look for a duplicate row that does not exist.
+fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
+    matches!(err, sea_orm::DbErr::RecordNotInserted)
+        || err
+            .sql_err()
+            .is_some_and(|e| matches!(e, sea_orm::SqlErr::UniqueConstraintViolation(_)))
 }
 
 #[cfg(test)]
@@ -1102,6 +1142,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_dkim_records_does_not_vacuously_pass_verification() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        assert!(
+            !DomainService::are_all_records_verified(&details),
+            "an empty DKIM record list must not vacuously satisfy the 'all verified' check"
+        );
+    }
+
+    #[test]
+    fn missing_spf_record_does_not_vacuously_pass_verification() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Verified,
+            spf_record: None,
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+        };
+        assert!(
+            !DomainService::are_all_records_verified(&details),
+            "a missing SPF record must not vacuously satisfy the 'all verified' check"
+        );
+    }
+
     // ========== Import Tests ==========
 
     #[tokio::test]
@@ -1150,6 +1220,58 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             EmailError::DomainAlreadyExists { provider_id: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn import_rejects_duplicate_domain_under_a_different_provider() {
+        // `email_domains.domain` has a global unique index (not
+        // `(domain, provider_id)`) — a domain already registered under
+        // provider 1 must also block an import attempt under provider 2,
+        // rather than reaching the insert and surfacing as a 500.
+        let now = chrono::Utc::now();
+        let existing = email_domains::Model {
+            id: 5,
+            provider_id: 1,
+            domain: "mail.example.com".to_string(),
+            status: "verified".to_string(),
+            spf_record_name: None,
+            spf_record_value: None,
+            dkim_selector: None,
+            dkim_record_name: None,
+            dkim_record_value: None,
+            mx_record_name: None,
+            mx_record_value: None,
+            mx_record_priority: None,
+            provider_identity_id: None,
+            last_verified_at: Some(now),
+            verification_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![existing]])
+                .into_connection(),
+        );
+        let provider_service = Arc::new(ProviderService::new(
+            db.clone(),
+            create_test_encryption_service(),
+        ));
+        let service = DomainService::new(db, provider_service);
+
+        let result = service
+            .import(ImportDomainRequest {
+                provider_id: 2,
+                domain: "mail.example.com".to_string(),
+                provider_identity_id: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EmailError::DomainAlreadyExists { provider_id: 2, .. }
         ));
     }
 
