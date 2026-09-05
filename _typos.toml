@@ -32,4 +32,13 @@ erly = "erly"
 mis = "mis"
 
 [default.extend-identifiers]
+# W3C traceparent spec example span-id used in test fixtures
+# (crates/temps-proxy/src/proxy.rs `extract_traceparent_trace_id` tests).
+# Hex string contains "ba" which the spell-checker mistakes for "by"/"be".
+"00f067aa0ba902b7" = "00f067aa0ba902b7"
+"deadbeef" = "deadbeef"
+# git-cliff nightly-tag changelog entry (CHANGELOG.md) — the short commit
+# hash "ba96c0f7" isolates to "ba", mistaken for "by"/"be".
+"ba96c0f7" = "ba96c0f7"
+# rustix's write-only file-open flag.
 WRONLY = "WRONLY"
