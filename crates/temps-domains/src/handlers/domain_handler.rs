@@ -2749,16 +2749,19 @@ async fn cleanup_dns_txt_records(
     provider: &dyn temps_dns::providers::DnsProvider,
     plan: &DnsCleanupPlan,
 ) -> Result<DnsCleanupOutcome, DnsCleanupError> {
-    // These providers expose a distinct ID for each TXT value. Azure, GCP,
-    // Route53, Namecheap, and Pebble expose one synthetic ID per RRset/name:
-    // calling their
-    // delete_record implementation could remove a sibling ACME order's
-    // value even after our exact-value filter succeeds.
+    // Cloudflare and DigitalOcean expose a distinct ID for each TXT value.
+    // Pebble is the explicitly gated, local-test-only exception: its synthetic
+    // ID is the challenge FQDN and delete_record calls challtestsrv's
+    // post-validation clear-txt endpoint. Azure, GCP, Route53, and Namecheap
+    // expose one synthetic ID per RRset/name in real user-controlled zones, so
+    // calling their delete_record implementation could remove a sibling ACME
+    // order's value even after our exact-value filter succeeds.
     let provider_type = provider.provider_type();
     if !matches!(
         provider_type,
         temps_dns::providers::DnsProviderType::Cloudflare
             | temps_dns::providers::DnsProviderType::DigitalOcean
+            | temps_dns::providers::DnsProviderType::Pebble
     ) {
         return Err(DnsCleanupError::SharedRecordSet {
             provider: provider_type,
@@ -3734,6 +3737,34 @@ mod tests {
             }
         ));
         assert_eq!(provider.record_names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_allows_local_test_only_pebble_provider() {
+        let provider = MockDnsProvider::seed(vec![txt_record(
+            "_acme-challenge.example.com.",
+            "_acme-challenge",
+            "completed-order-token",
+        )])
+        .with_provider_type(DnsProviderType::Pebble);
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "completed-order-token".to_string(),
+                record_id: "_acme-challenge.example.com.".to_string(),
+            }],
+        );
+
+        let outcome = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect("the gated local Pebble provider should clear its test RRset");
+
+        assert_eq!(outcome.deleted, 1);
+        assert!(outcome.errors.is_empty());
+        assert!(outcome.remaining_records.is_empty());
+        assert!(provider.record_names().is_empty());
     }
 
     #[tokio::test]
