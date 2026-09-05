@@ -1065,7 +1065,7 @@ async fn mirror_walg_backup(
         if !archived.contains(segment.as_str()) {
             // A missing segment is ordinarily just WAL catching up — but if
             // this service's continuous archiving has since been pinned to a
-            // *different* S3 source (see `walg_archive_s3_source_id` on
+            // *different* S3 source (see `continuous_archive_s3_source_id` on
             // `external_services`, and the guard in
             // `postgres_walg::PostgresWalgEngine::run`), and this backup's
             // base snapshot predates that pin, its WAL segments were written
@@ -1073,7 +1073,7 @@ async fn mirror_walg_backup(
             // appear under this prefix no matter how long we wait.
             let pinned_before_this_backup = service_id
                 .and_then(|service_id| resources.service(service_id).ok())
-                .and_then(|service| service.walg_archive_pinned_at)
+                .and_then(|service| service.continuous_archive_pinned_at)
                 .is_some_and(|pinned_at| backup.started_at < pinned_at);
             if pinned_before_this_backup {
                 return Err(StageError::Unsupported(format!(
@@ -2752,8 +2752,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
-            walg_archive_s3_source_id: None,
-            walg_archive_pinned_at: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
         let source = temps_entities::s3_sources::Model {
             id: 7,
@@ -3202,8 +3202,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
-            walg_archive_s3_source_id: None,
-            walg_archive_pinned_at: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         }
         .into_active_model()
         .insert(&db)
@@ -3348,8 +3348,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
-            walg_archive_s3_source_id: None,
-            walg_archive_pinned_at: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
 
         assert_eq!(
@@ -4158,8 +4158,8 @@ mod tests {
             container_name: None,
             ai_data_access: false,
             created_by_user_id: None,
-            walg_archive_s3_source_id: None,
-            walg_archive_pinned_at: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         }
         .into_active_model()
         .insert(&db)

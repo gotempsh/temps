@@ -16,7 +16,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`services projects`](#services-projects)
 - [`services update`](#services-update)
 - [`services upgrade`](#services-upgrade)
-- [`services repoint-walg-source`](#services-repoint-walg-source)
+- [`services repoint-continuous-archive-source`](#services-repoint-continuous-archive-source)
 - [`services import`](#services-import)
 - [`services link`](#services-link)
 - [`services unlink`](#services-unlink)
@@ -49,7 +49,7 @@ Manage external services (databases, caches, storage)
 - `projects` - List projects linked to a service
 - `update` - Update a service
 - `upgrade` - Upgrade a service to a newer version
-- `repoint-walg-source` - Repoint a Postgres service's WAL-G continuous archiving to a different S3 source. Base backups taken before this call keep their WAL under the previous source and will no longer be verifiable once archiving points at the new one.
+- `repoint-continuous-archive-source` - Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog shipper) to a different S3 source. Data archived before this call stays under the previous source and will no longer be verifiable or replayable once archiving points at the new one.
 - `import` - Import an existing external service
 - `link` - Link a service to a project
 - `unlink` - Unlink a service from a project
@@ -190,16 +190,16 @@ Upgrade a service to a newer version
 | `--id <id>` | Service ID | - | Yes |
 | `-v, --version <version>` | Docker image to upgrade to (e.g., postgres:18-alpine) | - | No |
 
-### `services repoint-walg-source`
+### `services repoint-continuous-archive-source`
 
-Repoint a Postgres service's WAL-G continuous archiving to a different S3 source. Base backups taken before this call keep their WAL under the previous source and will no longer be verifiable once archiving points at the new one.
+Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog shipper) to a different S3 source. Data archived before this call stays under the previous source and will no longer be verifiable or replayable once archiving points at the new one.
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
-| `--s3-source <id>` | S3 source ID to point WAL-G archiving at | - | Yes |
+| `--s3-source <id>` | S3 source ID to point continuous archiving at | - | Yes |
 
 ### `services import`
 

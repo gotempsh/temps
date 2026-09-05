@@ -24,13 +24,14 @@ pub struct ExternalServiceUpdatedAudit {
     pub updated_parameter_names: Vec<String>,
 }
 
-/// A deliberate, operator-initiated move of a Postgres service's continuous
-/// WAL-G archiving to a different S3 source. Audited both directions since
-/// it's consequential: base backups taken before this call have WAL segments
-/// under `previous_s3_source_id` that will no longer be verifiable once
-/// archiving points at `new_s3_source_id`.
+/// A deliberate, operator-initiated move of a service's continuous
+/// archiving process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) to
+/// a different S3 source. Audited both directions since it's consequential:
+/// data archived before this call under `previous_s3_source_id` will no
+/// longer be verifiable or replayable once archiving points at
+/// `new_s3_source_id`.
 #[derive(Debug, Clone, Serialize)]
-pub struct WalgArchiveSourceRepointedAudit {
+pub struct ContinuousArchiveSourceRepointedAudit {
     pub context: AuditContext,
     pub service_id: i32,
     pub name: String,
@@ -279,9 +280,9 @@ impl AuditOperation for ExternalServiceCreatedAudit {
     }
 }
 
-impl AuditOperation for WalgArchiveSourceRepointedAudit {
+impl AuditOperation for ContinuousArchiveSourceRepointedAudit {
     fn operation_type(&self) -> String {
-        "WALG_ARCHIVE_SOURCE_REPOINTED".to_string()
+        "CONTINUOUS_ARCHIVE_SOURCE_REPOINTED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

@@ -8177,6 +8177,27 @@
         ],
         "type": "object"
       },
+      "ContinuousArchiveSourceResponse": {
+        "properties": {
+          "continuous_archive_pinned_at": {
+            "type": "string"
+          },
+          "continuous_archive_s3_source_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "continuous_archive_s3_source_id",
+          "continuous_archive_pinned_at"
+        ],
+        "type": "object"
+      },
       "ConversationDetailResponse": {
         "allOf": [
           {
@@ -33962,11 +33983,11 @@
         ],
         "type": "object"
       },
-      "RepointWalgArchiveSourceRequest": {
-        "description": "Deliberately, explicitly move where a Postgres service's continuous\nWAL-G archiving points. See\n`ExternalServiceManager::repoint_walg_archive_source` for why this is a\ndedicated, guarded operation rather than something a schedule change\ndoes implicitly.",
+      "RepointContinuousArchiveSourceRequest": {
+        "description": "Deliberately, explicitly move where a service's continuous archiving\nprocess (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See\n`ExternalServiceManager::repoint_continuous_archive_source` for why this is a\ndedicated, guarded operation rather than something a schedule change\ndoes implicitly.",
         "properties": {
           "new_s3_source_id": {
-            "description": "The S3 source WAL-G archiving should point at from now on.",
+            "description": "The S3 source continuous archiving should point at from now on.",
             "format": "int32",
             "type": "integer"
           }
@@ -49040,27 +49061,6 @@
           "critical"
         ],
         "type": "string"
-      },
-      "WalgArchiveSourceResponse": {
-        "properties": {
-          "service_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "walg_archive_pinned_at": {
-            "type": "string"
-          },
-          "walg_archive_s3_source_id": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "service_id",
-          "walg_archive_s3_source_id",
-          "walg_archive_pinned_at"
-        ],
-        "type": "object"
       },
       "WebhookConfig": {
         "description": "Configuration for a generic webhook notification provider",
@@ -64251,6 +64251,59 @@
         ]
       }
     },
+    "/external-services/{id}/continuous-archive-source": {
+      "post": {
+        "description": "Deliberately, explicitly moves where a service's continuous, standing\narchiving process writes: Postgres/Timescale's WAL-G `archive_command`,\nor MariaDB's binlog shipper. Both need everything written under one S3\nprefix to stay restorable — data archived before this call lives under\nthe *previous* source and will no longer be verifiable or replayable\nonce archiving points at the new one.\n\nThis exists because a backup schedule that requests a different S3\nsource than the one archiving is currently pinned to is refused, not\nsilently honoured (see `ExternalServiceManager::repoint_continuous_archive_source`\nfor the incident this prevents). Call this endpoint to deliberately move\nthe pin instead — for example, to switch a service from an operator's\nown S3 source onto Temps Cloud's managed one.",
+        "operationId": "repointContinuousArchiveSource",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepointContinuousArchiveSourceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContinuousArchiveSourceResponse"
+                }
+              }
+            },
+            "description": "Continuous archive source repointed"
+          },
+          "400": {
+            "description": "Service type does not support continuous archiving, or the requested S3 source does not exist"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Repoint a service's continuous archive source",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/{id}/environment": {
       "get": {
         "operationId": "reveal_service_environment_variables",
@@ -66350,59 +66403,6 @@
           }
         },
         "summary": "Postgres WAL & archive health snapshot",
-        "tags": [
-          "External Services"
-        ]
-      }
-    },
-    "/external-services/{id}/walg-archive-source": {
-      "post": {
-        "description": "Deliberately, explicitly moves where a Postgres service's continuous\nWAL-G archiving (`archive_command`) writes WAL segments. Cloud's backup\nmirror (and any WAL-G restore) needs a base backup and the WAL segments\ncovering its start/end LSN under the same S3 prefix — base backups taken\nbefore this call have WAL under the *previous* source and will no\nlonger be verifiable once archiving points at the new one.\n\nThis exists because a backup schedule that requests a different S3\nsource than the one archiving is currently pinned to is refused, not\nsilently honoured (see `ExternalServiceManager::repoint_walg_archive_source`\nfor the incident this prevents). Call this endpoint to deliberately move\nthe pin instead — for example, to switch a service from an operator's\nown S3 source onto Temps Cloud's managed one.",
-        "operationId": "repointWalgArchiveSource",
-        "parameters": [
-          {
-            "description": "External service ID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RepointWalgArchiveSourceRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WalgArchiveSourceResponse"
-                }
-              }
-            },
-            "description": "WAL archive source repointed"
-          },
-          "400": {
-            "description": "Service is not Postgres, or the requested S3 source does not exist"
-          },
-          "404": {
-            "description": "Service not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Repoint a Postgres service's WAL-G archive source",
         "tags": [
           "External Services"
         ]

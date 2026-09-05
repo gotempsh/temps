@@ -4246,7 +4246,7 @@ impl PostgresService {
     /// pointed at a source we no longer want".
     ///
     /// Only the explicit, operator-initiated WAL archive source repoint
-    /// (`ExternalServiceManager::repoint_walg_archive_source`) should call
+    /// (`ExternalServiceManager::repoint_continuous_archive_source`) should call
     /// this — it accepts the brief archiving outage a container recreate
     /// causes, in exchange for actually moving where WAL segments land, not
     /// just updating a database record that no longer matches reality.
@@ -6460,8 +6460,8 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
-            walg_archive_s3_source_id: None,
-            walg_archive_pinned_at: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
         // Build a MockDatabase for the `pool` slot — restore_pitr for
         // Postgres doesn't touch it in the legacy-reject path.

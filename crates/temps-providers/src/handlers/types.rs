@@ -557,22 +557,22 @@ pub struct UpdateExternalServiceRequest {
     pub docker_image: Option<String>,
 }
 
-/// Deliberately, explicitly move where a Postgres service's continuous
-/// WAL-G archiving points. See
-/// `ExternalServiceManager::repoint_walg_archive_source` for why this is a
+/// Deliberately, explicitly move where a service's continuous archiving
+/// process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See
+/// `ExternalServiceManager::repoint_continuous_archive_source` for why this is a
 /// dedicated, guarded operation rather than something a schedule change
 /// does implicitly.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct RepointWalgArchiveSourceRequest {
-    /// The S3 source WAL-G archiving should point at from now on.
+pub struct RepointContinuousArchiveSourceRequest {
+    /// The S3 source continuous archiving should point at from now on.
     pub new_s3_source_id: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct WalgArchiveSourceResponse {
+pub struct ContinuousArchiveSourceResponse {
     pub service_id: i32,
-    pub walg_archive_s3_source_id: i32,
-    pub walg_archive_pinned_at: String,
+    pub continuous_archive_s3_source_id: i32,
+    pub continuous_archive_pinned_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

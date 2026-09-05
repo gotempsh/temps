@@ -18,7 +18,7 @@ import {
   listServiceProjects,
   updateService,
   upgradeService,
-  repointWalgArchiveSource,
+  repointContinuousArchiveSource,
   importExternalService,
   linkServiceToProject,
   unlinkServiceFromProject,
@@ -182,7 +182,7 @@ interface UpgradeOptions {
   version?: string
 }
 
-interface RepointWalgArchiveSourceOptions {
+interface RepointContinuousArchiveSourceOptions {
   id: string
   s3Source: string
 }
@@ -323,15 +323,16 @@ export function registerServicesCommands(program: Command): void {
     .action(upgradeServiceAction)
 
   services
-    .command('repoint-walg-source')
+    .command('repoint-continuous-archive-source')
     .description(
-      "Repoint a Postgres service's WAL-G continuous archiving to a different S3 source. " +
-        'Base backups taken before this call keep their WAL under the previous source and ' +
-        'will no longer be verifiable once archiving points at the new one.',
+      "Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog " +
+        'shipper) to a different S3 source. Data archived before this call stays under the ' +
+        'previous source and will no longer be verifiable or replayable once archiving points ' +
+        'at the new one.',
     )
     .requiredOption('--id <id>', 'Service ID')
-    .requiredOption('--s3-source <id>', 'S3 source ID to point WAL-G archiving at')
-    .action(repointWalgArchiveSourceAction)
+    .requiredOption('--s3-source <id>', 'S3 source ID to point continuous archiving at')
+    .action(repointContinuousArchiveSourceAction)
 
   services
     .command('import')
@@ -1086,7 +1087,7 @@ async function upgradeServiceAction(options: UpgradeOptions): Promise<void> {
   info(`Run: temps services show --id ${options.id} to check the status`)
 }
 
-async function repointWalgArchiveSourceAction(options: RepointWalgArchiveSourceOptions): Promise<void> {
+async function repointContinuousArchiveSourceAction(options: RepointContinuousArchiveSourceOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
@@ -1102,8 +1103,8 @@ async function repointWalgArchiveSourceAction(options: RepointWalgArchiveSourceO
     return
   }
 
-  const result = await withSpinner('Repointing WAL-G archive source...', async () => {
-    const { data, error } = await repointWalgArchiveSource({
+  const result = await withSpinner('Repointing continuous archive source...', async () => {
+    const { data, error } = await repointContinuousArchiveSource({
       client,
       path: { id },
       body: { new_s3_source_id: newS3SourceId },
@@ -1114,11 +1115,11 @@ async function repointWalgArchiveSourceAction(options: RepointWalgArchiveSourceO
     return data
   })
 
-  success('WAL-G archive source repointed')
+  success('Continuous archive source repointed')
   if (result) {
     keyValue('Service ID', String(result.service_id))
-    keyValue('S3 source', String(result.walg_archive_s3_source_id))
-    keyValue('Pinned at', result.walg_archive_pinned_at)
+    keyValue('S3 source', String(result.continuous_archive_s3_source_id))
+    keyValue('Pinned at', result.continuous_archive_pinned_at)
   }
 }
 

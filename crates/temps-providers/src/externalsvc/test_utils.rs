@@ -472,8 +472,8 @@ pub fn create_mock_external_service(
         ai_data_access: false,
         container_name: None,
         created_by_user_id: None,
-        walg_archive_s3_source_id: None,
-        walg_archive_pinned_at: None,
+        continuous_archive_s3_source_id: None,
+        continuous_archive_pinned_at: None,
     }
 }
 

@@ -4105,6 +4105,12 @@ export type ContextLogsResponse = {
     target_index: number;
 };
 
+export type ContinuousArchiveSourceResponse = {
+    continuous_archive_pinned_at: string;
+    continuous_archive_s3_source_id: number;
+    service_id: number;
+};
+
 export type ConversationDetailResponse = ConversationResponse & {
     /**
      * Turns oldest-first. The `system` seed message is omitted (internal).
@@ -15808,15 +15814,15 @@ export type RenewalAttemptResponse = {
 };
 
 /**
- * Deliberately, explicitly move where a Postgres service's continuous
- * WAL-G archiving points. See
- * `ExternalServiceManager::repoint_walg_archive_source` for why this is a
+ * Deliberately, explicitly move where a service's continuous archiving
+ * process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See
+ * `ExternalServiceManager::repoint_continuous_archive_source` for why this is a
  * dedicated, guarded operation rather than something a schedule change
  * does implicitly.
  */
-export type RepointWalgArchiveSourceRequest = {
+export type RepointContinuousArchiveSourceRequest = {
     /**
-     * The S3 source WAL-G archiving should point at from now on.
+     * The S3 source continuous archiving should point at from now on.
      */
     new_s3_source_id: number;
 };
@@ -22549,12 +22555,6 @@ export type WalWarning = {
 };
 
 export type WalWarningSeverity = 'warning' | 'critical';
-
-export type WalgArchiveSourceResponse = {
-    service_id: number;
-    walg_archive_pinned_at: string;
-    walg_archive_s3_source_id: number;
-};
 
 /**
  * Configuration for a generic webhook notification provider
@@ -31909,6 +31909,42 @@ export type GetClusterHealthResponses = {
 
 export type GetClusterHealthResponse = GetClusterHealthResponses[keyof GetClusterHealthResponses];
 
+export type RepointContinuousArchiveSourceData = {
+    body: RepointContinuousArchiveSourceRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/continuous-archive-source';
+};
+
+export type RepointContinuousArchiveSourceErrors = {
+    /**
+     * Service type does not support continuous archiving, or the requested S3 source does not exist
+     */
+    400: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RepointContinuousArchiveSourceResponses = {
+    /**
+     * Continuous archive source repointed
+     */
+    200: ContinuousArchiveSourceResponse;
+};
+
+export type RepointContinuousArchiveSourceResponse = RepointContinuousArchiveSourceResponses[keyof RepointContinuousArchiveSourceResponses];
+
 export type RevealServiceEnvironmentVariablesData = {
     body?: never;
     path: {
@@ -33350,42 +33386,6 @@ export type GetPostgresWalHealthResponses = {
 };
 
 export type GetPostgresWalHealthResponse = GetPostgresWalHealthResponses[keyof GetPostgresWalHealthResponses];
-
-export type RepointWalgArchiveSourceData = {
-    body: RepointWalgArchiveSourceRequest;
-    path: {
-        /**
-         * External service ID
-         */
-        id: number;
-    };
-    query?: never;
-    url: '/external-services/{id}/walg-archive-source';
-};
-
-export type RepointWalgArchiveSourceErrors = {
-    /**
-     * Service is not Postgres, or the requested S3 source does not exist
-     */
-    400: unknown;
-    /**
-     * Service not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type RepointWalgArchiveSourceResponses = {
-    /**
-     * WAL archive source repointed
-     */
-    200: WalgArchiveSourceResponse;
-};
-
-export type RepointWalgArchiveSourceResponse = RepointWalgArchiveSourceResponses[keyof RepointWalgArchiveSourceResponses];
 
 export type ExternalServiceEnablePgStatStatementsData = {
     body?: never;

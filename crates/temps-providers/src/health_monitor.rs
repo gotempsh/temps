@@ -13,6 +13,7 @@
 //! the monitor sends a notification via the shared `NotificationService`.
 //! A recovery notification is sent when the service returns to `operational`.
 
+use crate::continuous_archive;
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
 use crate::externalsvc::{HealthProbeStatus, S3Credentials};
@@ -486,24 +487,73 @@ impl ExternalServiceHealthMonitor {
             return;
         }
 
-        // Discover the S3 destination from a backup schedule covering this
-        // service. No schedule = no PITR destination configured = skip.
-        let s3_source = match self.find_s3_source_for_service(service.id).await {
-            Ok(Some(src)) => src,
-            Ok(None) => {
-                debug!(
+        // Once pinned, always ship to the pinned source — never re-resolve
+        // from the current schedule state. Re-resolving every tick (the
+        // previous behavior) meant editing *any* enabled schedule that
+        // covers this service, even one unrelated via `target_all_services`,
+        // could silently redirect an in-progress binlog stream mid-flight,
+        // splitting the chain a PITR restore needs across buckets.
+        let s3_source = if let Some(pinned_id) = service.continuous_archive_s3_source_id {
+            match s3_sources::Entity::find_by_id(pinned_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(src)) => src,
+                Ok(None) => {
+                    warn!(
+                        service_id = service.id,
+                        "MariaDB service's pinned continuous archive S3 source {} no longer exists; skipping binlog archive",
+                        pinned_id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        "Failed to load pinned S3 source for MariaDB binlog archive: {}", e
+                    );
+                    return;
+                }
+            }
+        } else {
+            // Unpinned yet: fall back to discovering a destination from a
+            // backup schedule covering this service (no schedule = no PITR
+            // destination configured = skip), then establish the pin —
+            // deferring to the instance's Cloud-managed source when one
+            // exists rather than whichever schedule happened to resolve
+            // first, exactly like a WAL-G backup's first run.
+            let candidate = match self.find_s3_source_for_service(service.id).await {
+                Ok(Some(src)) => src,
+                Ok(None) => {
+                    debug!(
+                        service_id = service.id,
+                        "MariaDB service has no backup schedule; skipping binlog archive"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        "Failed to resolve S3 source for MariaDB binlog archive: {}", e
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = continuous_archive::ensure_continuous_archive_source_pin(
+                self.db.as_ref(),
+                service,
+                candidate.id,
+                "MariaDB binlog archiving",
+            )
+            .await
+            {
+                warn!(
                     service_id = service.id,
-                    "MariaDB service has no backup schedule; skipping binlog archive"
+                    "MariaDB binlog archiving destination is ambiguous, skipping this tick: {}", e
                 );
                 return;
             }
-            Err(e) => {
-                debug!(
-                    service_id = service.id,
-                    "Failed to resolve S3 source for MariaDB binlog archive: {}", e
-                );
-                return;
-            }
+            candidate
         };
 
         // Build a decrypted S3 client from the source row.
