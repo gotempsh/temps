@@ -32,7 +32,8 @@
 pub mod messages;
 
 pub use messages::{
-    BackupArtifact, BackupCompleted, BackupCompression, BackupEngine, BackupFormat, BackupTarget,
+    BackupArtifact, BackupCompleted, BackupCompression, BackupEngine, BackupFormat,
+    BackupLifecycleEventAccepted, BackupLifecycleEventRequest, BackupLifecycleStage, BackupTarget,
     BackupTargetRequest, EnrollRequest, EnrollResponse, Envelope, Heartbeat, HeartbeatAck,
     IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability,
     ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation, ManagedAiEvidence,
