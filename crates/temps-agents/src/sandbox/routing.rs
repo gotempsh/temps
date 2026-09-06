@@ -104,6 +104,17 @@ impl SandboxProvider for RoutingSandboxProvider {
             .await
     }
 
+    async fn harness_mcp_url(
+        &self,
+        handle: &SandboxHandle,
+        control_plane_url: &str,
+        registered_url: &str,
+    ) -> Result<String, AgentError> {
+        self.owner_of(handle)
+            .harness_mcp_url(handle, control_plane_url, registered_url)
+            .await
+    }
+
     async fn exec(
         &self,
         handle: &SandboxHandle,

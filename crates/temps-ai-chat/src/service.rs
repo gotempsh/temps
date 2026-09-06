@@ -3222,6 +3222,10 @@ impl ConversationService {
             let mut stop_reason: Option<&'static str> = None;
             // Consecutive rounds in which every tool call was rejected.
             let mut unproductive_streak = 0usize;
+            // Set only when all anti-spin rounds complete normally. A provider
+            // error after a native tool call must not be mislabeled as this
+            // backstop being exhausted.
+            let mut round_backstop_exhausted = false;
             let turn_started = tokio::time::Instant::now();
             let trace_id = task_turn_id.as_deref().unwrap_or("untracked");
             tracing::info!(
@@ -3720,11 +3724,18 @@ impl ConversationService {
                 // Bound what gets replayed next round. This, not the round
                 // count, is what keeps a long turn from running out of context.
                 trim_carried_tool_results(&mut messages, MAX_CARRIED_TOOL_BYTES);
+                if round_index + 1 == MAX_ROUNDS {
+                    round_backstop_exhausted = true;
+                }
             }
 
             // Fell out of the loop by exhausting the backstop rather than by
             // answering — worth saying, since it means the task was cut short.
-            if !answered && stop_reason.is_none() && !tools_meta.is_empty() {
+            if round_backstop_exhausted
+                && !answered
+                && stop_reason.is_none()
+                && !tools_meta.is_empty()
+            {
                 stop_reason = Some("stopped after an unusually long run of steps");
             }
 
@@ -6140,6 +6151,51 @@ mod tests {
         }
     }
 
+    struct NativeToolThenErrorAi {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiService for NativeToolThenErrorAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            _request: ChatTurnRequest,
+        ) -> Result<ChatTurnStream, AiError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                let stream = async_stream::stream! {
+                    yield Ok(ChatStreamDelta::ToolCall(ToolCall {
+                        id: "native-1".to_string(),
+                        name: "Bash".to_string(),
+                        arguments: r#"{"command":"pwd"}"#.to_string(),
+                    }));
+                    yield Err(AiError::Provider {
+                        purpose: "chat.application.tools".to_string(),
+                        reason: "native permission bridge unavailable".to_string(),
+                    });
+                };
+                Ok(Box::pin(stream))
+            } else {
+                let stream = async_stream::stream! {
+                    yield Ok(ChatStreamDelta::Text("Could not finish the native command.".to_string()));
+                };
+                Ok(Box::pin(stream))
+            }
+        }
+    }
+
     /// Concatenate every `Token` event's text, in order.
     fn joined_text(events: &[ChatStreamEvent]) -> String {
         events
@@ -6450,6 +6506,53 @@ mod tests {
         assert!(
             !error.to_string().contains("Check the provider's key and model"),
             "sandbox and harness failures must not be mislabeled as API key/model failures: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tool_provider_error_is_not_reported_as_round_backstop_exhaustion() {
+        let ai: Arc<dyn AiService> = Arc::new(NativeToolThenErrorAi {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (svc, tools) = service_with(ai);
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        let stream = svc
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                None,
+                tools,
+                &test_auth(),
+                &test_request_metadata(),
+                None,
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_test".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_test"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                None,
+                false,
+                None,
+            )
+            .await;
+        let out = drain(stream).await;
+
+        assert!(out.iter().any(|event| matches!(
+            event,
+            ChatStreamEvent::ToolCall { name, .. } if name == "Bash"
+        )));
+        assert!(out.iter().any(|event| matches!(
+            event,
+            ChatStreamEvent::Token(text) if text == "Could not finish the native command."
+        )));
+        assert!(
+            !out.iter().any(|event| matches!(
+                event,
+                ChatStreamEvent::Token(text)
+                    if text.contains("stopped after an unusually long run of steps")
+            )),
+            "a provider failure after one native tool must not be described as exhausting 500 rounds: {out:?}"
         );
     }
 

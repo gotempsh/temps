@@ -377,6 +377,19 @@ pub trait SandboxProvider: Send + Sync {
         Ok(direct_model_relay_base_url(control_plane_url))
     }
 
+    /// Return the URL a process inside `handle` must use for a turn-scoped
+    /// harness MCP server. Backends with ordinary control-plane reachability
+    /// can use the registered URL directly. Network-isolated backends override
+    /// this with a capability-only relay owned by that backend.
+    async fn harness_mcp_url(
+        &self,
+        _handle: &SandboxHandle,
+        _control_plane_url: &str,
+        registered_url: &str,
+    ) -> Result<String, AgentError> {
+        Ok(registered_url.to_string())
+    }
+
     /// Attach a sandbox and a bounded set of application-owned data services
     /// to an isolated per-application network. The default rejects the
     /// operation; only providers capable of enforcing network membership

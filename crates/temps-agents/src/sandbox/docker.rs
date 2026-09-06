@@ -271,6 +271,21 @@ fn runtime_user_owns_uploaded_file(path: &str) -> bool {
     path.starts_with(SANDBOX_HOME) || is_turn_secret_path(path)
 }
 
+fn sandbox_mcp_relay_url(control_plane_url: &str, registered_url: &str) -> Option<String> {
+    let expected_prefix = format!(
+        "{}/api/ai/sandbox-tools/",
+        control_plane_url.trim_end_matches('/')
+    );
+    let bridge_id = registered_url
+        .strip_prefix(&expected_prefix)?
+        .strip_suffix("/mcp")?;
+    (bridge_id.len() == 32
+        && bridge_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then(|| format!("{SANDBOX_MCP_RELAY_BASE_URL}/{bridge_id}"))
+}
+
 fn workspace_mount_source(mounts: &[bollard::models::MountPoint]) -> Option<PathBuf> {
     mounts.iter().find_map(|mount| {
         (mount.destination.as_deref() == Some(CONTAINER_WORK_DIR))
@@ -569,6 +584,7 @@ pub const SANDBOX_MODEL_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/model-relay";
 const SANDBOX_EGRESS_POLICY_LABEL: &str = "sh.temps.sandbox-egress-policy";
 const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
+const SANDBOX_MCP_RELAY_BASE_URL: &str = "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
 
 /// Small CONNECT/HTTP forward proxy used as the sandbox's only internet
 /// route. It resolves the destination itself, rejects the request when *any*
@@ -647,6 +663,18 @@ function modelRelayTarget(request) {
   return target;
 }
 
+function mcpTarget(request) {
+  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+  if (request.method !== "POST" || incoming.host !== proxyAuthority) return null;
+  const match = incoming.pathname.match(/^\/\.temps\/mcp\/([a-f0-9]{32})$/);
+  if (!match) return null;
+  const basePath = controlPlane.pathname.replace(/\/$/, "");
+  const target = new URL(controlPlane.toString());
+  target.pathname = `${basePath}/api/ai/sandbox-tools/${match[1]}/mcp`;
+  target.search = "";
+  return target;
+}
+
 async function forward(request, response, target, allowPrivate) {
   const answer = allowPrivate
     ? (await dns.lookup(target.hostname, { all: true, verbatim: true }))[0]
@@ -683,6 +711,12 @@ const server = http.createServer(async (request, response) => {
         incoming.pathname.startsWith("/.temps/model-relay/")) {
       if (!relayTarget) throw new Error("model relay target is not allowed");
       await forward(request, response, relayTarget, true);
+      return;
+    }
+    if (incoming.host === proxyAuthority && incoming.pathname.startsWith("/.temps/mcp/")) {
+      const target = mcpTarget(request);
+      if (!target) throw new Error("MCP target is not allowed");
+      await forward(request, response, target, true);
       return;
     }
     const target = new URL(request.url);
@@ -3298,6 +3332,28 @@ impl SandboxProvider for DockerSandboxProvider {
         )
         .await?;
         Ok(SANDBOX_MODEL_RELAY_BASE_URL.to_string())
+    }
+
+    async fn harness_mcp_url(
+        &self,
+        handle: &SandboxHandle,
+        control_plane_url: &str,
+        registered_url: &str,
+    ) -> Result<String, AgentError> {
+        self.ensure_network(
+            &handle.sandbox_name,
+            &sandbox_network_name(&handle.sandbox_name),
+            control_plane_url,
+        )
+        .await?;
+        sandbox_mcp_relay_url(control_plane_url, registered_url).ok_or_else(|| {
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "turn-scoped MCP URL does not match the configured control-plane capability route"
+                    .to_string(),
+            }
+        })
     }
 
     async fn configure_application_network(
@@ -7258,6 +7314,54 @@ mod tests {
             &matching_container,
             SANDBOX_HOST_GATEWAY
         ));
+    }
+
+    #[test]
+    fn sandbox_proxy_exposes_only_capability_scoped_mcp_posts() {
+        assert_eq!(
+            SANDBOX_MCP_RELAY_BASE_URL,
+            "http://temps-sandbox-egress-proxy:3128/.temps/mcp"
+        );
+        for required_guard in [
+            "request.method !== \"POST\"",
+            "incoming.host !== proxyAuthority",
+            "^\\/\\.temps\\/mcp\\/([a-f0-9]{32})$",
+            "/api/ai/sandbox-tools/",
+            "if (!target) throw new Error(\"MCP target is not allowed\")",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "MCP relay is missing security guard: {required_guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_mcp_relay_rejects_urls_outside_the_registered_capability_route() {
+        let bridge_id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            sandbox_mcp_relay_url(
+                "http://host.docker.internal:8221",
+                &format!(
+                    "http://host.docker.internal:8221/api/ai/sandbox-tools/{bridge_id}/mcp"
+                )
+            )
+            .as_deref(),
+            Some("http://temps-sandbox-egress-proxy:3128/.temps/mcp/0123456789abcdef0123456789abcdef")
+        );
+        for rejected in [
+            format!("http://attacker.test/api/ai/sandbox-tools/{bridge_id}/mcp"),
+            format!("http://host.docker.internal:8221/api/ai/sandbox-tools/{bridge_id}/other"),
+            "http://host.docker.internal:8221/api/ai/sandbox-tools/short/mcp".to_string(),
+            "http://host.docker.internal:8221/api/ai/sandbox-tools/0123456789ABCDEF0123456789ABCDEF/mcp".to_string(),
+            format!("http://host.docker.internal:8221/api/ai/sandbox-tools/{bridge_id}/mcp?x=1"),
+        ] {
+            assert_eq!(
+                sandbox_mcp_relay_url("http://host.docker.internal:8221", &rejected),
+                None,
+                "unexpectedly relayed {rejected}"
+            );
+        }
     }
 
     // ---- legacy Linux iptables helper tests ---------------------------------

@@ -1026,6 +1026,16 @@ impl AgentCliAiService {
             .model_relay_base_url(&handle, &credentials.internal_api_url)
             .await
             .map_err(|error| map_agent_error(&request.purpose, error))?;
+        let harness_mcp_server = match request.harness_mcp_server.as_ref() {
+            Some(server) => Some(temps_ai::HarnessMcpServer {
+                url: sandbox_provider
+                    .harness_mcp_url(&handle, &credentials.internal_api_url, &server.url)
+                    .await
+                    .map_err(|error| map_agent_error(&request.purpose, error))?,
+                authorization_token: server.authorization_token.clone(),
+            }),
+            None => None,
+        };
         let (model_relay, model_relay_guard) = relay_service.register(
             self.provider.name(),
             request.principal_id.ok_or_else(|| AiError::Provider {
@@ -1052,7 +1062,7 @@ impl AgentCliAiService {
             &mut command,
             &mut sandbox_env,
             &mut turn_secret_files,
-            request.harness_mcp_server.as_ref(),
+            harness_mcp_server.as_ref(),
         )?;
         let sandbox = self
             .sandbox_provider
