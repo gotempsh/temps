@@ -95,7 +95,7 @@ function BackupWarning({
           complete database dump on local disk before uploading to S3. For large
           databases this can exhaust disk space and interrupt backup jobs. Use
           the default image or a <code className="font-mono">gotempsh/</code>{' '}
-          image for streaming backups with constant memory usage.
+          image for streaming backups with constant disk usage.
         </p>
       </div>
     </div>

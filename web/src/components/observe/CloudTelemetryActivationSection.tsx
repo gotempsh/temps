@@ -38,7 +38,7 @@ import type {
   BulkActivationProjectEstimateResponse,
   EstimateBulkActivationRequest,
 } from '@/api/client/types.gen'
-import { problemDetail } from '@/api/cloudTelemetry'
+import { problemDetail } from '@/lib/api-problem'
 import {
   AlertDialog,
   AlertDialogAction,

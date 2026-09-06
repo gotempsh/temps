@@ -750,7 +750,7 @@ impl TelemetryWriteModeService {
         let cloud_projects = ProjectModeRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT id, cloud_telemetry_fidelity, cloud_telemetry_write_mode, \
-                    cloud_telemetry_attribute_allowlist \
+                    cloud_analytics_write_mode, cloud_telemetry_attribute_allowlist \
              FROM projects WHERE cloud_telemetry_write_mode = 'cloud' FOR UPDATE",
             vec![],
         ))
@@ -810,7 +810,7 @@ impl TelemetryWriteModeService {
         let rows = ProjectModeRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT id, cloud_telemetry_fidelity, cloud_telemetry_write_mode, \
-                    cloud_telemetry_attribute_allowlist \
+                    cloud_analytics_write_mode, cloud_telemetry_attribute_allowlist \
              FROM projects WHERE cloud_telemetry_write_mode = 'cloud' FOR UPDATE",
             vec![],
         ))

@@ -3,11 +3,11 @@
 
 import { describe, expect, test } from 'bun:test'
 
+import type { CloudBackfillStatusResponse } from '@/api/client/types.gen'
 import {
   BACKFILL_STALL_THRESHOLD_MS,
-  CloudBackfillStatusResponse,
   isBackfillStalled,
-} from './cloud-telemetry-backfill'
+} from './backfill-stall'
 
 const NOW = Date.parse('2026-09-01T12:00:00Z')
 
@@ -61,7 +61,9 @@ describe('cloud telemetry backfill stall detection', () => {
   test('a missing or unparsable timestamp never reads as stalled', () => {
     // Guessing "stalled" from missing data would cry wolf on a healthy run.
     expect(isBackfillStalled(undefined, NOW)).toBe(false)
-    expect(isBackfillStalled(status({ updated_at: undefined }), NOW)).toBe(false)
+    expect(isBackfillStalled(status({ updated_at: undefined }), NOW)).toBe(
+      false
+    )
     expect(isBackfillStalled(status({ updated_at: 'not a date' }), NOW)).toBe(
       false
     )

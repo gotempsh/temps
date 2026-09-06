@@ -18,18 +18,19 @@
  * that state, so this never has to guess.
  */
 
-import { ProjectResponse } from '@/api/client'
 import {
-  cloudTelemetryStatusKey,
-  fetchProjectCloudTelemetry,
-  problemDetail,
-  problemSetupPath,
-  projectCloudTelemetryKey,
-  updateProjectCloudTelemetry,
+  ProjectResponse,
   type CloudTelemetryFidelity,
   type CloudTelemetryWriteMode,
-  type ProjectCloudTelemetry,
-} from '@/api/cloudTelemetry'
+  type ProjectCloudTelemetryResponse,
+} from '@/api/client'
+import {
+  getCloudTelemetryStatusQueryKey,
+  getProjectCloudTelemetryOptions,
+  getProjectCloudTelemetryQueryKey,
+  updateProjectCloudTelemetryMutation,
+} from '@/api/client/@tanstack/react-query.gen'
+import { problemDetail, problemSetupPath } from '@/lib/api-problem'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -96,10 +97,16 @@ const FIDELITY_COPY: Record<
   },
 }
 
-function WriteModeBadge({ settings }: { settings: ProjectCloudTelemetry }) {
+function WriteModeBadge({
+  settings,
+}: {
+  settings: ProjectCloudTelemetryResponse
+}) {
   if (settings.effective_write_mode === settings.write_mode) {
     return (
-      <Badge variant={settings.write_mode === 'cloud' ? 'default' : 'secondary'}>
+      <Badge
+        variant={settings.write_mode === 'cloud' ? 'default' : 'secondary'}
+      >
         {settings.write_mode === 'cloud' ? 'Cloud-primary' : 'Local'}
       </Badge>
     )
@@ -107,11 +114,7 @@ function WriteModeBadge({ settings }: { settings: ProjectCloudTelemetry }) {
   // Intent and reality disagree — a quota or credential fallback. Showing only
   // the declared mode here would tell the operator their spans are somewhere
   // they are not.
-  return (
-    <Badge variant="destructive">
-      Falling back to local storage
-    </Badge>
-  )
+  return <Badge variant="destructive">Falling back to local storage</Badge>
 }
 
 export function TelemetrySettings({ project }: TelemetrySettingsProps) {
@@ -124,10 +127,9 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
     isError,
     error,
     refetch,
-  } = useQuery({
-    queryKey: projectCloudTelemetryKey(project.id),
-    queryFn: () => fetchProjectCloudTelemetry(project.id),
-  })
+  } = useQuery(
+    getProjectCloudTelemetryOptions({ path: { project_id: project.id } })
+  )
 
   const [writeMode, setWriteMode] = useState<CloudTelemetryWriteMode>('local')
   const [fidelity, setFidelity] = useState<CloudTelemetryFidelity>('metered')
@@ -139,18 +141,19 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
   }, [settings])
 
   const save = useMutation({
-    mutationFn: () =>
-      updateProjectCloudTelemetry(project.id, {
-        fidelity,
-        write_mode: writeMode,
-      }),
+    ...updateProjectCloudTelemetryMutation(),
     onSuccess: (updated) => {
-      queryClient.setQueryData(projectCloudTelemetryKey(project.id), updated)
-      void queryClient.invalidateQueries({ queryKey: cloudTelemetryStatusKey() })
+      queryClient.setQueryData(
+        getProjectCloudTelemetryQueryKey({ path: { project_id: project.id } }),
+        updated
+      )
+      void queryClient.invalidateQueries({
+        queryKey: getCloudTelemetryStatusQueryKey(),
+      })
       toast.success(
         updated.write_mode === 'cloud'
           ? 'This project’s spans now go to Temps Cloud. They are no longer stored on this instance.'
-          : 'This project’s spans are stored on this instance.',
+          : 'This project’s spans are stored on this instance.'
       )
     },
     onError: (mutationError) => {
@@ -160,19 +163,21 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
       toast.error(
         problemDetail(
           mutationError,
-          'Could not change this project’s telemetry storage.',
+          'Could not change this project’s telemetry storage.'
         ),
         {
           action: problemSetupPath(mutationError)
             ? {
                 label: 'Fix this',
                 onClick: () => {
-                  window.location.href = problemSetupPath(mutationError) as string
+                  window.location.href = problemSetupPath(
+                    mutationError
+                  ) as string
                 },
               }
             : undefined,
           duration: 12_000,
-        },
+        }
       )
     },
   })
@@ -197,7 +202,7 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
             <p>
               {problemDetail(
                 error,
-                'This instance could not report where this project’s spans are stored.',
+                'This instance could not report where this project’s spans are stored.'
               )}
             </p>
             <Button size="sm" variant="outline" onClick={() => void refetch()}>
@@ -251,7 +256,8 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
           <Info className="h-4 w-4" />
           <AlertTitle>
             {settings.queued_spans.toLocaleString()} span
-            {settings.queued_spans === 1 ? '' : 's'} waiting to reach Temps Cloud
+            {settings.queued_spans === 1 ? '' : 's'} waiting to reach Temps
+            Cloud
           </AlertTitle>
           <AlertDescription>
             These are durably queued on this instance and survive a restart.
@@ -422,7 +428,11 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
               <p className="text-xs font-medium">Attributes allowed to leave</p>
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {settings.attribute_allowlist.map((key) => (
-                  <Badge key={key} variant="outline" className="font-mono text-[11px]">
+                  <Badge
+                    key={key}
+                    variant="outline"
+                    className="font-mono text-[11px]"
+                  >
                     {key}
                   </Badge>
                 ))}
@@ -459,7 +469,12 @@ export function TelemetrySettings({ project }: TelemetrySettingsProps) {
             </Button>
           )}
           <Button
-            onClick={() => save.mutate()}
+            onClick={() =>
+              save.mutate({
+                path: { project_id: project.id },
+                body: { fidelity, write_mode: writeMode },
+              })
+            }
             disabled={!dirty || downgradeBlocked || save.isPending}
           >
             {save.isPending ? 'Saving…' : 'Save changes'}

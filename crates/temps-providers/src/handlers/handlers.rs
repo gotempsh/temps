@@ -1513,11 +1513,15 @@ async fn repoint_continuous_archive_source(
         Err(e @ crate::services::ExternalServiceError::ParameterValidationFailed { .. }) => {
             Err(bad_request().detail(e.to_string()).build())
         }
-        // Distinct from a plain 500: the physical repoint already
-        // succeeded, so retrying this same request (same body) is the
-        // correct recovery action, not just "something went wrong,
-        // investigate the logs" -- a client that only sees a generic 500
-        // has no way to tell those two situations apart.
+        // Distinct from a plain 500: the DB persist failed after retries, so
+        // retrying this same request once the database is reachable is the
+        // correct recovery action. For Postgres/Timescale the container was
+        // already physically repointed (genuine desync); for MariaDB nothing
+        // moved (pin update is the entire repoint, so a retry is safe and
+        // idempotent). Either way the caller needs to know to retry, not just
+        // "something went wrong, investigate the logs" -- a client that only
+        // sees a generic 500 has no way to tell those two situations apart.
+        // `e.to_string()` surfaces the engine-accurate detail from the error.
         Err(e @ crate::services::ExternalServiceError::ArchiveSourceDesynced { .. }) => {
             Err(ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
                 .title("Archive Source Pin Desynchronized")

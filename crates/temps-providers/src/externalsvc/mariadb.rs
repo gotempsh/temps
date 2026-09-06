@@ -3418,10 +3418,19 @@ impl MariaDbService {
              if command -v mariadb >/dev/null 2>&1; then CLIENT=mariadb; else CLIENT=mysql; fi; \
              export BINLOG CLIENT; \
              echo temps-mariadb-pitr-replay: stream-binlogs; \
-             timeout 120s {pipeline}; \
+             {pipeline}; \
              echo temps-mariadb-pitr-replay: complete",
             pipeline = pipefail_command,
         );
+        // NOTE on the absent inner `timeout`: the outer `run_exec` call
+        // immediately below applies MARIADB_BINLOG_REPLAY_TIMEOUT (5 min) to
+        // this entire shell invocation, which is the correct control. Pre-PR
+        // this command was two separate shell steps each wrapped in
+        // `timeout 120s`, giving a combined 240 s budget. Merging them into
+        // one pipefail pipeline (a correctness win) inadvertently collapsed
+        // that to 120 s by keeping only one inner timeout. Relying solely on
+        // the outer bound restores the full 300 s and avoids the two timeouts
+        // drifting apart again.
 
         let env = vec![
             format!("MYSQL_PWD={}", config.root_password),

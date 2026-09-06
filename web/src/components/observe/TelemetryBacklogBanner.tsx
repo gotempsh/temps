@@ -16,11 +16,8 @@
  * comes back with zeros on a `local` project.
  */
 
-import {
-  fetchProjectCloudTelemetry,
-  projectCloudTelemetryKey,
-  type TelemetryGapWindow,
-} from '@/api/cloudTelemetry'
+import { getProjectCloudTelemetryOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { TelemetryGapWindowResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { useQuery } from '@tanstack/react-query'
@@ -41,10 +38,10 @@ interface TelemetryBacklogBannerProps {
 
 /** Gaps that overlap the window on screen. */
 function gapsInWindow(
-  gaps: TelemetryGapWindow[],
+  gaps: TelemetryGapWindowResponse[],
   startTime?: string,
-  endTime?: string,
-): TelemetryGapWindow[] {
+  endTime?: string
+): TelemetryGapWindowResponse[] {
   if (!startTime || !endTime) return gaps
   const from = new Date(startTime).getTime()
   const to = new Date(endTime).getTime()
@@ -63,8 +60,7 @@ export function TelemetryBacklogBanner({
   endTime,
 }: TelemetryBacklogBannerProps) {
   const { data } = useQuery({
-    queryKey: projectCloudTelemetryKey(projectId),
-    queryFn: () => fetchProjectCloudTelemetry(projectId),
+    ...getProjectCloudTelemetryOptions({ path: { project_id: projectId } }),
     // A backlog drains; an operator watching one needs it to move without a
     // manual refresh.
     refetchInterval: 30_000,
@@ -79,12 +75,12 @@ export function TelemetryBacklogBanner({
   if (backlog === 0 && gaps.length === 0 && !fallingBack) return null
 
   const droppedSpans = gaps.reduce((total, gap) => total + gap.dropped_spans, 0)
-  const oldestGap = gaps.reduce<TelemetryGapWindow | null>(
+  const oldestGap = gaps.reduce<TelemetryGapWindowResponse | null>(
     (oldest, gap) =>
       !oldest || new Date(gap.started_at) < new Date(oldest.started_at)
         ? gap
         : oldest,
-    null,
+    null
   )
 
   return (
@@ -151,9 +147,12 @@ export function TelemetryBacklogBanner({
               <>
                 {' '}
                 This project has been Cloud-primary{' '}
-                {formatDistanceToNow(new Date(data.intervals[0].effective_from), {
-                  addSuffix: true,
-                })}
+                {formatDistanceToNow(
+                  new Date(data.intervals[0].effective_from),
+                  {
+                    addSuffix: true,
+                  }
+                )}
                 .
               </>
             )}

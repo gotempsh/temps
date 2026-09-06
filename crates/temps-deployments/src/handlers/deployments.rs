@@ -4355,6 +4355,7 @@ mod tests {
             config_service.clone(),
             queue_service.clone(),
             docker_log_service,
+            docker.clone(),
             deployer,
             encryption_service.clone(),
         ));

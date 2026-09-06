@@ -69,6 +69,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let config_service = context.require_service::<temps_config::ConfigService>();
             let queue_service = context.require_service::<dyn temps_core::JobQueue>();
             let docker_log_service = context.require_service::<temps_logs::DockerLogService>();
+            let docker = context.require_service::<bollard::Docker>();
             let deployer = context.require_service::<dyn temps_deployer::ContainerDeployer>();
             let git_provider = context.require_service::<dyn temps_git::GitProviderManagerTrait>();
             let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
@@ -88,6 +89,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 config_service.clone(),
                 queue_service.clone(),
                 docker_log_service,
+                docker,
                 deployer.clone(),
                 encryption_service.clone(),
             ));

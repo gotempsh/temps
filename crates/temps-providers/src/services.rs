@@ -210,18 +210,25 @@ pub enum ExternalServiceError {
     /// wrong until this is reconciled. Kept distinct from `DatabaseError` so
     /// this specific, actionable state is never mistaken for an ordinary
     /// transient failure that left nothing inconsistent behind.
-    #[error(
-        "Service {service_id} archiving now writes to S3 source {new_s3_source_id}, but the \
-         database still records the previous source because persisting the pin failed after \
-         {attempts} attempt(s): {reason}. The live WAL destination and the recorded pin are now \
-         out of sync -- repoint to the same source again to reconcile, or fix the underlying \
-         database issue first."
-    )]
+    ///
+    /// `message` is computed at construction time to produce an engine-accurate
+    /// description. Postgres/Timescale physically repoints WAL-G's
+    /// `archive_command` before persisting, so a DB failure creates a genuine
+    /// live desync. MariaDB's shipper re-reads the pin every tick, so if the
+    /// DB persist fails there is no live desync — archiving has not moved.
+    #[error("{message}")]
     ArchiveSourceDesynced {
         service_id: i32,
         new_s3_source_id: i32,
         attempts: u32,
         reason: String,
+        /// `true` when the container-side archive was physically repointed
+        /// before the DB persist failed (Postgres/Timescale: WAL-G
+        /// `archive_command` already rewritten). `false` for MariaDB: the pin
+        /// update is the entire repoint, so nothing changed on the container.
+        physical_repoint_occurred: bool,
+        /// Engine-accurate error text derived from `physical_repoint_occurred`.
+        message: String,
     },
 
     #[error("Parameter validation failed for service {service_id}: {reason}")]
@@ -3050,10 +3057,14 @@ impl ExternalServiceManager {
         // state to rewrite: it reads the pin fresh every tick (see
         // `ExternalServiceHealthMonitor::maybe_archive_mariadb_binlogs`), so
         // updating the pin below is the entire repoint for that engine.
-        if matches!(
+        //
+        // Captured before the conditional so `ArchiveSourceDesynced` can
+        // produce an engine-accurate message if the DB persist fails below.
+        let physical_repoint_occurred = matches!(
             service_type.as_str(),
             "postgres" | "postgresql" | "timescale" | "timescaledb"
-        ) {
+        );
+        if physical_repoint_occurred {
             let access_key = self
                 .encryption_service
                 .decrypt_string(&s3_source.access_key_id)
@@ -3167,11 +3178,40 @@ impl ExternalServiceManager {
             .await;
 
         if let Err(reason) = persisted {
+            let attempts = retry.max_attempts;
+            let message = if physical_repoint_occurred {
+                // Postgres/Timescale: WAL-G archive_command was already
+                // rewritten in the container, so archiving really is landing
+                // in the new source. The DB still records the old one.
+                // Genuine live desync — operator must repoint again once
+                // the database is reachable.
+                format!(
+                    "Service {service_id} archiving now writes to S3 source \
+                     {new_s3_source_id}, but the database still records the previous \
+                     source because persisting the pin failed after {attempts} \
+                     attempt(s): {reason}. The live WAL destination and the recorded \
+                     pin are now out of sync — repoint to the same source again to \
+                     reconcile, or fix the underlying database issue first."
+                )
+            } else {
+                // MariaDB: no container-side change occurred. The shipper
+                // re-reads the pin every tick, so archiving has not moved.
+                // No live desync — operator just needs to retry once the
+                // database is reachable.
+                format!(
+                    "Service {service_id}: persisting the continuous archive source \
+                     pin to S3 source {new_s3_source_id} failed after {attempts} \
+                     attempt(s): {reason}. The archiving source was not changed — \
+                     retry to apply the change once the database issue is resolved."
+                )
+            };
             return Err(ExternalServiceError::ArchiveSourceDesynced {
                 service_id,
                 new_s3_source_id,
-                attempts: retry.max_attempts,
+                attempts,
                 reason,
+                physical_repoint_occurred,
+                message,
             });
         }
 
@@ -16076,5 +16116,166 @@ mod tests {
             select_remote_container_name(None, "postgres-orders", false, "orders", false),
             "postgres-orders"
         );
+    }
+
+    // ── repoint_continuous_archive_source ───────────────────────────────────
+
+    /// Minimal external_services model suitable for repoint tests. No config
+    /// encryption needed: the fields read by `repoint_continuous_archive_source`
+    /// before the Postgres-specific decryption branch are only `service_type`,
+    /// `id`, and `name`.
+    fn repoint_test_service(id: i32, service_type: &str) -> external_services::Model {
+        let now = Utc::now();
+        external_services::Model {
+            id,
+            name: format!("test-{service_type}-{id}"),
+            service_type: service_type.to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    fn repoint_test_s3_source(id: i32) -> temps_entities::s3_sources::Model {
+        let now = Utc::now();
+        temps_entities::s3_sources::Model {
+            id,
+            name: format!("test-source-{id}"),
+            bucket_name: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "ciphertext-key".to_string(),
+            secret_key: "ciphertext-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn repoint_rejects_unsupported_service_type() {
+        // Redis has no continuous archive mechanism; repoint must fail fast.
+        let service = repoint_test_service(100, "redis");
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .repoint_continuous_archive_source(100, 5)
+            .await
+            .expect_err("redis service type must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::InvalidServiceType { id: 100, .. }
+            ),
+            "expected InvalidServiceType(100), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repoint_rejects_nonexistent_s3_source() {
+        // Valid service type (mariadb) but the requested S3 source ID does not exist.
+        let service = repoint_test_service(101, "mariadb");
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                // Empty result for `s3_sources::Entity::find_by_id(999)`.
+                .append_query_results([Vec::<temps_entities::s3_sources::Model>::new()])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .repoint_continuous_archive_source(101, 999)
+            .await
+            .expect_err("unknown S3 source must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::ParameterValidationFailed {
+                    service_id: 101,
+                    ..
+                }
+            ),
+            "expected ParameterValidationFailed(101), got {err:?}"
+        );
+    }
+
+    /// Exercises the retry-exhausted path for MariaDB, which has no
+    /// container-side physical repoint (`physical_repoint_occurred = false`).
+    /// The DB persist is attempted `max_attempts` (3) times and all fail; the
+    /// returned error must carry the correct attempt count and a message that
+    /// does NOT imply a live desync (archiving was never redirected).
+    #[tokio::test]
+    async fn repoint_mariadb_desynced_error_after_all_persist_attempts_fail() {
+        let service = repoint_test_service(102, "mariadb");
+        let s3_source = repoint_test_s3_source(7);
+        // 3 exec errors: one per retry attempt (RetryConfig::new(3)).
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service]])
+            .append_query_results([vec![s3_source]])
+            .append_exec_errors([
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+            ])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let err = manager
+            .repoint_continuous_archive_source(102, 7)
+            .await
+            .expect_err("persist failure after all retries must be surfaced");
+
+        match err {
+            ExternalServiceError::ArchiveSourceDesynced {
+                service_id: 102,
+                new_s3_source_id: 7,
+                attempts,
+                physical_repoint_occurred: false,
+                ref message,
+                ..
+            } => {
+                assert_eq!(attempts, 3, "must report the configured retry count");
+                assert!(
+                    message.contains("was not changed"),
+                    "MariaDB message must say the archiving source was not changed; got: {message}"
+                );
+                assert!(
+                    !message.contains("now writes to"),
+                    "MariaDB message must not imply archiving moved to the new source; got: {message}"
+                );
+            }
+            other => panic!("expected ArchiveSourceDesynced(102, 7, false), got: {other:?}"),
+        }
     }
 }

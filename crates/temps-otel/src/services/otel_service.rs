@@ -867,7 +867,16 @@ impl OtelService {
                     }
                     Err(error) => {
                         let error: OtelError = error.into();
-                        self.stats.spans_dropped.fetch_add(count, Ordering::Relaxed);
+                        // Use projected.len() (the per-project span count) rather
+                        // than the outer `count` (the total batch size). Using
+                        // `count` here was a bug: only THIS project's enqueue
+                        // failed; the other projects in the batch were either
+                        // already accepted or are local-write. Mirrors the
+                        // identical pattern in `ingest_metrics` which uses
+                        // `cloud_project_point_counts.get(project_id)`.
+                        self.stats
+                            .spans_dropped
+                            .fetch_add(projected.len() as u64, Ordering::Relaxed);
                         self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
                         error!(
                             project_id,
@@ -3106,5 +3115,134 @@ mod tests {
             ..span_stats_query(vec![1], 1)
         };
         assert!(OtelService::validate_span_stats_query(&inverted).is_err());
+    }
+
+    // ── ADR-041 outbox error accounting ─────────────────────────────────
+
+    /// `spans_dropped` must reflect only the per-project span count when an
+    /// outbox enqueue fails, not the entire batch size.
+    ///
+    /// # Why this matters
+    ///
+    /// The ingest loop builds `cloud_by_project: HashMap<i32, Vec<SpanRecord>>`.
+    /// When `outbox.enqueue(project_id, projected)` fails, the counter must be
+    /// `projected.len()` — the number of spans for THAT project — not the outer
+    /// `count` variable which equals the whole batch size including local-write
+    /// projects. Using `count` was a miscounting bug: if a 3-local + 5-cloud
+    /// batch had its cloud enqueue fail, `spans_dropped` would be reported as 8
+    /// instead of 5.
+    ///
+    /// This test pins the correct behaviour without a real Postgres instance.
+    /// The outbox uses a `Disconnected` database so any enqueue attempt fails
+    /// immediately with a DB error, which `ingest_spans` converts to an
+    /// `OtelError` and returns — but only after recording the per-project count.
+    #[tokio::test]
+    async fn outbox_enqueue_failure_counts_only_the_failing_projects_spans() {
+        use sea_orm::sea_query::ArrayType;
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+        use std::collections::BTreeMap;
+        use temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
+        use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
+        use temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
+
+        let mock_storage = MockOtelStorage::new();
+        let (svc, _storage) = make_service(mock_storage);
+        let (_directory, link) = linked_cloud();
+
+        // Project 7 → Cloud-primary (spans go to outbox, which will fail).
+        // Project 1 → absent from DB → defaults to Local (spans go to local
+        // storage). This makes `count` (total batch) ≠ `projected.len()` (cloud
+        // project only), so the bug manifests as the counter reading 8 instead
+        // of 5.
+        let mut row: BTreeMap<String, Value> = BTreeMap::new();
+        row.insert("id".to_string(), Value::Int(Some(7)));
+        row.insert(
+            "cloud_telemetry_fidelity".to_string(),
+            Value::String(Some(Box::new(
+                CloudTelemetryFidelity::Queryable.to_string(),
+            ))),
+        );
+        row.insert(
+            "cloud_telemetry_attribute_allowlist".to_string(),
+            Value::Array(ArrayType::String, Some(Box::new(vec![]))),
+        );
+        row.insert(
+            "cloud_telemetry_write_mode".to_string(),
+            Value::String(Some(Box::new(CloudTelemetryWriteMode::Cloud.to_string()))),
+        );
+        row.insert(
+            "cloud_analytics_write_mode".to_string(),
+            Value::String(Some(Box::new(CloudAnalyticsWriteMode::Local.to_string()))),
+        );
+        row.insert("deleted_at".to_string(), Value::ChronoDateTimeUtc(None));
+
+        let policy_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+        let policy_cache = crate::services::cloud_fidelity::CloudPolicyCache::with_ttl(
+            Arc::new(policy_db),
+            Duration::from_secs(300),
+        );
+
+        // A disconnected DB makes every `insert_rows` call fail immediately,
+        // so the enqueue returns `Err(SpanOutboxError::Enqueue { .. })` without
+        // needing a real Postgres container.
+        let failing_outbox = Arc::new(temps_cloud_client::SpanOutbox::new(
+            Arc::new(sea_orm::DatabaseConnection::Disconnected),
+            u64::MAX, // no byte-cap refusal before the DB call
+        ));
+
+        let svc = svc
+            .with_cloud_link(link.clone())
+            .with_cloud_policy_cache(Arc::new(policy_cache))
+            .with_span_outbox(failing_outbox);
+
+        // 3 spans for project 1 (local-write path — never touches the outbox).
+        // 5 spans for project 7 (cloud-primary — enqueue fails).
+        // Total batch `count` = 8.  Per-project cloud count = 5.
+        let now = chrono::Utc::now();
+        let make_span = |project_id: i32, idx: usize| SpanRecord {
+            project_id,
+            deployment_id: None,
+            resource: crate::types::ResourceInfo {
+                service_name: "test-svc".to_string(),
+                service_version: None,
+                deployment_environment: None,
+                attributes: Default::default(),
+            },
+            trace_id: format!("{:032x}", idx),
+            span_id: format!("{:016x}", idx),
+            parent_span_id: None,
+            name: "test-op".to_string(),
+            kind: crate::types::SpanKind::Internal,
+            start_time: now,
+            end_time: now,
+            duration_ms: 1.0,
+            status_code: crate::types::SpanStatusCode::Unset,
+            status_message: String::new(),
+            attributes: Default::default(),
+            events: vec![],
+        };
+
+        let mut spans = Vec::new();
+        for i in 0..3 {
+            spans.push(make_span(1, i)); // local-write project
+        }
+        for i in 3..8 {
+            spans.push(make_span(7, i)); // cloud-primary project (5 spans)
+        }
+        assert_eq!(spans.len(), 8);
+
+        let result = svc.ingest_spans(spans).await;
+        assert!(result.is_err(), "outbox failure must propagate as Err");
+
+        let stats = svc.pipeline_stats();
+        assert_eq!(stats.spans_received, 8, "all 8 spans were received");
+        assert_eq!(
+            stats.spans_dropped, 5,
+            "only the 5 cloud-primary spans for project 7 were dropped; \
+             the total batch was 8 but only project 7's enqueue failed"
+        );
+        assert_eq!(stats.ingest_errors, 1);
     }
 }

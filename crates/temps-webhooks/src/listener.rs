@@ -636,7 +636,7 @@ impl WebhookEventListener {
 const MAX_ERROR_MESSAGE_LEN: usize = 500;
 
 fn bound_error_message(message: &str) -> String {
-    if message.len() <= MAX_ERROR_MESSAGE_LEN {
+    if message.chars().count() <= MAX_ERROR_MESSAGE_LEN {
         return message.to_string();
     }
     let mut truncated: String = message.chars().take(MAX_ERROR_MESSAGE_LEN).collect();
@@ -755,5 +755,73 @@ mod tests {
         // Stopping an unstarted listener should not panic
         listener.stop().await;
         assert!(!listener.is_running().await);
+    }
+
+    // -------------------------------------------------------------------------
+    // bound_error_message tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_bound_error_message_short_ascii_returned_unchanged() {
+        let msg = "Database connection refused";
+        assert_eq!(bound_error_message(msg), msg);
+    }
+
+    #[test]
+    fn test_bound_error_message_300_multibyte_chars_not_truncated() {
+        // 300 'é' characters = 600 bytes, 300 chars.
+        // Before the fix, `message.len()` (600) > MAX_ERROR_MESSAGE_LEN (500)
+        // caused the code to take the truncation branch; `.chars().take(500)`
+        // then collected all 300 chars unchanged, and " [truncated]" was
+        // appended — falsely labelling a complete message as truncated.
+        let msg: String = "é".repeat(300);
+        assert_eq!(msg.len(), 600, "sanity: 300 × 2 bytes");
+        assert_eq!(msg.chars().count(), 300, "sanity: 300 chars");
+        let result = bound_error_message(&msg);
+        assert_eq!(
+            result, msg,
+            "a 300-char string must be returned unchanged regardless of byte length"
+        );
+        assert!(
+            !result.ends_with(" [truncated]"),
+            "must NOT carry the truncation suffix"
+        );
+    }
+
+    #[test]
+    fn test_bound_error_message_exactly_500_chars_not_truncated() {
+        let msg: String = "x".repeat(500);
+        let result = bound_error_message(&msg);
+        assert_eq!(result, msg);
+        assert!(!result.ends_with(" [truncated]"));
+    }
+
+    #[test]
+    fn test_bound_error_message_over_500_chars_truncated_and_suffixed() {
+        let msg: String = "a".repeat(600);
+        let result = bound_error_message(&msg);
+        assert!(
+            result.ends_with(" [truncated]"),
+            "a 600-char string must get the truncation suffix"
+        );
+        let body = result
+            .strip_suffix(" [truncated]")
+            .expect("suffix was verified above");
+        assert_eq!(
+            body.chars().count(),
+            500,
+            "truncated body must be exactly MAX_ERROR_MESSAGE_LEN chars"
+        );
+    }
+
+    #[test]
+    fn test_bound_error_message_501_chars_truncated_at_boundary() {
+        // One char over the limit must be truncated.
+        let msg: String = "b".repeat(501);
+        let result = bound_error_message(&msg);
+        assert!(
+            result.ends_with(" [truncated]"),
+            "a 501-char string must be truncated"
+        );
     }
 }

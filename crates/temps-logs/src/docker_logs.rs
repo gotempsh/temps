@@ -43,11 +43,6 @@ impl DockerLogService {
         DockerLogService { docker }
     }
 
-    /// Return the shared Docker client used by the local container runtime.
-    pub fn docker(&self) -> Arc<Docker> {
-        self.docker.clone()
-    }
-
     pub async fn get_container_logs(
         &self,
         container_id: &str,

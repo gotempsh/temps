@@ -415,73 +415,6 @@ pub struct WalGSnapshotCompleted {
     pub backup_id: Uuid,
 }
 
-/// Machine-readable restore contract for one backup object.
-///
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackupArtifact {
-    pub engine: BackupEngine,
-    pub format: BackupFormat,
-    pub compression: BackupCompression,
-    /// Major server/tooling version used to create the dump.
-    pub postgres_major: u16,
-}
-
-/// Instance asks where to put a backup.
-///
-/// The cloud replies with a presigned destination; backup bytes then travel
-/// instance -> object storage **directly**. They never transit the control
-/// plane, which is what keeps our bandwidth cost at zero and stops us becoming
-/// a throughput bottleneck.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupTargetRequest {
-    /// Client-generated idempotency key. Retrying target creation after a lost
-    /// response must resolve to the same object instead of creating an orphan.
-    pub backup_id: Uuid,
-    pub instance_id: Uuid,
-    /// What is being backed up, e.g. a service or database name.
-    pub source: String,
-    pub estimated_bytes: u64,
-    /// SHA-256 of the finished artifact. Clients compute the backup before
-    /// requesting a target so object storage can validate the bytes during the
-    /// direct PUT and the restore worker can verify the recovery read.
-    pub checksum_sha256: String,
-    pub artifact: BackupArtifact,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupTarget {
-    pub backup_id: Uuid,
-    /// False when the same client-generated backup id was already completed.
-    /// This makes recovery after a lost completion response safe: the instance
-    /// records success without rewriting an object that may already have been
-    /// restore-verified.
-    #[serde(default = "default_true")]
-    pub upload_required: bool,
-    /// Presigned PUT destination, scoped to this object key alone.
-    pub upload_url: String,
-    pub object_key: String,
-    pub expires_at_millis: i64,
-    /// Headers covered by the presigned request. The uploader must send these
-    /// exact values; notably the provider-verified content checksum.
-    #[serde(default)]
-    pub headers: std::collections::BTreeMap<String, String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Instance reports the upload finished. Until this arrives the object is not
-/// a backup: a partial multipart upload must never be counted as one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupCompleted {
-    pub backup_id: Uuid,
-    pub bytes: u64,
-    /// SHA-256 of the uploaded object, so restore can detect corruption before
-    /// the customer discovers it during an actual disaster.
-    pub checksum_sha256: String,
-}
-
 // ---------------------------------------------------------------------------
 // Managed AI — context is assembled and approved on the OSS instance
 // ---------------------------------------------------------------------------
@@ -1062,58 +995,6 @@ mod tests {
         assert_eq!(response.tenant_id, tenant_id);
         assert!(response.account_email.is_none());
         assert!(response.capabilities.is_empty());
-    }
-
-    #[test]
-    fn backup_target_request_requires_a_restore_contract() {
-        let request = serde_json::from_value::<BackupTargetRequest>(serde_json::json!({
-            "instance_id": Uuid::new_v4(),
-            "source": "postgres/main",
-            "estimated_bytes": 42,
-            "checksum_sha256": "00"
-        }));
-
-        assert!(request.is_err());
-    }
-
-    #[test]
-    fn backup_target_request_requires_a_checksum() {
-        let request = serde_json::from_value::<BackupTargetRequest>(serde_json::json!({
-            "instance_id": Uuid::new_v4(),
-            "source": "postgres/main",
-            "estimated_bytes": 42,
-            "artifact": {
-                "engine": "postgres",
-                "format": "pg_dump_plain",
-                "compression": "gzip",
-                "postgres_major": 18
-            }
-        }));
-
-        assert!(request.is_err());
-    }
-
-    #[test]
-    fn backup_restore_contract_uses_stable_wire_names() {
-        let request = BackupTargetRequest {
-            backup_id: Uuid::new_v4(),
-            instance_id: Uuid::new_v4(),
-            source: "timescaledb/telemetry".into(),
-            estimated_bytes: 42,
-            checksum_sha256: "00".into(),
-            artifact: BackupArtifact {
-                engine: BackupEngine::TimescaleDb,
-                format: BackupFormat::PgDumpPlain,
-                compression: BackupCompression::Gzip,
-                postgres_major: 18,
-            },
-        };
-
-        let value = serde_json::to_value(request).unwrap();
-        assert_eq!(value["artifact"]["engine"], "timescale_db");
-        assert_eq!(value["artifact"]["format"], "pg_dump_plain");
-        assert_eq!(value["artifact"]["compression"], "gzip");
-        assert_eq!(value["artifact"]["postgres_major"], 18);
     }
 
     #[test]

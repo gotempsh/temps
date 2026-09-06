@@ -1236,6 +1236,20 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
         "service_endpoints",
         "node_dns_state",
         "dns_generation",
+        // m20260810_000001_create_cloud_backup_mirror_states
+        "cloud_backup_mirror_states",
+        "cloud_backup_mirror_cursors",
+        // m20260901_000002_create_cloud_telemetry_backfills
+        "cloud_telemetry_backfills",
+        // m20260901_000004_create_cloud_span_outbox (renamed to cloud_telemetry_outbox
+        // by m20260903_000001_generalize_cloud_telemetry_outbox)
+        "cloud_telemetry_outbox",
+        // m20260901_000006_create_telemetry_write_ledger
+        "project_telemetry_write_intervals",
+        "telemetry_gap_windows",
+        // m20260901_000007_create_cloud_telemetry_bulk_jobs
+        "cloud_telemetry_bulk_jobs",
+        "cloud_telemetry_bulk_job_projects",
     ];
 
     for table in tables {
@@ -1261,6 +1275,20 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
 
 async fn verify_tables_dropped(db: &DatabaseConnection) -> anyhow::Result<()> {
     let tables = vec![
+        // cloud-funnel PR tables — FK ordering: children before parents
+        "cloud_telemetry_bulk_job_projects",
+        "cloud_telemetry_bulk_jobs",
+        "project_telemetry_write_intervals",
+        "telemetry_gap_windows",
+        // After full down, m20260903_000001 reverses the rename back to
+        // cloud_span_outbox, then m20260901_000004 drops it.
+        // Neither name should exist after a complete rollback.
+        "cloud_telemetry_outbox",
+        "cloud_span_outbox",
+        "cloud_telemetry_backfills",
+        "cloud_backup_mirror_cursors",
+        "cloud_backup_mirror_states",
+        // core tables
         "project_dsns",
         "error_events",
         "error_groups",
@@ -3021,4 +3049,985 @@ async fn control_plane_overlay_column_count(db: &DatabaseConnection) -> anyhow::
         .await?
         .expect("network_config column count");
     Ok(row.try_get("", "n")?)
+}
+
+// ============================================================================
+// Helpers shared by the cloud-funnel reversibility tests below.
+// ============================================================================
+
+/// Returns true when `table.column` exists in the public schema.
+async fn column_exists(db: &DatabaseConnection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2) AS present",
+            [table.into(), column.into()],
+        ))
+        .await?
+        .expect("column_exists query returned no row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+/// Returns true when `table` exists in the public schema.
+async fn table_exists_in_db(db: &DatabaseConnection, table: &str) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name = $1) AS present",
+            [table.into()],
+        ))
+        .await?
+        .expect("table_exists query returned no row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+/// Returns true when a pg_constraint with `conname = constraint_name` exists.
+async fn pg_constraint_exists(
+    db: &DatabaseConnection,
+    constraint_name: &str,
+) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1) AS present",
+            [constraint_name.into()],
+        ))
+        .await?
+        .expect("pg_constraint_exists query returned no row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+// ============================================================================
+// Reversibility tests — one per new migration introduced by this PR.
+//
+// Template: `test_control_plane_overlay_allocation_migration_is_reversible`
+// (up N migrations, assert pre-state; up 1 more, assert post-state;
+//  down 1, assert pre-state again).
+// ============================================================================
+
+/// m20260810_000001_create_cloud_backup_mirror_states
+/// Creates: cloud_backup_mirror_states, cloud_backup_mirror_cursors
+#[tokio::test]
+async fn test_cloud_backup_mirror_states_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping cloud_backup_mirror_states reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260810_000001_create_cloud_backup_mirror_states";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_backup_mirror_states").await?);
+    assert!(!table_exists_in_db(&db, "cloud_backup_mirror_cursors").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "cloud_backup_mirror_states").await?);
+    assert!(table_exists_in_db(&db, "cloud_backup_mirror_cursors").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_backup_mirror_states").await?);
+    assert!(!table_exists_in_db(&db, "cloud_backup_mirror_cursors").await?);
+    Ok(())
+}
+
+/// m20260827_000002_add_control_plane_setup_generation
+/// Adds: network_config.control_plane_setup_generation
+#[tokio::test]
+async fn test_control_plane_setup_generation_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping control_plane_setup_generation reversibility test: Docker unavailable: {e}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260827_000002_add_control_plane_setup_generation";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "network_config", "control_plane_setup_generation").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "network_config", "control_plane_setup_generation").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "network_config", "control_plane_setup_generation").await?);
+    Ok(())
+}
+
+/// m20260830_000001_add_managed_by_cloud_to_s3_sources
+/// Adds: s3_sources.managed_by_cloud
+#[tokio::test]
+async fn test_managed_by_cloud_s3_source_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping managed_by_cloud_s3_source reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260830_000001_add_managed_by_cloud_to_s3_sources";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "s3_sources", "managed_by_cloud").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "s3_sources", "managed_by_cloud").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "s3_sources", "managed_by_cloud").await?);
+    Ok(())
+}
+
+/// m20260901_000001_add_cloud_telemetry_fidelity
+/// Adds: projects.cloud_telemetry_fidelity, projects.cloud_telemetry_attribute_allowlist
+#[tokio::test]
+async fn test_cloud_telemetry_fidelity_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping cloud_telemetry_fidelity reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260901_000001_add_cloud_telemetry_fidelity";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "projects", "cloud_telemetry_fidelity").await?);
+    assert!(!column_exists(&db, "projects", "cloud_telemetry_attribute_allowlist").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "cloud_telemetry_fidelity").await?);
+    assert!(column_exists(&db, "projects", "cloud_telemetry_attribute_allowlist").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "projects", "cloud_telemetry_fidelity").await?);
+    assert!(!column_exists(&db, "projects", "cloud_telemetry_attribute_allowlist").await?);
+    Ok(())
+}
+
+/// m20260901_000002_create_cloud_telemetry_backfills
+/// Creates: cloud_telemetry_backfills
+#[tokio::test]
+async fn test_cloud_telemetry_backfills_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping cloud_telemetry_backfills reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260901_000002_create_cloud_telemetry_backfills";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_telemetry_backfills").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "cloud_telemetry_backfills").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_telemetry_backfills").await?);
+    Ok(())
+}
+
+/// m20260901_000003_constrain_cloud_telemetry_fidelity
+/// Adds: CHECK constraint projects_cloud_telemetry_fidelity_valid on projects
+#[tokio::test]
+async fn test_constrain_cloud_telemetry_fidelity_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping constrain_cloud_telemetry_fidelity reversibility test: Docker unavailable: {e}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260901_000003_constrain_cloud_telemetry_fidelity";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!pg_constraint_exists(&db, "projects_cloud_telemetry_fidelity_valid").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(pg_constraint_exists(&db, "projects_cloud_telemetry_fidelity_valid").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!pg_constraint_exists(&db, "projects_cloud_telemetry_fidelity_valid").await?);
+    Ok(())
+}
+
+/// m20260901_000004_create_cloud_span_outbox
+/// Creates: cloud_span_outbox (later renamed to cloud_telemetry_outbox by 000903_000001)
+#[tokio::test]
+async fn test_cloud_span_outbox_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping cloud_span_outbox reversibility test: Docker unavailable: {e}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260901_000004_create_cloud_span_outbox";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_span_outbox").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "cloud_span_outbox").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_span_outbox").await?);
+    Ok(())
+}
+
+/// m20260901_000005_add_cloud_telemetry_write_mode
+/// Adds: projects.cloud_telemetry_write_mode
+#[tokio::test]
+async fn test_cloud_telemetry_write_mode_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping cloud_telemetry_write_mode reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260901_000005_add_cloud_telemetry_write_mode";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "projects", "cloud_telemetry_write_mode").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "cloud_telemetry_write_mode").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "projects", "cloud_telemetry_write_mode").await?);
+    Ok(())
+}
+
+/// m20260901_000006_create_telemetry_write_ledger
+/// Creates: project_telemetry_write_intervals, telemetry_gap_windows
+#[tokio::test]
+async fn test_telemetry_write_ledger_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping telemetry_write_ledger reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260901_000006_create_telemetry_write_ledger";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!table_exists_in_db(&db, "project_telemetry_write_intervals").await?);
+    assert!(!table_exists_in_db(&db, "telemetry_gap_windows").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "project_telemetry_write_intervals").await?);
+    assert!(table_exists_in_db(&db, "telemetry_gap_windows").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "project_telemetry_write_intervals").await?);
+    assert!(!table_exists_in_db(&db, "telemetry_gap_windows").await?);
+    Ok(())
+}
+
+/// m20260901_000007_create_cloud_telemetry_bulk_jobs
+/// Creates: cloud_telemetry_bulk_jobs, cloud_telemetry_bulk_job_projects
+/// Also adds bulk_job_id column to cloud_telemetry_backfills.
+#[tokio::test]
+async fn test_cloud_telemetry_bulk_jobs_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping cloud_telemetry_bulk_jobs reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260901_000007_create_cloud_telemetry_bulk_jobs";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_telemetry_bulk_jobs").await?);
+    assert!(!table_exists_in_db(&db, "cloud_telemetry_bulk_job_projects").await?);
+    assert!(!column_exists(&db, "cloud_telemetry_backfills", "bulk_job_id").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists_in_db(&db, "cloud_telemetry_bulk_jobs").await?);
+    assert!(table_exists_in_db(&db, "cloud_telemetry_bulk_job_projects").await?);
+    assert!(column_exists(&db, "cloud_telemetry_backfills", "bulk_job_id").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!table_exists_in_db(&db, "cloud_telemetry_bulk_jobs").await?);
+    assert!(!table_exists_in_db(&db, "cloud_telemetry_bulk_job_projects").await?);
+    assert!(!column_exists(&db, "cloud_telemetry_backfills", "bulk_job_id").await?);
+    Ok(())
+}
+
+/// m20260902_000001_add_session_token_to_s3_sources
+/// Adds: s3_sources.session_token, s3_sources.credentials_expire_at
+#[tokio::test]
+async fn test_session_token_s3_source_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping session_token_s3_source reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260902_000001_add_session_token_to_s3_sources";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "s3_sources", "session_token").await?);
+    assert!(!column_exists(&db, "s3_sources", "credentials_expire_at").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "s3_sources", "session_token").await?);
+    assert!(column_exists(&db, "s3_sources", "credentials_expire_at").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "s3_sources", "session_token").await?);
+    assert!(!column_exists(&db, "s3_sources", "credentials_expire_at").await?);
+    Ok(())
+}
+
+/// m20260903_000001_generalize_cloud_telemetry_outbox
+/// Renames cloud_span_outbox → cloud_telemetry_outbox, adds entity_type column.
+#[tokio::test]
+async fn test_generalize_cloud_telemetry_outbox_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping generalize_cloud_telemetry_outbox reversibility test: Docker unavailable: {e}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260903_000001_generalize_cloud_telemetry_outbox";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    // Before: the table is cloud_span_outbox (created by 000904_000004), no entity_type.
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(
+        table_exists_in_db(&db, "cloud_span_outbox").await?,
+        "cloud_span_outbox must exist before the rename"
+    );
+    assert!(
+        !table_exists_in_db(&db, "cloud_telemetry_outbox").await?,
+        "cloud_telemetry_outbox must not yet exist"
+    );
+    assert!(!column_exists(&db, "cloud_span_outbox", "entity_type").await?);
+    // After: renamed to cloud_telemetry_outbox with entity_type column.
+    Migrator::up(&db, Some(1)).await?;
+    assert!(
+        !table_exists_in_db(&db, "cloud_span_outbox").await?,
+        "cloud_span_outbox must be gone after rename"
+    );
+    assert!(
+        table_exists_in_db(&db, "cloud_telemetry_outbox").await?,
+        "cloud_telemetry_outbox must exist after rename"
+    );
+    assert!(column_exists(&db, "cloud_telemetry_outbox", "entity_type").await?);
+    // After rollback: renamed back to cloud_span_outbox, entity_type gone.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(
+        table_exists_in_db(&db, "cloud_span_outbox").await?,
+        "cloud_span_outbox must be restored by down()"
+    );
+    assert!(
+        !table_exists_in_db(&db, "cloud_telemetry_outbox").await?,
+        "cloud_telemetry_outbox must be gone after down()"
+    );
+    assert!(!column_exists(&db, "cloud_span_outbox", "entity_type").await?);
+    Ok(())
+}
+
+/// m20260903_000002_add_signal_group_to_write_intervals
+/// Adds: project_telemetry_write_intervals.signal_group
+#[tokio::test]
+async fn test_signal_group_write_intervals_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping signal_group_write_intervals reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260903_000002_add_signal_group_to_write_intervals";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "project_telemetry_write_intervals", "signal_group").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "project_telemetry_write_intervals", "signal_group").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "project_telemetry_write_intervals", "signal_group").await?);
+    Ok(())
+}
+
+/// m20260903_000003_add_cloud_analytics_write_mode
+/// Adds: projects.cloud_analytics_write_mode
+#[tokio::test]
+async fn test_cloud_analytics_write_mode_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping cloud_analytics_write_mode reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260903_000003_add_cloud_analytics_write_mode";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "projects", "cloud_analytics_write_mode").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "projects", "cloud_analytics_write_mode").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "projects", "cloud_analytics_write_mode").await?);
+    Ok(())
+}
+
+/// m20260903_000004_add_target_table_and_payload_row_to_outbox
+/// Adds: cloud_telemetry_outbox.target_table, cloud_telemetry_outbox.payload_row
+#[tokio::test]
+async fn test_outbox_payload_columns_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping outbox_payload_columns reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260903_000004_add_target_table_and_payload_row_to_outbox";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    // cloud_telemetry_outbox already exists at this point (created by 000901_000004,
+    // renamed by 000903_000001); target_table and payload_row are absent.
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "cloud_telemetry_outbox", "target_table").await?);
+    assert!(!column_exists(&db, "cloud_telemetry_outbox", "payload_row").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "cloud_telemetry_outbox", "target_table").await?);
+    assert!(column_exists(&db, "cloud_telemetry_outbox", "payload_row").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "cloud_telemetry_outbox", "target_table").await?);
+    assert!(!column_exists(&db, "cloud_telemetry_outbox", "payload_row").await?);
+    Ok(())
+}
+
+/// m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources
+/// Adds: s3_sources.lifecycle_reconcile_failed_at
+#[tokio::test]
+async fn test_lifecycle_reconcile_failed_at_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping lifecycle_reconcile_failed_at reversibility test: Docker unavailable: {e}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "s3_sources", "lifecycle_reconcile_failed_at").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "s3_sources", "lifecycle_reconcile_failed_at").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "s3_sources", "lifecycle_reconcile_failed_at").await?);
+    Ok(())
+}
+
+/// m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources
+/// Adds: s3_sources.lifecycle_reconcile_generation
+#[tokio::test]
+async fn test_lifecycle_reconcile_generation_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping lifecycle_reconcile_generation reversibility test: Docker unavailable: {e}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "s3_sources", "lifecycle_reconcile_generation").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "s3_sources", "lifecycle_reconcile_generation").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "s3_sources", "lifecycle_reconcile_generation").await?);
+    Ok(())
+}
+
+/// m20260904_000003_add_continuous_archive_source_to_external_services
+/// Adds: external_services.continuous_archive_s3_source_id,
+///       external_services.continuous_archive_pinned_at
+#[tokio::test]
+async fn test_continuous_archive_source_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Skipping continuous_archive_source reversibility test: Docker unavailable: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260904_000003_add_continuous_archive_source_to_external_services";
+    let pre = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found"));
+    Migrator::up(&db, Some(pre as u32)).await?;
+    assert!(!column_exists(&db, "external_services", "continuous_archive_s3_source_id").await?);
+    assert!(!column_exists(&db, "external_services", "continuous_archive_pinned_at").await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(column_exists(&db, "external_services", "continuous_archive_s3_source_id").await?);
+    assert!(column_exists(&db, "external_services", "continuous_archive_pinned_at").await?);
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!column_exists(&db, "external_services", "continuous_archive_s3_source_id").await?);
+    assert!(!column_exists(&db, "external_services", "continuous_archive_pinned_at").await?);
+    Ok(())
 }

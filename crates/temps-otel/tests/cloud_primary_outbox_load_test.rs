@@ -258,7 +258,7 @@ impl Harness {
         self.db
             .execute(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "DELETE FROM cloud_span_outbox".to_string(),
+                "DELETE FROM cloud_telemetry_outbox".to_string(),
             ))
             .await
             .expect("queue must be resettable");

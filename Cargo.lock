@@ -10983,6 +10983,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "chrono",
+ "regex",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",

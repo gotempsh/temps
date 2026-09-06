@@ -27,8 +27,12 @@ pub enum ContinuousArchiveError {
     #[error("{0}")]
     Mismatch(String),
     /// A database error occurred while reading or persisting the pin.
-    #[error("{0}")]
-    Database(String),
+    #[error("Database error while {context}: {source}")]
+    Database {
+        context: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
 }
 
 /// Ensure `service`'s continuous archive source is pinned to `requested_source_id`,
@@ -69,11 +73,12 @@ pub async fn ensure_continuous_archive_source_pin(
         .filter(s3_sources::Column::ManagedByCloud.eq(true))
         .one(db)
         .await
-        .map_err(|e| {
-            ContinuousArchiveError::Database(format!(
-                "db error looking up the Cloud-managed S3 source for service {}: {}",
-                service.id, e
-            ))
+        .map_err(|e| ContinuousArchiveError::Database {
+            context: format!(
+                "looking up the Cloud-managed S3 source for service {}",
+                service.id
+            ),
+            source: e,
         })?
         .map(|source| source.id)
         .unwrap_or(requested_source_id);
@@ -99,11 +104,12 @@ pub async fn ensure_continuous_archive_source_pin(
     }
     .update(db)
     .await
-    .map_err(|e| {
-        ContinuousArchiveError::Database(format!(
-            "db error pinning service {} to continuous archive source {default_source_id}: {}",
-            service.id, e
-        ))
+    .map_err(|e| ContinuousArchiveError::Database {
+        context: format!(
+            "pinning service {} to continuous archive source {default_source_id}",
+            service.id
+        ),
+        source: e,
     })?;
 
     Ok(default_source_id)

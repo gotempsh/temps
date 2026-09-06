@@ -22,6 +22,7 @@ axum.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 sea-orm.workspace = true
 sha2.workspace = true

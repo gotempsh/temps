@@ -17,12 +17,10 @@ import {
 import { CopyButton } from '@/components/ui/copy-button'
 import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  CloudBackfillStatusResponse,
-  getCloudBackfillStatusOptions,
-  isBackfillStalled,
-} from '@/lib/cloud-telemetry-backfill'
+import { getCloudBackfillStatusOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { CloudBackfillStatusResponse } from '@/api/client/types.gen'
 import { PROJECT_STATUS_HINTS } from '@/lib/cloud-telemetry-activation'
+import { isBackfillStalled } from '@/lib/backfill-stall'
 import { useQuery } from '@tanstack/react-query'
 import { AlertCircle, ArrowRight, Cloud, Layers } from 'lucide-react'
 import { Link } from 'react-router'
@@ -57,7 +55,7 @@ export function CloudTelemetryBackfillCard({
   project: ProjectResponse
 }) {
   const { data, isPending, isError, error, refetch } = useQuery(
-    getCloudBackfillStatusOptions(project?.id ?? undefined)
+    getCloudBackfillStatusOptions({ path: { project_id: project.id } })
   )
 
   // A running backfill this project's own settings page never started is the

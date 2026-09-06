@@ -92,9 +92,12 @@ impl BackupEngine for PostgresWalgEngine {
             temps_providers::continuous_archive::ContinuousArchiveError::Mismatch(reason) => {
                 BackupError::PermanentFailure { reason }
             }
-            temps_providers::continuous_archive::ContinuousArchiveError::Database(reason) => {
-                BackupError::Failed { reason }
-            }
+            temps_providers::continuous_archive::ContinuousArchiveError::Database {
+                context,
+                source,
+            } => BackupError::Failed {
+                reason: format!("{context}: {source}"),
+            },
         })?;
 
         let s3_source = v2_common::load_s3_source(deps.db.as_ref(), s3_source_id).await?;

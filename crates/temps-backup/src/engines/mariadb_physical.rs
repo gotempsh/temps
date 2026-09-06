@@ -100,9 +100,12 @@ impl BackupEngine for MariadbPhysicalEngine {
             temps_providers::continuous_archive::ContinuousArchiveError::Mismatch(reason) => {
                 BackupError::PermanentFailure { reason }
             }
-            temps_providers::continuous_archive::ContinuousArchiveError::Database(reason) => {
-                BackupError::Failed { reason }
-            }
+            temps_providers::continuous_archive::ContinuousArchiveError::Database {
+                context,
+                source,
+            } => BackupError::Failed {
+                reason: format!("{context}: {source}"),
+            },
         })?;
 
         let (s3_source, s3_client) = v2_common::load_and_build_s3_client(

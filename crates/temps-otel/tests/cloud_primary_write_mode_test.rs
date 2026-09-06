@@ -1737,12 +1737,12 @@ async fn a_dead_letter_keeps_its_failure_record_after_its_span_content_expires()
         .db
         .execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "INSERT INTO cloud_span_outbox \
-                 (project_id, payload, payload_bytes, enqueued_at, attempts, state, settled_at, \
-                  last_error) \
-             VALUES ($1, '{\"trace_id\":\"aged\"}', 22, now() - INTERVAL '40 days', 10, \
+            "INSERT INTO cloud_telemetry_outbox \
+                 (project_id, entity_type, payload, payload_bytes, enqueued_at, attempts, state, \
+                  settled_at, last_error) \
+             VALUES ($1, 'span', '{\"trace_id\":\"aged\"}', 22, now() - INTERVAL '40 days', 10, \
                      'dead_letter', now() - INTERVAL '30 days', 'upstream refused the batch'), \
-                    ($1, '{\"trace_id\":\"fresh\"}', 23, now(), 10, 'dead_letter', now(), \
+                    ($1, 'span', '{\"trace_id\":\"fresh\"}', 23, now(), 10, 'dead_letter', now(), \
                      'upstream refused the batch')",
             vec![project.into()],
         ))
@@ -1757,7 +1757,7 @@ async fn a_dead_letter_keeps_its_failure_record_after_its_span_content_expires()
 
     let with_payload = harness
         .scalar::<i64>(
-            "SELECT COUNT(*)::bigint AS v FROM cloud_span_outbox \
+            "SELECT COUNT(*)::bigint AS v FROM cloud_telemetry_outbox \
              WHERE project_id = $1 AND payload IS NOT NULL",
             vec![project.into()],
         )
@@ -1786,7 +1786,7 @@ async fn a_dead_letter_keeps_its_failure_record_after_its_span_content_expires()
     assert_eq!(
         harness
             .scalar::<i32>(
-                "SELECT attempts AS v FROM cloud_span_outbox \
+                "SELECT attempts AS v FROM cloud_telemetry_outbox \
                  WHERE project_id = $1 AND payload IS NULL",
                 vec![project.into()],
             )

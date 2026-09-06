@@ -140,11 +140,13 @@ pub async fn setup(
             address: underlay_address,
         });
     }
-    // Serialize reservation, privileged host mutation, and readiness
-    // publication across server startup and operator CLI processes. Database
-    // generation fencing remains the stale-writer backstop, while this lock
-    // prevents two generations from concurrently reconfiguring shared kernel
-    // and Docker resources.
+    // Take the advisory lock in a short transaction to serialize concurrent
+    // reservation attempts, then commit immediately. The generation counter
+    // written by ensure_control_plane_reservation fences any concurrent
+    // completion in set_control_plane_ready_for, so there is no need to hold
+    // a DB transaction (and a connection-pool slot) open across the slow
+    // privileged I/O below (subprocess ip/nft, Docker network create/inspect,
+    // manager.bootstrap). Holding it open risks pool exhaustion under load.
     let setup_lock = db.begin().await?;
     setup_lock
         .execute(Statement::from_string(
@@ -156,6 +158,10 @@ pub async fn setup(
     let reservation = allocator
         .ensure_control_plane_reservation(underlay_address)
         .await?;
+    // Release the advisory lock and the connection-pool slot before the slow
+    // privileged I/O begins. The generation counter in the reservation now
+    // acts as the serialization backstop.
+    setup_lock.commit().await?;
     let cluster_network = reservation.cluster_config;
     let mut privileged_setup_started = false;
     let attempt = async {
@@ -266,7 +272,6 @@ pub async fn setup(
             Err(setup_error)
         }
     };
-    setup_lock.commit().await?;
     let (alloc, peers, config, manager) = outcome?;
     info!(
         cidr = %alloc.compute_cidr,

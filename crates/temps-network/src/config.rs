@@ -118,35 +118,58 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Validate an interface name against the allowlist `^[a-zA-Z0-9._@:-]{1,15}$`.
+///
+/// This is the exact set the Linux kernel permits minus characters that could
+/// break nft or iptables script literals (notably `"`, which terminates an
+/// nft string literal, and whitespace/`/`, which the kernel never allows
+/// anyway). Validation here is the single gate for all three device-name
+/// fields; render call sites do not need to re-check.
+fn validate_interface_name(name: &str, field: &str) -> crate::Result<()> {
+    if name.is_empty() {
+        return Err(NetworkError::InvalidConfig {
+            reason: format!("{field} must not be empty"),
+        });
+    }
+    // Linux IFNAMSIZ is 16 bytes including the trailing NUL, so the
+    // human-visible cap is 15. Catch this here rather than letting netlink
+    // fail with a less obvious error.
+    if name.len() > 15 {
+        return Err(NetworkError::InvalidConfig {
+            reason: format!(
+                "{field} '{}' exceeds the 15-character interface-name limit",
+                name
+            ),
+        });
+    }
+    // Allow only characters safe for nft/iptables script interpolation.
+    let all_safe = name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b':' | b'-'));
+    if !all_safe {
+        return Err(NetworkError::InvalidConfig {
+            reason: format!(
+                "{field} '{}' contains characters not allowed in nft/iptables scripts; \
+                 interface names must match [a-zA-Z0-9._@:-]",
+                name
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl NetworkConfig {
     /// Validate the config in isolation (without considering peers).
     ///
     /// Per-peer validation lives in [`Self::validate_with`].
     pub fn validate(&self) -> crate::Result<()> {
-        if self.bridge_name.is_empty() {
-            return Err(NetworkError::InvalidConfig {
-                reason: "bridge_name must not be empty".into(),
-            });
-        }
-        if self.bridge_name.len() > 15 {
-            // Linux IFNAMSIZ is 16 bytes including the trailing NUL, so the
-            // human-visible cap is 15. We catch this here rather than letting
-            // netlink fail with a less obvious error message later.
-            return Err(NetworkError::InvalidConfig {
-                reason: format!(
-                    "bridge_name '{}' exceeds the 15-character interface-name limit",
-                    self.bridge_name
-                ),
-            });
-        }
-        if self.vxlan_dev_name.len() > 15 {
-            return Err(NetworkError::InvalidConfig {
-                reason: format!(
-                    "vxlan_dev_name '{}' exceeds the 15-character interface-name limit",
-                    self.vxlan_dev_name
-                ),
-            });
-        }
+        // validate_interface_name checks non-empty, <=15 chars, and the
+        // allowlist [a-zA-Z0-9._@:-]. The allowlist closes the structural
+        // gap where a '"' in an interface name would terminate an nft string
+        // literal when the name is interpolated unescaped.
+        validate_interface_name(&self.bridge_name, "bridge_name")?;
+        validate_interface_name(&self.vxlan_dev_name, "vxlan_dev_name")?;
+
         if self.docker_network_name.is_empty() {
             return Err(NetworkError::InvalidConfig {
                 reason: "docker_network_name must not be empty".into(),
@@ -170,11 +193,8 @@ impl NetworkConfig {
                     reason: "vxlan port must not be zero".into(),
                 });
             }
-            if self.underlay_dev.is_empty() {
-                return Err(NetworkError::InvalidConfig {
-                    reason: "underlay_dev must be set when transport is vxlan".into(),
-                });
-            }
+            // Covers empty, too-long, and unsafe characters in one call.
+            validate_interface_name(&self.underlay_dev, "underlay_dev")?;
         }
         Ok(())
     }
@@ -292,6 +312,54 @@ mod tests {
         };
         let err = c.validate().unwrap_err();
         assert!(matches!(err, NetworkError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn config_rejects_bridge_name_with_double_quote() {
+        // '"' is permitted by the Linux kernel but terminates an nft string
+        // literal when interpolated unescaped inside iifname "...".
+        let c = NetworkConfig {
+            bridge_name: "br-\"bad".into(),
+            ..NetworkConfig::default()
+        };
+        assert!(matches!(
+            c.validate().unwrap_err(),
+            NetworkError::InvalidConfig { .. }
+        ));
+    }
+
+    #[test]
+    fn config_rejects_underlay_dev_with_space() {
+        let c = NetworkConfig {
+            underlay_dev: "eth 0".into(),
+            ..NetworkConfig::default()
+        };
+        assert!(matches!(
+            c.validate().unwrap_err(),
+            NetworkError::InvalidConfig { .. }
+        ));
+    }
+
+    #[test]
+    fn config_rejects_vxlan_dev_name_with_slash() {
+        let c = NetworkConfig {
+            vxlan_dev_name: "vxlan/bad".into(),
+            ..NetworkConfig::default()
+        };
+        assert!(matches!(
+            c.validate().unwrap_err(),
+            NetworkError::InvalidConfig { .. }
+        ));
+    }
+
+    #[test]
+    fn config_accepts_valid_interface_name_chars() {
+        // All character classes in the allowlist [a-zA-Z0-9._@:-] in one name.
+        let c = NetworkConfig {
+            bridge_name: "br0._@:-".into(),
+            ..NetworkConfig::default()
+        };
+        c.validate().unwrap();
     }
 
     #[test]

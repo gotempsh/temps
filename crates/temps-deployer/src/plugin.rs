@@ -22,6 +22,8 @@ use crate::{
 pub struct DeployerPlugin;
 
 const CONTROL_PLANE_OVERLAY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+// Exponential backoff for transient errors caps at this ceiling.
+const CONTROL_PLANE_OVERLAY_MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 minutes
 
 #[derive(Debug, Error)]
 enum ControlPlaneOverlayReconcileError {
@@ -69,8 +71,10 @@ fn spawn_control_plane_overlay_setup_watcher(
     underlay_dev: Option<String>,
 ) {
     tokio::spawn(async move {
+        // Count consecutive transient failures to drive exponential backoff.
+        let mut consecutive_errors: u32 = 0;
         loop {
-            match reconcile_control_plane_overlay(
+            let sleep_duration = match reconcile_control_plane_overlay(
                 db.clone(),
                 docker.clone(),
                 preferred_private_address.as_deref(),
@@ -79,14 +83,46 @@ fn spawn_control_plane_overlay_setup_watcher(
             .await
             {
                 Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    repair = "temps network setup-multi-node",
-                    "Could not reconcile control-plane multi-node networking; retrying"
-                ),
-            }
-            tokio::time::sleep(CONTROL_PLANE_OVERLAY_RETRY_INTERVAL).await;
+                // No private address configured yet — poll at the base interval.
+                Ok(false) => {
+                    consecutive_errors = 0;
+                    CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
+                }
+                // Operator-actionable misconfigurations can never succeed on
+                // retry. Log once at error level and stop burning resources.
+                Err(error @ ControlPlaneOverlayReconcileError::Setup(
+                    temps_network::control_plane::ControlPlaneSetupError::PublicUnderlayAddress { .. }
+                    | temps_network::control_plane::ControlPlaneSetupError::InvalidUnderlayAddress { .. }
+                    | temps_network::control_plane::ControlPlaneSetupError::InvalidTransport { .. },
+                )) => {
+                    tracing::error!(
+                        error = %error,
+                        repair = "temps network setup-multi-node",
+                        "control-plane overlay requires operator action; \
+                         automatic retry stopped"
+                    );
+                    break;
+                }
+                // Transient errors (DB hiccup, Docker not yet ready, kernel
+                // module loading): retry with exponential backoff capped at
+                // CONTROL_PLANE_OVERLAY_MAX_BACKOFF.
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let delay = CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
+                        .saturating_mul(1u32 << consecutive_errors.min(6))
+                        .min(CONTROL_PLANE_OVERLAY_MAX_BACKOFF);
+                    tracing::warn!(
+                        error = %error,
+                        attempt = consecutive_errors,
+                        retry_secs = delay.as_secs(),
+                        repair = "temps network setup-multi-node",
+                        "could not reconcile control-plane multi-node networking; \
+                         retrying with backoff"
+                    );
+                    delay
+                }
+            };
+            tokio::time::sleep(sleep_duration).await;
         }
     });
 }

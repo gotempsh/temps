@@ -7,6 +7,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { isInternalConsolePath } from '@/lib/cloud-telemetry-activation'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight, Cloud, ShieldCheck, Sparkles, X } from 'lucide-react'
@@ -57,7 +58,11 @@ export function AiAssistantGate({
   return (
     <CloudAiEmptyState
       reason={cloud.data?.reason}
-      setupPath={cloud.data?.setup_path}
+      setupPath={
+        isInternalConsolePath(cloud.data?.setup_path)
+          ? cloud.data.setup_path
+          : undefined
+      }
       onClose={onClose}
     />
   )

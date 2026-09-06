@@ -17,16 +17,16 @@
 //! application. So it takes `&self`, returns `()`, and the worst it can do is
 //! silently... no: the worst it can do is *count a drop the operator can see*.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{mpsc, watch};
 
 use temps_cloud_protocol::{
-    BackupArtifact, BackupTarget, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
-    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedBackupCapability,
-    ManagedNotificationAccepted, ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest,
-    SpanRecord, WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
+    ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability, ManagedAiChatRequest,
+    ManagedAiChatResponse, ManagedBackupCapability, ManagedNotificationAccepted,
+    ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest, SpanRecord,
+    WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
     WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 use uuid::Uuid;
@@ -1114,23 +1114,6 @@ impl CloudLink {
         let backend = self.parse_backend(&base_url)?;
         CloudClient::new(backend)?
             .managed_ai_chat(&token, request)
-            .await
-    }
-
-    /// Upload a completed local artifact without ever routing its bytes through
-    /// the Cloud API process. The instance credential is read only for the two
-    /// small lifecycle calls around the direct object-storage PUT.
-    pub async fn upload_backup_file(
-        &self,
-        backup_id: Uuid,
-        source: String,
-        artifact: BackupArtifact,
-        path: &Path,
-    ) -> Result<BackupTarget, CloudError> {
-        let (base_url, token, instance_id) = self.linked_backup_credential()?;
-        let backend = self.parse_backend(&base_url)?;
-        CloudClient::new(backend)?
-            .upload_backup_file(&token, instance_id, backup_id, source, artifact, path)
             .await
     }
 

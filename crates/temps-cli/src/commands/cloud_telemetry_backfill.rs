@@ -349,7 +349,7 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
 
     println!();
     println!(
-        "{} Backfill complete: {} span(s) accepted by Temps Cloud",
+        "{} Backfill complete (this run): {} span(s) accepted by Temps Cloud",
         "✓".bright_green(),
         shipped_total.to_string().bright_white().bold(),
     );
@@ -588,7 +588,7 @@ fn print_plan(
 
 fn print_estimate(estimate: &temps_otel::services::cloud_backfill::CloudBackfillEstimate) {
     println!(
-        "{} Spans in window: {}",
+        "{} Spans in window (full estimate): {}",
         "→".bright_blue(),
         estimate.spans.to_string().bright_white().bold()
     );

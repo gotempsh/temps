@@ -32,12 +32,11 @@
 pub mod messages;
 
 pub use messages::{
-    BackupArtifact, BackupCompleted, BackupCompression, BackupEngine, BackupFormat,
-    BackupLifecycleEventAccepted, BackupLifecycleEventRequest, BackupLifecycleStage, BackupTarget,
-    BackupTargetRequest, EnrollRequest, EnrollResponse, Envelope, Heartbeat, HeartbeatAck,
-    IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability,
-    ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation, ManagedAiEvidence,
-    ManagedAiTask, ManagedBackupCapability, ManagedNotificationAccepted,
+    BackupCompression, BackupEngine, BackupFormat, BackupLifecycleEventAccepted,
+    BackupLifecycleEventRequest, BackupLifecycleStage, EnrollRequest, EnrollResponse, Envelope,
+    Heartbeat, HeartbeatAck, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
+    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation,
+    ManagedAiEvidence, ManagedAiTask, ManagedBackupCapability, ManagedNotificationAccepted,
     ManagedNotificationRequest, ManagedNotificationSeverity, NativeSnapshot,
     NativeSnapshotIdentity, NativeSnapshotObjectDeclaration, NativeSnapshotObjectKind,
     NativeSnapshotRequest, SpanRecord, TelemetryBatch, WalGObjectCompleted, WalGObjectDeclaration,

@@ -22,13 +22,10 @@
  * unhappy.
  */
 
-import {
-  cloudTelemetryStatusKey,
-  fetchCloudTelemetryStatus,
-  problemDetail,
-} from '@/api/cloudTelemetry'
+import { getCloudTelemetryStatusOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { CloudTelemetryWriteStatusResponse } from '@/api/client/types.gen'
 import { CloudTelemetryActivationSection } from '@/components/observe/CloudTelemetryActivationSection'
-import type { CloudTelemetryWriteStatus } from '@/api/cloudTelemetry'
+import { problemDetail } from '@/lib/api-problem'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -78,8 +75,7 @@ function Stat({
 
 export function CloudTelemetryWriteStatusCard() {
   const { data, isPending, isError, error, refetch } = useQuery({
-    queryKey: cloudTelemetryStatusKey(),
-    queryFn: fetchCloudTelemetryStatus,
+    ...getCloudTelemetryStatusOptions(),
     refetchInterval: 30_000,
   })
 
@@ -122,8 +118,8 @@ export function CloudTelemetryWriteStatusCard() {
         <CloudTelemetryActivationSection
           configured={data?.configured ?? false}
           statusPending={isPending}
-          reason={data?.reason}
-          setupPath={data?.setup_path}
+          reason={data?.reason ?? undefined}
+          setupPath={data?.setup_path ?? undefined}
         />
       </CardContent>
     </Card>
@@ -137,7 +133,7 @@ function WriteStatusBody({
   error,
   onRetry,
 }: {
-  data: CloudTelemetryWriteStatus | undefined
+  data: CloudTelemetryWriteStatusResponse | undefined
   isPending: boolean
   isError: boolean
   error: unknown
@@ -271,12 +267,12 @@ function WriteStatusBody({
           value={
             // `undefined` is not zero: an empty queue has no oldest span, and
             // rendering "0s" would read as "everything is instant".
-            data.oldest_unshipped_age_secs === undefined
+            data.oldest_unshipped_age_secs == null
               ? '—'
               : humanAge(data.oldest_unshipped_age_secs)
           }
           hint={
-            data.oldest_unshipped_age_secs === undefined
+            data.oldest_unshipped_age_secs == null
               ? 'Queue is empty'
               : 'Time this span has waited for Cloud'
           }

@@ -5,12 +5,10 @@
 //! `cloud_telemetry_outbox` in ADR-043 (see
 //! `m20260903_000001_generalize_cloud_telemetry_outbox`).
 //!
-//! The table name in Postgres is now `cloud_telemetry_outbox`, but
-//! `temps-cloud-client/src/outbox.rs` still references the old SQL table name
-//! as raw string literals (that crate is updated separately by the next agent
-//! per the ADR-043 implementation plan). The Sea-ORM `Entity` in this module
-//! cannot itself change the live table name without the crate that uses it
-//! issuing SQL against the correct table name.
+//! The table name in Postgres is now `cloud_telemetry_outbox`.
+//! `temps-cloud-client/src/outbox.rs` has been updated to reference the new
+//! table name; this shim exists only to keep existing import paths compiling
+//! without a second simultaneous rename of every callsite.
 //!
 //! **New code must use [`super::cloud_telemetry_outbox`] directly.**
 //! This module exists only so existing import paths that would fail at compile
