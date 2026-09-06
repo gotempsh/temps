@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState, type CSSProperties } from 'react'
-import { RefreshCw } from 'lucide-react'
+import { Cpu, RefreshCw, Server } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -76,7 +76,9 @@ export function NodesLedger({ dense, go, meta }: { dense: boolean; go: (v: strin
       </span>
     )
     return {
-      id: n.name, state: NODE_STATE[n.status], onOpen: () => go(`node:${n.name}`),
+      // Brand §6 "an icon wherever it adds context": the fleet mixes roles, so the role leads the row.
+      // Muted ink; the status glyph keeps its own slot, so an offline worker reads × and a chip, never a red chip.
+      id: n.name, state: NODE_STATE[n.status], onOpen: () => go(`node:${n.name}`), icon: n.role === 'control plane' ? <Server aria-hidden /> : <Cpu aria-hidden />,
       sort: { name: n.name, status: n.status, heartbeat: n.heartbeat, mem: off ? null : n.memPct, running: n.containers.length },
       mobile: <><span className="block font-medium">{n.name} <span className="font-normal text-muted-foreground">· {n.role}</span></span><span className="block truncate text-[11px] text-muted-foreground">{n.status} · heartbeat {n.heartbeat} · {off ? `${n.containers.length} containers unreachable` : `mem ${n.memPct}%`}</span></>,
       cells: [

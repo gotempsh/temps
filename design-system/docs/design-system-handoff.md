@@ -323,15 +323,44 @@ The searchable select. Anything with more than about seven options, or options
 the operator recognises rather than recalls (branches, images, regions,
 environments, providers), is a Picker, never a plain `<select>`. Mono trigger
 the height of an Input showing the current value; opens to an autofocused
-filter box and grouped rows (`group`), each with an optional state glyph and a
-muted `meta` on the right (last commit and age, region, "1 deploy ahead"). The
-current value is marked ●. `allowCustom="use branch"` offers the typed text
+filter box and grouped rows (`group`), each with a state glyph slot, a fixed
+16px slot for the option's kind `icon` in muted ink, the label, and a muted
+`meta` on the right (last commit and age, region, "1 deploy ahead"). The
+current value is marked ● in the glyph slot. The two slots are separate and
+stay separate: `icon` says what the option is (a worktree, a sandbox, a
+permission mode), the glyph says how it is, and an icon is never tinted by
+`state`. `icon` is required wherever the options are of different kinds — the
+workspace picker (worktree · shared main checkout · sandbox), a list mixing
+environments and regions — and left off when every option is the same kind. `allowCustom="use branch"` offers the typed text
 as a row for values not in the list. `loading` and `error` are states inside
 the list, not a spinner on the trigger: they say what was being fetched and
 from where, quote the source's error, and offer retry. Reference: branch
 picker in project settings (`/v1?p=api-gateway`, settings tab) and
 `/op-components#picker`. The real console's `SearchableSelect` in
 `web/src/components/ui/searchable-select.tsx` is the migration target.
+
+### Command palette (`⌘K`)
+
+`CommandDialog` from `src/components/ui/command.tsx`, skinned: the magnifier is
+replaced by a `>` prompt, the whole dialog is mono, group headings are
+`.op-label`-style uppercase, the selected row is an ink fill, and there is no
+shadow — the ink border is the elevation. It is anchored near the top, not
+centred, so the list does not grow its tail out of the viewport. `⌘K` opens it
+everywhere and a visible **find** button in the header opens it too; the key is
+the accelerator, never the only entry point.
+
+Every row leads with a fixed 16px slot, and the palette is the list where the
+kind icon matters most, because it is the one list that mixes every kind the
+console has. *Projects* rows are the state glyph, then the project's identity
+mark and its kind (app · worker · static), then the name. *Pages* and
+*resources* rows carry the same icon the sidebar gives that page, so the
+palette and the nav read as one map: databases is `Database`, traces is
+`Waypoints`, uptime is `Globe`, git providers is `GitBranch`. *Commands* rows
+carry the icon of what the command does (`Rocket` deploy, `HardDrive` back up).
+Bare words in a palette group are a bug: a reader scanning results has nothing
+but the word to tell a page from a project from a command. Icons are muted ink;
+the state glyph keeps its own slot beside them. Reference: `/components#palette`
+and the `⌘K` palette on `/v1`.
 
 ### Switch and Toggle
 
@@ -445,7 +474,15 @@ only and say "more" instead of the total; do not invent a count.
 **Ledger**: title, status line, filter with `/`, actions, rows with `j` `k` `⏎`,
 footer with counts and keys. Rows sort attention first. `grid` is the CSS
 `grid-template-columns` for md and up; phones get name + note + glyph. Pass a
-`PageState` as `state` to replace the rows. Used for projects, databases,
+`PageState` as `state` to replace the rows. A row takes an `icon`: the kind of
+record it is (app / worker / static project, database engine, control plane /
+worker node, span kind), drawn in a fixed 16px slot at the head of the first
+cell and before the name on a phone, in muted ink. It rides the first cell
+rather than taking a column of its own, so no `grid` string changes and no
+single-kind ledger carries an empty slot. It is required when the list mixes
+kinds and left off when the ledger's title already names the kind (the deploys
+of one project). The state glyph stays where it is; an icon never carries a
+state colour. Used for projects, databases,
 errors; intended for deploys, domains, users, backups, sandboxes, email.
 
 **The observe primitives** (`src/components/op/viz.tsx`, demos on
@@ -455,7 +492,7 @@ states, soft rule between rows, ink frame around the group.
 
 | Primitive | Shape it draws | Where web needs it |
 |---|---|---|
-| `Breakdown` | one dimension ranked: label · count · share, share as an ink bar behind the row; optional `icon` in a fixed 16px slot (flag, browser mark, channel, device); fills its Section's height with the footer pinned to the bottom so grid peers align; rows with `children` open in place with a path header; honest "other" remainder | the ten analytics cards, dimension lists, page/event detail |
+| `Breakdown` | one dimension ranked: label · count · share, share as an ink bar behind the row; `icon` in a fixed 16px slot (flag, browser mark, channel, device), muted ink, required when the rows are of different kinds and omitted when they are not; fills its Section's height with the footer pinned to the bottom so grid peers align; rows with `children` open in place with a path header; honest "other" remainder | the ten analytics cards, dimension lists, page/event detail |
 | `GeoMap` | countries filled by state (ok / warn / error tones, muted for no data); on a fine pointer the hovered country reads at the pointer and nothing sits under the map, click opens; below md the readout is a row under the map, tap to read and tap again to open; second view of a by-country list, never the only one | speed by country, locations |
 | `Sparkline` | one ink line in a cell, last point marked, no axes, never its own number | page rows, observe tiles, metric lists |
 | `Funnel` | bars by share of entrants; conversion and drop-off per step, drop-off ≥ 50% red | funnels |

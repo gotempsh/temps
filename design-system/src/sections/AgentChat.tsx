@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { ArrowUp, Bot, Brain, Check, ChevronDown, ShieldOff, Zap, ChevronRight, Copy, Pencil, X, FilePen, FileText, GitBranch, Globe, HelpCircle, ListChecks, ListOrdered, Paperclip, RotateCcw, Search, Square, Terminal, ThumbsDown, ThumbsUp, type LucideIcon } from 'lucide-react'
+import { ArrowUp, Bot, Box, Brain, Check, ChevronDown, Container, ShieldOff, Zap, ChevronRight, Copy, Pencil, X, FilePen, FileText, GitBranch, Globe, HelpCircle, ListChecks, ListOrdered, Paperclip, RotateCcw, Search, Square, Terminal, ThumbsDown, ThumbsUp, type LucideIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Drop, EchoDialog, Kbd, MOD, Phrase, Picker, Section, Status, StatusLine, GLYPH, GLYPH_CLASS, type State } from '@/components/op'
 import { PAGE_BLEED } from '@/components/shell-context'
@@ -385,7 +385,16 @@ const MODES = [
   { value: 'auto', label: 'Auto', meta: 'safe runs; destructive asks', icon: <Zap /> },
   { value: 'full', label: 'Full access', meta: 'nothing asks · sandbox only', state: 'warn' as State, icon: <ShieldOff /> },
 ]
-const SPACES = [{ value: 'worktree', label: 'worktree · feat/checkout-address', meta: 'isolated', state: 'ok' as State }, { value: 'main', label: 'main checkout', meta: 'shared with you', state: 'warn' as State }, { value: 'sandbox', label: 'sandbox · sbx_9f3', meta: 'docker · fsn1', state: 'ok' as State }]
+/* Three different kinds of place, not three flavours of one: brand §6 "an icon
+   wherever it adds context" puts the kind in its own slot before the name, so a
+   reader tells a worktree from the shared checkout from a container without reading.
+   The state glyph keeps its slot — the shared checkout is ◐ and a folder mark, never
+   an amber folder. */
+const SPACES = [
+  { value: 'worktree', label: 'worktree · feat/checkout-address', meta: 'isolated', state: 'ok' as State, icon: <GitBranch /> },
+  { value: 'main', label: 'main checkout', meta: 'shared with you', state: 'warn' as State, icon: <Box /> },
+  { value: 'sandbox', label: 'sandbox · sbx_9f3', meta: 'docker · fsn1', state: 'ok' as State, icon: <Container /> },
+]
 
 /**
  * The context meter and what it opens. The panel is a `Drop`, not a hand-rolled

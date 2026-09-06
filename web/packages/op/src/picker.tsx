@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useMemo, useState, type ReactNode } from 'react'
-import { Check, ChevronsUpDown, RotateCcw } from 'lucide-react'
+import { ChevronsUpDown, RotateCcw } from 'lucide-react'
 import { cn } from './lib/cn'
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from './ui/command'
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
@@ -19,8 +19,11 @@ import { GLYPH, GLYPH_CLASS, type State } from './status'
  *    nothing is chosen
  *  - opens to a search box (autofocused, `/` is not needed) and grouped rows;
  *    type to filter, ↑↓ to move, ⏎ to choose, Esc to close
- *  - each row: optional state glyph, label, and a muted `meta` on the right
- *    (last commit, "default", region). The current value is marked ●
+ *  - each row: the state glyph slot (● when it is the current value), then a
+ *    fixed 16px slot for the option's kind `icon` in muted ink, then the label
+ *    and a muted `meta` on the right (last commit, "default", region). Kind and
+ *    state never share a slot: the icon says what the option is, the glyph says
+ *    how it is
  *  - `allowCustom`: typing something not in the list offers "use <typed>",
  *    for branches that do not exist yet or values the list did not load
  *  - `loading` and `error` are real states inside the list, not a spinner
@@ -33,7 +36,7 @@ export type PickerOption = {
   group?: string
   meta?: ReactNode
   state?: State
-  /** A small icon that describes the option (permission mode, provider). Drawn in the glyph slot, coloured by `state` if any. */
+  /** What kind of thing the option is (permission mode, provider, workspace). Drawn in its own fixed 16px slot before the label, in muted ink — never coloured, never in the glyph's slot. Required when the list mixes kinds. */
   icon?: ReactNode
   /** Extra words that should match the filter (issue id, sha, alias). */
   keywords?: string
@@ -84,8 +87,8 @@ export function Picker({ value, onChange, options, label, placeholder = 'choose�
           aria-label={label ?? placeholder}
           className={cn('flex h-8 w-full items-center gap-2 border bg-background px-2 text-left text-xs hover:bg-muted focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring', mono && 'font-mono', !selected && !value && 'text-muted-foreground', className)}
         >
-          {selected?.icon ? <span aria-hidden className={cn('flex w-3.5 shrink-0 items-center justify-center [&_svg]:h-3.5 [&_svg]:w-3.5', selected.state && GLYPH_CLASS[selected.state])}>{selected.icon}</span>
-            : selected?.state && <span aria-hidden className={cn('w-3 shrink-0 text-center', GLYPH_CLASS[selected.state])}>{GLYPH[selected.state]}</span>}
+          {selected?.state && <span aria-hidden className={cn('w-3 shrink-0 text-center', GLYPH_CLASS[selected.state])}>{GLYPH[selected.state]}</span>}
+          {selected?.icon && <span aria-hidden className="flex w-3.5 shrink-0 items-center justify-center text-muted-foreground [&_svg]:h-3.5 [&_svg]:w-3.5">{selected.icon}</span>}
           <span className="min-w-0 flex-1 truncate">{selected?.label ?? value ?? placeholder}</span>
           <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 opacity-50" />
         </button>
@@ -107,12 +110,11 @@ export function Picker({ value, onChange, options, label, placeholder = 'choose�
               <CommandGroup key={g || '__'} heading={g || undefined} className="[&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[0.1em]">
                 {items.map((o) => (
                   <CommandItem key={o.value} value={`${o.label ?? o.value} ${o.value} ${o.keywords ?? ''}`} disabled={o.disabled} onSelect={() => choose(o.value)} className="gap-2 rounded-none data-[selected=true]:bg-foreground data-[selected=true]:text-background">
-                    {o.icon
-                      ? <span aria-hidden className={cn('flex w-3.5 shrink-0 items-center justify-center [&_svg]:h-3.5 [&_svg]:w-3.5', o.value !== value && o.state && GLYPH_CLASS[o.state])}>{o.icon}</span>
-                      : <span aria-hidden className={cn('w-3 shrink-0 text-center', o.value === value ? '' : o.state ? GLYPH_CLASS[o.state] : 'opacity-0')}>{o.value === value ? '●' : o.state ? GLYPH[o.state] : '○'}</span>}
+                    {/* Two slots, never one: the glyph says how (state, or ● for the current value), the icon says what kind. */}
+                    <span aria-hidden className={cn('w-3 shrink-0 text-center', o.value === value ? '' : o.state ? GLYPH_CLASS[o.state] : 'opacity-0')}>{o.value === value ? '●' : o.state ? GLYPH[o.state] : '○'}</span>
+                    {o.icon && <span aria-hidden className={cn('flex w-3.5 shrink-0 items-center justify-center [&_svg]:h-3.5 [&_svg]:w-3.5', o.value === value ? '' : 'text-muted-foreground')}>{o.icon}</span>}
                     <span className={cn('shrink-0', o.value === value && 'font-medium')}>{o.label ?? o.value}</span>
                     {o.meta && <span className="min-w-0 flex-1 truncate text-right text-[11px] opacity-60" title={typeof o.meta === 'string' ? o.meta : undefined}>{o.meta}</span>}
-                    {o.icon && o.value === value && <Check aria-label="selected" className="h-3.5 w-3.5 shrink-0" />}
                   </CommandItem>
                 ))}
               </CommandGroup>

@@ -2,6 +2,24 @@
 
 ## 0.1.2
 
+- Kind icons have a slot of their own, everywhere a list mixes kinds (brand
+  guidelines §6, "an icon wherever it adds context").
+
+  - `LedgerRow` takes `icon`: what kind of record the row is (app / worker /
+    static project, database engine, control plane / worker node, span kind).
+    It renders in a fixed 16px slot at the head of the first cell, and before
+    the name on a phone, in muted ink. It rides the first cell rather than
+    taking a grid track of its own, so no caller's `grid` string changes and no
+    single-kind ledger carries an empty slot. Row heights are unchanged.
+
+  - `PickerOption.icon` no longer shares the state glyph's slot. The glyph slot
+    keeps the state (and the ● that marks the current value); the icon gets its
+    own 16px slot after it, in muted ink, and is never tinted by `state`. An
+    option with an icon is therefore marked selected by the same ● as every
+    other option, so the trailing `Check` is gone. Callers that passed both
+    `icon` and `state` (the permission-mode picker) now read as a glyph *and* a
+    mark rather than a coloured mark.
+
 - The skin class is now `operator ink v1`, the first published version of the
   system. The unreleased `.v4` and `.v5` classes are gone; their rules are
   consolidated unchanged into `.operator.ink.v1`, so a root that used to carry

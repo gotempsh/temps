@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
-import { ExternalLink, Moon, Plus, Square, Terminal as TerminalIcon, Trash2 } from 'lucide-react'
+import { ArrowUpRight, ExternalLink, Inbox, Moon, Plus, Server, Square, Terminal as TerminalIcon, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { LogViewer, type LogLine } from '@/components/ui/log-viewer'
 import {
@@ -220,6 +220,10 @@ const TRACES: Trace[] = [
   { trace_id: 'a7b8c9d0e1f2a3b4', root_span_name: 'GET /api/cart', service_name: 'api-gateway', deployment_environment: 'production', duration_ms: 61, span_count: 5, error_count: 0, status_code: 'OK', start_time: '09:12:48', kind: 'SERVER' },
 ]
 const TRACE_STATE: Record<Trace['status_code'], State> = { OK: 'ok', ERROR: 'error', UNSET: 'idle' }
+/* Brand §6 "an icon wherever it adds context": the list mixes span kinds, and a
+   consumer trace with no caller is a different animal from an inbound request. The
+   kind leads the row in muted ink; the status glyph stays with the operation name. */
+const SPAN_KIND = { SERVER: Server, CLIENT: ArrowUpRight, CONSUMER: Inbox } as const
 const OPS = [
   { span_name: 'POST /checkout', service_name: 'api-gateway', count: 1840, p50: 142, p95: 398, p99: 612, error_rate: 1.7, tail_ratio: 4.3 },
   { span_name: 'GET /api/products', service_name: 'api-gateway', count: 12400, p50: 48, p95: 210, p99: 1900, error_rate: 0.0, tail_ratio: 39.6 },
@@ -245,7 +249,7 @@ export function TracesScreen({ go, dense, plan, notify }: { go: (v: string) => v
   const list = TRACES.filter((t) => inWindow(t) && matches(q, t.root_span_name, t.trace_id, t.service_name, t.deployment_environment) && (only === 'all' || (only === 'errors' && t.error_count > 0) || (only === 'slow' && t.duration_ms > 398)))
   const max = Math.max(...TRACES.map((t) => t.duration_ms))
   const rows: LedgerRow[] = list.map((t) => ({
-    id: t.trace_id, state: TRACE_STATE[t.status_code], onOpen: () => go(`trace:${t.trace_id}`),
+    id: t.trace_id, state: TRACE_STATE[t.status_code], onOpen: () => go(`trace:${t.trace_id}`), icon: (() => { const K = SPAN_KIND[t.kind]; return <K aria-hidden /> })(),
     mobile: <><span className="block font-medium">{t.root_span_name}</span><span className="block truncate text-[11px] text-muted-foreground">{t.service_name} · {t.duration_ms}ms · {t.start_time}</span></>,
     cells: [
       <span className="font-mono text-muted-foreground">{t.trace_id.slice(0, 8)}</span>,

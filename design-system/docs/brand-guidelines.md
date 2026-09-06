@@ -299,6 +299,18 @@ the same way every time.
   eye can scan a list by kind without reading. State stays with the glyph
   (● ◐ × ○ ◌) and never with the icon: a red Chrome logo means nothing.
   Icons are monochrome ink at 14px, never brand colours.
+- **An icon wherever it adds context.** The slot is not a decoration to be
+  granted; it is owed to any list whose items are of different kinds, or
+  whose kind the reader would otherwise have to work out by reading. Pages
+  and resources in the palette, projects (app · worker · static · database),
+  environments, nodes (control plane · worker), providers, settings rows:
+  each carries its kind in a fixed 16px slot before the name, in muted ink.
+  Kind and state never share that slot — the glyph keeps its own, so a
+  degraded worker reads ◐ and a cog, not an amber cog. A single-kind list
+  whose title already names the kind (the deployments of one project) needs
+  no icon: a column of the same mark is noise, and noise is what makes the
+  rest of the marks stop meaning anything. Bare words in a mixed list are
+  the bug, not the restraint.
 - **Rank by the question, not by the header.** "Language" ranks languages
   with locales inside, because the question is "what should I serve", not
   "which Accept-Language strings arrived". A campaign is source · medium ·

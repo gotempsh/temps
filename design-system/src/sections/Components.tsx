@@ -3,7 +3,7 @@
 
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { ArrowUpFromLine, ExternalLink, Loader2, MoreHorizontal, RotateCcw, Trash2 } from 'lucide-react'
+import { ArrowUpFromLine, Box, Cpu, Database, ExternalLink, FileText, HardDrive, Loader2, MoreHorizontal, RotateCcw, Rocket, Rows3, Trash2, Waypoints } from 'lucide-react'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -61,6 +61,7 @@ import {
   Picker,
   Segmented,
   Status,
+  type State,
 } from '@/components/op'
 import { Block, Demo, DocPage, Rule } from '@/components/op-doc'
 import { cn } from '@/lib/utils'
@@ -96,6 +97,24 @@ const TOC = [
   ['breadcrumb', 'Breadcrumb · PageTitle'],
   ['identity', 'Identity'],
   ['banned', 'Banned'],
+] as const
+
+/* Brand §6 "an icon wherever it adds context": the palette is the one list that
+   mixes every kind the console has, so every row leads with a fixed 16px slot in
+   muted ink. Projects carry their kind (app · worker · static), pages carry the
+   same icon the sidebar gives them, commands carry the icon of what they do. The
+   state glyph keeps its own slot: kind and state never share one. */
+const KIND = 'size-4 shrink-0 text-muted-foreground'
+const PROJECT_KIND = { app: Box, worker: Cpu, static: FileText } as const
+const PALETTE_PROJECTS = [
+  ['billing-worker', 'error', 'worker'],
+  ['api-gateway', 'warn', 'app'],
+  ['docs', 'ok', 'static'],
+] as const satisfies readonly (readonly [string, State, keyof typeof PROJECT_KIND])[]
+const PALETTE_PAGES = [
+  ['databases', Database, 'storage'],
+  ['traces', Waypoints, 'observe'],
+  ['backups', HardDrive, 'storage'],
 ] as const
 
 /* The command palette rows and the picker rows share the ink treatment:
@@ -774,6 +793,13 @@ export function ComponentsPage() {
               Rows carry the same status glyphs as the page they jump to, so a failing project looks failing in the
               palette too.
             </p>
+            <p>
+              Every row also leads with its <em>kind</em> in a fixed 16px slot of muted ink: a project&rsquo;s shape
+              (app, worker, static), the icon the sidebar gives a page, the icon of what a command does. The palette
+              is the one list that mixes every kind the console has, so bare words leave the reader nothing but the
+              word to tell a page from a project. Kind and state never share the slot — the glyph keeps its own, and
+              an icon is never tinted.
+            </p>
           </>
         }
       >
@@ -790,26 +816,36 @@ export function ComponentsPage() {
             <CommandList className="font-mono text-xs">
               <CommandEmpty>no matches</CommandEmpty>
               <CommandGroup heading="projects" className={CMDK_HEADING}>
-                <CommandItem className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
-                  <Status state="error" label="billing-worker" />
-                  <CommandShortcut className="text-inherit opacity-60">production</CommandShortcut>
-                </CommandItem>
-                <CommandItem className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
-                  <Status state="warn" label="api-gateway" />
-                  <CommandShortcut className="text-inherit opacity-60">production</CommandShortcut>
-                </CommandItem>
-                <CommandItem className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
-                  <Status state="ok" label="docs" />
-                  <CommandShortcut className="text-inherit opacity-60">production</CommandShortcut>
-                </CommandItem>
+                {PALETTE_PROJECTS.map(([name, state, kind]) => {
+                  const Kind = PROJECT_KIND[kind]
+                  return (
+                    <CommandItem key={name} className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
+                      <Status state={state} label="" />
+                      <Kind aria-hidden className={KIND} />
+                      <span>{name}</span>
+                      <CommandShortcut className="text-inherit opacity-60">{kind} · production</CommandShortcut>
+                    </CommandItem>
+                  )
+                })}
+              </CommandGroup>
+              <CommandGroup heading="pages" className={CMDK_HEADING}>
+                {PALETTE_PAGES.map(([name, Icon, group]) => (
+                  <CommandItem key={name} className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
+                    <Icon aria-hidden className={KIND} />
+                    <span>{name}</span>
+                    <CommandShortcut className="text-inherit opacity-60">{group}</CommandShortcut>
+                  </CommandItem>
+                ))}
               </CommandGroup>
               <CommandGroup heading="commands" className={CMDK_HEADING}>
                 <CommandItem className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
-                  deploy api-gateway
+                  <Rocket aria-hidden className={KIND} />
+                  <span>deploy api-gateway</span>
                   <CommandShortcut className="text-inherit opacity-60">{MOD} ⏎</CommandShortcut>
                 </CommandItem>
                 <CommandItem className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
-                  toggle density
+                  <Rows3 aria-hidden className={KIND} />
+                  <span>toggle density</span>
                   <CommandShortcut className="text-inherit opacity-60">d</CommandShortcut>
                 </CommandItem>
               </CommandGroup>
@@ -824,17 +860,29 @@ export function ComponentsPage() {
               <CommandEmpty>no matches</CommandEmpty>
               <CommandGroup heading="projects" className={CMDK_HEADING}>
                 <CommandItem className={CMDK_ITEM}>
-                  <Status state="error" label="billing-worker" />
-                  <CommandShortcut className="text-inherit opacity-60">production</CommandShortcut>
+                  <Status state="error" label="" />
+                  <Cpu aria-hidden className={KIND} />
+                  <span>billing-worker</span>
+                  <CommandShortcut className="text-inherit opacity-60">worker · production</CommandShortcut>
                 </CommandItem>
                 <CommandItem className={CMDK_ITEM}>
-                  <Status state="ok" label="docs" />
-                  <CommandShortcut className="text-inherit opacity-60">production</CommandShortcut>
+                  <Status state="ok" label="" />
+                  <FileText aria-hidden className={KIND} />
+                  <span>docs</span>
+                  <CommandShortcut className="text-inherit opacity-60">static · production</CommandShortcut>
                 </CommandItem>
               </CommandGroup>
               <CommandGroup heading="pages" className={CMDK_HEADING}>
-                <CommandItem className={CMDK_ITEM}>databases</CommandItem>
-                <CommandItem className={CMDK_ITEM}>traces</CommandItem>
+                <CommandItem className={CMDK_ITEM}>
+                  <Database aria-hidden className={KIND} />
+                  <span>databases</span>
+                  <CommandShortcut className="text-inherit opacity-60">storage</CommandShortcut>
+                </CommandItem>
+                <CommandItem className={CMDK_ITEM}>
+                  <Waypoints aria-hidden className={KIND} />
+                  <span>traces</span>
+                  <CommandShortcut className="text-inherit opacity-60">observe</CommandShortcut>
+                </CommandItem>
               </CommandGroup>
             </CommandList>
           </Command>

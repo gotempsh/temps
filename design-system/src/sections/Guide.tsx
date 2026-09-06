@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
+import { Box, Cpu, Database, FileText, Rocket, Waypoints } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -241,6 +242,50 @@ function LiveCallout() {
       >
         Auto-deploys for four projects are paused until the app is reconnected.
       </Callout>
+    </Live>
+  )
+}
+
+/* The palette group is the sharpest case for "an icon wherever it adds context":
+   one list holding pages, projects and commands. Same six rows twice — the only
+   difference is the 16px slot. */
+const PALETTE_ROWS = [
+  { group: 'pages', label: 'databases', icon: Database, meta: 'storage' },
+  { group: 'pages', label: 'traces', icon: Waypoints, meta: 'observe' },
+  { group: 'projects', label: 'api-gateway', icon: Box, meta: 'app · production', state: 'warn' as State },
+  { group: 'projects', label: 'billing-worker', icon: Cpu, meta: 'worker · production', state: 'error' as State },
+  { group: 'projects', label: 'docs', icon: FileText, meta: 'static · production', state: 'ok' as State },
+  { group: 'commands', label: 'deploy api-gateway', icon: Rocket, meta: '⌘⏎' },
+]
+
+function PaletteRows({ icons }: { icons: boolean }) {
+  return (
+    <div className="op-rows border font-mono text-xs">
+      {PALETTE_ROWS.map((r) => (
+        <div key={r.label} className="flex items-center gap-2 px-3 py-1.5">
+          <span aria-hidden className="w-3 shrink-0 text-center">{r.state ? <Status state={r.state} label="" /> : null}</span>
+          {icons && <r.icon aria-hidden className="size-4 shrink-0 text-muted-foreground" />}
+          <span className="min-w-0 truncate">{r.label}</span>
+          <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">{r.meta}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function LiveKindIcons() {
+  return (
+    <Live label="the same palette, without the slot and with it">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <p className="mb-2 min-h-8 text-[11px] text-muted-foreground">bare words: every row is the same shape, so the reader reads each one to find out what it is</p>
+          <PaletteRows icons={false} />
+        </div>
+        <div>
+          <p className="mb-2 min-h-8 text-[11px] text-muted-foreground">with the kind in a fixed 16px slot: page, app, worker, static site and command, told apart before reading</p>
+          <PaletteRows icons />
+        </div>
+      </div>
     </Live>
   )
 }
@@ -486,6 +531,7 @@ const LIVE: Record<string, ReactNode> = {
 const TASTE_LIVE: Record<string, ReactNode> = {
   'taste--shapes-before-type': <LiveShapes />,
   'taste--icons-say-what-glyphs-say-how': <LiveGlyphs />,
+  'taste--an-icon-wherever-it-adds-context': <LiveKindIcons />,
   'taste--a-fault-looks-like-a-fault': <LiveCallout />,
 }
 

@@ -3,7 +3,7 @@
 
 import { useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { Bot, Link as LinkIcon, Monitor, Rocket, RotateCcw, Search, Share2, Smartphone, Tablet, Trash2 } from 'lucide-react'
+import { Bot, Box, Container, Cpu, FileText, GitBranch, Link as LinkIcon, Monitor, Rocket, RotateCcw, Search, Share2, Smartphone, Tablet, Trash2 } from 'lucide-react'
 import { DocPage, Rule } from '@/components/op-doc'
 import {
   Breakdown, Sparkline, StatusStrip, ScoreRing, CalendarHeatmap, Funnel, Flow, Waterfall, StackTrace, LogLines, Stages, Histogram, Live, ProjectMark,
@@ -167,6 +167,7 @@ export function OpComponentsPage() {
   const [saved, setSaved] = useState(form)
   const [branch, setBranch] = useState('main')
   const [env, setEnv] = useState<string | null>(null)
+  const [space, setSpace] = useState<string>('worktree')
   const [pickState, setPickState] = useState<'loading' | 'error' | 'ok'>('error')
   const [span, setSpan] = useState<string>('s1')
   const [pct, setPct] = useState<Pct>('p95')
@@ -174,9 +175,11 @@ export function OpComponentsPage() {
   const [log, setLog] = useState<string[]>([])
 
   const rows: LedgerRow[] = ([
-    { id: 'api-gateway', state: 'warn' as State, sort: { name: 'api-gateway', visitors: 30800, err: 0.61 }, mobile: <span>api-gateway</span>, cells: [<span className="font-medium">api-gateway</span>, <Status state="warn" label="error rate above 0.5%" />, <Num value={30800} />, <Num value="0.61" unit="%" className="text-destructive" />], onOpen: () => setLog((l) => ['open api-gateway', ...l]) },
-    { id: 'docs', state: 'ok' as State, sort: { name: 'docs', visitors: 2210, err: 0 }, mobile: <span>docs</span>, cells: [<span className="font-medium">docs</span>, <Status state="ok" label="production" />, <Num value={2210} />, <Num value="0.00" unit="%" />], onOpen: () => setLog((l) => ['open docs', ...l]) },
-    { id: 'acme-web', state: 'idle' as State, sort: { name: 'acme-web', visitors: null, err: null }, mobile: <span>acme-web</span>, cells: [<span className="font-medium">acme-web</span>, <Status state="idle" label="not deployed" />, <Num value={null} />, <Num value={null} />] },
+    // `icon` is the row's kind (app · static · worker), muted ink in a fixed 16px slot at the
+    // head of the first cell: the list mixes kinds, so brand §6 owes it the slot. The glyph keeps its own.
+    { id: 'api-gateway', state: 'warn' as State, icon: <Box aria-hidden />, sort: { name: 'api-gateway', visitors: 30800, err: 0.61 }, mobile: <span>api-gateway</span>, cells: [<span className="font-medium">api-gateway</span>, <Status state="warn" label="error rate above 0.5%" />, <Num value={30800} />, <Num value="0.61" unit="%" className="text-destructive" />], onOpen: () => setLog((l) => ['open api-gateway', ...l]) },
+    { id: 'docs', state: 'ok' as State, icon: <FileText aria-hidden />, sort: { name: 'docs', visitors: 2210, err: 0 }, mobile: <span>docs</span>, cells: [<span className="font-medium">docs</span>, <Status state="ok" label="production" />, <Num value={2210} />, <Num value="0.00" unit="%" />], onOpen: () => setLog((l) => ['open docs', ...l]) },
+    { id: 'acme-web', state: 'idle' as State, icon: <Cpu aria-hidden />, sort: { name: 'acme-web', visitors: null, err: null }, mobile: <span>acme-web</span>, cells: [<span className="font-medium">acme-web</span>, <Status state="idle" label="not deployed" />, <Num value={null} />, <Num value={null} />] },
   ] as LedgerRow[]).filter((r) => r.id.includes(q))
 
   return (
@@ -305,7 +308,8 @@ export function OpComponentsPage() {
   page={{ page, pageSize: 20, total: 1284, onPage, onPageSize }} />   footer: 1–20 of 1,284 · ‹ prev · next › · 20 per page
 
 // no filter props → no search box and no "/"; footer is extra text beside the pager, never instead of it
-<Ledger status={null} columns={…} grid="…" rows={rows} total={n} dense={false} footer={<span>…</span>} />`}
+<Ledger status={null} columns={…} grid="…" rows={rows} total={n} dense={false} footer={<span>…</span>} />
+rows={[{ id, state, icon: <Box />, cells, mobile, onOpen }]}   // icon = the row's kind`}
             rule={<><p>Status line, filter (<code>/</code>), actions, rows with <code>j</code>/<code>k</code>/<code>⏎</code>, footer with counts and keys. Rows sort by attention first. Pass a <code>PageState</code> as <code>state</code> and the rows are replaced.</p><p>The search box is drawn only when it is wired: pass <code>filter</code> and <code>onFilter</code> and you get the box and the <code>/</code> binding; omit them and neither exists. When <code>page</code> is set the footer is always the pager, and <code>footer</code> is extra text beside it. Text filters match case-insensitively.</p><p>Columns with a <code>key</code> are sortable: click the header to cycle ascending → descending → off, which returns to the default attention-first order. One column at a time; the footer says what is sorted and offers <em>clear</em>. Numeric columns right-align and sort as numbers; empty values sort last either way.</p><p>Projects, databases, deploys, domains, users, backups, errors are all this.</p></>}>
             <Demo label="live · try j k ⏎ /">
               <Ledger status={<StatusLine sticky={false} state="warn"><Phrase>api-gateway</Phrase> error rate 0.61% since dep_91a.</StatusLine>} columns={[{ label: 'project', key: 'name' }, 'status', { label: 'visitors · 24h', key: 'visitors', numeric: true }, { label: 'error rate', key: 'err', numeric: true }]} grid="1.4fr 1.4fr 120px 100px" rows={rows} total={3} filter={q} onFilter={setQ} placeholder="filter projects" hint="needs attention first" dense={false} />
@@ -358,8 +362,9 @@ export function OpComponentsPage() {
   allowCustom="use branch" searchPlaceholder="filter 9 branches" />
 <Picker value onChange options={ENVS} placeholder="choose an environment" />
 <Picker … loading="branches from github.com/acme/web" />
-<Picker … error="GitHub 401: token expired" onRetry />`}
-            rule={<><p>Anything with more than about seven options, or options the operator recognises rather than recalls (branches, images, regions, environments), is a Picker, never a plain <code>select</code>. Mono trigger the height of an Input; opens to a filter box and grouped rows with a muted <code>meta</code> (last commit, region). The current value is ●.</p><p><code>allowCustom</code> offers "use &lt;typed&gt;" for a branch that does not exist yet. Loading and error are states inside the list that say what was being fetched and from where, with a retry, because the operator has no one to ask why the branch list is empty.</p></>}>
+<Picker … error="GitHub 401: token expired" onRetry />
+<Picker … options={[{ value, label, meta, state, icon: <GitBranch /> }]} />   // icon = the option's kind`}
+            rule={<><p>Anything with more than about seven options, or options the operator recognises rather than recalls (branches, images, regions, environments), is a Picker, never a plain <code>select</code>. Mono trigger the height of an Input; opens to a filter box and grouped rows with a muted <code>meta</code> (last commit, region). The current value is ●.</p><p>An option carries its <em>kind</em> in <code>icon</code>, a fixed 16px slot of muted ink before the label, separate from the glyph slot: required wherever the options are of different kinds (worktree · shared checkout · sandbox), left off when they are all the same. An icon is never tinted by <code>state</code>.</p><p><code>allowCustom</code> offers "use &lt;typed&gt;" for a branch that does not exist yet. Loading and error are states inside the list that say what was being fetched and from where, with a retry, because the operator has no one to ask why the branch list is empty.</p></>}>
             <Demo label="branches · grouped by recency · type to filter · try a new name">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Picker value={branch} onChange={setBranch} options={BRANCHES} label="auto-deploy branch" allowCustom="use branch" searchPlaceholder="filter 9 branches" />
@@ -368,6 +373,15 @@ export function OpComponentsPage() {
                   { value: 'staging', state: 'warn', meta: '1 deploy ahead' },
                   { value: 'pr-212', state: 'idle', meta: 'preview · sleeping', group: 'previews' },
                   { value: 'pr-209', state: 'idle', meta: 'preview · sleeping', group: 'previews' },
+                ]} />
+              </div>
+            </Demo>
+            <Demo label="mixed kinds · the icon says what the option is, the glyph how it is — two slots, never one">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Picker value={space} onChange={setSpace} label="workspace" mono={false} width="380px" options={[
+                  { value: 'worktree', label: 'worktree · feat/checkout-address', meta: 'isolated', state: 'ok', icon: <GitBranch /> },
+                  { value: 'main', label: 'main checkout', meta: 'shared with you', state: 'warn', icon: <Box /> },
+                  { value: 'sandbox', label: 'sandbox · sbx_9f3', meta: 'docker · fsn1', state: 'ok', icon: <Container /> },
                 ]} />
               </div>
             </Demo>

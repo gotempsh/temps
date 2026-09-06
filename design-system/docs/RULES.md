@@ -39,6 +39,8 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - `href="#"` with `preventDefault`. A `Kbd` badge with no handler. A filter that filters nothing.
 - Tabs on a single record. Tabs inside tabs. Two `Ledger`s on one screen.
 - Red on a confirmation that is reversible. Red means irreversible loss only.
+- A mixed-kind list with no kind icons.
+- A kind icon in the state glyph's slot, or a kind icon carrying a state colour.
 
 ## Type
 
@@ -60,6 +62,16 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - `sampled` ◌ muted — head-sampled past the plan allowance.
 - Order lists with `STATE_RANK`. Pick the page glyph with `worst(states)`.
 - Use an icon for what a thing or event *is*; use a glyph for what state it is in.
+
+## Icons
+
+- Give every mixed-kind list a kind icon: palette pages and resources, projects
+  (app / worker / static / database), environments, nodes, providers, settings rows.
+- Put it in a fixed 16px slot (`size-4 shrink-0`) before the name, in muted ink.
+- Keep the state glyph in its own slot. Icons and glyphs never share one.
+- Leave the icon off a single-kind list whose title already names the kind.
+- Use `LedgerRow.icon`, `PickerOption.icon`, the `Breakdown` row `icon`, and the
+  leading icon on a palette `CommandItem`. Never colour an icon.
 
 ## Page structure
 

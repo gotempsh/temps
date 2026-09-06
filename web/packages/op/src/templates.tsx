@@ -298,6 +298,14 @@ export function Pager({ page: p, className }: { page: Page; className?: string }
 export type LedgerRow = {
   id: string
   state: State
+  /**
+   * What kind of record the row is (an app / worker / static project, a
+   * database engine, a control plane / worker node, a span kind). Drawn in a
+   * fixed 16px slot at the head of the first cell, and before the name on a
+   * phone, in muted ink — never coloured, never the state. Required when the
+   * list mixes kinds; omitted when the ledger's title already names the kind.
+   */
+  icon?: ReactNode
   /** Desktop cells, one per column. Use <Num>, <Status>, plain spans. */
   cells: ReactNode[]
   /** Phone rendering: name on the first line, the status note on the second. */
@@ -459,9 +467,20 @@ export function Ledger({ title, meta, status, columns, grid, rows, total, filter
               className={cn('op-row relative grid w-full grid-cols-[1fr_auto] items-center gap-x-3 text-left text-xs outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring md:col-span-full md:grid-cols-subgrid', r.onOpen ? 'cursor-pointer' : 'cursor-default', i === cursor && 'bg-muted', dense ? 'py-0' : 'py-1 md:py-0')}
             >
               {i === cursor && <span aria-hidden className="absolute left-0 top-0 h-full w-0.5 bg-foreground" />}
-              <span className="min-w-0 overflow-hidden md:hidden">{r.mobile}</span>
+              {/* The kind icon rides the first cell (and the phone line) rather than a column
+                  of its own: an extra grid track would push every ledger's `grid` string and
+                  leave an empty slot on the lists whose kind is already in the title. */}
+              <span className="flex min-w-0 items-center gap-2 overflow-hidden md:hidden">
+                {r.icon && <span aria-hidden className="flex size-4 shrink-0 items-center justify-center text-muted-foreground [&_svg]:size-4">{r.icon}</span>}
+                <span className="min-w-0 overflow-hidden">{r.mobile}</span>
+              </span>
               <span className="md:hidden"><Status state={r.state} label="" /></span>
-              {r.cells.map((c, j) => <span key={j} className={cn('hidden min-w-0 truncate md:block', cols_[j]?.numeric && 'text-right')}>{c}</span>)}
+              {r.cells.map((c, j) => (
+                <span key={j} className={cn('hidden min-w-0 truncate md:block', cols_[j]?.numeric && 'text-right', j === 0 && r.icon && 'md:flex md:items-center md:gap-2')}>
+                  {j === 0 && r.icon && <span aria-hidden className="flex size-4 shrink-0 items-center justify-center text-muted-foreground [&_svg]:size-4">{r.icon}</span>}
+                  {j === 0 && r.icon ? <span className="min-w-0 truncate">{c}</span> : c}
+                </span>
+              ))}
             </div>
           ))}
           {sorted.length === 0 && <div className="op-row flex items-center text-xs text-muted-foreground md:col-span-full">{filterable && filter ? <>no match for &quot;{filter}&quot; · <button type="button" className="ml-1 underline underline-offset-4 hover:text-foreground" onClick={() => { onFilter?.(''); inputRef.current?.focus() }}>clear</button></> : 'nothing here yet'}</div>}

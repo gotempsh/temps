@@ -19,8 +19,13 @@ import {
   Cog,
   BarChart3,
   Bell,
+  Box,
+  Columns3,
+  Cpu,
   Database,
+  FileText,
   FolderOpen,
+  Layers,
   Gauge,
   GitBranch,
   Globe,
@@ -153,6 +158,16 @@ const PROJECTS = [
 ].map((p) => ({ ...p, icon: ICONS[p.name], spark: Array.from({ length: 24 }, (_, i) => Math.max(1, diurnal(i * 2, p.visitors / 40 + 4, 6))) }))
 type Project = (typeof PROJECTS)[number]
 
+/* Brand §6 "an icon wherever it adds context": these lists mix kinds, so the kind
+   leads the row in a fixed 16px slot of muted ink. One vocabulary per axis, shared
+   by the ledger and the palette, so the same project is the same mark everywhere.
+   State never moves onto the icon; the glyph keeps its own slot. */
+const PROJECT_KIND = { app: Box, worker: Cpu, static: FileText } as const
+const projectKind = (p: { kind: string }) => PROJECT_KIND[p.kind as keyof typeof PROJECT_KIND] ?? Box
+/** Relational, key-value, columnar: the shape of the store, not its logo. */
+const ENGINE_KIND: Record<string, typeof Database> = { PostgreSQL: Database, Redis: Layers, ClickHouse: Columns3 }
+const engineKind = (engine: string) => ENGINE_KIND[engine.split(' ')[0]] ?? Database
+
 /** A branch is a kind of thing, so it carries a kind icon, never a colour (brand §6, "icons say what"). */
 function Branch({ name }: { name: string }) {
   return <span className="inline-flex min-w-0 items-baseline gap-1"><GitBranch aria-hidden className="h-3 w-3 shrink-0 translate-y-0.5 text-muted-foreground" /><span className="min-w-0 truncate">{name}</span></span>
@@ -262,7 +277,7 @@ function ProjectsScreen({ go, dense }: { go: (v: string) => void; dense: boolean
   const list = useMemo(() => PROJECTS.filter((p) => matches(q, p.name, p.note)).sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state]), [q])
   const attention = PROJECTS.filter((p) => p.state === 'warn' || p.state === 'error')
   const rows: LedgerRow[] = list.map((p) => ({
-    id: p.name, state: p.state, onOpen: () => go(p.name),
+    id: p.name, state: p.state, onOpen: () => go(p.name), icon: (() => { const K = projectKind(p); return <K aria-hidden /> })(),
     sort: { name: p.name, deployed: agoNum(p.deployed), visitors: p.visitors || null, err: p.dep === '—' ? null : p.err, cert: p.cert === '—' ? null : Number(p.cert) },
     mobile: <><span className="flex items-center gap-2 truncate font-medium"><ProjectMark name={p.name} icon={p.icon} />{p.name}</span><span className="block truncate text-[11px] text-muted-foreground">{p.note || `${p.env} · deployed ${p.deployed}`}</span></>,
     cells: [
@@ -297,7 +312,7 @@ function DatabasesScreen({ dense, go }: { dense: boolean; go: (v: string) => voi
   const plan = usePlan()
   const list = DATABASES.filter((d) => matches(q, d.name, d.engine))
   const rows: LedgerRow[] = list.map((d) => ({
-    id: d.name, state: d.state, onOpen: () => go(`db:${d.name}`),
+    id: d.name, state: d.state, onOpen: () => go(`db:${d.name}`), icon: (() => { const K = engineKind(d.engine); return <K aria-hidden /> })(),
     sort: { name: d.name, size: sizeNum(d.size), backup: agoNum(d.backup) },
     mobile: <><span className="block truncate font-medium">{d.name}</span><span className="block truncate text-[11px] text-muted-foreground">{d.note || d.engine}</span></>,
     cells: [<span className="font-medium">{d.name}</span>, <Status state={d.state} label={d.note || d.engine} />, <Num value={d.size} />, <span className="text-muted-foreground">{d.backup}</span>, <span className="font-mono">{d.pitr ? plan.pitr : '–'}</span>],
@@ -562,7 +577,12 @@ function Palette({ open, onOpenChange, go }: { open: boolean; onOpenChange: (o: 
       <CommandList className="max-h-[min(70vh,640px)] font-mono text-xs">
         <CommandEmpty>no matches</CommandEmpty>
         <CommandGroup heading="projects" className={heading}>
-          {PROJECTS.map((p) => <CommandItem key={p.name} onSelect={() => { onOpenChange(false); go(p.name) }} className={item}><Status state={p.state} label="" /><ProjectMark name={p.name} icon={p.icon} />{p.name}<CommandShortcut className="text-inherit opacity-60">{p.env}</CommandShortcut></CommandItem>)}
+          {PROJECTS.map((p) => { const Kind = projectKind(p); return (
+            <CommandItem key={p.name} value={`${p.name} ${p.kind}`} onSelect={() => { onOpenChange(false); go(p.name) }} className={item}>
+              <Status state={p.state} label="" /><ProjectMark name={p.name} icon={p.icon} /><Kind aria-hidden className="size-4 shrink-0 text-muted-foreground" />{p.name}
+              <CommandShortcut className="text-inherit opacity-60">{p.kind} · {p.env}</CommandShortcut>
+            </CommandItem>
+          ) })}
         </CommandGroup>
         {/* Pages carry the same icon as the sidebar, so the palette and the nav read as one map. Commands carry the icon of what they do. */}
         <CommandGroup heading="pages" className={heading}>
