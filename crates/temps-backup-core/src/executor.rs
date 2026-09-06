@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use temps_core::{BackupCompletedJob, BackupFailedJob, Job, JobQueue};
+use temps_core::{BackupCompletedJob, BackupFailedJob, BackupStartedJob, Job, JobQueue};
 
 use crate::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 use crate::notifier::{BackupFailureContext, BackupFailureNotifier};
@@ -370,6 +370,27 @@ UPDATE backups
                     .await;
                 executor.remove_from_in_flight(backup_id).await;
                 return;
+            }
+
+            // Publish a BackupStarted event for downstream consumers (e.g.
+            // Cloud's lifecycle notifier) before the engine runs, which can
+            // take anywhere from seconds to hours. Fire-and-forget, same as
+            // the completion events below — a dropped notification here
+            // costs a stale "processing" indicator, never correctness.
+            if let Some(queue) = executor.inner.event_publisher.clone() {
+                let event = Job::BackupStarted(BackupStartedJob {
+                    backup_id,
+                    engine: params.engine.clone(),
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = queue.send(event).await {
+                        error!(
+                            backup_id,
+                            error = %e,
+                            "BackupExecutor: failed to publish BackupStarted event",
+                        );
+                    }
+                });
             }
 
             let ctx = BackupContext {

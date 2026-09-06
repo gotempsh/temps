@@ -8,6 +8,7 @@
 mod backup_credential_rotation;
 mod backup_mirror;
 mod handler;
+mod lifecycle_notify;
 mod plugin;
 mod service;
 

@@ -153,6 +153,7 @@ pub struct CloudService {
     backup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    lifecycle_notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     allow_loopback_development: bool,
     configuration_issue: RwLock<Option<String>>,
     managed_backup_setup: RwLock<Option<ManagedBackupSetup>>,
@@ -178,6 +179,7 @@ impl CloudService {
             backup_task: Mutex::new(None),
             backup_credential_rotation_task: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
+            lifecycle_notify_task: Mutex::new(None),
             allow_loopback_development,
             configuration_issue: RwLock::new(None),
             managed_backup_setup: RwLock::new(None),
@@ -292,6 +294,27 @@ impl CloudService {
             }));
         } else {
             tracing::debug!("Cloud heartbeat sender task is already registered");
+        }
+    }
+
+    /// Launch the backup lifecycle notifier: subscribes to the job queue and
+    /// pushes started/completed/failed events to Cloud as they happen. Safe
+    /// to spawn unconditionally -- like the heartbeat sender, it self-gates
+    /// on [`temps_cloud_client::CloudLink::is_linked`] per event rather than
+    /// needing separate start/stop wiring.
+    pub fn start_backup_lifecycle_notify(self: &Arc<Self>, queue: Arc<dyn temps_core::JobQueue>) {
+        let mut task = self
+            .lifecycle_notify_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_none() {
+            tracing::info!("Cloud service launching backup lifecycle notifier task");
+            let service = self.clone();
+            *task = Some(tokio::spawn(async move {
+                crate::lifecycle_notify::run(service, queue).await;
+            }));
+        } else {
+            tracing::debug!("Cloud backup lifecycle notifier task is already registered");
         }
     }
 

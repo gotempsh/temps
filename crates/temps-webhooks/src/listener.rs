@@ -3,12 +3,14 @@
 
 //! Webhook event listener that subscribes to deployment events from the job queue.
 
-use crate::events::{DeploymentPayload, WebhookEvent, WebhookEventType, WebhookPayload};
+use crate::events::{
+    BackupPayload, DeploymentPayload, WebhookEvent, WebhookEventType, WebhookPayload,
+};
 use crate::service::WebhookService;
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::Arc;
 use temps_core::{Job, JobQueue};
-use temps_entities::{deployments, projects};
+use temps_entities::{deployments, external_service_backups, project_services, projects};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -20,6 +22,20 @@ struct DeploymentContext {
     commit_sha: Option<String>,
     commit_message: Option<String>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Project resolved for a backup's underlying service. Unlike a deployment,
+/// which belongs to exactly one project, a backup is scoped to a service
+/// and schedule: `external_service_backups` links the backup to a service,
+/// and `project_services` links that service to project(s). Since webhooks
+/// are strictly project-scoped (`webhooks.project_id`), a backup whose
+/// service maps to zero or more than one project has nowhere unambiguous
+/// to deliver to, so [`WebhookEventListener::fetch_backup_context`] returns
+/// `None` in both cases and the webhook is skipped, same as "no webhooks
+/// configured for this project".
+struct BackupContext {
+    project_id: i32,
+    project_name: String,
 }
 
 /// Webhook event listener that processes deployment lifecycle events
@@ -156,6 +172,101 @@ impl WebhookEventListener {
         })
     }
 
+    /// Resolve the single project a backup's underlying service belongs to,
+    /// for enriching and scoping backup webhook payloads. Returns `None`
+    /// (and logs why) when the backup isn't linked to a service, or the
+    /// service isn't linked to exactly one project -- see [`BackupContext`].
+    async fn fetch_backup_context(
+        db: &DatabaseConnection,
+        backup_id: i32,
+    ) -> Option<BackupContext> {
+        // `.all()`, not `.one()`: `backup_id` carries no uniqueness constraint
+        // on `external_service_backups`, and the authorization model for
+        // reading a backup's own children already treats "producer services"
+        // as a set that must resolve unambiguously (see
+        // `require_services_access` in temps-backup). An unordered `LIMIT 1`
+        // here would let an arbitrary producer's project win a race if a
+        // backup ever gains a second child row; failing closed on more than
+        // one distinct service matches that existing model instead.
+        let service_backups = match external_service_backups::Entity::find()
+            .filter(external_service_backups::Column::BackupId.eq(backup_id))
+            .all(db)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    "Failed to fetch external_service_backups for backup {}: {}",
+                    backup_id, e
+                );
+                return None;
+            }
+        };
+        let service_ids: std::collections::BTreeSet<i32> =
+            service_backups.iter().map(|sb| sb.service_id).collect();
+        let service_id = match service_ids.len() {
+            0 => {
+                debug!(
+                    "Backup {} has no external_service_backups row; skipping backup webhook",
+                    backup_id
+                );
+                return None;
+            }
+            1 => *service_ids.iter().next().expect("checked len == 1 above"),
+            count => {
+                debug!(
+                    "Backup {} has {} distinct producer services; webhook project resolution \
+                     requires exactly one, so skipping",
+                    backup_id, count
+                );
+                return None;
+            }
+        };
+
+        let project_links = match project_services::Entity::find()
+            .filter(project_services::Column::ServiceId.eq(service_id))
+            .all(db)
+            .await
+        {
+            Ok(links) => links,
+            Err(e) => {
+                warn!(
+                    "Failed to fetch project_services for service {} (backup {}): {}",
+                    service_id, backup_id, e
+                );
+                return None;
+            }
+        };
+
+        let project_id = match project_links.as_slice() {
+            [link] => link.project_id,
+            [] => {
+                debug!(
+                    "Service {} (backup {}) is not linked to any project; skipping backup webhook",
+                    service_id, backup_id
+                );
+                return None;
+            }
+            links => {
+                debug!(
+                    "Service {} (backup {}) is linked to {} projects; webhooks are project-scoped so skipping",
+                    service_id, backup_id, links.len()
+                );
+                return None;
+            }
+        };
+
+        let project_name = match projects::Entity::find_by_id(project_id).one(db).await {
+            Ok(Some(p)) => p.name,
+            _ => String::new(),
+        };
+
+        Some(BackupContext {
+            project_id,
+            project_name,
+        })
+    }
+
     /// Process a single job
     async fn process_job(
         webhook_service: &WebhookService,
@@ -284,6 +395,66 @@ impl WebhookEventListener {
                 )
                 .await?;
             }
+            Job::BackupStarted(event) => {
+                debug!(
+                    "Processing BackupStarted event for backup {}",
+                    event.backup_id
+                );
+                Self::trigger_backup_webhook(
+                    webhook_service,
+                    db,
+                    WebhookEventType::BackupStarted,
+                    event.backup_id,
+                    event.engine.clone(),
+                    "started".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(chrono::Utc::now()),
+                    None,
+                )
+                .await?;
+            }
+            Job::BackupCompleted(event) => {
+                debug!(
+                    "Processing BackupCompleted event for backup {}",
+                    event.backup_id
+                );
+                Self::trigger_backup_webhook(
+                    webhook_service,
+                    db,
+                    WebhookEventType::BackupCompleted,
+                    event.backup_id,
+                    event.engine.clone(),
+                    "completed".to_string(),
+                    Some(event.s3_location.clone()),
+                    event.size_bytes,
+                    None,
+                    None,
+                    Some(chrono::Utc::now()),
+                )
+                .await?;
+            }
+            Job::BackupFailed(event) => {
+                debug!(
+                    "Processing BackupFailed event for backup {}",
+                    event.backup_id
+                );
+                Self::trigger_backup_webhook(
+                    webhook_service,
+                    db,
+                    WebhookEventType::BackupFailed,
+                    event.backup_id,
+                    event.engine.clone(),
+                    "failed".to_string(),
+                    None,
+                    None,
+                    Some(bound_error_message(&event.error_message)),
+                    None,
+                    Some(chrono::Utc::now()),
+                )
+                .await?;
+            }
             _ => {
                 // Ignore other job types
                 return Ok(());
@@ -385,6 +556,92 @@ impl WebhookEventListener {
             }
         }
     }
+
+    /// Trigger a webhook for a backup lifecycle event. Unlike deployments,
+    /// a backup has no direct project association, so this resolves one via
+    /// [`Self::fetch_backup_context`] first and skips delivery entirely
+    /// (not an error) when that resolution is ambiguous.
+    #[allow(clippy::too_many_arguments)]
+    async fn trigger_backup_webhook(
+        webhook_service: &WebhookService,
+        db: &DatabaseConnection,
+        event_type: WebhookEventType,
+        backup_id: i32,
+        engine: String,
+        status: String,
+        s3_location: Option<String>,
+        size_bytes: Option<i64>,
+        error_message: Option<String>,
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(ctx) = Self::fetch_backup_context(db, backup_id).await else {
+            debug!(
+                "Skipping {} webhook for backup {}: no single project resolved",
+                event_type, backup_id
+            );
+            return Ok(());
+        };
+
+        let payload = WebhookPayload::Backup(BackupPayload {
+            backup_id,
+            engine,
+            project_id: Some(ctx.project_id),
+            project_name: Some(ctx.project_name.clone()),
+            status,
+            s3_location,
+            size_bytes,
+            error_message,
+            started_at,
+            finished_at,
+        });
+
+        let webhook_event = WebhookEvent::new(event_type, Some(ctx.project_id), payload);
+
+        debug!(
+            "📤 Triggering webhooks for event: {:?}",
+            webhook_event.event_type
+        );
+
+        match webhook_service.trigger_event(webhook_event).await {
+            Ok(results) => {
+                let success_count = results.iter().filter(|r| r.success).count();
+                let total_count = results.len();
+
+                if total_count > 0 {
+                    info!(
+                        "✅ Triggered {} webhooks for backup {} (project {}), {} succeeded",
+                        total_count, backup_id, ctx.project_id, success_count
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "❌ Failed to trigger webhooks for backup {}: {}",
+                    backup_id, e
+                );
+                Err(Box::new(e))
+            }
+        }
+    }
+}
+
+/// Failure reasons on this path come from raw engine stderr, which is not
+/// scrubbed of credentials at every call site (`s3_mirror`'s own reason
+/// string is the one place that already had to special-case this). Webhook
+/// URLs are operator-configured and this is the first path that ships that
+/// text to one, so bound it defensively -- this caps exposure, it does not
+/// replace fixing redaction at the source.
+const MAX_ERROR_MESSAGE_LEN: usize = 500;
+
+fn bound_error_message(message: &str) -> String {
+    if message.len() <= MAX_ERROR_MESSAGE_LEN {
+        return message.to_string();
+    }
+    let mut truncated: String = message.chars().take(MAX_ERROR_MESSAGE_LEN).collect();
+    truncated.push_str(" [truncated]");
+    truncated
 }
 
 impl Drop for WebhookEventListener {

@@ -345,6 +345,18 @@ pub struct BackupRequestedJob {
     pub max_runtime_secs: i64,
 }
 
+/// Result event published by the backup processor when a backup transitions
+/// to `running`, before the engine actually executes. Lets a listener (e.g.
+/// Cloud's lifecycle notifier) learn a backup is in flight without waiting
+/// for it to finish — the sole purpose is a fast "this is happening" signal,
+/// not a durable record; `BackupCompleted`/`BackupFailed` remain the source
+/// of truth for outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupStartedJob {
+    pub backup_id: i32,
+    pub engine: String,
+}
+
 /// Result event published by the backup processor after a successful run.
 /// The schedule_runs aggregator listens for this to update the parent
 /// `schedule_runs.finished_at` once every sibling reaches a terminal state.
@@ -441,6 +453,7 @@ pub enum Job {
     // the `BackupJobProcessor` consumes it and runs the engine in a
     // one-shot container, then publishes BackupCompleted or BackupFailed.
     BackupRequested(BackupRequestedJob),
+    BackupStarted(BackupStartedJob),
     BackupCompleted(BackupCompletedJob),
     BackupFailed(BackupFailedJob),
     BackupCancelRequested(BackupCancelRequestedJob),
@@ -499,6 +512,7 @@ impl fmt::Display for Job {
             Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {:?}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
             Job::AutopilotTrigger(job) => write!(f, "AutopilotTrigger(project: {}, type: {}, source: {:?})", job.project_id, job.trigger_type, job.trigger_source_id),
             Job::BackupRequested(job) => write!(f, "BackupRequested(backup: {}, engine: {})", job.backup_id, job.engine),
+            Job::BackupStarted(job) => write!(f, "BackupStarted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),
             Job::BackupFailed(job) => write!(f, "BackupFailed(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCancelRequested(job) => write!(f, "BackupCancelRequested(backup: {})", job.backup_id),

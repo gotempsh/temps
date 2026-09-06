@@ -14,7 +14,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_auth::{
+    permission_check, permission_guard, project_access_guard, Permission, RequireAuth,
+};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
@@ -311,6 +313,23 @@ async fn get_webhook(
     }
 }
 
+/// Backup webhook payloads carry the same metadata (S3 locations, sizes, raw
+/// engine failure text) as the `BackupsRead`-gated local backup API. Without
+/// this, `WebhooksCreate` alone -- a much broader, commonly-granted
+/// permission -- would let a principal without any backup access route that
+/// data to a URL of their choosing and read it back via the webhook's
+/// delivery log.
+fn subscribes_to_backup_events(events: &[WebhookEventType]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            WebhookEventType::BackupStarted
+                | WebhookEventType::BackupCompleted
+                | WebhookEventType::BackupFailed
+        )
+    })
+}
+
 /// Create a new webhook
 #[utoipa::path(
     post,
@@ -351,6 +370,9 @@ async fn create_webhook(
             .title("Invalid event types")
             .detail("At least one valid event type is required")
             .build());
+    }
+    if subscribes_to_backup_events(&events) {
+        permission_check!(auth, Permission::BackupsRead);
     }
 
     let request = CreateWebhookRequest {
@@ -431,11 +453,16 @@ async fn update_webhook(
     }
 
     // Parse event types if provided
-    let events = body.events.map(|e| {
+    let events: Option<Vec<WebhookEventType>> = body.events.map(|e| {
         e.iter()
             .filter_map(|s| WebhookEventType::from_str(s))
             .collect()
     });
+    if let Some(events) = &events {
+        if subscribes_to_backup_events(events) {
+            permission_check!(auth, Permission::BackupsRead);
+        }
+    }
 
     let request = UpdateWebhookRequest {
         url: body.url,

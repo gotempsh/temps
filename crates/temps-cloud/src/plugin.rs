@@ -93,6 +93,9 @@ impl TempsPlugin for CloudPlugin {
                 );
                 service.start_backup_credential_rotation();
                 service.start_heartbeat_sender();
+                service.start_backup_lifecycle_notify(
+                    context.require_service::<dyn temps_core::JobQueue>(),
+                );
             }
             Ok(())
         })

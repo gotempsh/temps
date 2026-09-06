@@ -1243,6 +1243,23 @@ impl CloudLink {
         client.complete_walg_snapshot(&token, completion).await
     }
 
+    /// Push a backup lifecycle transition. Gated the same as every other
+    /// backup call ([`Self::linked_backup_credential`]): a no-op unless
+    /// backups are actually enabled/managed, since Cloud has no catalog
+    /// entry to attach this to otherwise.
+    pub async fn notify_backup_lifecycle(
+        &self,
+        event: &temps_cloud_protocol::BackupLifecycleEventRequest,
+    ) -> Result<temps_cloud_protocol::BackupLifecycleEventAccepted, CloudError> {
+        let (client, token, instance_id) = self.walg_client()?;
+        if event.instance_id != instance_id {
+            return Err(CloudError::Rejected {
+                detail: "backup lifecycle event instance_id does not match this Cloud link".into(),
+            });
+        }
+        client.notify_backup_lifecycle(&token, event).await
+    }
+
     pub async fn send_notification(
         &self,
         request: &ManagedNotificationRequest,

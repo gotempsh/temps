@@ -72,12 +72,13 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use sha2::{Digest, Sha256};
 use temps_cloud_protocol::{
-    BackupArtifact, BackupCompleted, BackupTarget, BackupTargetRequest, EnrollRequest,
-    EnrollResponse, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
-    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedBackupCapability,
-    ManagedNotificationAccepted, ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest,
-    SpanRecord, TelemetryBatch, WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest,
-    WalGSnapshot, WalGSnapshotCompleted, WalGSnapshotRequest,
+    BackupArtifact, BackupCompleted, BackupLifecycleEventAccepted, BackupLifecycleEventRequest,
+    BackupTarget, BackupTargetRequest, EnrollRequest, EnrollResponse, IngestAck,
+    ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability, ManagedAiChatRequest,
+    ManagedAiChatResponse, ManagedBackupCapability, ManagedNotificationAccepted,
+    ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest, SpanRecord, TelemetryBatch,
+    WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
+    WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 use temps_core::url_validation::{validate_ipv4, validate_ipv6};
 use thiserror::Error;
@@ -718,6 +719,19 @@ impl CloudClient {
             .retry_backup_json("/v1/backups/walg/snapshots/complete", token, completion)
             .await?;
         Ok(())
+    }
+
+    /// Push a backup lifecycle transition (started/completed/failed) as it
+    /// happens, so Cloud can show a live state instead of waiting for its
+    /// next mirror-sweep poll. Best-effort: the mirror sweep remains the
+    /// source of truth, this is purely a latency improvement.
+    pub async fn notify_backup_lifecycle(
+        &self,
+        token: &str,
+        event: &BackupLifecycleEventRequest,
+    ) -> Result<BackupLifecycleEventAccepted, CloudError> {
+        self.retry_backup_json("/v1/backups/lifecycle", token, event)
+            .await
     }
 
     async fn complete_backup(
