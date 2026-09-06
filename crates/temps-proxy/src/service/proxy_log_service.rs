@@ -2409,7 +2409,7 @@ impl ProxyLogService {
     /// HTTP status-class breakdown for AI-agent traffic.
     ///
     /// Same pre-filter as the AI agent breakdown (`is_bot = true AND bot_name IN
-    /// (known)`), grouped by status class (`2xx`, `3xx`, `4xx`, `5xx`, `other`).
+    /// (known)`), grouped by status class (`1xx`, `2xx`, `3xx`, `4xx`, `5xx`, `other`).
     /// Surfaces whether crawlers are getting served (`2xx`) or hitting broken /
     /// blocked pages (`4xx`/`5xx`) — a content-health signal the request tables
     /// don't make obvious.
@@ -2466,6 +2466,7 @@ impl ProxyLogService {
             r#"
             SELECT
                 CASE
+                    WHEN status_code >= 100 AND status_code < 200 THEN '1xx'
                     WHEN status_code >= 200 AND status_code < 300 THEN '2xx'
                     WHEN status_code >= 300 AND status_code < 400 THEN '3xx'
                     WHEN status_code >= 400 AND status_code < 500 THEN '4xx'
@@ -2928,7 +2929,7 @@ pub struct AiAgentTimelineRow {
 }
 
 /// One row in the AI-agent HTTP status breakdown: the request count for a
-/// status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+/// status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AiStatusBreakdownRow {
     /// Status class label.
@@ -3028,6 +3029,18 @@ impl ProjectHealthSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_class_range_includes_1xx() {
+        // 101 Switching Protocols (and other informational codes) must map to
+        // the `1xx` bucket, not be excluded/misrouted into an error range.
+        assert_eq!(ProxyLogService::status_class_range("1xx"), Some((100, 200)));
+        assert_eq!(ProxyLogService::status_class_range("2xx"), Some((200, 300)));
+        assert_eq!(ProxyLogService::status_class_range("3xx"), Some((300, 400)));
+        assert_eq!(ProxyLogService::status_class_range("4xx"), Some((400, 500)));
+        assert_eq!(ProxyLogService::status_class_range("5xx"), Some((500, 600)));
+        assert_eq!(ProxyLogService::status_class_range("other"), None);
+    }
 
     #[test]
     fn project_health_uses_latency_sample_count_and_gapfills_24_hours() {
@@ -3739,6 +3752,78 @@ mod tests {
         assert!((cagg_busy.p50_response_time_ms - raw_busy.p50_response_time_ms).abs() < 1e-9);
         assert!((cagg_busy.p95_response_time_ms - raw_busy.p95_response_time_ms).abs() < 1e-9);
         assert!((cagg_busy.p99_response_time_ms - raw_busy.p99_response_time_ms).abs() < 1e-9);
+    }
+
+    /// A `101 Switching Protocols` response (e.g. a WebSocket/SSE upgrade) must
+    /// be bucketed as `1xx`, not silently dropped into the `other` catch-all
+    /// which the frontend renders identically to an unrecognized/broken
+    /// status. Regression test for the AI status-breakdown SQL CASE
+    /// statement missing a `1xx` branch. Skips gracefully when no test
+    /// Postgres is available, per the repo's Docker-test convention.
+    #[tokio::test]
+    async fn test_get_ai_status_breakdown_classifies_101_as_1xx() {
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Test database not available, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let geoip = Arc::new(temps_geo::GeoIpService::new().expect("mock GeoIpService for tests"));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip));
+        let service = ProxyLogService::new(db.clone(), ip_service);
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO projects (id, name, repo_name, repo_owner, directory, \
+             main_branch, preset, created_at, updated_at, slug) \
+             VALUES (1, 'ai-status-p1', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'ai-status-p1')",
+            vec![],
+        );
+        db.execute(stmt).await.expect("insert project row");
+
+        async fn insert_ai_log(db: &DatabaseConnection, status: i16, request_id: &str) {
+            let stmt = sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"INSERT INTO proxy_logs
+                    (timestamp, method, path, host, status_code, response_time_ms,
+                     request_source, is_system_request, routing_status, project_id,
+                     request_id, is_bot, bot_name, request_size_bytes,
+                     response_size_bytes, created_date)
+                   VALUES (now(), 'GET', '/', 'test.local', $1, 10,
+                           'proxy', false, 'routed', 1, $2, true, 'GPTBot', 100, 200,
+                           now()::date)"#,
+                vec![status.into(), request_id.into()],
+            );
+            db.execute(stmt).await.expect("insert proxy_logs row");
+        }
+
+        insert_ai_log(&db, 101, "ai-status-101").await;
+        insert_ai_log(&db, 200, "ai-status-200").await;
+
+        let start = Utc::now() - chrono::Duration::hours(1);
+        let end = Utc::now() + chrono::Duration::minutes(1);
+
+        let breakdown = service
+            .get_ai_status_breakdown(Some(1), None, start, end)
+            .await
+            .expect("ai status breakdown");
+
+        let class_1xx = breakdown
+            .iter()
+            .find(|r| r.status_class == "1xx")
+            .expect("101 response must be classified as 1xx, not folded into 'other'");
+        assert_eq!(class_1xx.request_count, 1);
+
+        assert!(
+            breakdown.iter().all(|r| r.status_class != "other"),
+            "no row should fall into the 'other' catch-all: {breakdown:?}"
+        );
     }
 
     fn sample_proxy_log_model(request_id: &str) -> proxy_logs::Model {

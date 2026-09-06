@@ -5,6 +5,7 @@ import { getProxyLogsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProxyLogResponse } from '@/api/client/types.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
+import { httpStatusClass } from '@/lib/http-status-class'
 import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -599,9 +600,15 @@ export function ProxyLogsDataTable({
     JSON.stringify(filters) !== JSON.stringify(pendingFilters)
 
   const getStatusBadgeVariant = (statusCode: number) => {
-    if (statusCode >= 200 && statusCode < 300) return 'default'
-    if (statusCode >= 300 && statusCode < 400) return 'secondary'
-    return 'destructive'
+    switch (httpStatusClass(statusCode)) {
+      case '1xx':
+      case '3xx':
+        return 'secondary'
+      case '2xx':
+        return 'default'
+      default:
+        return 'destructive'
+    }
   }
 
   const getRoutingStatusBadge = (status: string) => {
@@ -1866,7 +1873,13 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
 }
 
 function getStatusVariant(statusCode: number) {
-  if (statusCode >= 200 && statusCode < 300) return 'default'
-  if (statusCode >= 300 && statusCode < 400) return 'secondary'
-  return 'destructive'
+  switch (httpStatusClass(statusCode)) {
+    case '1xx':
+    case '3xx':
+      return 'secondary'
+    case '2xx':
+      return 'default'
+    default:
+      return 'destructive'
+  }
 }
