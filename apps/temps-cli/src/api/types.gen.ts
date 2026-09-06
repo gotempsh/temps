@@ -1484,6 +1484,19 @@ export type AppSettings = {
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
     /**
+     * Prefix applied to Docker Hub base images generated for a build (e.g.
+     * autopack's `FROM node:22-slim`), turning them into
+     * `{prefix}/node:22-slim`. Unlike `docker_registry` above — which
+     * authenticates pulls to one *named* private registry a user's own image
+     * reference already points at — this rewrites Temps' own generated,
+     * otherwise-anonymous `docker.io` references, for operators whose
+     * internal registry is a path-prefixing reverse proxy rather than a
+     * `registry-mirrors`-compatible pull-through cache (which needs no
+     * rewriting at all — see docs/howto/configure-a-docker-registry-mirror).
+     * `None`/empty (the default) leaves every reference untouched.
+     */
+    registry_mirror_prefix?: string | null;
+    /**
      * Upstream request/connection timeouts applied by the proxy to customer
      * app traffic. Provides a global hard ceiling plus global defaults for
      * regular HTTP, SSE, and WebSocket traffic; projects and environments
@@ -1619,6 +1632,12 @@ export type AppSettingsResponse = {
      */
     proxy_port: number;
     rate_limiting: RateLimitSettings;
+    /**
+     * Prefix applied to implicit Docker Hub base images in generated
+     * Dockerfiles (e.g. autopack's `FROM node:22-slim`). No sensitive
+     * content, passed through as-is. `None`/empty disables rewriting.
+     */
+    registry_mirror_prefix?: string | null;
     /**
      * Upstream request/connection timeouts (hard ceiling + defaults) applied
      * by the proxy to customer app traffic. No sensitive content.

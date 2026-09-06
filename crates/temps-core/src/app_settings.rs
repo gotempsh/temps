@@ -63,6 +63,19 @@ pub struct AppSettings {
     // Docker registry settings
     pub docker_registry: DockerRegistrySettings,
 
+    /// Prefix applied to Docker Hub base images generated for a build (e.g.
+    /// autopack's `FROM node:22-slim`), turning them into
+    /// `{prefix}/node:22-slim`. Unlike `docker_registry` above — which
+    /// authenticates pulls to one *named* private registry a user's own image
+    /// reference already points at — this rewrites Temps' own generated,
+    /// otherwise-anonymous `docker.io` references, for operators whose
+    /// internal registry is a path-prefixing reverse proxy rather than a
+    /// `registry-mirrors`-compatible pull-through cache (which needs no
+    /// rewriting at all — see docs/howto/configure-a-docker-registry-mirror).
+    /// `None`/empty (the default) leaves every reference untouched.
+    #[serde(default)]
+    pub registry_mirror_prefix: Option<String>,
+
     // System monitoring settings
     pub disk_space_alert: DiskSpaceAlertSettings,
 
@@ -1257,6 +1270,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             docker_registry: DockerRegistrySettings::default(),
+            registry_mirror_prefix: None,
             image_retention: ImageRetentionSettings::default(),
             disk_space_alert: DiskSpaceAlertSettings::default(),
             container_logs: ContainerLogSettings::default(),

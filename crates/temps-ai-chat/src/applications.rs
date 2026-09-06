@@ -1073,12 +1073,18 @@ fn list_workspace_directory_fd_relative(
     let mut entries = Vec::new();
     let mut truncated = false;
     let mut names = Vec::new();
+    let mut inspected_entries = 0usize;
     for entry in directory.iter() {
         let entry = entry.map_err(std::io::Error::other)?;
         let name_bytes = entry.file_name().to_bytes();
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
+        if inspected_entries >= MAX_WORKSPACE_DIRECTORY_ENTRIES {
+            truncated = true;
+            break;
+        }
+        inspected_entries += 1;
         let name = match std::str::from_utf8(name_bytes) {
             Ok(name) => name.to_string(),
             Err(_) => {
@@ -1093,10 +1099,6 @@ fn list_workspace_directory_fd_relative(
         };
         if is_sensitive_workspace_path(&path) {
             continue;
-        }
-        if names.len() >= MAX_WORKSPACE_DIRECTORY_ENTRIES {
-            truncated = true;
-            break;
         }
         names.push((name, path));
     }
@@ -3280,6 +3282,35 @@ mod tests {
         assert_eq!(preview.bytes.len(), MAX_WORKSPACE_FILE_PREVIEW_BYTES);
         assert_eq!(preview.size_bytes, large.len() as u64);
         assert!(preview.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_browser_counts_hidden_entries_toward_scan_limit() {
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+        for index in 0..=MAX_WORKSPACE_DIRECTORY_ENTRIES {
+            std::fs::write(
+                workspace.host_work_dir.join(format!(".env.{index}")),
+                "hidden",
+            )
+            .expect("hidden workspace entry");
+        }
+
+        let page = service
+            .list_directory("app_safe_123", "", 0, 100)
+            .await
+            .expect("bounded directory page");
+
+        assert!(
+            page.entries.iter().all(|entry| entry.path == "projects"),
+            "sensitive entries must stay hidden regardless of directory order"
+        );
+        assert!(page.truncated);
     }
 
     #[test]

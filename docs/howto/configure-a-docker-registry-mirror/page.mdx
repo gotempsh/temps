@@ -1,0 +1,102 @@
+{/*
+SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
+*/}
+
+export const metadata = {
+  title: 'Configure a Docker Registry Mirror',
+  description:
+    'Stop builds from failing with Docker Hub anonymous pull rate limits by configuring a registry mirror on the Docker daemon.',
+  alternates: {
+    canonical: '/docs/configure-a-docker-registry-mirror',
+  },
+}
+
+export const sections = [
+  { title: 'Why this happens', id: 'why-this-happens' },
+  { title: 'Configure a registry mirror', id: 'configure-a-registry-mirror' },
+  { title: 'Also get the authenticated pull ceiling', id: 'also-get-the-authenticated-pull-ceiling' },
+  { title: 'Multi-node clusters', id: 'multi-node-clusters' },
+  { title: 'Verify it worked', id: 'verify-it-worked' },
+]
+
+# Configure a Docker Registry Mirror
+
+Every build Temps runs — including autopack — pulls its base images (`node:22-slim`, `debian:bookworm-slim`, and similar) straight from Docker Hub through the local Docker daemon. Temps does not add registry authentication or rewrite those references, so the daemon's own configuration decides how those pulls resolve. {{ className: 'lead' }}
+
+---
+
+## Why this happens {{ anchor: true, id: 'why-this-happens' }}
+
+Docker Hub throttles anonymous (unauthenticated) image pulls by source IP. That limit is shared across every build a host runs — and, on a multi-node cluster, across every node sitting behind the same WAN IP. Once you cross it, builds start failing with an error like:
+
+```
+toomanyrequests: You have reached your pull rate limit
+```
+
+or, on BuildKit:
+
+```
+failed to authorize: failed to fetch anonymous token: ...: 429 Too Many Requests
+```
+
+Temps surfaces this in the deployment log as "Docker Hub rate-limited an anonymous image pull" so it is not mistaken for a broken Dockerfile — but fixing it happens at the Docker Engine level, not in Temps.
+
+---
+
+## Configure a registry mirror {{ anchor: true, id: 'configure-a-registry-mirror' }}
+
+Because autopack always emits unqualified image references (no registry prefix), Docker's built-in `registry-mirrors` daemon option is enough — it transparently redirects any pull that would otherwise go to `docker.io`, with no changes needed to Temps or to any Dockerfile.
+
+1. Edit (or create) `/etc/docker/daemon.json` on the build host:
+
+   ```json
+   {
+     "registry-mirrors": ["https://mirror.gcr.io"]
+   }
+   ```
+
+   `mirror.gcr.io` is a public, read-only cache for Docker Hub images and works well as a first step. For a self-hosted cache, see the next section.
+
+2. Restart Docker:
+
+   ```bash
+   sudo systemctl restart docker
+   ```
+
+3. Re-run the failing deployment.
+
+If the mirror is unreachable, the daemon falls back to pulling from `docker.io` directly — configuring this is safe to leave on permanently.
+
+---
+
+## Also get the authenticated pull ceiling {{ anchor: true, id: 'also-get-the-authenticated-pull-ceiling' }}
+
+`registry-mirrors` alone only caches — it does not authenticate to Docker Hub, so it doesn't raise the underlying rate limit. To get both caching and a higher, authenticated pull ceiling, run your own pull-through cache and give it real Docker Hub credentials:
+
+```bash
+docker run -d --name registry-mirror \
+  -p 5000:5000 \
+  -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io \
+  -e REGISTRY_PROXY_USERNAME=<your-docker-hub-username> \
+  -e REGISTRY_PROXY_PASSWORD=<your-docker-hub-token> \
+  registry:2
+```
+
+Then point `registry-mirrors` in `daemon.json` at `http://<mirror-host>:5000` instead of a public mirror.
+
+---
+
+## Multi-node clusters {{ anchor: true, id: 'multi-node-clusters' }}
+
+If several worker nodes build behind the same WAN IP (for example several Kubernetes clusters or a Temps multi-node deployment egressing through one NAT gateway), the rate limit is shared across all of them even though each node's Docker daemon is independent. Point every node's `registry-mirrors` at the same shared cache so the pulls are deduplicated instead of each node hitting Docker Hub separately.
+
+---
+
+## Verify it worked {{ anchor: true, id: 'verify-it-worked' }}
+
+```bash
+docker info | grep -A2 "Registry Mirrors"
+```
+
+Should list the mirror URL you configured. A subsequent `docker pull node:22-slim` on an image not already cached locally will go through the mirror rather than `docker.io` directly.

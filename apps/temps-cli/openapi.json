@@ -3032,6 +3032,14 @@
               }
             ]
           },
+          "registry_mirror_prefix": {
+            "default": null,
+            "description": "Prefix applied to Docker Hub base images generated for a build (e.g.\nautopack's `FROM node:22-slim`), turning them into\n`{prefix}/node:22-slim`. Unlike `docker_registry` above — which\nauthenticates pulls to one *named* private registry a user's own image\nreference already points at — this rewrites Temps' own generated,\notherwise-anonymous `docker.io` references, for operators whose\ninternal registry is a path-prefixing reverse proxy rather than a\n`registry-mirrors`-compatible pull-through cache (which needs no\nrewriting at all — see docs/howto/configure-a-docker-registry-mirror).\n`None`/empty (the default) leaves every reference untouched.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "request_timeouts": {
             "default": {
               "default_http_timeout_seconds": 0,
@@ -3236,6 +3244,13 @@
           },
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings"
+          },
+          "registry_mirror_prefix": {
+            "description": "Prefix applied to implicit Docker Hub base images in generated\nDockerfiles (e.g. autopack's `FROM node:22-slim`). No sensitive\ncontent, passed through as-is. `None`/empty disables rewriting.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "request_timeouts": {
             "$ref": "#/components/schemas/RequestTimeoutSettings",
