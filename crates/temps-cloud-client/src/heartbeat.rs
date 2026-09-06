@@ -244,7 +244,6 @@ async fn handshake(
         agent_version: link.agent_version().to_string(),
         capabilities: vec![
             Capability::TelemetryShipping,
-            Capability::BackupOrchestration,
             Capability::ManagedAiInference,
         ],
     };

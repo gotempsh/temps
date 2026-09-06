@@ -334,7 +334,6 @@ pub struct NativeSnapshotRequest {
 pub struct NativeSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
-    pub declared_objects: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,7 +380,6 @@ pub struct WalGSnapshotRequest {
 pub struct WalGSnapshot {
     pub backup_id: Uuid,
     pub upload_required: bool,
-    pub declared_objects: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -58,9 +58,6 @@ pub enum Capability {
     /// Instance may ship telemetry to the managed backend for longer retention
     /// than local storage provides. Local storage is unaffected either way.
     TelemetryShipping,
-    /// Instance may have backups orchestrated centrally. Backup bytes always
-    /// travel instance -> object storage directly, never through the backend.
-    BackupOrchestration,
     /// Instance accepts managed DNS records and certificate material for a
     /// subdomain issued by the backend.
     ManagedSubdomain,
@@ -165,7 +162,7 @@ mod tests {
     fn negotiate_yields_the_intersection() {
         let ours = hello(&[
             Capability::TelemetryShipping,
-            Capability::BackupOrchestration,
+            Capability::ManagedAiInference,
         ]);
         let theirs = hello(&[Capability::TelemetryShipping, Capability::ManagedSubdomain]);
         assert_eq!(
