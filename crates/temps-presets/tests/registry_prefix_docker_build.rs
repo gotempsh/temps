@@ -10,11 +10,16 @@
 //! the one place that runs `docker build` against the rewritten output, the
 //! same way `tests/starters.rs` runs a real build for the unprefixed case.
 
+use std::collections::HashSet;
 use std::io::Write;
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use temps_presets::{apply_registry_prefix, AutopackPreset, DockerfileConfig, Preset};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::GenericImage;
 
 /// `mirror.gcr.io` is a public, unauthenticated pull-through cache for
 /// Docker Hub -- exactly the kind of target this doc/feature exists to
@@ -134,5 +139,134 @@ fn a_registry_mirror_prefixed_dockerfile_actually_builds() {
 
     if let Err(e) = result {
         panic!("building the registry-mirror-prefixed Dockerfile failed: {e}");
+    }
+}
+
+/// Extracts the docker-hub image references a `FROM {prefix}/...` rewrite
+/// produced, so the test can seed exactly those images into the local
+/// registry before building -- rather than guessing what autopack chose.
+fn images_rewritten_through(rewritten: &str, prefix: &str) -> HashSet<String> {
+    let needle = format!("FROM {prefix}/");
+    rewritten
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix(&needle)?;
+            // A stage reference is "<image> AS <name>" -- keep only the image.
+            rest.split_whitespace().next().map(str::to_string)
+        })
+        .collect()
+}
+
+fn wait_for_tcp(port: u16, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+fn docker(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|e| format!("could not run docker {args:?}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "docker {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Same proof as above, but against a real *self-hosted* registry rather
+/// than a public mirror -- this is the scenario the feature actually exists
+/// for (an operator's own path-prefixing registry proxy, not Docker's own
+/// pull-through cache infrastructure), and it runs fully offline once the
+/// base image is cached, with no dependency on a third-party host being up.
+#[test]
+fn a_registry_mirror_prefixed_dockerfile_builds_against_a_self_hosted_registry() {
+    if !docker_available() {
+        println!("Docker not available, skipping");
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime");
+
+    let port = match runtime.block_on(async {
+        let container = GenericImage::new("registry", "2").start().await?;
+        let port = container.get_host_port_ipv4(5000).await?;
+        // `ContainerAsync::drop` schedules async cleanup on the current Tokio
+        // reactor; by the time this function returns, the `current_thread`
+        // runtime above is no longer entered, so a normal drop panics with
+        // "no reactor running". Leak it instead -- the test process exits
+        // right after, same workaround already used by
+        // `temps-providers/tests/role_reconciler_integration.rs`.
+        Box::leak(Box::new(container));
+        Ok::<_, testcontainers::TestcontainersError>(port)
+    }) {
+        Ok(port) => port,
+        Err(e) => {
+            println!("could not start a local registry container, skipping: {e}");
+            return;
+        }
+    };
+
+    if !wait_for_tcp(port, Duration::from_secs(15)) {
+        println!("local registry never accepted connections, skipping");
+        return;
+    }
+    let prefix = format!("localhost:{port}");
+
+    let fixture = tempfile::tempdir().expect("a temp dir");
+    write_node_fixture(fixture.path());
+    let dockerfile = render_dockerfile(fixture.path());
+    assert!(
+        !dockerfile.contains("autopack could not plan"),
+        "the preset produced no build plan:\n{dockerfile}"
+    );
+
+    let rewritten = apply_registry_prefix(&dockerfile, &prefix);
+    assert_ne!(
+        dockerfile, rewritten,
+        "prefix rewrite must change the Dockerfile"
+    );
+
+    let images = images_rewritten_through(&rewritten, &prefix);
+    assert!(
+        !images.is_empty(),
+        "expected at least one FROM line rewritten through {prefix}, got:\n{rewritten}"
+    );
+
+    // Seed the local registry with exactly the images the rewrite expects to
+    // find there -- mirroring what an operator's own registry proxy would
+    // already have cached/proxied.
+    for image in &images {
+        if let Err(e) = docker(&["pull", image]) {
+            println!("could not pull {image} to seed the local registry, skipping: {e}");
+            return;
+        }
+        let local_ref = format!("{prefix}/{image}");
+        docker(&["tag", image, &local_ref]).expect("tag for local registry push");
+        docker(&["push", &local_ref]).expect("push to local registry");
+    }
+
+    let tag = "temps-registry-prefix-e2e-self-hosted:test";
+    let result = docker_build(fixture.path(), tag, &rewritten);
+
+    let _ = Command::new("docker")
+        .args(["rmi", "-f", tag])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    if let Err(e) = result {
+        panic!("building against the self-hosted registry mirror failed: {e}");
     }
 }
