@@ -64,9 +64,11 @@ pub fn routes() -> Router<Arc<AppState>> {
     request_body = CreateEmailProviderRequest,
     responses(
         (status = 201, description = "Provider created successfully", body = EmailProviderResponse),
-        (status = 400, description = "Invalid request"),
+        (status = 400, description = "Invalid request or validation error"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 422, description = "Provider credentials are invalid — the provider API definitively rejected them"),
+        (status = 502, description = "Could not reach the provider API to verify credentials — the credentials may still be valid"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -143,11 +145,9 @@ pub async fn create_email_provider(
         .provider_service
         .create_with_sns_topic(create_request, sns_topic_arn)
         .await
-        .map_err(|e| {
+        .map_err(|e: crate::errors::EmailError| -> Problem {
             error!("Failed to create email provider: {}", e);
-            internal_server_error()
-                .detail(format!("Failed to create provider: {}", e))
-                .build()
+            e.into()
         })?;
 
     // Get masked credentials for response
@@ -320,6 +320,8 @@ pub async fn get_email_provider(
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Provider not found"),
         (status = 409, description = "Provider type mismatch"),
+        (status = 422, description = "New credentials are invalid — the provider API definitively rejected them"),
+        (status = 502, description = "Could not reach the provider API to verify new credentials"),
         (status = 500, description = "Internal server error")
     ),
     params(

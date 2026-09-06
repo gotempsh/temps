@@ -22,6 +22,21 @@ pub enum EmailError {
     #[error("Domain not verified: {0}")]
     DomainNotVerified(String),
 
+    #[error("Domain '{domain}' already exists for provider {provider_id}")]
+    DomainAlreadyExists { domain: String, provider_id: i32 },
+
+    /// The domain's row was removed from Temps, but the provider-side identity
+    /// could not be deleted (network failure, revoked credentials, or the
+    /// identity-domain mismatch guard rejecting a stale `provider_identity_id`).
+    /// Deliberately not rolled back: an unreachable provider must not strand
+    /// the local row forever, but the operator still needs to know a manual
+    /// cleanup on the provider's side may be required.
+    #[error(
+        "Domain '{domain}' was removed from Temps, but the provider-side identity could not be \
+         deleted and may still exist: {reason}"
+    )]
+    ProviderCleanupFailed { domain: String, reason: String },
+
     #[error("Email domain '{domain}' is not authorized for project {project_id}")]
     DomainNotAuthorized { domain: String, project_id: i32 },
 
@@ -85,6 +100,26 @@ pub enum EmailError {
         provider: String,
         retryable: bool,
         message: String,
+    },
+
+    /// The provider's API definitively rejected the supplied credentials during
+    /// the read-only verification check that runs before persisting a new or
+    /// updated provider. This is a client input error, not an internal failure —
+    /// the user typed the wrong key, secret, or project ID.
+    #[error("Invalid {provider_type} credentials: {reason}")]
+    InvalidCredentials {
+        provider_type: String,
+        reason: String,
+    },
+
+    /// A lightweight credential check could not reach the provider's API,
+    /// most likely due to a network or DNS issue on the Temps host. The
+    /// credentials themselves may be valid. The operator should verify that
+    /// the Temps server can reach the provider's API endpoint.
+    #[error("Could not reach {provider_type} to verify credentials: {reason}")]
+    ProviderUnreachable {
+        provider_type: String,
+        reason: String,
     },
 }
 

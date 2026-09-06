@@ -15,7 +15,9 @@ mod tracking_setup_integration_tests;
 mod tracking_setup_service;
 mod validation;
 
-pub use domain_service::{CreateDomainRequest, DomainService, DomainWithDnsRecords};
+pub use domain_service::{
+    CreateDomainRequest, DomainService, DomainWithDnsRecords, ImportDomainRequest,
+};
 pub use email_service::{
     EmailService, EmailStats, ListEmailsOptions, SendEmailRequest, SendEmailResponse,
     TrackingRewriter,

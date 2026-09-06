@@ -28,6 +28,8 @@ interface ProjectSelectProps {
   onValueChange: (projectId: number | null) => void
   /** Show the "All projects" row. Off for pickers that require a project. */
   allowAll?: boolean
+  /** Project ids to omit from the list, e.g. ones already assigned elsewhere. */
+  excludeIds?: number[]
   placeholder?: string
   disabled?: boolean
   className?: string
@@ -44,6 +46,7 @@ export function ProjectSelect({
   value,
   onValueChange,
   allowAll = true,
+  excludeIds,
   placeholder = 'Select project…',
   disabled,
   className,
@@ -56,15 +59,15 @@ export function ProjectSelect({
     staleTime: 60_000,
   })
 
-  const projects = React.useMemo(
-    () =>
-      (projectsQuery.data?.projects ?? [])
-        .slice()
-        .sort((a, b) =>
-          a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-        ),
-    [projectsQuery.data?.projects]
-  )
+  const projects = React.useMemo(() => {
+    const excluded = excludeIds ? new Set(excludeIds) : null
+    return (projectsQuery.data?.projects ?? [])
+      .filter((p) => !excluded?.has(p.id))
+      .slice()
+      .sort((a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+      )
+  }, [projectsQuery.data?.projects, excludeIds])
 
   const selected = React.useMemo(
     () => projects.find((p) => p.id === value) ?? null,
