@@ -1,0 +1,592 @@
+/* SPDX-FileCopyrightText: 2024-2026 Temps Contributors */
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+
+/* ────────────────────────────────────────────────────────────────────────
+   @temps-sdk/op — the skin.
+
+   Import this once, anywhere in your Tailwind v4 entry CSS:
+
+       @import '@temps-sdk/op/op.css';
+
+   It carries the operator token layer and every `.op-*` utility the
+   primitives in this package render. Without it the components still
+   mount, but they render unskinned.
+
+   `@source "./"` is relative to THIS file: it tells Tailwind to scan the
+   package's own TSX for utility classes, so the utilities used inside
+   `@temps-sdk/op` get generated in whatever app imports this stylesheet.
+   Consumers do not need to add the package to their own `@source` list.
+
+   Docs: design-system/docs/brand-guidelines.md §6 (the op layer) and
+   design-system/docs/design-system-handoff.md §6/§7.
+   ──────────────────────────────────────────────────────────────────────── */
+@source "./";
+
+
+/* ────────────────────────────────────────────────────────────────────────
+   Operator console — proposed production token layer (v2).
+
+   This is the `/operator` route's reskin. It is a class, not a route-local
+   inline style, so the same block can be dropped onto the real console's
+   root element as a one-line migration experiment. `/directions` keeps its
+   own inline OPERATOR_VARS untouched for comparison.
+
+   Decisions baked in (see docs/operator-console-brief.md §3.3, §3.4):
+   - Geist Mono for chrome (already loaded, already used for IDs in prod);
+     Geist Sans for wrapping prose via `.op-prose`. No new font dependency.
+   - Ring is the brand blue, not green — green stays a status colour.
+   - Page background is near-black (oklch 0.06), true black is reserved for
+     inset panes (`--op-inset`: logs, code, previews) so the pane/page step
+     is the separation instead of a border.
+   - Charts: chart-1/2 collapse to foreground/muted; 3–5 stay status-only.
+   - Motion: colour/border/transform transitions are 0s. Only skeleton
+     pulse and spinners keep their animation.
+   ──────────────────────────────────────────────────────────────────────── */
+.operator {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.1 0 0);
+  --card: oklch(0.985 0 0);
+  --card-foreground: oklch(0.1 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.1 0 0);
+  --primary: oklch(0.1 0 0);
+  --primary-foreground: oklch(1 0 0);
+  --secondary: oklch(0.95 0 0);
+  --secondary-foreground: oklch(0.1 0 0);
+  --muted: oklch(0.955 0 0);
+  --muted-foreground: oklch(0.42 0 0);
+  --accent: oklch(0.93 0 0);
+  --accent-foreground: oklch(0.1 0 0);
+  --border: oklch(0.82 0 0);
+  --input: oklch(0.82 0 0);
+  --ring: oklch(0.59 0.2032 256.82);
+  --chart-1: oklch(0.1 0 0);
+  --chart-2: oklch(0.6 0 0);
+  --op-inset: oklch(0.985 0 0);
+  --op-inset-foreground: oklch(0.1 0 0);
+  --radius: 0.125rem;
+  --font-sans: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
+  font-feature-settings: 'tnum' 1, 'ss01' 1;
+  color: var(--foreground);
+  background-color: var(--background);
+}
+
+.dark .operator,
+.dark.operator {
+  --background: oklch(0.06 0 0);
+  --foreground: oklch(0.97 0 0);
+  --card: oklch(0.1 0 0);
+  --card-foreground: oklch(0.97 0 0);
+  --popover: oklch(0.08 0 0);
+  --popover-foreground: oklch(0.97 0 0);
+  --primary: oklch(0.97 0 0);
+  --primary-foreground: oklch(0.06 0 0);
+  --secondary: oklch(0.16 0 0);
+  --secondary-foreground: oklch(0.97 0 0);
+  --muted: oklch(0.14 0 0);
+  --muted-foreground: oklch(0.66 0 0);
+  --accent: oklch(0.2 0 0);
+  --accent-foreground: oklch(0.97 0 0);
+  --border: oklch(0.3 0 0);
+  --input: oklch(0.3 0 0);
+  --chart-1: oklch(0.97 0 0);
+  --chart-2: oklch(0.55 0 0);
+  --op-inset: oklch(0 0 0);
+  --op-inset-foreground: oklch(0.97 0 0);
+}
+
+/* Prose that wraps past one line goes back to Geist Sans — all-mono
+   paragraphs are the fatigue risk the brief calls out; labels/data aren't. */
+.operator .op-prose {
+  font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-feature-settings: normal;
+}
+
+/* `font-mono` utilities are inlined by @theme inline, so force them back to
+   the operator face rather than the sandbox's Noto fallback. */
+.operator .font-mono,
+.operator code,
+.operator kbd,
+.operator pre {
+  font-family: var(--font-mono);
+}
+
+/* Inset panes: logs, code, previews. True black in dark, card in light. */
+.operator .op-inset {
+  background-color: var(--op-inset);
+  color: var(--op-inset-foreground);
+}
+
+/* Micro-label: the one typographic device that carries the direction. */
+.operator .op-label {
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+/* Iconography: lighter stroke, chrome-sized. Status uses glyphs, not icons. */
+.operator svg.lucide {
+  stroke-width: 1.5;
+}
+
+/* Motion: state changes are instant. Skeleton pulse and spinners are the
+   only two animations kept — both communicate "still working", which an
+   instant state change cannot. Reduced-motion is satisfied for free. */
+.operator,
+.operator *:not(.animate-pulse):not(.animate-spin),
+.operator *::before,
+.operator *::after {
+  transition-duration: 0s !important;
+  animation-duration: 0s !important;
+}
+
+/* High-contrast users: hairlines double up. */
+@media (prefers-contrast: more) {
+  .operator {
+    --border: oklch(0.55 0 0);
+  }
+  .dark .operator {
+    --border: oklch(0.6 0 0);
+  }
+}
+
+/* iOS Safari zooms the page into any focused input whose font-size is under
+   16px, and the user has to pinch back out afterwards. Dense 12px inputs are
+   fine with a hardware keyboard; on a phone they must render at 16px. This is
+   unlayered on purpose so it wins over `text-xs` utilities. Do NOT "fix" this
+   with `maximum-scale=1` in the viewport meta — that disables user zoom. */
+@media (max-width: 767px) {
+  .operator input:not([type='range']):not([type='checkbox']),
+  .operator textarea,
+  .operator select,
+  .operator [cmdk-input] {
+    font-size: 16px;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   Hardline — a second skin on the same page, borrowed from what actually
+   sets gumroad.com apart, translated into Temps' white/black rule:
+
+   - Paper, not white: warm off-white canvas (#f4f4f0 on gumroad) and pure
+     black ink. Dark scheme inverts to warm near-black paper + bone ink.
+   - Rules are ink: every border is 1px of the foreground colour, never a
+     grey. This is the single biggest visual break from Vercel's grey-200.
+   - Hard offset shadow (no blur) on raised things: cards, primary buttons,
+     dialogs. Press = translate into the shadow.
+   - Pill buttons, black fill primary, geometric grotesk at regular weight
+     for headings (Space Grotesk here, standing in for a commercial face). Mono stays
+     for data only — Hardline is NOT all-mono.
+   - Motion is allowed again (hover lift, press) — restraint is in colour,
+     not in movement.
+   - Still no new hue. Gumroad's pink is where a signature colour would go;
+     that decision is the user's, so `--mark` is defined but set to ink.
+   Applied as `.operator.hardline` so it reuses every op-* utility above.
+   ──────────────────────────────────────────────────────────────────────── */
+.operator.hardline {
+  --background: oklch(0.97 0.004 95);      /* warm paper */
+  --foreground: oklch(0.12 0 0);
+  --card: oklch(0.99 0.003 95);
+  --card-foreground: oklch(0.12 0 0);
+  --popover: oklch(0.99 0.003 95);
+  --popover-foreground: oklch(0.12 0 0);
+  --primary: oklch(0.12 0 0);
+  --primary-foreground: oklch(0.99 0.003 95);
+  --secondary: oklch(0.93 0.005 95);
+  --secondary-foreground: oklch(0.12 0 0);
+  --muted: oklch(0.93 0.005 95);
+  --muted-foreground: oklch(0.42 0 0);
+  --accent: oklch(0.9 0.006 95);
+  --accent-foreground: oklch(0.12 0 0);
+  --border: oklch(0.12 0 0);               /* ink rules */
+  --input: oklch(0.12 0 0);
+  --chart-1: oklch(0.12 0 0);
+  --chart-2: oklch(0.6 0 0);
+  --op-inset: oklch(0.99 0.003 95);
+  --op-inset-foreground: oklch(0.12 0 0);
+  --mark: oklch(0.12 0 0);
+  --radius: 0.5rem;
+  --font-sans: 'Space Grotesk', 'Geist', -apple-system, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-sans);
+  font-feature-settings: normal;
+}
+
+.dark .operator.hardline {
+  --background: oklch(0.16 0.004 95);      /* warm near-black */
+  --foreground: oklch(0.95 0.008 95);      /* bone */
+  --card: oklch(0.2 0.004 95);
+  --card-foreground: oklch(0.95 0.008 95);
+  --popover: oklch(0.2 0.004 95);
+  --popover-foreground: oklch(0.95 0.008 95);
+  --primary: oklch(0.95 0.008 95);
+  --primary-foreground: oklch(0.16 0.004 95);
+  --secondary: oklch(0.26 0.004 95);
+  --secondary-foreground: oklch(0.95 0.008 95);
+  --muted: oklch(0.24 0.004 95);
+  --muted-foreground: oklch(0.68 0 0);
+  --accent: oklch(0.3 0.004 95);
+  --accent-foreground: oklch(0.95 0.008 95);
+  --border: oklch(0.95 0.008 95);
+  --input: oklch(0.95 0.008 95);
+  --chart-1: oklch(0.95 0.008 95);
+  --chart-2: oklch(0.55 0 0);
+  --op-inset: oklch(0.12 0.004 95);
+  --op-inset-foreground: oklch(0.95 0.008 95);
+  --mark: oklch(0.95 0.008 95);
+}
+
+/* Type: headings in the grotesk at regular weight, big; labels stay
+   micro but in the grotesk, not mono. Data cells keep mono via .font-mono. */
+.operator.hardline h1,
+.operator.hardline h2,
+.operator.hardline h3 {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.operator.hardline .op-label {
+  font-family: var(--font-sans);
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+.operator.hardline .op-prose {
+  font-family: var(--font-sans);
+}
+.operator.hardline .font-mono,
+.operator.hardline code,
+.operator.hardline kbd,
+.operator.hardline pre,
+.operator.hardline .tabular-nums {
+  font-family: var(--font-mono);
+}
+
+/* Pills + hard shadow on raised things. Press sinks into the shadow. */
+.operator.hardline button,
+.operator.hardline [role='button'] {
+  border-radius: 9999px;
+}
+.operator.hardline .op-raise,
+.operator.hardline button:not(.op-flat):not([data-state]):not([role='switch']),
+.operator.hardline [role='alertdialog'],
+.operator.hardline [role='dialog'] {
+  box-shadow: 3px 3px 0 0 var(--foreground);
+  border: 1px solid var(--foreground);
+}
+.operator.hardline button:not(.op-flat):not([data-state]):not([role='switch']):active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 0 var(--foreground);
+}
+.operator.hardline .op-raise:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0 0 var(--foreground);
+}
+.operator.hardline input:not([type='range']):not([type='checkbox']),
+.operator.hardline textarea {
+  border-radius: 9999px;
+  border-color: var(--foreground);
+}
+
+/* Ink is for the outline; row dividers inside a table are a 15% tint so a
+   50-row table doesn't become a black ladder. Header keeps the full rule. */
+.operator.hardline tbody tr,
+.operator.hardline tfoot {
+  border-color: color-mix(in oklch, var(--foreground) 18%, transparent);
+}
+
+/* Key badges inside a filled button: paper pill on ink. */
+.operator.hardline .bg-primary kbd,
+.operator.hardline .bg-foreground kbd {
+  background: var(--background);
+  color: var(--foreground);
+  border-color: var(--background);
+}
+.operator.hardline kbd {
+  border-color: var(--foreground);
+  border-radius: 9999px;
+}
+
+/* Icons back to the stock 2px stroke: heavier ink suits heavier rules. */
+.operator.hardline svg.lucide {
+  stroke-width: 2;
+}
+
+/* Motion comes back for this skin: press/lift only, 120ms, no easing curve
+   longer than that. Overrides the operator 0s rule via higher specificity. */
+.operator.hardline,
+.operator.hardline *:not(.animate-pulse):not(.animate-spin),
+.operator.hardline *::before,
+.operator.hardline *::after {
+  transition-duration: 120ms !important;
+  transition-property: transform, box-shadow, background-color, color, border-color;
+}
+
+/* Inverted "mark": the accent slot. Black block, paper text. If a hue is
+   ever chosen, only --mark changes. */
+.operator.hardline .op-mark {
+  background: var(--mark);
+  color: var(--background);
+  padding: 0 0.35em;
+  border-radius: 0.2em;
+}
+.operator.hardline .op-raise {
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+/* Icon-only helpers inside inset panes and table cells stay flat — a hard
+   shadow on a 20px copy button is noise, not affordance. */
+.operator.hardline .op-inset button,
+.operator.hardline td button,
+.operator.hardline .group button {
+  box-shadow: none;
+  border-color: transparent;
+}
+
+/* Keyboard-triggered press. Operator: instant invert (no motion, so the
+   state change itself is the feedback). Hardline: sink into the shadow,
+   same as a pointer press. */
+.operator .op-pressed {
+  background: var(--background) !important;
+  color: var(--foreground) !important;
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.operator.hardline .op-pressed {
+  background: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+  outline: none;
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 0 var(--foreground);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   Ink — Operator console v3. The decided direction, as tokens:
+     1. Paper and ink, nothing else. Grey only for secondary text.
+     2. Every border is ink (1px foreground).
+     3. No cards. Rules and whitespace separate surfaces. One raised
+        element per screen (.op-raise), hard 3px shadow, no blur.
+     4. Colour means status only, always with glyph + word.
+     5. Dense by default: 32px rows, micro-labels, mono for data.
+   Geist stays. Reuses the op-* utilities from .operator above.
+   ──────────────────────────────────────────────────────────────────────── */
+.operator.ink {
+  --background: oklch(0.975 0.004 95);
+  --foreground: oklch(0.13 0 0);
+  /* State colours are used as TEXT (glyph + word, red numbers, "danger zone"), so they must
+     read at AA on paper: ≥4.5:1 for body sizes. The shadcn defaults (L 0.63 / 0.77) sit at
+     3.7 / 3.1 / 2.0 and fail; these darker mixes clear 4.5 against --background. */
+  --destructive: oklch(0.53 0.21 25);
+  --success: oklch(0.50 0.15 150);
+  --warning: oklch(0.52 0.14 68);
+  --card: oklch(0.975 0.004 95);
+  --card-foreground: oklch(0.13 0 0);
+  --popover: oklch(0.99 0.003 95);
+  --popover-foreground: oklch(0.13 0 0);
+  --primary: oklch(0.13 0 0);
+  --primary-foreground: oklch(0.975 0.004 95);
+  --secondary: oklch(0.94 0.005 95);
+  --secondary-foreground: oklch(0.13 0 0);
+  --muted: oklch(0.94 0.005 95);
+  --muted-foreground: oklch(0.45 0 0);
+  --accent: oklch(0.91 0.006 95);
+  --accent-foreground: oklch(0.13 0 0);
+  --border: oklch(0.13 0 0);
+  --input: oklch(0.13 0 0);
+  --ring: oklch(0.59 0.2032 256.82);
+  --chart-1: oklch(0.13 0 0);
+  --chart-2: oklch(0.62 0 0);
+  --op-inset: oklch(0.99 0.003 95);
+  --op-inset-foreground: oklch(0.13 0 0);
+  --op-rule-soft: color-mix(in oklch, var(--foreground) 16%, transparent);
+  --radius: 0.25rem;
+  --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-sans);
+  font-feature-settings: 'tnum' 1;
+}
+.dark .operator.ink {
+  --background: oklch(0.17 0.004 95);
+  --foreground: oklch(0.95 0.008 95);
+  /* Same states on ink: lighter and less saturated so they clear 4.5 against the dark paper. */
+  --destructive: oklch(0.72 0.18 23);
+  --destructive-foreground: oklch(0.17 0.004 95); /* ink text on the lighter red fill: white would be 2.7:1 */
+  --success: oklch(0.72 0.15 150);
+  --warning: oklch(0.80 0.15 75);
+  --card: oklch(0.17 0.004 95);
+  --card-foreground: oklch(0.95 0.008 95);
+  --popover: oklch(0.21 0.004 95);
+  --popover-foreground: oklch(0.95 0.008 95);
+  --primary: oklch(0.95 0.008 95);
+  --primary-foreground: oklch(0.17 0.004 95);
+  --secondary: oklch(0.26 0.004 95);
+  --secondary-foreground: oklch(0.95 0.008 95);
+  --muted: oklch(0.24 0.004 95);
+  --muted-foreground: oklch(0.68 0 0);
+  --accent: oklch(0.3 0.004 95);
+  --accent-foreground: oklch(0.95 0.008 95);
+  --border: oklch(0.95 0.008 95);
+  --input: oklch(0.95 0.008 95);
+  --chart-1: oklch(0.95 0.008 95);
+  --chart-2: oklch(0.55 0 0);
+  --op-inset: oklch(0.13 0.004 95);
+  --op-inset-foreground: oklch(0.95 0.008 95);
+}
+.operator.ink .op-label { font-family: var(--font-sans); letter-spacing: 0.1em; font-weight: 500; }
+.operator.ink .op-prose { font-family: var(--font-sans); }
+.operator.ink .font-mono, .operator.ink code, .operator.ink kbd, .operator.ink pre, .operator.ink .tabular-nums { font-family: var(--font-mono); }
+.operator.ink svg.lucide { stroke-width: 1.75; }
+/* Soft rules: inside a ledger, row dividers are a tint; the frame is ink. */
+.operator.ink .op-rows > * + * { border-top: 1px solid var(--op-rule-soft); }
+/* Page anatomy (handoff §7 "record page"). A section is a title + one body. Sections in the
+   same column are separated by an ink rule with 1.25rem above and below; the first has none.
+   Rows inside a section (key/value, timeline) are separated by soft rules at 0.5rem padding. */
+.operator.ink .op-block + .op-block { border-top: 1px solid var(--border); margin-top: 1.25rem; padding-top: 1.25rem; }
+.operator.ink .op-block > .op-block-body { margin-top: 0.75rem; }
+/* Sections side by side (a grid of breakdowns) are peers, not a stack: no rule between them.
+   They stretch to the row height so framed lists end on one baseline; a Breakdown pins its footer to the bottom. */
+.operator.ink .op-grid > .op-block + .op-block { border-top: 0; margin-top: 0; padding-top: 0; }
+.operator.ink .op-halves > * { min-width: 0; }
+@media (max-width: 79.99rem) { .operator.ink .op-halves > * + * { border-top: 1px solid var(--border); margin-top: 1.25rem; padding-top: 1.25rem; } }
+.operator.ink .op-kv, .operator.ink .op-timeline { border: 1px solid var(--border); background: var(--background); }
+.operator.ink .op-kv > * + *, .operator.ink .op-timeline > * + * { border-top: 1px solid var(--op-rule-soft); }
+.operator.ink tbody tr, .operator.ink tfoot { border-color: var(--op-rule-soft); }
+/* The one raised element per screen. */
+.operator.ink .op-raise { box-shadow: 3px 3px 0 0 var(--foreground); border: 1px solid var(--foreground); border-radius: var(--radius); }
+.operator.ink button.op-primary { box-shadow: 2px 2px 0 0 var(--foreground); border: 1px solid var(--foreground); }
+.operator.ink button.op-primary:active { transform: translate(1px, 1px); box-shadow: 1px 1px 0 0 var(--foreground); }
+.operator.ink .bg-primary kbd, .operator.ink .bg-foreground kbd { background: var(--background); color: var(--foreground); border-color: var(--background); }
+.operator.ink, .operator.ink *:not(.animate-pulse):not(.animate-spin), .operator.ink *::before, .operator.ink *::after {
+  transition-duration: 100ms !important;
+  transition-property: transform, box-shadow, background-color, color;
+}
+/* Status line: the sentence. Each phrase is a link. */
+.operator.ink .op-status a { text-decoration: underline; text-decoration-color: var(--op-rule-soft); text-underline-offset: 3px; }
+.operator.ink .op-status a:hover { text-decoration-color: var(--foreground); }
+
+/* ────────────────────────────────────────────────────────────────────────
+   v4 — Ink plus everything v2 and v3 left open. Same tokens as .ink; adds
+   a density axis (data-density on the shell), sticky status line, true
+   inset panes for logs in dark, and nothing else new in colour.
+   ──────────────────────────────────────────────────────────────────────── */
+.operator.ink.v4 { --row-h: 2.25rem; --cell-px: 0.75rem; }
+.operator.ink.v4[data-density='dense'] { --row-h: 1.75rem; --cell-px: 0.5rem; }
+.operator.ink.v4 .op-row { height: var(--row-h); padding-left: var(--cell-px); padding-right: var(--cell-px); }
+.dark .operator.ink.v4 { --op-inset: oklch(0 0 0); }
+.operator.ink.v4 .op-sticky { position: sticky; top: 0; z-index: 20; background: var(--background); }
+.operator.ink.v4 .op-marker-hot { background: var(--muted); }
+.operator.ink.v4 .op-progress { background: linear-gradient(90deg, var(--foreground) var(--p, 0%), transparent 0); }
+
+/* Accent experiment: primary is ink by default. Setting data-accent swaps
+   only --primary / --primary-foreground, so filled buttons, active tabs and
+   inverted panels take the hue while everything else stays paper and ink.
+   Status colours and the focus ring are untouched. */
+.operator.ink[data-accent='signal'] { --primary: oklch(0.64 0.21 32); --primary-foreground: oklch(0.99 0.003 95); }
+.operator.ink[data-accent='moss'] { --primary: oklch(0.55 0.15 150); --primary-foreground: oklch(0.99 0.003 95); }
+.operator.ink[data-accent='cobalt'] { --primary: oklch(0.5 0.2 262); --primary-foreground: oklch(0.99 0.003 95); }
+.operator.ink[data-accent='violet'] { --primary: oklch(0.5 0.22 300); --primary-foreground: oklch(0.99 0.003 95); }
+.dark .operator.ink[data-accent='signal'] { --primary: oklch(0.7 0.19 32); }
+.dark .operator.ink[data-accent='moss'] { --primary: oklch(0.72 0.15 150); --primary-foreground: oklch(0.13 0 0); }
+.dark .operator.ink[data-accent='cobalt'] { --primary: oklch(0.7 0.16 262); --primary-foreground: oklch(0.13 0 0); }
+.dark .operator.ink[data-accent='violet'] { --primary: oklch(0.72 0.17 300); --primary-foreground: oklch(0.13 0 0); }
+.operator.ink .op-fill { background: var(--primary); color: var(--primary-foreground); }
+
+/* Filled controls answer hover and press themselves. Before this every
+   component hand-rolled it, and two got it wrong: `hover:bg-destructive` on a
+   destructive fill is a no-op, and a selected+disabled option that inherits
+   `hover:bg-muted` loses its fill under the pointer while keeping its white
+   text. Hover mixes 15% paper into the fill; press nudges 1px like op-primary. */
+.operator.ink .op-fill-ink { background: var(--foreground); color: var(--background); border: 1px solid var(--foreground); }
+.operator.ink .op-fill-ink:hover:not(:disabled) { background: color-mix(in oklch, var(--foreground), var(--background) 15%); border-color: color-mix(in oklch, var(--foreground), var(--background) 15%); }
+.operator.ink .op-fill-destructive { background: var(--destructive); color: var(--destructive-foreground); border: 1px solid var(--destructive); }
+.operator.ink .op-fill-destructive:hover:not(:disabled) { background: color-mix(in oklch, var(--destructive), black 14%); border-color: color-mix(in oklch, var(--destructive), black 14%); }
+.operator.ink button.op-fill-ink:active:not(:disabled), .operator.ink button.op-fill-destructive:active:not(:disabled) { transform: translate(1px, 1px); }
+.operator.ink .op-fill-ink kbd, .operator.ink .op-fill-destructive kbd { background: transparent; color: inherit; border-color: currentColor; }
+
+/* ────────────────────────────────────────────────────────────────────────
+   Ink type hierarchy. Six tiers, each with a fixed weight so that weight
+   alone tells the reader what level they are on. Geist has real 700/800.
+   display  hero only, one per page          800  -0.04em
+   h1       major section title              700  -0.03em
+   h2       minor section / panel title       600  -0.02em
+   h3       item title inside a grid          600  -0.01em
+   lead     the sentence under a title        400  muted
+   label    eyebrow / column header           500  uppercase, tracked
+   ──────────────────────────────────────────────────────────────────────── */
+.operator.ink .op-display { font-weight: 800; letter-spacing: -0.04em; line-height: 0.98; font-size: clamp(2.75rem, 8vw, 6rem); text-wrap: balance; }
+.operator.ink .op-h1 { font-weight: 700; letter-spacing: -0.03em; line-height: 1.05; font-size: clamp(2rem, 4.2vw, 3.25rem); text-wrap: balance; }
+.operator.ink .op-h2 { font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; font-size: clamp(1.375rem, 2.4vw, 1.75rem); text-wrap: balance; }
+.operator.ink .op-h3 { font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; font-size: 1rem; }
+/* Console page title: the one 700-weight line on a console screen. Sized for
+   density, not for a landing page. */
+.operator.ink .op-title { font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; font-size: 1.25rem; }
+
+/* Switch under ink: a square track with a 1px ink border. Off is paper with a
+   muted thumb, on is an ink fill with a paper thumb. The stock pill filled the
+   track with ink in BOTH states (unchecked used --input, which is ink here),
+   so off looked on. */
+.operator.ink button[role='switch'] { height: 1.25rem; width: 2.25rem; border-radius: 0; border: 1px solid var(--foreground); background: var(--background); padding: 0 2px; transition: background-color 100ms; }
+.operator.ink button[role='switch'][data-state='checked'] { background: var(--foreground); }
+.operator.ink button[role='switch']:disabled { opacity: 0.4; }
+/* Tailwind's translate-x-* utilities set the `translate` property, not `transform`, so override that one or the two add up and the thumb leaves the track. */
+.operator.ink button[role='switch'] > span { height: 0.75rem; width: 0.75rem; border-radius: 0; box-shadow: none; background: var(--muted-foreground); transform: none; translate: 0 0; transition: translate 100ms; }
+.operator.ink button[role='switch'][data-state='checked'] > span { background: var(--background); translate: 1rem 0; }
+.operator.ink .op-lead { font-weight: 400; line-height: 1.5; font-size: clamp(1.0625rem, 1.5vw, 1.25rem); color: var(--muted-foreground); text-wrap: pretty; }
+.operator.ink .op-lead strong { color: var(--foreground); font-weight: 500; }
+/* Section rhythm: major sections breathe, minor ones sit close. A muted
+   tone is the only allowed background change between sections. */
+.operator.ink .op-section { padding-block: 5rem; }
+.operator.ink .op-section[data-tier='minor'] { padding-block: 3.5rem; }
+.operator.ink .op-section[data-tone='muted'] { background: var(--muted); }
+@media (max-width: 640px) {
+  .operator.ink .op-section { padding-block: 3.5rem; }
+  .operator.ink .op-section[data-tier='minor'] { padding-block: 2.5rem; }
+}
+.operator.ink .op-section[data-tier='minor'] .op-lead { font-size: 1rem; }
+
+/* v5: frozen decisions. No accent axis, radius 0.25rem, sticky save bar. */
+.operator.ink.v5 { --radius: 0.25rem; }
+.operator.ink.v5 .op-sticky-bottom { position: sticky; bottom: 0; z-index: 20; }
+.operator.ink.v5 select { border-radius: 0; }
+@media (min-width: 768px) { .operator.ink.v5 .op-cols { grid-template-columns: var(--cols); } }
+
+/* Metric grid: dividers drawn by the grid, tiles stay plain. */
+.operator.ink .op-metric-grid > * + * { border-left: 1px solid var(--border); }
+.operator.ink .op-metric-grid > *:nth-child(2n + 1) { border-left: 0; }
+.operator.ink .op-metric-grid > *:nth-child(n + 3) { border-top: 1px solid var(--border); }
+@media (min-width: 768px) {
+  .operator.ink .op-metric-grid { grid-template-columns: repeat(var(--metric-cols, 4), minmax(0, 1fr)); }
+  .operator.ink .op-metric-grid > * { border-top: 0 !important; }
+  .operator.ink .op-metric-grid > *:nth-child(2n + 1) { border-left: 1px solid var(--border); }
+  .operator.ink .op-metric-grid > *:first-child { border-left: 0; }
+}
+
+/* Horizontal scroll for tab strips and segmented controls on narrow screens. */
+.operator .op-scroll-x { overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+/* Tiles: a strip of N equal cells in one frame (metric tiles, vital tiles). md+ is one row of --tiles columns;
+   phones pair them two per row and an odd last tile spans the row, so the frame stays a rectangle. */
+.operator .op-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--border); background: var(--background); }
+.operator .op-tiles > * { min-width: 0; }
+/* The pair layout is phone-only, in its own query: as `> :nth-child(even)` (0,3,0) outranks
+   `> * + *` (0,2,0), leaving it on at md+ would cancel every other divider whatever the order. */
+@media (max-width: 767px) {
+  .operator .op-tiles > :nth-child(even) { border-left: 1px solid var(--border); }
+  .operator .op-tiles > :nth-child(n + 3) { border-top: 1px solid var(--border); }
+  .operator .op-tiles > :last-child:nth-child(odd) { grid-column: 1 / -1; }
+}
+@media (min-width: 768px) {
+  .operator .op-tiles { grid-template-columns: repeat(var(--tiles, 4), minmax(0, 1fr)); }
+  .operator .op-tiles > * + * { border-left: 1px solid var(--border); }
+}
+.operator .op-scroll-x::-webkit-scrollbar { display: none; }
+/* Phones: rows grow with their content instead of clipping it. */
+@media (max-width: 767px) {
+  .operator.ink.v4 .op-row { height: auto; min-height: var(--row-h); padding-top: 0.375rem; padding-bottom: 0.375rem; }
+}
+
+/* Streaming caret for tool input / agent text under ink: a 1ch ink block that blinks. */
+.operator.ink .op-caret::after { content: '▍'; margin-left: 1px; animation: op-blink 1s steps(1) infinite; }
+@keyframes op-blink { 50% { opacity: 0; } }
