@@ -196,17 +196,20 @@ export function AiAgentsDetail({
     const items = statusQuery.data?.items ?? []
     const total = items.reduce((s, r) => s + r.request_count, 0)
     const colorFor = (cls: string) =>
-      cls.startsWith('2')
-        ? 'var(--chart-2)' // green — served
-        : cls.startsWith('3')
-          ? 'var(--chart-1)' // blue — redirect
-          : cls.startsWith('4')
-            ? 'var(--chart-3)' // amber — client error
-            : cls.startsWith('5')
-              ? 'var(--chart-4)' // red — server error
-              : 'var(--muted-foreground)'
+      cls.startsWith('1')
+        ? 'var(--chart-1)' // blue — informational / upgrade
+        : cls.startsWith('2')
+          ? 'var(--chart-2)' // green — served
+          : cls.startsWith('3')
+            ? 'var(--chart-1)' // blue — redirect
+            : cls.startsWith('4')
+              ? 'var(--chart-3)' // amber — client error
+              : cls.startsWith('5')
+                ? 'var(--chart-4)' // red — server error
+                : 'var(--muted-foreground)'
     const labelFor = (cls: string) =>
       ({
+        '1xx': '1xx Informational',
         '2xx': '2xx Served',
         '3xx': '3xx Redirect',
         '4xx': '4xx Not found / blocked',

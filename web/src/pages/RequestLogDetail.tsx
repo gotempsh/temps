@@ -11,6 +11,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { httpStatusClass } from '@/lib/http-status-class'
 import {
   ArrowLeft,
   Monitor,
@@ -68,11 +69,20 @@ export default function RequestLogDetail({
   } = isLegacyNumericId ? byId : byRequestId
 
   const getStatusColor = (status: number) => {
-    if (status >= 200 && status < 300) return 'bg-green-100 text-green-800'
-    if (status >= 300 && status < 400) return 'bg-yellow-100 text-yellow-800'
-    if (status >= 400 && status < 500) return 'bg-orange-100 text-orange-800'
-    if (status >= 500) return 'bg-red-100 text-red-800'
-    return 'bg-gray-100 text-gray-800'
+    switch (httpStatusClass(status)) {
+      case '1xx':
+        return 'bg-blue-100 text-blue-800'
+      case '2xx':
+        return 'bg-green-100 text-green-800'
+      case '3xx':
+        return 'bg-yellow-100 text-yellow-800'
+      case '4xx':
+        return 'bg-orange-100 text-orange-800'
+      case '5xx':
+        return 'bg-red-100 text-red-800'
+      default:
+        return 'bg-gray-100 text-gray-800'
+    }
   }
 
   const getMethodColor = (method: string) => {

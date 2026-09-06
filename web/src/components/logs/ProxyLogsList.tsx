@@ -8,6 +8,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { Badge } from '@/components/ui/badge'
+import { httpStatusClass } from '@/lib/http-status-class'
 import { Button } from '@/components/ui/button'
 import {
   Select,
@@ -43,6 +44,20 @@ interface ProxyLogsListProps {
   project: ProjectResponse
   onRowClick?: (requestId: string, projectId: number, timestamp: string) => void
   showEnvironmentFilter?: boolean
+}
+
+const STATUS_BADGE_CLASSES: Record<
+  ReturnType<typeof httpStatusClass>,
+  string
+> = {
+  '1xx': 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
+  '2xx': 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
+  '3xx':
+    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+  '4xx': 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  '5xx': 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  unknown:
+    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
 }
 
 export default function ProxyLogsList({
@@ -722,14 +737,7 @@ export default function ProxyLogsList({
                             </TableCell>
                             <TableCell>
                               <span
-                                className={`rounded-full px-2 py-1 text-xs font-medium ${
-                                  log.status_code >= 200 &&
-                                  log.status_code < 300
-                                    ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                                    : log.status_code >= 400
-                                      ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
-                                      : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
-                                }`}
+                                className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_BADGE_CLASSES[httpStatusClass(log.status_code)]}`}
                               >
                                 {log.status_code}
                               </span>
