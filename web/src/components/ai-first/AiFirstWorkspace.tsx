@@ -43,6 +43,9 @@ import {
   getApplicationWorkspace,
   getApplicationWorkspaceChanges,
   getApplicationWorkspaceDiff,
+  getGlobalAiWorkspace,
+  getGlobalWorkspaceChanges,
+  getGlobalWorkspaceDiff,
   listAiProviders,
   listAllConversations,
   listApplicationConversations,
@@ -98,6 +101,7 @@ import { ApplicationProjectsPanel } from './ApplicationProjectsPanel'
 import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSettingsPanel'
 import { GlobalWorkspaceStatusPanel } from './GlobalWorkspaceStatusPanel'
 import { WorkspaceDiffViewer } from './WorkspaceDiffViewer'
+import { WorkspaceFileExplorer } from './WorkspaceFileExplorer'
 import { shouldRefreshArtifactsForLiveEvent } from './artifact-refresh'
 import {
   applicationsFromPages,
@@ -249,7 +253,6 @@ export function AiFirstWorkspace() {
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
   const [workspaceLoadPhase, setWorkspaceLoadPhase] =
     useState<WorkspaceLoadPhase>('idle')
-  const [workspaceFileCursor, setWorkspaceFileCursor] = useState(0)
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<
     string | null
@@ -364,24 +367,9 @@ export function AiFirstWorkspace() {
   const applicationConversationsQuery = useQuery({
     ...applicationConversationsOptions,
     enabled: Boolean(activeApplicationId),
-    refetchInterval: (query) =>
-      query.state.data?.some(
-        (conversation) => conversation.turn_status === 'running'
-      )
-        ? 2_000
-        : false,
   })
   const globalConversationsQuery = useQuery({
     ...globalConversationsOptions,
-    refetchInterval: (query) =>
-      query.state.data?.some(
-        (conversation) =>
-          conversation.context_type === 'global' &&
-          conversation.project_id == null &&
-          conversation.turn_status === 'running'
-      )
-        ? 2_000
-        : false,
   })
   const applicationWorkspaceQuery = useQuery({
     ...applicationWorkspaceOptions,
@@ -976,14 +964,6 @@ export function AiFirstWorkspace() {
     async (cursor: number) => {
       const requestGeneration = ++workspaceRequestGeneration.current
       workspaceAbortController.current?.abort()
-      if (!activeApplicationId) {
-        setWorkspaceChanges(null)
-        setSelectedWorkspacePath(null)
-        setWorkspaceFileCursor(0)
-        setWorkspaceLoading(false)
-        setWorkspaceLoadPhase('idle')
-        return
-      }
       const controller = new AbortController()
       workspaceAbortController.current = controller
       let clientTimedOut = false
@@ -995,11 +975,16 @@ export function AiFirstWorkspace() {
       setWorkspaceLoadPhase('checking')
       setWorkspaceError(null)
       try {
-        const { data: workspace } = await getApplicationWorkspace({
-          path: { application_public_id: activeApplicationId },
-          signal: controller.signal,
-          throwOnError: true,
-        })
+        const { data: workspace } = activeApplicationId
+          ? await getApplicationWorkspace({
+              path: { application_public_id: activeApplicationId },
+              signal: controller.signal,
+              throwOnError: true,
+            })
+          : await getGlobalAiWorkspace({
+              signal: controller.signal,
+              throwOnError: true,
+            })
         if (requestGeneration !== workspaceRequestGeneration.current) return
         if (workspace.desired_state !== 'running') {
           setWorkspaceError(
@@ -1010,15 +995,20 @@ export function AiFirstWorkspace() {
           return
         }
         setWorkspaceLoadPhase(workspaceLoadPhaseFor(workspace))
-        const { data: payload } = await getApplicationWorkspaceChanges({
-          path: { application_public_id: activeApplicationId },
-          query: { cursor, limit: WORKSPACE_FILES_PAGE_SIZE },
-          signal: controller.signal,
-          throwOnError: true,
-        })
+        const { data: payload } = activeApplicationId
+          ? await getApplicationWorkspaceChanges({
+              path: { application_public_id: activeApplicationId },
+              query: { cursor, limit: WORKSPACE_FILES_PAGE_SIZE },
+              signal: controller.signal,
+              throwOnError: true,
+            })
+          : await getGlobalWorkspaceChanges({
+              query: { cursor, limit: WORKSPACE_FILES_PAGE_SIZE },
+              signal: controller.signal,
+              throwOnError: true,
+            })
         if (requestGeneration !== workspaceRequestGeneration.current) return
         setWorkspaceChanges(payload)
-        setWorkspaceFileCursor(cursor)
         setSelectedWorkspacePath((current) =>
           current && payload.changes.some((change) => change.path === current)
             ? current
@@ -1051,7 +1041,7 @@ export function AiFirstWorkspace() {
   )
 
   useEffect(() => {
-    if (rightView !== 'files' || !activeApplicationId) return
+    if (rightView !== 'files') return
     const refreshTimer = window.setTimeout(() => void refreshWorkspace(), 0)
     return () => {
       window.clearTimeout(refreshTimer)
@@ -1065,15 +1055,21 @@ export function AiFirstWorkspace() {
 
   useEffect(() => {
     const requestGeneration = ++workspaceDiffGeneration.current
-    if (!activeApplicationId || !selectedWorkspacePath) return
+    if (!selectedWorkspacePath) return
     const loadTimer = window.setTimeout(() => {
       setWorkspaceDiff(null)
       setWorkspaceDiffLoading(true)
-      getApplicationWorkspaceDiff({
-        path: { application_public_id: activeApplicationId },
-        query: { path: selectedWorkspacePath },
-        throwOnError: true,
-      })
+      const request = activeApplicationId
+        ? getApplicationWorkspaceDiff({
+            path: { application_public_id: activeApplicationId },
+            query: { path: selectedWorkspacePath },
+            throwOnError: true,
+          })
+        : getGlobalWorkspaceDiff({
+            query: { path: selectedWorkspacePath },
+            throwOnError: true,
+          })
+      request
         .then(({ data: payload }) => {
           if (requestGeneration === workspaceDiffGeneration.current) {
             setWorkspaceDiff(payload)
@@ -2027,34 +2023,23 @@ export function AiFirstWorkspace() {
           <WorkspaceViewTabs
             activeView={rightView}
             changedFileCount={workspaceChanges?.changes.length ?? 0}
-            hasApplication={Boolean(activeApplication)}
             onChange={setRightView}
           />
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            {rightView === 'preview' && activeApplication ? (
+            {rightView === 'preview' ? (
               <ApplicationPreviewPanel
-                applicationPublicId={activeApplication.public_id}
-                key={activeApplication.public_id}
+                applicationPublicId={activeApplication?.public_id}
+                key={activeApplication?.public_id ?? 'global-workspace'}
               />
-            ) : rightView === 'files' && activeApplication ? (
+            ) : rightView === 'files' ? (
               <WorkspaceFilesPanel
+                applicationPublicId={activeApplication?.public_id}
                 changes={workspaceChanges}
                 diff={workspaceDiff}
                 diffLoading={workspaceDiffLoading}
                 error={workspaceError}
                 loading={workspaceLoading}
                 loadPhase={workspaceLoadPhase}
-                fileCursor={workspaceFileCursor}
-                onNextPage={() => {
-                  if (workspaceChanges?.next_cursor != null) {
-                    void loadWorkspacePage(workspaceChanges.next_cursor)
-                  }
-                }}
-                onPreviousPage={() =>
-                  void loadWorkspacePage(
-                    Math.max(0, workspaceFileCursor - WORKSPACE_FILES_PAGE_SIZE)
-                  )
-                }
                 onRefresh={() => void refreshWorkspace()}
                 onOpenSettings={() => setRightView('workspace')}
                 onSelect={setSelectedWorkspacePath}
@@ -2121,34 +2106,23 @@ export function AiFirstWorkspace() {
           <WorkspaceViewTabs
             activeView={rightView}
             changedFileCount={workspaceChanges?.changes.length ?? 0}
-            hasApplication={Boolean(activeApplication)}
             onChange={setRightView}
           />
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            {rightView === 'preview' && activeApplication ? (
+            {rightView === 'preview' ? (
               <ApplicationPreviewPanel
-                applicationPublicId={activeApplication.public_id}
-                key={activeApplication.public_id}
+                applicationPublicId={activeApplication?.public_id}
+                key={activeApplication?.public_id ?? 'global-workspace'}
               />
-            ) : rightView === 'files' && activeApplication ? (
+            ) : rightView === 'files' ? (
               <WorkspaceFilesPanel
+                applicationPublicId={activeApplication?.public_id}
                 changes={workspaceChanges}
                 diff={workspaceDiff}
                 diffLoading={workspaceDiffLoading}
                 error={workspaceError}
                 loading={workspaceLoading}
                 loadPhase={workspaceLoadPhase}
-                fileCursor={workspaceFileCursor}
-                onNextPage={() => {
-                  if (workspaceChanges?.next_cursor != null) {
-                    void loadWorkspacePage(workspaceChanges.next_cursor)
-                  }
-                }}
-                onPreviousPage={() =>
-                  void loadWorkspacePage(
-                    Math.max(0, workspaceFileCursor - WORKSPACE_FILES_PAGE_SIZE)
-                  )
-                }
                 onRefresh={() => void refreshWorkspace()}
                 onOpenSettings={() => setRightView('workspace')}
                 onSelect={setSelectedWorkspacePath}
@@ -2322,12 +2296,10 @@ function workspaceLoadMessage(phase: WorkspaceLoadPhase): string {
 export function WorkspaceViewTabs({
   activeView,
   changedFileCount,
-  hasApplication,
   onChange,
 }: {
   activeView: RightView
   changedFileCount: number
-  hasApplication: boolean
   onChange: (view: RightView) => void
 }) {
   const tabs: Array<{
@@ -2337,27 +2309,20 @@ export function WorkspaceViewTabs({
     count?: number
   }> = [
     { view: 'generated', label: 'Output', icon: Boxes },
-    ...(hasApplication
-      ? [
-          { view: 'preview' as const, label: 'Preview', icon: MonitorPlay },
-          {
-            view: 'files' as const,
-            label: 'Files',
-            icon: FolderTree,
-            count: changedFileCount,
-          },
-        ]
-      : []),
+    { view: 'preview', label: 'Preview', icon: MonitorPlay },
+    {
+      view: 'files',
+      label: 'Files',
+      icon: FolderTree,
+      count: changedFileCount,
+    },
     { view: 'workspace', label: 'Workspace', icon: Server },
   ]
 
   return (
     <div
       aria-label="Application workspace views"
-      className={cn(
-        'grid h-14 shrink-0 border-b border-border bg-card px-1',
-        hasApplication ? 'grid-cols-4' : 'grid-cols-2'
-      )}
+      className="grid h-14 shrink-0 grid-cols-4 border-b border-border bg-card px-1"
       role="tablist"
     >
       {tabs.map((tab) => {
@@ -2396,30 +2361,26 @@ export function WorkspaceViewTabs({
 }
 
 export function WorkspaceFilesPanel({
+  applicationPublicId,
   changes,
   diff,
   diffLoading,
   error,
-  fileCursor,
   loading,
   loadPhase,
-  onNextPage,
   onOpenSettings,
-  onPreviousPage,
   onRefresh,
   onSelect,
   selectedPath,
 }: {
+  applicationPublicId?: string
   changes: ApplicationWorkspaceChangesResponse | null
   diff: ApplicationWorkspaceDiffResponse | null
   diffLoading: boolean
   error: string | null
-  fileCursor: number
   loading: boolean
   loadPhase: WorkspaceLoadPhase
-  onNextPage: () => void
   onOpenSettings: () => void
-  onPreviousPage: () => void
   onRefresh: () => void
   onSelect: (path: string) => void
   selectedPath: string | null
@@ -2464,6 +2425,11 @@ export function WorkspaceFilesPanel({
           </Button>
         </div>
       )}
+
+      <WorkspaceFileExplorer
+        applicationPublicId={applicationPublicId}
+        changes={changes?.changes ?? []}
+      />
 
       {!changes && loading ? (
         <div className="flex items-center gap-2 rounded-md border border-border bg-background px-3 py-4 text-xs text-muted-foreground">
@@ -2561,72 +2527,12 @@ export function WorkspaceFilesPanel({
             </>
           )}
 
-          <section className="overflow-hidden rounded-lg border border-border bg-background">
-            <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-              <div className="flex items-center gap-2 text-xs font-medium">
-                <FolderTree className="size-3.5 text-muted-foreground" /> Files
-                <span className="font-mono text-[9px] text-muted-foreground">
-                  {changes
-                    ? `${Math.min(fileCursor + 1, changes.listed_file_count)}–${Math.min(
-                        fileCursor + changes.files.length,
-                        changes.listed_file_count
-                      )} of ${changes.listed_file_count}${changes.files_truncated ? '+' : ''}`
-                    : '0'}
-                </span>
-              </div>
-              <div className="flex items-center gap-1">
-                <Button
-                  className="h-6 px-2 text-[9px]"
-                  disabled={loading || fileCursor === 0}
-                  onClick={onPreviousPage}
-                  size="sm"
-                  type="button"
-                  variant="ghost"
-                >
-                  Previous
-                </Button>
-                <Button
-                  className="h-6 px-2 text-[9px]"
-                  disabled={loading || changes?.next_cursor == null}
-                  onClick={onNextPage}
-                  size="sm"
-                  type="button"
-                  variant="ghost"
-                >
-                  Next
-                </Button>
-              </div>
-            </div>
-            <div className="max-h-52 overflow-y-auto p-1.5">
-              {changes?.files.map((path) => (
-                <div
-                  className="flex items-center gap-2 px-2 py-1 font-mono text-[10px] text-muted-foreground"
-                  key={path}
-                  title={path}
-                >
-                  <FileCode2 className="size-3 shrink-0" />
-                  <span className="truncate">{path}</span>
-                </div>
-              ))}
-              {changes?.files.length === 0 && (
-                <p className="px-2 py-5 text-center text-[11px] text-muted-foreground">
-                  This repository is empty.
-                </p>
-              )}
-            </div>
-          </section>
-
           <p className="text-[10px] leading-4 text-muted-foreground">
-            Git runs inside this application&apos;s persistent sandbox. Commits
-            stay here until you explicitly connect and approve a remote push.
-            Sensitive file paths and credential-like diff values are hidden.
+            File browsing reads the persistent workspace without waking its
+            compute. Git changes are inspected in the sandbox; commits stay here
+            until you explicitly connect and approve a remote push. Sensitive
+            file paths and credential-like diff values are hidden.
           </p>
-          {changes?.files_truncated && (
-            <p className="text-[10px] text-amber-600 dark:text-amber-300">
-              Large workspace: browsing is capped at the first 1,000 safe file
-              paths.
-            </p>
-          )}
           {changes?.changes_truncated && (
             <p className="text-[10px] text-amber-600 dark:text-amber-300">
               Working changes are capped at the first 200 safe paths.

@@ -2087,6 +2087,23 @@ export function shouldShowAssistantActivityAfterContent(
 
 /** Backoff schedule for WS reconnects — bounded, no thundering herd. */
 const WS_RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 15000]
+const DISCONNECTED_CHAT_POLL_INTERVAL_MS = 2000
+
+type ConversationTransportState = 'connecting' | 'connected' | 'unavailable'
+
+/**
+ * WebSocket events are authoritative while the transport is connected. Full
+ * transcript polling is reserved for a running turn after reconnect attempts
+ * are exhausted; terminal turns and healthy sockets never poll.
+ */
+export function conversationSnapshotPollInterval(
+  transport: ConversationTransportState,
+  turnRunning: boolean
+): number | false {
+  return transport === 'unavailable' && turnRunning
+    ? DISCONNECTED_CHAT_POLL_INTERVAL_MS
+    : false
+}
 
 /** A disconnected observer wire must never be represented as model activity. */
 export function shouldShowLiveTurn(
@@ -2165,7 +2182,7 @@ function useConversationStream(
   userScoped: boolean,
   projectId: number | undefined,
   publicId: string | null,
-  turnActiveRef: { current: boolean },
+  turnActive: boolean,
   suppressRef: { current: number },
   setMessages: SetMessages,
   setError: SetChatFailure,
@@ -2175,6 +2192,9 @@ function useConversationStream(
   onLiveEvent?: (eventName: string, data: string) => void
 ) {
   const onLiveEventRef = useRef(onLiveEvent)
+  const resyncRef = useRef<(() => Promise<boolean>) | null>(null)
+  const [transportState, setTransportState] =
+    useState<ConversationTransportState>('connecting')
 
   useEffect(() => {
     onLiveEventRef.current = onLiveEvent
@@ -2188,6 +2208,7 @@ function useConversationStream(
     let cancelled = false
     let ws: WebSocket | null = null
     let attempt = 0
+    setTransportState('connecting')
     // True once this effect instance has completed at least one connection —
     // distinguishes the initial connect (history was already loaded by the
     // panel's own init fetch, no need to resync) from a later reconnect
@@ -2198,8 +2219,6 @@ function useConversationStream(
     let liveEventRevision = 0
     let resyncRequestRevision = 0
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-    let fallbackPollTimer: ReturnType<typeof setTimeout> | null = null
-    let activeTurnPollTimer: ReturnType<typeof setInterval> | null = null
 
     const resync = async () => {
       const requestedAtRevision = liveEventRevision
@@ -2238,26 +2257,7 @@ function useConversationStream(
       }
       return false
     }
-
-    // The server owns turn and approval state. A WebSocket can appear open
-    // while an intermediary silently drops an individual frame, so socket
-    // health alone is not enough to prove the client is current. Reconcile a
-    // running turn at low frequency even while the socket is connected. This
-    // restores missed approvals and terminal state without polling idle chats;
-    // revision checks above keep a late snapshot from overwriting newer wire
-    // events.
-    activeTurnPollTimer = setInterval(() => {
-      if (turnActiveRef.current) void resync()
-    }, 2000)
-
-    const pollUntilTerminal = (): void => {
-      if (cancelled) return
-      void resync().then((running) => {
-        if (!cancelled && running) {
-          fallbackPollTimer = setTimeout(pollUntilTerminal, 2000)
-        }
-      })
-    }
+    resyncRef.current = resync
 
     const connect = () => {
       if (cancelled) return
@@ -2268,10 +2268,7 @@ function useConversationStream(
       ws = socket
       socket.onopen = () => {
         attempt = 0
-        if (fallbackPollTimer) {
-          clearTimeout(fallbackPollTimer)
-          fallbackPollTimer = null
-        }
+        setTransportState('connected')
         setLiveUpdatesUnavailable(false)
         if (hasConnectedBefore) {
           onLiveEventRef.current?.('resync_required', '')
@@ -2381,9 +2378,10 @@ function useConversationStream(
           // Surface one stable, non-blocking state only after bounded retries
           // instead of flashing an alert per reconnect.
           setLiveUpdatesUnavailable(true)
-          pollUntilTerminal()
+          setTransportState('unavailable')
           return
         }
+        setTransportState('connecting')
         const delay = WS_RECONNECT_DELAYS_MS[attempt]
         attempt += 1
         reconnectTimer = setTimeout(connect, delay)
@@ -2399,8 +2397,7 @@ function useConversationStream(
     return () => {
       cancelled = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
-      if (fallbackPollTimer) clearTimeout(fallbackPollTimer)
-      if (activeTurnPollTimer) clearInterval(activeTurnPollTimer)
+      resyncRef.current = null
       ws?.close()
     }
   }, [
@@ -2408,7 +2405,6 @@ function useConversationStream(
     userScoped,
     projectId,
     publicId,
-    turnActiveRef,
     suppressRef,
     setMessages,
     setError,
@@ -2416,6 +2412,31 @@ function useConversationStream(
     setTurnStartedAt,
     setLiveUpdatesUnavailable,
   ])
+
+  useEffect(() => {
+    const interval = conversationSnapshotPollInterval(
+      transportState,
+      turnActive
+    )
+    if (!publicId || interval === false) return
+
+    let cancelled = false
+    let pollTimer: ReturnType<typeof setTimeout> | null = null
+    const pollUntilTerminal = async (): Promise<void> => {
+      const running = (await resyncRef.current?.()) ?? false
+      // The first recovery snapshot can race the message POST and still look
+      // idle. Keep the fallback alive while this tab owns an active command;
+      // the state update from a terminal snapshot cancels the effect.
+      if (!cancelled && (running || turnActive)) {
+        pollTimer = setTimeout(pollUntilTerminal, interval)
+      }
+    }
+    void pollUntilTerminal()
+    return () => {
+      cancelled = true
+      if (pollTimer) clearTimeout(pollTimer)
+    }
+  }, [publicId, transportState, turnActive])
 }
 
 /**
@@ -2551,10 +2572,6 @@ export function DebugChatPanel({
   const [turnStartedAt, setTurnStartedAt] = useState<string | null>(null)
   const [liveUpdatesUnavailable, setLiveUpdatesUnavailable] = useState(false)
   const turnActive = streaming || wsTurnActive
-  const turnActiveRef = useRef(turnActive)
-  useEffect(() => {
-    turnActiveRef.current = turnActive
-  }, [turnActive])
 
   const changePermissionMode = useCallback(
     async (permissionModeId: string) => {
@@ -2714,7 +2731,7 @@ export function DebugChatPanel({
     userScoped,
     projectId,
     publicId,
-    turnActiveRef,
+    turnActive,
     wsSuppressRef,
     setMessages,
     setError,

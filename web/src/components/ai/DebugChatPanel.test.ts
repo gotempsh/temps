@@ -18,6 +18,7 @@ import {
   chatFailureFromProblem,
   chatTurnActivityLabel,
   clearResolvedPermissionParts,
+  conversationSnapshotPollInterval,
   conversationHistoryErrorMessage,
   ensureRunningAssistant,
   hasRunningServerTurn,
@@ -74,6 +75,13 @@ describe('assistantParts', () => {
 })
 
 describe('conversation-local client state', () => {
+  test('polls conversation snapshots only when live updates are unavailable', () => {
+    expect(conversationSnapshotPollInterval('connected', true)).toBe(false)
+    expect(conversationSnapshotPollInterval('connecting', true)).toBe(false)
+    expect(conversationSnapshotPollInterval('unavailable', false)).toBe(false)
+    expect(conversationSnapshotPollInterval('unavailable', true)).toBe(2000)
+  })
+
   test('uses durable conversation ids to isolate drafts in one context', () => {
     const common = {
       userScoped: true,

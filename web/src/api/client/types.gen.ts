@@ -844,7 +844,7 @@ export type AiStatusBreakdownResponse = {
 
 /**
  * One row in the AI-agent HTTP status breakdown: the request count for a
- * status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+ * status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
  */
 export type AiStatusBreakdownRow = {
     request_count: number;
@@ -1721,6 +1721,28 @@ export type ApplicationWorkspaceChangesResponse = {
 export type ApplicationWorkspaceDiffResponse = {
     diff: string;
     path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceDirectoryEntryResponse = {
+    kind: string;
+    name: string;
+    path: string;
+    size_bytes: number;
+};
+
+export type ApplicationWorkspaceDirectoryResponse = {
+    entries: Array<ApplicationWorkspaceDirectoryEntryResponse>;
+    next_cursor?: number | null;
+    path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceFileContentResponse = {
+    binary: boolean;
+    content?: string | null;
+    path: string;
+    size_bytes: number;
     truncated: boolean;
 };
 
@@ -24093,6 +24115,67 @@ export type GetApplicationWorkspaceDiffResponses = {
 
 export type GetApplicationWorkspaceDiffResponse = GetApplicationWorkspaceDiffResponses[keyof GetApplicationWorkspaceDiffResponses];
 
+export type GetApplicationWorkspaceDirectoryData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/directory';
+};
+
+export type GetApplicationWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetApplicationWorkspaceDirectoryResponse = GetApplicationWorkspaceDirectoryResponses[keyof GetApplicationWorkspaceDirectoryResponses];
+
+export type GetApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file';
+};
+
+export type GetApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetApplicationWorkspaceFileResponse = GetApplicationWorkspaceFileResponses[keyof GetApplicationWorkspaceFileResponses];
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -25385,6 +25468,138 @@ export type GetGlobalAiWorkspaceResponses = {
 };
 
 export type GetGlobalAiWorkspaceResponse = GetGlobalAiWorkspaceResponses[keyof GetGlobalAiWorkspaceResponses];
+
+export type GetGlobalWorkspaceChangesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Files per page (1-200, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/changes';
+};
+
+export type GetGlobalWorkspaceChangesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceChangesResponses = {
+    200: ApplicationWorkspaceChangesResponse;
+};
+
+export type GetGlobalWorkspaceChangesResponse = GetGlobalWorkspaceChangesResponses[keyof GetGlobalWorkspaceChangesResponses];
+
+export type GetGlobalWorkspaceDiffData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/diff';
+};
+
+export type GetGlobalWorkspaceDiffErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceDiffResponses = {
+    200: ApplicationWorkspaceDiffResponse;
+};
+
+export type GetGlobalWorkspaceDiffResponse = GetGlobalWorkspaceDiffResponses[keyof GetGlobalWorkspaceDiffResponses];
+
+export type GetGlobalWorkspaceDirectoryData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/directory';
+};
+
+export type GetGlobalWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetGlobalWorkspaceDirectoryResponse = GetGlobalWorkspaceDirectoryResponses[keyof GetGlobalWorkspaceDirectoryResponses];
+
+export type GetGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file';
+};
+
+export type GetGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetGlobalWorkspaceFileResponse = GetGlobalWorkspaceFileResponses[keyof GetGlobalWorkspaceFileResponses];
+
+export type CreateGlobalWorkspacePreviewLinkData = {
+    body: CreateApplicationPreviewLinkRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/preview-link';
+};
+
+export type CreateGlobalWorkspacePreviewLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponse = CreateGlobalWorkspacePreviewLinkResponses[keyof CreateGlobalWorkspacePreviewLinkResponses];
 
 export type GetAnalyticsActiveVisitorsData = {
     body?: never;

@@ -230,7 +230,6 @@ describe('WorkspaceViewTabs', () => {
       <WorkspaceViewTabs
         activeView="files"
         changedFileCount={128}
-        hasApplication
         onChange={() => {}}
       />
     )
@@ -252,22 +251,21 @@ describe('WorkspaceViewTabs', () => {
       <WorkspaceViewTabs
         activeView="workspace"
         changedFileCount={0}
-        hasApplication={false}
         onChange={() => {}}
       />
     )
 
-    expect(html).toContain('grid-cols-2')
+    expect(html).toContain('grid-cols-4')
     expect(html).toContain('Output')
     expect(html).toContain('Workspace')
-    expect(html).not.toContain('Preview')
-    expect(html).not.toContain('Files')
+    expect(html).toContain('Preview')
+    expect(html).toContain('Files')
     expect(html).toContain('aria-selected="true"')
   })
 })
 
 describe('WorkspaceFilesPanel', () => {
-  test('renders the sandbox branch, changed files, diff, and tracked tree', () => {
+  test('renders the persistent explorer separately from Git changes and diff', () => {
     const html = renderToStaticMarkup(
       <WorkspaceFilesPanel
         changes={{
@@ -296,12 +294,9 @@ describe('WorkspaceFilesPanel', () => {
         }}
         diffLoading={false}
         error={null}
-        fileCursor={0}
         loading={false}
         loadPhase="idle"
-        onNextPage={() => {}}
         onOpenSettings={() => {}}
-        onPreviousPage={() => {}}
         onRefresh={() => {}}
         onSelect={() => {}}
         selectedPath="src/app.tsx"
@@ -317,9 +312,10 @@ describe('WorkspaceFilesPanel', () => {
     expect(html).toContain('+1')
     expect(html).toContain('−1')
     expect(html).not.toContain('diff --git')
-    expect(html).toContain('README.md')
-    expect(html).toContain('<span class="truncate">src/app.tsx</span>')
-    expect(html).toContain('Git runs inside this application')
+    expect(html).toContain('Workspace files')
+    expect(html).toContain('Persistent files, available while compute sleeps')
+    expect(html).toContain('Working changes')
+    expect(html).toContain('File browsing reads the persistent workspace')
   })
 
   test('lists files even when every repository file is a working change', () => {
@@ -347,24 +343,20 @@ describe('WorkspaceFilesPanel', () => {
         diff={null}
         diffLoading={false}
         error={null}
-        fileCursor={0}
         loading={false}
         loadPhase="idle"
-        onNextPage={() => {}}
         onOpenSettings={() => {}}
-        onPreviousPage={() => {}}
         onRefresh={() => {}}
         onSelect={() => {}}
         selectedPath={null}
       />
     )
 
-    expect(html).toContain('Files')
+    expect(html).toContain('Workspace files')
     expect(html).toContain('src/new-file.ts')
-    expect(html).toContain('<span class="truncate">src/new-file.ts</span>')
   })
 
-  test('renders bounded file-page navigation and communicates server caps', () => {
+  test('communicates the bounded Git changes cap without conflating it with files', () => {
     const html = renderToStaticMarkup(
       <WorkspaceFilesPanel
         changes={{
@@ -382,22 +374,17 @@ describe('WorkspaceFilesPanel', () => {
         diff={null}
         diffLoading={false}
         error={null}
-        fileCursor={100}
         loading={false}
         loadPhase="idle"
-        onNextPage={() => {}}
         onOpenSettings={() => {}}
-        onPreviousPage={() => {}}
         onRefresh={() => {}}
         onSelect={() => {}}
         selectedPath={null}
       />
     )
 
-    expect(html).toContain('101–101 of 1000+')
-    expect(html).toContain('Previous')
-    expect(html).toContain('Next')
-    expect(html).toContain('first 1,000 safe file paths')
+    expect(html).toContain('Workspace files')
+    expect(html).not.toContain('first 1,000 safe file paths')
     expect(html).toContain('first 200 safe paths')
   })
 
@@ -408,12 +395,9 @@ describe('WorkspaceFilesPanel', () => {
         diff={null}
         diffLoading={false}
         error={null}
-        fileCursor={0}
         loading
         loadPhase="waking"
-        onNextPage={() => {}}
         onOpenSettings={() => {}}
-        onPreviousPage={() => {}}
         onRefresh={() => {}}
         onSelect={() => {}}
         selectedPath={null}

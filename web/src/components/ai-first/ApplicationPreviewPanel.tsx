@@ -5,6 +5,7 @@ import { ExternalLink, Loader2, Monitor, RefreshCw } from 'lucide-react'
 import { type FormEvent, useCallback, useEffect, useState } from 'react'
 import {
   createApplicationPreviewLink,
+  createGlobalWorkspacePreviewLink,
   type ApplicationPreviewLinkResponse,
 } from '@/api/client'
 import { Button } from '@/components/ui/button'
@@ -12,14 +13,19 @@ import { Input } from '@/components/ui/input'
 import { safePreviewHost } from './application-preview'
 
 async function requestPreviewLink(
-  applicationPublicId: string,
+  applicationPublicId: string | undefined,
   port: number
 ): Promise<ApplicationPreviewLinkResponse> {
-  const { data } = await createApplicationPreviewLink({
-    path: { application_public_id: applicationPublicId },
-    body: { port, path: '/' },
-    throwOnError: true,
-  })
+  const { data } = applicationPublicId
+    ? await createApplicationPreviewLink({
+        path: { application_public_id: applicationPublicId },
+        body: { port, path: '/' },
+        throwOnError: true,
+      })
+    : await createGlobalWorkspacePreviewLink({
+        body: { port, path: '/' },
+        throwOnError: true,
+      })
   return data
 }
 
@@ -40,7 +46,7 @@ function previewErrorMessage(error: unknown): string {
 export function ApplicationPreviewPanel({
   applicationPublicId,
 }: {
-  applicationPublicId: string
+  applicationPublicId?: string
 }) {
   const [portText, setPortText] = useState('3000')
   const [preview, setPreview] = useState<ApplicationPreviewLinkResponse | null>(
@@ -152,7 +158,7 @@ export function ApplicationPreviewPanel({
             referrerPolicy="no-referrer"
             sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
             src={preview.url}
-            title={`Application preview on port ${portText}`}
+            title={`Sandbox preview on port ${portText}`}
           />
         </section>
       ) : error ? (

@@ -10449,6 +10449,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "nix 0.31.3",
  "regex",
  "rustix",
  "sea-orm",

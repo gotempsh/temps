@@ -8,7 +8,10 @@ import type {
   ApplicationResponse,
   ApplicationWorkspaceResponse,
 } from '@/api/client'
-import { ManagedApplicationWorkspaceRow } from './Sandboxes'
+import {
+  ManagedApplicationWorkspaceRow,
+  ManagedGlobalWorkspaceRow,
+} from './Sandboxes'
 
 describe('ManagedApplicationWorkspaceRow', () => {
   test('identifies a Temps-managed application sandbox without generic controls', () => {
@@ -63,6 +66,23 @@ describe('ManagedApplicationWorkspaceRow', () => {
 
     expect(html).toContain('not started')
     expect(html).toContain('Sandbox starts on the first application turn')
+  })
+})
+
+describe('ManagedGlobalWorkspaceRow', () => {
+  test('shows the shared AI sandbox without standalone lifecycle controls', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ManagedGlobalWorkspaceRow workspace={workspace} />
+      </MemoryRouter>
+    )
+
+    expect(html).toContain('Global AI workspace')
+    expect(html).toContain('sbx_workspace123')
+    expect(html).toContain('/ai-first?scope=global')
+    expect(html).toContain('Managed by Temps')
+    expect(html).not.toContain('>Stop<')
+    expect(html).not.toContain('>Delete<')
   })
 })
 

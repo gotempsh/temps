@@ -169,6 +169,14 @@ pub struct ApplicationPreviewLinkCreatedAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GlobalWorkspacePreviewLinkCreatedAudit {
+    pub context: AuditContext,
+    pub workspace_id: String,
+    pub sandbox_id: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ApplicationWorkspaceSourceImportedAudit {
     pub context: AuditContext,
     pub application_id: String,
@@ -207,6 +215,10 @@ impl_audit_operation!(
 impl_audit_operation!(
     ApplicationPreviewLinkCreatedAudit,
     "ai.application.preview_link.created"
+);
+impl_audit_operation!(
+    GlobalWorkspacePreviewLinkCreatedAudit,
+    "ai.workspace.preview_link.created"
 );
 impl_audit_operation!(
     ApplicationWorkspaceSourceImportedAudit,

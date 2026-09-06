@@ -32,6 +32,8 @@ const MAX_USER_WORKSPACE_CPU: f64 = 32.0;
 const MAX_USER_WORKSPACE_MEMORY_MB: i64 = 65_536;
 const MAX_USER_WORKSPACE_PIDS: i64 = 8_192;
 const MAX_USER_WORKSPACE_DISK_MB: i64 = 262_144;
+pub(crate) const MAX_WORKSPACE_DIRECTORY_ENTRIES: usize = 5_000;
+pub(crate) const MAX_WORKSPACE_FILE_PREVIEW_BYTES: usize = 256 * 1024;
 pub(crate) const ALLOWED_ARTIFACT_KINDS: &[&str] = &[
     "topology",
     "execution_plan",
@@ -85,6 +87,12 @@ pub enum ApplicationError {
     },
     #[error("application workspace identifier '{0}' is invalid")]
     InvalidWorkspaceIdentifier(String),
+    #[error("workspace path '{0}' is invalid")]
+    InvalidWorkspacePath(String),
+    #[error("workspace path '{0}' was not found")]
+    WorkspacePathNotFound(String),
+    #[error("workspace path '{0}' is not a regular file")]
+    WorkspacePathNotFile(String),
     #[error("chat attachment is invalid: {0}")]
     InvalidAttachment(String),
     #[error("chat attachment '{0}' was not found in this workspace")]
@@ -134,6 +142,36 @@ pub struct ApplicationWorkspaceService {
     import_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: WorkspaceEntryKind,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDirectoryPage {
+    pub entries: Vec<WorkspaceDirectoryEntry>,
+    pub next_cursor: Option<usize>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFilePreview {
+    pub bytes: Vec<u8>,
+    pub size_bytes: u64,
+    pub truncated: bool,
+}
+
 /// A project tree moved outside the mounted application workspace while its
 /// database link is removed. The opaque paths are only produced by
 /// [`ApplicationWorkspaceService`] after validating server-owned components.
@@ -153,6 +191,76 @@ impl ApplicationWorkspaceService {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// List one directory from the durable workspace without waking its
+    /// disposable compute. On Unix every component is opened relative to a
+    /// trusted descriptor with `NOFOLLOW`, so sandbox-created symlinks cannot
+    /// redirect the control plane outside the workspace root.
+    pub async fn list_directory(
+        &self,
+        workspace_id: &str,
+        relative_path: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<WorkspaceDirectoryPage, ApplicationError> {
+        validate_workspace_component(workspace_id)?;
+        validate_workspace_relative_path(relative_path, true)?;
+        if cursor > MAX_WORKSPACE_DIRECTORY_ENTRIES || limit == 0 || limit > 100 {
+            return Err(ApplicationError::InvalidWorkspacePath(
+                relative_path.to_string(),
+            ));
+        }
+        let root = self.root.clone();
+        let workspace_id = workspace_id.to_string();
+        let relative_path = relative_path.to_string();
+        let error_path = relative_path.clone();
+        let task_error_path = self.root.join(&workspace_id);
+        tokio::task::spawn_blocking(move || {
+            list_workspace_directory_fd_relative(
+                &root,
+                &workspace_id,
+                &relative_path,
+                cursor,
+                limit,
+            )
+        })
+        .await
+        .map_err(|source| ApplicationError::Workspace {
+            path: task_error_path,
+            source: std::io::Error::other(format!("workspace listing task failed: {source}")),
+        })?
+        .map_err(|source| map_workspace_read_error(error_path, source))
+    }
+
+    /// Read a bounded text-preview candidate from the durable workspace. The
+    /// caller decides whether the returned bytes are textual or binary.
+    pub async fn read_file_preview(
+        &self,
+        workspace_id: &str,
+        relative_path: &str,
+    ) -> Result<WorkspaceFilePreview, ApplicationError> {
+        validate_workspace_component(workspace_id)?;
+        validate_workspace_relative_path(relative_path, false)?;
+        let root = self.root.clone();
+        let workspace_id = workspace_id.to_string();
+        let relative_path = relative_path.to_string();
+        let error_path = relative_path.clone();
+        let task_error_path = self.root.join(&workspace_id);
+        tokio::task::spawn_blocking(move || {
+            read_workspace_file_fd_relative(
+                &root,
+                &workspace_id,
+                &relative_path,
+                MAX_WORKSPACE_FILE_PREVIEW_BYTES,
+            )
+        })
+        .await
+        .map_err(|source| ApplicationError::Workspace {
+            path: task_error_path,
+            source: std::io::Error::other(format!("workspace read task failed: {source}")),
+        })?
+        .map_err(|source| map_workspace_read_error(error_path, source))
     }
 
     /// Store browser-selected project files without ever resolving a
@@ -814,6 +922,305 @@ fn store_project_files_fd_relative(
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "secure workspace imports require descriptor-relative filesystem support",
+    ))
+}
+
+fn validate_workspace_relative_path(
+    value: &str,
+    allow_empty: bool,
+) -> Result<(), ApplicationError> {
+    if value.len() > 1_024 || (!allow_empty && value.is_empty()) || value.contains('\0') {
+        return Err(ApplicationError::InvalidWorkspacePath(value.to_string()));
+    }
+    if value.is_empty() {
+        return Ok(());
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || is_sensitive_workspace_path(value)
+    {
+        return Err(ApplicationError::InvalidWorkspacePath(value.to_string()));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
+    if path.starts_with('/') || path.contains("../") {
+        return true;
+    }
+    let components = path
+        .split('/')
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| component == ".config")
+        && components.iter().any(|component| component == "gcloud")
+    {
+        return true;
+    }
+    components.iter().any(|lower| {
+        let lower = lower.as_str();
+        lower == ".git"
+            || lower == ".temps"
+            || matches!(
+                lower,
+                ".aws"
+                    | ".azure"
+                    | ".docker"
+                    | ".gnupg"
+                    | ".kube"
+                    | ".pulumi"
+                    | ".ssh"
+                    | ".terraform"
+            )
+            || lower == ".env"
+            || (lower.starts_with(".env.") && lower != ".env.example")
+            || lower == ".envrc"
+            || lower == ".git-credentials"
+            || lower == ".ds_store"
+            || lower == ".netrc"
+            || lower == ".npmrc"
+            || lower == ".pypirc"
+            || lower == ".yarnrc"
+            || lower == "credentials"
+            || lower == "credentials.json"
+            || lower == "id_dsa"
+            || lower == "id_rsa"
+            || lower == "id_ed25519"
+            || lower.ends_with(".credentials.json")
+            || (lower.contains("service-account") && lower.ends_with(".json"))
+            || lower.ends_with(".pem")
+            || lower.ends_with(".key")
+            || lower.ends_with(".p12")
+            || lower.ends_with(".pfx")
+            || lower.ends_with(".jks")
+            || lower.ends_with(".keystore")
+            || lower.ends_with(".tfstate")
+            || lower.ends_with(".tfstate.backup")
+    })
+}
+
+fn map_workspace_read_error(path: String, source: std::io::Error) -> ApplicationError {
+    match source.kind() {
+        std::io::ErrorKind::NotFound => ApplicationError::WorkspacePathNotFound(path),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied => {
+            ApplicationError::InvalidWorkspacePath(path)
+        }
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::IsADirectory => {
+            ApplicationError::WorkspacePathNotFile(path)
+        }
+        _ => ApplicationError::Workspace {
+            path: PathBuf::from(path),
+            source,
+        },
+    }
+}
+
+#[cfg(unix)]
+fn open_workspace_directory_fd(
+    root: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{open, openat, Mode, OFlags};
+    use std::os::fd::OwnedFd;
+
+    fn open_dir(parent: &OwnedFd, component: &std::ffi::OsStr) -> std::io::Result<OwnedFd> {
+        openat(
+            parent,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+    }
+
+    let root_fd = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let mut directory = open_dir(&root_fd, std::ffi::OsStr::new(workspace_id))?;
+    for component in Path::new(relative_path).components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace path contains a non-normal component",
+            ));
+        };
+        directory = open_dir(&directory, component)?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn list_workspace_directory_fd_relative(
+    root: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+    cursor: usize,
+    limit: usize,
+) -> std::io::Result<WorkspaceDirectoryPage> {
+    use nix::dir::Dir;
+    use rustix::fs::{statat, AtFlags, FileType};
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory_fd = open_workspace_directory_fd(root, workspace_id, relative_path)?;
+    let mut directory = Dir::from_fd(directory_fd).map_err(std::io::Error::other)?;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    let mut names = Vec::new();
+    for entry in directory.iter() {
+        let entry = entry.map_err(std::io::Error::other)?;
+        let name_bytes = entry.file_name().to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(name) => name.to_string(),
+            Err(_) => {
+                truncated = true;
+                continue;
+            }
+        };
+        let path = if relative_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{relative_path}/{name}")
+        };
+        if is_sensitive_workspace_path(&path) {
+            continue;
+        }
+        if names.len() >= MAX_WORKSPACE_DIRECTORY_ENTRIES {
+            truncated = true;
+            break;
+        }
+        names.push((name, path));
+    }
+    for (name, path) in names {
+        let stat = statat(
+            &directory,
+            std::ffi::OsStr::from_bytes(name.as_bytes()),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+        let file_type = FileType::from_raw_mode(stat.st_mode);
+        let kind = if file_type.is_dir() {
+            WorkspaceEntryKind::Directory
+        } else if file_type.is_file() {
+            WorkspaceEntryKind::File
+        } else if file_type.is_symlink() {
+            WorkspaceEntryKind::Symlink
+        } else {
+            WorkspaceEntryKind::Other
+        };
+        let size_bytes = if file_type.is_file() {
+            u64::try_from(stat.st_size).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "negative file size")
+            })?
+        } else {
+            0
+        };
+        entries.push(WorkspaceDirectoryEntry {
+            name,
+            path,
+            kind,
+            size_bytes,
+        });
+    }
+    entries.sort_by(|left, right| {
+        let left_rank = usize::from(left.kind != WorkspaceEntryKind::Directory);
+        let right_rank = usize::from(right.kind != WorkspaceEntryKind::Directory);
+        left_rank.cmp(&right_rank).then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+    });
+    let end = cursor.saturating_add(limit).min(entries.len());
+    let page = entries.get(cursor..end).unwrap_or_default().to_vec();
+    let next_cursor = (end < entries.len()).then_some(end);
+    Ok(WorkspaceDirectoryPage {
+        entries: page,
+        next_cursor,
+        truncated,
+    })
+}
+
+#[cfg(unix)]
+fn read_workspace_file_fd_relative(
+    root: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+    max_bytes: usize,
+) -> std::io::Result<WorkspaceFilePreview> {
+    use rustix::fs::{openat, Mode, OFlags};
+    use std::fs::File;
+
+    let path = Path::new(relative_path);
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name is missing")
+    })?;
+    let parent_path = path
+        .parent()
+        .and_then(Path::to_str)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid parent"))?;
+    let parent = open_workspace_directory_fd(root, workspace_id, parent_path)?;
+    let file = openat(
+        &parent,
+        file_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let mut file = File::from(file);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "workspace path is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(max_bytes.min(metadata.len() as usize));
+    Read::by_ref(&mut file)
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    Ok(WorkspaceFilePreview {
+        bytes,
+        size_bytes: metadata.len(),
+        truncated,
+    })
+}
+
+#[cfg(not(unix))]
+fn list_workspace_directory_fd_relative(
+    _root: &Path,
+    _workspace_id: &str,
+    _relative_path: &str,
+    _cursor: usize,
+    _limit: usize,
+) -> std::io::Result<WorkspaceDirectoryPage> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure workspace browsing requires descriptor-relative filesystem support",
+    ))
+}
+
+#[cfg(not(unix))]
+fn read_workspace_file_fd_relative(
+    _root: &Path,
+    _workspace_id: &str,
+    _relative_path: &str,
+    _max_bytes: usize,
+) -> std::io::Result<WorkspaceFilePreview> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure workspace browsing requires descriptor-relative filesystem support",
     ))
 }
 
@@ -2765,6 +3172,114 @@ mod tests {
             .expect_err("repeated zero-byte files must hit the aggregate entry quota");
         assert!(matches!(error, ApplicationError::WorkspaceQuota(_)));
         assert!(!project.join("three").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_browser_lists_all_safe_entries_and_reads_text() {
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+        tokio::fs::write(workspace.host_work_dir.join("README.md"), "hello workspace")
+            .await
+            .expect("workspace file");
+        tokio::fs::create_dir_all(workspace.host_work_dir.join(".temps/internal"))
+            .await
+            .expect("internal workspace directory");
+        tokio::fs::write(workspace.host_work_dir.join(".env"), "SECRET=value")
+            .await
+            .expect("sensitive workspace file");
+
+        let first_page = service
+            .list_directory("app_safe_123", "", 0, 1)
+            .await
+            .expect("first directory page");
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(first_page.entries[0].path, "projects");
+        assert_eq!(first_page.next_cursor, Some(1));
+
+        let second_page = service
+            .list_directory("app_safe_123", "", 1, 100)
+            .await
+            .expect("remaining directory page");
+        assert_eq!(
+            second_page
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["README.md"]
+        );
+        assert!(second_page.next_cursor.is_none());
+
+        let preview = service
+            .read_file_preview("app_safe_123", "README.md")
+            .await
+            .expect("text preview");
+        assert_eq!(preview.bytes, b"hello workspace");
+        assert_eq!(preview.size_bytes, 15);
+        assert!(!preview.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_browser_rejects_traversal_sensitive_paths_and_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+        std::fs::write(outside.path().join("secret.txt"), "outside").expect("outside secret file");
+        symlink(
+            outside.path().join("secret.txt"),
+            workspace.host_work_dir.join("escape.txt"),
+        )
+        .expect("workspace symlink");
+
+        assert!(matches!(
+            service
+                .read_file_preview("app_safe_123", "../secret.txt")
+                .await,
+            Err(ApplicationError::InvalidWorkspacePath(_))
+        ));
+        assert!(matches!(
+            service.read_file_preview("app_safe_123", ".env").await,
+            Err(ApplicationError::InvalidWorkspacePath(_))
+        ));
+        assert!(service
+            .read_file_preview("app_safe_123", "escape.txt")
+            .await
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_browser_bounds_large_file_previews() {
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+        let large = vec![b'a'; MAX_WORKSPACE_FILE_PREVIEW_BYTES + 1];
+        tokio::fs::write(workspace.host_work_dir.join("large.txt"), &large)
+            .await
+            .expect("large workspace file");
+
+        let preview = service
+            .read_file_preview("app_safe_123", "large.txt")
+            .await
+            .expect("bounded preview");
+        assert_eq!(preview.bytes.len(), MAX_WORKSPACE_FILE_PREVIEW_BYTES);
+        assert_eq!(preview.size_bytes, large.len() as u64);
+        assert!(preview.truncated);
     }
 
     #[test]

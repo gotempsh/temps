@@ -46,6 +46,7 @@ use temps_entities::{ai_conversations, ai_messages, ai_pending_actions};
 
 use temps_ai::streaming::{PermissionDecision, PermissionKind, PermissionRequest};
 
+use crate::applications::{is_sensitive_workspace_path, WorkspaceEntryKind};
 use crate::audit::{
     AiActionConfirmedAudit, AiActionRejectedAudit, ApplicationArchivedAudit,
     ApplicationCreatedAudit, ApplicationPreviewLinkCreatedAudit, ApplicationRestoredAudit,
@@ -54,7 +55,7 @@ use crate::audit::{
     ApplicationWorkspaceSourceImportedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
     ConversationAttachmentUploadedAudit, ConversationCreatedAudit,
     ConversationPermissionModeChangedAudit, ConversationRenamedAudit, ConversationRestoredAudit,
-    PermissionResolvedAudit, ThreadArtifactCreatedAudit,
+    GlobalWorkspacePreviewLinkCreatedAudit, PermissionResolvedAudit, ThreadArtifactCreatedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
 use crate::sensitive::{
@@ -354,6 +355,46 @@ pub struct ApplicationWorkspaceDiffQuery {
 pub struct ApplicationWorkspaceDiffResponse {
     pub path: String,
     pub diff: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ApplicationWorkspaceDirectoryQuery {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplicationWorkspaceFileQuery {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApplicationWorkspaceDirectoryEntryResponse {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApplicationWorkspaceDirectoryResponse {
+    pub path: String,
+    pub entries: Vec<ApplicationWorkspaceDirectoryEntryResponse>,
+    pub next_cursor: Option<usize>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApplicationWorkspaceFileContentResponse {
+    pub path: String,
+    pub content: Option<String>,
+    pub binary: bool,
+    pub size_bytes: u64,
     pub truncated: bool,
 }
 
@@ -946,6 +987,7 @@ impl From<ApplicationError> for Problem {
             | ApplicationError::ProjectNotFound(_)
             | ApplicationError::ConversationNotFound(_)
             | ApplicationError::ProjectNotLinked { .. }
+            | ApplicationError::WorkspacePathNotFound(_)
             | ApplicationError::AttachmentNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("AI Application Resource Not Found")
                 .with_detail(error.to_string()),
@@ -956,6 +998,8 @@ impl From<ApplicationError> for Problem {
             | ApplicationError::InvalidArtifactKind(_)
             | ApplicationError::SecretValue(_)
             | ApplicationError::InvalidWorkspaceIdentifier(_)
+            | ApplicationError::InvalidWorkspacePath(_)
+            | ApplicationError::WorkspacePathNotFile(_)
             | ApplicationError::InvalidAttachment(_) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid AI Application Request")
@@ -967,11 +1011,11 @@ impl From<ApplicationError> for Problem {
                     .with_detail(error.to_string())
             }
             ApplicationError::Workspace { .. } | ApplicationError::Database(_) => {
-                error!(error = %error, "AI application database operation failed");
+                error!(error = %error, "AI application operation failed");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(
-                        "A database operation failed while handling the AI application request.",
+                        "An internal operation failed while handling the AI application request.",
                     )
             }
         }
@@ -3090,6 +3134,52 @@ pub async fn create_application_preview_link(
     Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
 }
 
+/// Mint a short-lived preview URL for a port in the user's shared global AI
+/// workspace. The gateway grant is identical to application previews; the
+/// only difference is how the owning sandbox is resolved.
+#[utoipa::path(
+    post, tag = "AI Chat", path = "/ai/workspace/preview-link",
+    operation_id = "create_global_workspace_preview_link",
+    request_body = CreateApplicationPreviewLinkRequest,
+    responses((status = 200, body = ApplicationPreviewLinkResponse), (status = 400), (status = 401), (status = 403), (status = 503)),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_global_workspace_preview_link(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateApplicationPreviewLinkRequest>,
+) -> Result<Json<ApplicationPreviewLinkResponse>, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    let (workspace_id, sandbox_public_id) = global_workspace_sandbox(&state, &auth).await?;
+    let sandboxes = state.application_sandboxes.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Global Workspace Unavailable")
+            .with_detail("The instance sandbox service is not configured.")
+    })?;
+    let (url, expires_at) = sandboxes
+        .preview_share_link(
+            &sandbox_public_id,
+            auth.user_id(),
+            request.port,
+            request.path.as_deref().unwrap_or("/"),
+            std::time::Duration::from_secs(60 * 60),
+        )
+        .await
+        .map_err(Problem::from)?;
+    state
+        .audit(&GlobalWorkspacePreviewLinkCreatedAudit {
+            context: audit_context(&auth, &metadata),
+            workspace_id,
+            sandbox_id: sandbox_public_id,
+            port: request.port,
+        })
+        .await;
+    Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
+}
+
 const WORKSPACE_LIST_LIMIT_BYTES: usize = 256 * 1024;
 const WORKSPACE_DIFF_LIMIT_BYTES: usize = 256 * 1024;
 const WORKSPACE_MAX_FILES: usize = 1_000;
@@ -3291,61 +3381,6 @@ pub async fn write_application_workspace_files(
     Ok(Json(WriteApplicationWorkspaceFilesResponse { written }))
 }
 
-fn is_sensitive_workspace_path(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') || path.contains("../") {
-        return true;
-    }
-    let components = path
-        .split('/')
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    if components.iter().any(|component| component == ".config")
-        && components.iter().any(|component| component == "gcloud")
-    {
-        return true;
-    }
-    components.iter().any(|lower| {
-        let lower = lower.as_str();
-        lower == ".git"
-            || lower.starts_with(".git/")
-            || matches!(
-                lower,
-                ".aws"
-                    | ".azure"
-                    | ".docker"
-                    | ".gnupg"
-                    | ".kube"
-                    | ".pulumi"
-                    | ".ssh"
-                    | ".terraform"
-            )
-            || lower == ".env"
-            || (lower.starts_with(".env.") && lower != ".env.example")
-            || lower == ".envrc"
-            || lower == ".git-credentials"
-            || lower == ".ds_store"
-            || lower == ".netrc"
-            || lower == ".npmrc"
-            || lower == ".pypirc"
-            || lower == ".yarnrc"
-            || lower == "credentials"
-            || lower == "credentials.json"
-            || lower == "id_dsa"
-            || lower == "id_rsa"
-            || lower == "id_ed25519"
-            || lower.ends_with(".credentials.json")
-            || (lower.contains("service-account") && lower.ends_with(".json"))
-            || lower.ends_with(".pem")
-            || lower.ends_with(".key")
-            || lower.ends_with(".p12")
-            || lower.ends_with(".pfx")
-            || lower.ends_with(".jks")
-            || lower.ends_with(".keystore")
-            || lower.ends_with(".tfstate")
-            || lower.ends_with(".tfstate.backup")
-    })
-}
-
 fn parse_workspace_status(value: &str) -> Vec<ApplicationWorkspaceFileResponse> {
     let records = value.split('\0').collect::<Vec<_>>();
     let mut changes = Vec::new();
@@ -3543,6 +3578,41 @@ async fn application_workspace_sandbox(
     Ok((application, sandbox.public_id))
 }
 
+async fn global_workspace_sandbox(
+    state: &AppState,
+    auth: &AuthContext,
+) -> Result<(String, String), Problem> {
+    let workspace_id = global_workspace_context_id(auth.user_id());
+    let workspace = state
+        .application_workspaces
+        .ensure(&workspace_id, &[])
+        .await?;
+    let sandboxes = state.application_sandboxes.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Global Workspace Unavailable")
+            .with_detail("The instance sandbox service is not configured.")
+    })?;
+    let sandbox = sandboxes
+        .get_or_create_application_workspace(
+            auth.user_id(),
+            &workspace_id,
+            None,
+            workspace.host_work_dir,
+        )
+        .await
+        .map_err(|error| {
+            error!(
+                %error,
+                workspace_id,
+                "failed to prepare global AI workspace sandbox"
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Global Workspace Failed")
+                .with_detail("Temps could not prepare the persistent global workspace.")
+        })?;
+    Ok((workspace_id, sandbox.public_id))
+}
+
 async fn run_workspace_command(
     state: &AppState,
     auth: &AuthContext,
@@ -3616,6 +3686,175 @@ async fn application_workspace_repositories(
     Ok(repositories)
 }
 
+fn workspace_entry_kind(kind: WorkspaceEntryKind) -> &'static str {
+    match kind {
+        WorkspaceEntryKind::Directory => "directory",
+        WorkspaceEntryKind::File => "file",
+        WorkspaceEntryKind::Symlink => "symlink",
+        WorkspaceEntryKind::Other => "other",
+    }
+}
+
+async fn workspace_directory_response(
+    state: &AppState,
+    workspace_id: &str,
+    query: ApplicationWorkspaceDirectoryQuery,
+) -> Result<ApplicationWorkspaceDirectoryResponse, Problem> {
+    let path = query.path.unwrap_or_default();
+    let page = state
+        .application_workspaces
+        .list_directory(
+            workspace_id,
+            &path,
+            query.cursor.unwrap_or(0),
+            query.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(ApplicationWorkspaceDirectoryResponse {
+        path,
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| ApplicationWorkspaceDirectoryEntryResponse {
+                name: entry.name,
+                path: entry.path,
+                kind: workspace_entry_kind(entry.kind).to_string(),
+                size_bytes: entry.size_bytes,
+            })
+            .collect(),
+        next_cursor: page.next_cursor,
+        truncated: page.truncated,
+    })
+}
+
+async fn workspace_file_response(
+    state: &AppState,
+    workspace_id: &str,
+    path: String,
+) -> Result<ApplicationWorkspaceFileContentResponse, Problem> {
+    let preview = state
+        .application_workspaces
+        .read_file_preview(workspace_id, &path)
+        .await?;
+    let content = String::from_utf8(preview.bytes).ok();
+    Ok(ApplicationWorkspaceFileContentResponse {
+        path,
+        binary: content.is_none(),
+        content,
+        size_bytes: preview.size_bytes,
+        truncated: preview.truncated,
+    })
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications", path = "/ai/applications/{application_public_id}/workspace/directory",
+    params(
+        ("application_public_id" = String, Path,),
+        ("path" = Option<String>, Query, description = "Workspace-relative directory; omit for the root"),
+        ("cursor" = Option<usize>, Query, description = "Position returned by the previous page"),
+        ("limit" = Option<usize>, Query, description = "Entries per page (1-100, default 100)"),
+    ),
+    responses((status = 200, body = ApplicationWorkspaceDirectoryResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_application_workspace_directory(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(application_public_id): Path<String>,
+    Query(query): Query<ApplicationWorkspaceDirectoryQuery>,
+) -> Result<Json<ApplicationWorkspaceDirectoryResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesRead);
+    deny_deployment_token!(auth);
+    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    state
+        .application_workspaces
+        .ensure(&application.application.public_id, &application.projects)
+        .await?;
+    Ok(Json(
+        workspace_directory_response(&state, &application.application.public_id, query).await?,
+    ))
+}
+
+#[utoipa::path(
+    get, tag = "AI Chat", path = "/ai/workspace/directory",
+    operation_id = "get_global_workspace_directory",
+    params(
+        ("path" = Option<String>, Query, description = "Workspace-relative directory; omit for the root"),
+        ("cursor" = Option<usize>, Query, description = "Position returned by the previous page"),
+        ("limit" = Option<usize>, Query, description = "Entries per page (1-100, default 100)"),
+    ),
+    responses((status = 200, body = ApplicationWorkspaceDirectoryResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_global_workspace_directory(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ApplicationWorkspaceDirectoryQuery>,
+) -> Result<Json<ApplicationWorkspaceDirectoryResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesRead);
+    deny_deployment_token!(auth);
+    let workspace_id = global_workspace_context_id(auth.user_id());
+    state
+        .application_workspaces
+        .ensure(&workspace_id, &[])
+        .await?;
+    Ok(Json(
+        workspace_directory_response(&state, &workspace_id, query).await?,
+    ))
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications", path = "/ai/applications/{application_public_id}/workspace/file",
+    params(("application_public_id" = String, Path,), ("path" = String, Query,)),
+    responses((status = 200, body = ApplicationWorkspaceFileContentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_application_workspace_file(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(application_public_id): Path<String>,
+    Query(query): Query<ApplicationWorkspaceFileQuery>,
+) -> Result<Json<ApplicationWorkspaceFileContentResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesRead);
+    deny_deployment_token!(auth);
+    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    state
+        .application_workspaces
+        .ensure(&application.application.public_id, &application.projects)
+        .await?;
+    Ok(Json(
+        workspace_file_response(&state, &application.application.public_id, query.path).await?,
+    ))
+}
+
+#[utoipa::path(
+    get, tag = "AI Chat", path = "/ai/workspace/file",
+    operation_id = "get_global_workspace_file",
+    params(("path" = String, Query,)),
+    responses((status = 200, body = ApplicationWorkspaceFileContentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_global_workspace_file(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ApplicationWorkspaceFileQuery>,
+) -> Result<Json<ApplicationWorkspaceFileContentResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesRead);
+    deny_deployment_token!(auth);
+    let workspace_id = global_workspace_context_id(auth.user_id());
+    state
+        .application_workspaces
+        .ensure(&workspace_id, &[])
+        .await?;
+    Ok(Json(
+        workspace_file_response(&state, &workspace_id, query.path).await?,
+    ))
+}
+
 #[utoipa::path(
     get, tag = "AI Applications", path = "/ai/applications/{application_public_id}/workspace/changes",
     params(
@@ -3656,6 +3895,45 @@ pub async fn get_application_workspace_changes(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get, tag = "AI Chat", path = "/ai/workspace/changes",
+    operation_id = "get_global_workspace_changes",
+    params(
+        ("cursor" = Option<usize>, Query, description = "Position returned by the previous page"),
+        ("limit" = Option<usize>, Query, description = "Files per page (1-200, default 100)"),
+    ),
+    responses((status = 200, body = ApplicationWorkspaceChangesResponse), (status = 400), (status = 401), (status = 403), (status = 503), (status = 504)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_global_workspace_changes(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ApplicationWorkspaceChangesQuery>,
+) -> Result<Json<ApplicationWorkspaceChangesResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    let response = tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, async {
+        let (_, sandbox_public_id) = global_workspace_sandbox(&state, &auth).await?;
+        collect_workspace_changes(&state, &auth, &sandbox_public_id, &query).await
+    })
+    .await
+    .map_err(|_| {
+        error!(
+            user_id = auth.user_id(),
+            timeout_seconds = WORKSPACE_REQUEST_TIMEOUT.as_secs(),
+            "global workspace inspection request timed out"
+        );
+        problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+            .with_title("Global Workspace Timed Out")
+            .with_detail(format!(
+                "Workspace inspection exceeded the {} second safety limit. Narrow the workspace or try again.",
+                WORKSPACE_REQUEST_TIMEOUT.as_secs()
+            ))
+    })??;
+    Ok(Json(response))
+}
+
 async fn collect_application_workspace_changes(
     state: &AppState,
     auth: &AuthContext,
@@ -3665,7 +3943,16 @@ async fn collect_application_workspace_changes(
     let (_application, sandbox_public_id) =
         application_workspace_sandbox(state, auth, application_public_id).await?;
 
-    let repositories = application_workspace_repositories(state, auth, &sandbox_public_id).await?;
+    collect_workspace_changes(state, auth, &sandbox_public_id, query).await
+}
+
+async fn collect_workspace_changes(
+    state: &AppState,
+    auth: &AuthContext,
+    sandbox_public_id: &str,
+    query: &ApplicationWorkspaceChangesQuery,
+) -> Result<ApplicationWorkspaceChangesResponse, Problem> {
+    let repositories = application_workspace_repositories(state, auth, sandbox_public_id).await?;
     let nested_repositories = repositories
         .iter()
         .filter(|repository| !repository.is_empty())
@@ -3682,7 +3969,7 @@ async fn collect_application_workspace_changes(
         let files_result = run_workspace_command(
             state,
             auth,
-            &sandbox_public_id,
+            sandbox_public_id,
             bounded_workspace_git_command(
                 &repository,
                 "git -C \"$1\" ls-files -co --exclude-standard -z | head -c 262144",
@@ -3692,7 +3979,7 @@ async fn collect_application_workspace_changes(
         let status_result = run_workspace_command(
             state,
             auth,
-            &sandbox_public_id,
+            sandbox_public_id,
             bounded_workspace_git_command(
                 &repository,
                 "git -C \"$1\" status --porcelain=v1 -z --untracked-files=all | head -c 262144",
@@ -3702,19 +3989,19 @@ async fn collect_application_workspace_changes(
         if files_result.exit_code != 0 || status_result.exit_code != 0 {
             return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Git Workspace Inspection Failed")
-                .with_detail("Git could not inspect this application workspace."));
+                .with_detail("Git could not inspect this persistent workspace."));
         }
         let branch_result = run_workspace_command(
             state,
             auth,
-            &sandbox_public_id,
+            sandbox_public_id,
             workspace_git_command(&repository, &["branch", "--show-current"]),
         )
         .await?;
         let head_result = run_workspace_command(
             state,
             auth,
-            &sandbox_public_id,
+            sandbox_public_id,
             workspace_git_command(&repository, &["rev-parse", "--short=12", "HEAD"]),
         )
         .await?;
@@ -3792,7 +4079,7 @@ pub async fn get_application_workspace_diff(
     permission_guard!(auth, ProjectsRead);
     permission_guard!(auth, SandboxesWrite);
     deny_deployment_token!(auth);
-    if is_sensitive_workspace_path(&query.path) {
+    if query.path.is_empty() || is_sensitive_workspace_path(&query.path) {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Workspace Path")
             .with_detail("That workspace path cannot be displayed."));
@@ -3818,6 +4105,47 @@ pub async fn get_application_workspace_diff(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get, tag = "AI Chat", path = "/ai/workspace/diff",
+    operation_id = "get_global_workspace_diff",
+    params(("path" = String, Query,)),
+    responses((status = 200, body = ApplicationWorkspaceDiffResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 503), (status = 504)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_global_workspace_diff(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ApplicationWorkspaceDiffQuery>,
+) -> Result<Json<ApplicationWorkspaceDiffResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    if query.path.is_empty() || is_sensitive_workspace_path(&query.path) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Workspace Path")
+            .with_detail("That workspace path cannot be displayed."));
+    }
+    let response = tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, async {
+        let (_, sandbox_public_id) = global_workspace_sandbox(&state, &auth).await?;
+        collect_workspace_diff(&state, &auth, &sandbox_public_id, &query).await
+    })
+    .await
+    .map_err(|_| {
+        error!(
+            user_id = auth.user_id(),
+            timeout_seconds = WORKSPACE_REQUEST_TIMEOUT.as_secs(),
+            "global workspace diff request timed out"
+        );
+        problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+            .with_title("Global Workspace Timed Out")
+            .with_detail(format!(
+                "Workspace diff inspection exceeded the {} second safety limit. Try again or inspect the file in the sandbox.",
+                WORKSPACE_REQUEST_TIMEOUT.as_secs()
+            ))
+    })??;
+    Ok(Json(response))
+}
+
 async fn collect_application_workspace_diff(
     state: &AppState,
     auth: &AuthContext,
@@ -3826,13 +4154,23 @@ async fn collect_application_workspace_diff(
 ) -> Result<ApplicationWorkspaceDiffResponse, Problem> {
     let (_application, sandbox_public_id) =
         application_workspace_sandbox(state, auth, application_public_id).await?;
-    let repositories = application_workspace_repositories(state, auth, &sandbox_public_id).await?;
+
+    collect_workspace_diff(state, auth, &sandbox_public_id, query).await
+}
+
+async fn collect_workspace_diff(
+    state: &AppState,
+    auth: &AuthContext,
+    sandbox_public_id: &str,
+    query: &ApplicationWorkspaceDiffQuery,
+) -> Result<ApplicationWorkspaceDiffResponse, Problem> {
+    let repositories = application_workspace_repositories(state, auth, sandbox_public_id).await?;
     let mut owner = None;
     for repository in repositories {
         let status_result = run_workspace_command(
             state,
             auth,
-            &sandbox_public_id,
+            sandbox_public_id,
             bounded_workspace_git_command(
                 &repository,
                 "git -C \"$1\" status --porcelain=v1 -z --untracked-files=all | head -c 262144",
@@ -3850,7 +4188,7 @@ async fn collect_application_workspace_diff(
     let (repository, change) = owner.ok_or_else(|| {
         problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Workspace Change Not Found")
-            .with_detail("That file is not currently changed in this application workspace.")
+            .with_detail("That file is not currently changed in this persistent workspace.")
     })?;
     let relative_path = query
         .path
@@ -3861,7 +4199,7 @@ async fn collect_application_workspace_diff(
     let current_size = run_workspace_command(
         state,
         auth,
-        &sandbox_public_id,
+        sandbox_public_id,
         vec![
             "stat".into(),
             "-c".into(),
@@ -3875,7 +4213,7 @@ async fn collect_application_workspace_diff(
     let head_size = run_workspace_command(
         state,
         auth,
-        &sandbox_public_id,
+        sandbox_public_id,
         workspace_git_command(&repository, &["cat-file", "-s", &head_object]),
     )
     .await?;
@@ -3909,7 +4247,7 @@ async fn collect_application_workspace_diff(
         }
         arguments.extend(["--", relative_path.as_str()]);
         let cmd = workspace_git_command(&repository, &arguments);
-        let result = run_workspace_command(state, auth, &sandbox_public_id, cmd).await?;
+        let result = run_workspace_command(state, auth, sandbox_public_id, cmd).await?;
         if result.exit_code == 0 && !result.stdout.is_empty() {
             diff.push_str(&result.stdout);
         }
@@ -3918,7 +4256,7 @@ async fn collect_application_workspace_diff(
         let result = run_workspace_command(
             state,
             auth,
-            &sandbox_public_id,
+            sandbox_public_id,
             vec![
                 "git".into(),
                 "-C".into(),
@@ -7465,6 +7803,20 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/ai/workspace", get(get_global_ai_workspace))
         .route(
+            "/ai/workspace/preview-link",
+            post(create_global_workspace_preview_link),
+        )
+        .route(
+            "/ai/workspace/changes",
+            get(get_global_workspace_changes),
+        )
+        .route(
+            "/ai/workspace/directory",
+            get(get_global_workspace_directory),
+        )
+        .route("/ai/workspace/file", get(get_global_workspace_file))
+        .route("/ai/workspace/diff", get(get_global_workspace_diff))
+        .route(
             "/ai/applications",
             get(list_applications).post(create_application),
         )
@@ -7515,6 +7867,14 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/ai/applications/{application_public_id}/workspace/changes",
             get(get_application_workspace_changes),
+        )
+        .route(
+            "/ai/applications/{application_public_id}/workspace/directory",
+            get(get_application_workspace_directory),
+        )
+        .route(
+            "/ai/applications/{application_public_id}/workspace/file",
+            get(get_application_workspace_file),
         )
         .route(
             "/ai/applications/{application_public_id}/workspace/diff",
@@ -7684,8 +8044,15 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         set_application_primary_project,
         get_application,
         create_application_preview_link,
+        create_global_workspace_preview_link,
         get_application_workspace_changes,
+        get_global_workspace_changes,
+        get_application_workspace_directory,
+        get_global_workspace_directory,
+        get_application_workspace_file,
+        get_global_workspace_file,
         get_application_workspace_diff,
+        get_global_workspace_diff,
         get_application_workspace,
         update_application_workspace,
         control_application_workspace,
@@ -9267,6 +9634,7 @@ mod tests {
         assert!(is_sensitive_workspace_path(".env.production"));
         assert!(is_sensitive_workspace_path(".Git-Credentials"));
         assert!(is_sensitive_workspace_path(".docker/config.json"));
+        assert!(is_sensitive_workspace_path(".temps/runtime.json"));
         assert!(is_sensitive_workspace_path(".config/gcloud/credentials.db"));
         assert!(is_sensitive_workspace_path("infra/terraform.tfstate"));
         assert!(is_sensitive_workspace_path("config/private-key.pem"));
@@ -9351,5 +9719,19 @@ mod tests {
                 .get("get")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn openapi_documents_global_workspace_files_and_preview() {
+        let document = serde_json::to_value(AiChatApiDoc::openapi())
+            .expect("AI chat OpenAPI document should serialize");
+
+        assert!(document["paths"]["/ai/workspace/changes"]
+            .get("get")
+            .is_some());
+        assert!(document["paths"]["/ai/workspace/diff"].get("get").is_some());
+        assert!(document["paths"]["/ai/workspace/preview-link"]
+            .get("post")
+            .is_some());
     }
 }

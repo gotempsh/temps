@@ -49,6 +49,7 @@ import {
 import {
   extendTimeoutMutation,
   getApplicationWorkspaceOptions,
+  getGlobalAiWorkspaceOptions,
   listApplicationsOptions,
   listSandboxesOptions,
   pauseSandboxMutation,
@@ -182,20 +183,28 @@ export default function Sandboxes() {
     application,
     workspace: applicationWorkspaceQueries[index]?.data ?? null,
   }))
+  const globalWorkspaceQuery = useQuery({
+    ...getGlobalAiWorkspaceOptions(),
+    refetchInterval: 15_000,
+  })
   const managedWorkspacesLoading =
     applicationsQuery.isLoading ||
-    applicationWorkspaceQueries.some((query) => query.isLoading)
+    applicationWorkspaceQueries.some((query) => query.isLoading) ||
+    globalWorkspaceQuery.isLoading
   const managedWorkspacesError =
     applicationsQuery.isError ||
-    applicationWorkspaceQueries.some((query) => query.isError)
+    applicationWorkspaceQueries.some((query) => query.isError) ||
+    globalWorkspaceQuery.isError
   const refreshing =
     isFetching ||
     applicationsQuery.isFetching ||
-    applicationWorkspaceQueries.some((query) => query.isFetching)
+    applicationWorkspaceQueries.some((query) => query.isFetching) ||
+    globalWorkspaceQuery.isFetching
 
   const refreshAll = () => {
     void refetch()
     void applicationsQuery.refetch()
+    void globalWorkspaceQuery.refetch()
     for (const query of applicationWorkspaceQueries) void query.refetch()
   }
 
@@ -307,6 +316,7 @@ export default function Sandboxes() {
       <ManagedApplicationWorkspaces
         entries={managedWorkspaces}
         error={managedWorkspacesError}
+        globalWorkspace={globalWorkspaceQuery.data ?? null}
         loading={managedWorkspacesLoading}
       />
 
@@ -471,14 +481,17 @@ type ManagedWorkspaceEntry = {
 
 function ManagedApplicationWorkspaces({
   entries,
+  globalWorkspace,
   loading,
   error,
 }: {
   entries: ManagedWorkspaceEntry[]
+  globalWorkspace: ApplicationWorkspaceResponse | null
   loading: boolean
   error: boolean
 }) {
-  if (!loading && !error && entries.length === 0) return null
+  if (!loading && !error && entries.length === 0 && !globalWorkspace)
+    return null
 
   return (
     <section
@@ -491,16 +504,16 @@ function ManagedApplicationWorkspaces({
             className="text-base font-semibold tracking-tight"
             id="application-workspaces-title"
           >
-            Application workspaces
+            Managed AI workspaces
           </h2>
           <p className="text-sm text-muted-foreground">
-            Persistent sandboxes that Temps wakes and recovers for application
-            chats.
+            Persistent sandboxes that Temps wakes and recovers for global and
+            application chats.
           </p>
         </div>
         {entries.length > 0 && (
           <Badge variant="secondary" className="shrink-0 tabular-nums">
-            {entries.length}
+            {entries.length + (globalWorkspace ? 1 : 0)}
           </Badge>
         )}
       </div>
@@ -518,6 +531,9 @@ function ManagedApplicationWorkspaces({
         </div>
       ) : (
         <div className="space-y-3">
+          {globalWorkspace && (
+            <ManagedGlobalWorkspaceRow workspace={globalWorkspace} />
+          )}
           {entries.map(({ application, workspace }) => (
             <ManagedApplicationWorkspaceRow
               application={application}
@@ -542,12 +558,47 @@ export function ManagedApplicationWorkspaceRow({
   application,
   workspace,
 }: ManagedWorkspaceEntry) {
+  return (
+    <ManagedWorkspaceRow
+      href={`/ai-first?application=${encodeURIComponent(application.public_id)}`}
+      name={application.name}
+      notStartedMessage="Sandbox starts on the first application turn"
+      workspace={workspace}
+    />
+  )
+}
+
+export function ManagedGlobalWorkspaceRow({
+  workspace,
+}: {
+  workspace: ApplicationWorkspaceResponse
+}) {
+  return (
+    <ManagedWorkspaceRow
+      href="/ai-first?scope=global"
+      name="Global AI workspace"
+      notStartedMessage="Sandbox starts on the first global AI turn"
+      workspace={workspace}
+    />
+  )
+}
+
+function ManagedWorkspaceRow({
+  name,
+  href,
+  notStartedMessage,
+  workspace,
+}: {
+  name: string
+  href: string
+  notStartedMessage: string
+  workspace: ApplicationWorkspaceResponse | null
+}) {
   const state = workspace?.sandbox_public_id
     ? workspace.state
     : workspace
       ? 'not started'
       : 'loading'
-  const workspaceHref = `/ai-first?application=${encodeURIComponent(application.public_id)}`
   const sleeping = state === 'sleeping'
 
   return (
@@ -558,9 +609,9 @@ export function ManagedApplicationWorkspaceRow({
             <div className="flex flex-wrap items-center gap-2">
               <Link
                 className="truncate font-semibold leading-none hover:underline"
-                to={workspaceHref}
+                to={href}
               >
-                {application.name}
+                {name}
               </Link>
               <Badge
                 title={
@@ -580,8 +631,7 @@ export function ManagedApplicationWorkspaceRow({
               </Badge>
             </div>
             <p className="truncate font-mono text-xs text-muted-foreground">
-              {workspace?.sandbox_public_id ??
-                'Sandbox starts on the first application turn'}
+              {workspace?.sandbox_public_id ?? notStartedMessage}
             </p>
             {sleeping && (
               <p className="text-xs text-muted-foreground">
@@ -591,7 +641,7 @@ export function ManagedApplicationWorkspaceRow({
             )}
           </div>
           <Button asChild className="shrink-0" size="sm" variant="outline">
-            <Link to={workspaceHref}>Manage workspace</Link>
+            <Link to={href}>Manage workspace</Link>
           </Button>
         </div>
 
