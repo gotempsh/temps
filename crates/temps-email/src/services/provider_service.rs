@@ -9,8 +9,8 @@ use sea_orm::{
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
-use temps_entities::email_providers;
-use tracing::{debug, error};
+use temps_entities::{email_domains, email_providers};
+use tracing::{debug, error, info};
 
 use crate::errors::EmailError;
 use crate::providers::{
@@ -392,10 +392,59 @@ impl ProviderService {
             "Updated email provider {} (changed fields: {:?})",
             id, changed_fields
         );
+
+        // A domain's "verified" status was earned against whatever
+        // account/project the *old* credentials pointed at — e.g. Scaleway's
+        // "checked domain" state is scoped to a `project_id`, so rotating the
+        // API key/project silently repoints every domain at a project where
+        // none of them were ever checked. Leaving the stale `verified` status
+        // in place would let `EmailService::send` skip its local verification
+        // gate and call the provider directly, which then rejects the send
+        // with a raw provider error (e.g. Scaleway's "Email must be sent from
+        // a checked domain") instead of the graceful "domain not verified"
+        // capture path. Forcing re-verification keeps the local status honest.
+        if changed_fields.contains(&"credentials".to_string()) {
+            self.invalidate_domain_verification(id).await?;
+        }
+
         Ok(UpdateProviderOutcome {
             provider: updated,
             changed_fields,
         })
+    }
+
+    /// Reset every domain bound to `provider_id` back to `pending`, clearing
+    /// its last-verified timestamp so the operator must re-verify before
+    /// Temps will send through it again. Called after a provider's
+    /// credentials change; see the call site for why that's necessary.
+    async fn invalidate_domain_verification(&self, provider_id: i32) -> Result<(), EmailError> {
+        use sea_orm::sea_query::Expr;
+
+        let reset = email_domains::Entity::update_many()
+            .col_expr(email_domains::Column::Status, Expr::value("pending"))
+            .col_expr(
+                email_domains::Column::VerificationError,
+                Expr::value(Some(
+                    "Provider credentials changed; domain must be re-verified".to_string(),
+                )),
+            )
+            .col_expr(
+                email_domains::Column::LastVerifiedAt,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
+            .filter(email_domains::Column::ProviderId.eq(provider_id))
+            .filter(email_domains::Column::Status.ne("pending"))
+            .exec(self.db.as_ref())
+            .await?;
+
+        if reset.rows_affected > 0 {
+            info!(
+                "Reset {} domain(s) for provider {} to pending after credential change",
+                reset.rows_affected, provider_id
+            );
+        }
+
+        Ok(())
     }
 
     /// Decrypt and parse a provider's stored SES credentials. Fails for
@@ -825,6 +874,24 @@ mod tests {
         let encryption_service = create_test_encryption_service();
         let service = ProviderService::new(db.db.clone(), encryption_service);
         Some((db, service))
+    }
+
+    // Helper to create a test domain directly in the database (bypasses the
+    // provider's create_identity, which needs real credentials).
+    async fn create_test_domain(
+        db: &Arc<sea_orm::DatabaseConnection>,
+        provider_id: i32,
+        domain_name: &str,
+    ) -> email_domains::Model {
+        let domain = email_domains::ActiveModel {
+            provider_id: Set(provider_id),
+            domain: Set(domain_name.to_string()),
+            status: Set("pending".to_string()),
+            provider_identity_id: Set(Some(format!("mock-identity-{}", domain_name))),
+            ..Default::default()
+        };
+
+        domain.insert(db.as_ref()).await.unwrap()
     }
 
     // ========== Unit Tests (no database required) ==========
@@ -1650,6 +1717,93 @@ mod tests {
             outcome.provider.credentials, created.credentials,
             "encrypted blob must be byte-identical when caller omits credentials"
         );
+    }
+
+    /// Reproduces the reported bug: a domain verified against a provider's old
+    /// credentials keeps showing `verified` after the credentials are rotated
+    /// to point at a different account/project, so `EmailService::send` skips
+    /// its local gate and lets a genuinely unchecked domain reach the
+    /// provider — which is exactly how a live Scaleway send ends up rejected
+    /// with "Email must be sent from a checked domain" while Temps still
+    /// displays the domain as verified. Rotating credentials must reset any
+    /// domain bound to that provider back to `pending`.
+    #[tokio::test]
+    async fn test_update_credentials_resets_verified_domains_to_pending() {
+        let Some((db, service)) = setup_test_env().await else {
+            return;
+        };
+
+        // SMTP, not Scaleway/SES: verify_provider_credentials makes a real
+        // network call for those provider types (see test_list_providers's
+        // comment above), so SMTP is used here to exercise the credential
+        // rotation path without depending on network access.
+        let created = service
+            .create(CreateProviderRequest {
+                name: "SMTP".to_string(),
+                provider_type: EmailProviderType::Smtp,
+                region: "us-east-1".to_string(),
+                credentials: ProviderCredentials::Smtp(crate::providers::SmtpCredentials {
+                    host: "smtp.old-account.example.com".to_string(),
+                    port: 587,
+                    username: None,
+                    password: None,
+                    encryption: crate::providers::SmtpEncryption::Starttls,
+                    accept_invalid_certs: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let verified_domain = create_test_domain(&db.db, created.id, "verified.example.com").await;
+        let mut active: email_domains::ActiveModel = verified_domain.clone().into();
+        active.status = Set("verified".to_string());
+        active.last_verified_at = Set(Some(chrono::Utc::now()));
+        active.update(db.db.as_ref()).await.unwrap();
+
+        // A domain that was never verified must not be reported as "reset" —
+        // only genuinely stale verified domains are the bug being fixed here.
+        let pending_domain = create_test_domain(&db.db, created.id, "pending.example.com").await;
+        assert_eq!(pending_domain.status, "pending");
+
+        let outcome = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    credentials: Some(ProviderCredentials::Smtp(
+                        crate::providers::SmtpCredentials {
+                            host: "smtp.new-account.example.com".to_string(),
+                            port: 587,
+                            username: None,
+                            password: None,
+                            encryption: crate::providers::SmtpEncryption::Starttls,
+                            accept_invalid_certs: false,
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.changed_fields, vec!["credentials".to_string()]);
+
+        let refreshed = email_domains::Entity::find_by_id(verified_domain.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refreshed.status, "pending",
+            "a previously-verified domain must be forced back to pending after credential rotation"
+        );
+        assert!(refreshed.verification_error.is_some());
+        assert!(refreshed.last_verified_at.is_none());
+
+        let refreshed_pending = email_domains::Entity::find_by_id(pending_domain.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed_pending.status, "pending");
     }
 
     // ========== Unit Tests for TestEmailResult ==========
