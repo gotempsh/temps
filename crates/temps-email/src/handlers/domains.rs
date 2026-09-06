@@ -27,8 +27,8 @@ use super::audit::{
     EmailDomainProjectRevokedAudit, EmailDomainVerifiedAudit,
 };
 use super::types::{
-    AppState, AuthorizedEmailDomainProjectResponse, CreateEmailDomainRequest, DnsRecordResponse,
-    DnsRecordSetupResult, EmailDomainResponse, EmailDomainWithDnsResponse,
+    AppState, AuthorizedEmailDomainProjectResponse, CreateEmailDomainRequest, DeleteDomainQuery,
+    DnsRecordResponse, DnsRecordSetupResult, EmailDomainResponse, EmailDomainWithDnsResponse,
     ImportEmailDomainRequest, ListDomainsQuery, SetupDnsRequest, SetupDnsResponse,
 };
 use crate::errors::EmailError;
@@ -884,19 +884,28 @@ pub async fn verify_domain(
 }
 
 /// Delete an email domain
+///
+/// By default this only removes the Temps-side record; the domain identity
+/// on the provider (Scaleway/SES) is left intact, since it may be shared
+/// with other tools against that provider account. Pass
+/// `delete_from_provider=true` to also remove it on the provider's side. In
+/// either case, the local record is deleted regardless of whether that
+/// provider-side deletion succeeds — an unreachable provider never blocks
+/// removing the domain from Temps.
 #[utoipa::path(
     tag = "Email Domains",
     delete,
     path = "/email-domains/{id}",
+    params(
+        ("id" = i32, Path, description = "Domain ID"),
+        DeleteDomainQuery
+    ),
     responses(
         (status = 204, description = "Domain deleted"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain not found"),
-        (status = 500, description = "Internal server error")
-    ),
-    params(
-        ("id" = i32, Path, description = "Domain ID")
+        (status = 500, description = "Internal server error (includes provider-side cleanup failure; the local record is still deleted)")
     ),
     security(("bearer_auth" = []))
 )]
@@ -905,6 +914,7 @@ pub async fn delete_email_domain(
     State(state): State<Arc<AppState>>,
     axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(id): Path<i32>,
+    Query(query): Query<DeleteDomainQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailDomainsDelete);
 
@@ -914,7 +924,10 @@ pub async fn delete_email_domain(
         not_found().detail("Domain not found").build()
     })?;
 
-    let delete_result = state.domain_service.delete(id).await;
+    let delete_result = state
+        .domain_service
+        .delete(id, query.delete_from_provider)
+        .await;
 
     // The domain's Temps-side row is gone in both the success case and the
     // ProviderCleanupFailed case (see DomainService::delete) -- audit the
@@ -927,6 +940,7 @@ pub async fn delete_email_domain(
         },
         domain_id: domain.id,
         domain: domain.domain,
+        delete_from_provider: query.delete_from_provider,
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {

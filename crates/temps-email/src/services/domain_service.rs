@@ -758,36 +758,49 @@ impl DomainService {
         })
     }
 
-    /// Delete a domain
-    pub async fn delete(&self, id: i32) -> Result<(), EmailError> {
+    /// Delete a domain.
+    ///
+    /// `delete_from_provider` controls whether the identity is also removed
+    /// on the provider's side (e.g. Scaleway/SES). It defaults to `false` at
+    /// the API layer: the same domain identity may be shared with other
+    /// tools against that provider account, so removing it from Temps must
+    /// not silently un-register it elsewhere unless the caller explicitly
+    /// asks for that.
+    ///
+    /// Regardless of `delete_from_provider`, a provider-side failure (network
+    /// error, revoked credentials, the identity-domain mismatch guard
+    /// rejecting a stale UUID) never blocks removing Temps' own record — an
+    /// unreachable provider must not strand this domain forever, since the
+    /// local row is also what the authorization/sending checks use.
+    pub async fn delete(&self, id: i32, delete_from_provider: bool) -> Result<(), EmailError> {
         let domain = self.get(id).await?;
 
-        debug!("Deleting domain: {}", domain.domain);
+        debug!(
+            "Deleting domain: {} (delete_from_provider: {})",
+            domain.domain, delete_from_provider
+        );
 
-        // Get the provider
-        let provider = self.provider_service.get(domain.provider_id).await?;
-
-        // Create provider instance
-        let provider_instance = self
-            .provider_service
-            .create_provider_instance(&provider)
-            .await?;
-
-        // Delete from provider first, but don't let a failure here (network
-        // error, revoked credentials, the identity-domain mismatch guard
-        // rejecting a stale UUID) block removing Temps' own record — an
-        // unreachable provider must not strand this domain forever, since
-        // the local row is also what the authorization/sending checks use.
-        let provider_delete_result = provider_instance
-            .delete_identity(&domain.domain, domain.provider_identity_id.as_deref())
-            .await;
+        let provider_delete_result = if delete_from_provider {
+            let provider = self.provider_service.get(domain.provider_id).await?;
+            let provider_instance = self
+                .provider_service
+                .create_provider_instance(&provider)
+                .await?;
+            Some(
+                provider_instance
+                    .delete_identity(&domain.domain, domain.provider_identity_id.as_deref())
+                    .await,
+            )
+        } else {
+            None
+        };
 
         // Delete from database
         email_domains::Entity::delete_by_id(domain.id)
             .exec(self.db.as_ref())
             .await?;
 
-        if let Err(e) = provider_delete_result {
+        if let Some(Err(e)) = provider_delete_result {
             error!(
                 "Domain '{}' removed from Temps, but the provider-side identity could not be \
                  deleted: {}",
@@ -799,7 +812,15 @@ impl DomainService {
             });
         }
 
-        info!("Deleted email domain: {}", domain.domain);
+        info!(
+            "Deleted email domain: {} (provider-side identity {})",
+            domain.domain,
+            if delete_from_provider {
+                "also removed"
+            } else {
+                "left intact"
+            }
+        );
 
         Ok(())
     }
@@ -940,6 +961,24 @@ mod tests {
             }),
         };
         service.create(request).await.unwrap()
+    }
+
+    // Helper to create a test domain directly in the database (bypasses the
+    // provider's create_identity, which needs real credentials).
+    async fn create_test_domain(
+        db: &Arc<sea_orm::DatabaseConnection>,
+        provider_id: i32,
+        domain_name: &str,
+    ) -> email_domains::Model {
+        let domain = email_domains::ActiveModel {
+            provider_id: Set(provider_id),
+            domain: Set(domain_name.to_string()),
+            status: Set("pending".to_string()),
+            provider_identity_id: Set(Some(format!("mock-identity-{}", domain_name))),
+            ..Default::default()
+        };
+
+        domain.insert(db.as_ref()).await.unwrap()
     }
 
     // ========== Unit Tests (no database required) ==========
@@ -1699,6 +1738,78 @@ mod tests {
         assert!(
             result.is_err(),
             "a failed provider check must not be silently swallowed"
+        );
+    }
+
+    /// Corrupt a provider's stored credentials in place (bypassing
+    /// `EncryptionService`) so `create_provider_instance` fails to decrypt
+    /// them, without touching the provider row itself — deleting the row
+    /// would cascade-delete the domain too (`ON DELETE CASCADE`), which
+    /// would make these tests pass for the wrong reason.
+    async fn corrupt_provider_credentials(db: &Arc<sea_orm::DatabaseConnection>, provider_id: i32) {
+        let mut active: email_providers::ActiveModel =
+            email_providers::Entity::find_by_id(provider_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        active.credentials = Set("not valid ciphertext".to_string());
+        active.update(db.as_ref()).await.unwrap();
+    }
+
+    /// The default (`delete_from_provider: false`) must not touch the
+    /// provider at all — proven by corrupting the provider's stored
+    /// credentials first. If `delete()` still built a provider instance on
+    /// this path, it would fail to decrypt them; since the domain identity
+    /// may be shared with other tools against that provider account, Temps
+    /// must never reach out to the provider unless the caller opts in.
+    #[tokio::test]
+    async fn delete_without_provider_flag_never_needs_the_provider() {
+        let Some((db, domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
+
+        let provider = create_test_provider(&provider_service).await;
+        let domain = create_test_domain(&db.db, provider.id, "opt-out.example.com").await;
+        corrupt_provider_credentials(&db.db, provider.id).await;
+
+        let result = domain_service.delete(domain.id, false).await;
+
+        assert!(
+            result.is_ok(),
+            "deleting without delete_from_provider must never need the provider: {result:?}"
+        );
+
+        let remaining = email_domains::Entity::find_by_id(domain.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_none(),
+            "local record must still be deleted even though the provider was skipped"
+        );
+    }
+
+    /// Opting in to `delete_from_provider` must actually route through the
+    /// provider — proven by the inverse of the test above: with the
+    /// provider's credentials corrupted, `delete(id, true)` must surface a
+    /// decryption failure instead of silently behaving like the opt-out path.
+    #[tokio::test]
+    async fn delete_with_provider_flag_requires_the_provider() {
+        let Some((db, domain_service, provider_service)) = setup_test_env().await else {
+            return;
+        };
+
+        let provider = create_test_provider(&provider_service).await;
+        let domain = create_test_domain(&db.db, provider.id, "opt-in.example.com").await;
+        corrupt_provider_credentials(&db.db, provider.id).await;
+
+        let result = domain_service.delete(domain.id, true).await;
+
+        assert!(
+            matches!(result, Err(EmailError::Decryption(_))),
+            "delete_from_provider=true must build a provider instance: {result:?}"
         );
     }
 }

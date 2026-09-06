@@ -413,6 +413,19 @@ pub struct ListDomainsQuery {
     pub provider_id: Option<i32>,
 }
 
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct DeleteDomainQuery {
+    /// Also remove the domain identity on the provider's side (Scaleway/SES),
+    /// not just the local Temps record. Defaults to `false`: the same domain
+    /// may be shared with other tools against that provider account, so
+    /// deleting it from Temps must not silently un-register it elsewhere
+    /// unless explicitly requested. If the provider-side deletion fails
+    /// (network error, revoked credentials), the local record is still
+    /// deleted -- an unreachable provider never blocks removing it from Temps.
+    #[serde(default)]
+    pub delete_from_provider: bool,
+}
+
 /// Request to setup DNS records using a configured DNS provider
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetupDnsRequest {
