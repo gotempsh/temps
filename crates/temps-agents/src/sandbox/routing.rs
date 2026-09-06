@@ -94,6 +94,16 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.get(backend)?.create(config).await
     }
 
+    async fn model_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        self.owner_of(handle)
+            .model_relay_base_url(handle, control_plane_url)
+            .await
+    }
+
     async fn exec(
         &self,
         handle: &SandboxHandle,

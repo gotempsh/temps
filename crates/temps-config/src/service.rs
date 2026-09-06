@@ -531,6 +531,16 @@ pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 /// proxy's per-request hot path (`request_filter`) never hammers Postgres.
 const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Default)]
+struct SettingsCacheState {
+    snapshot: Option<(AppSettings, std::time::Instant)>,
+    /// Monotonic generation protecting publication from stale in-flight
+    /// database reads. Kept under the same lock as the snapshot and global TLS
+    /// publication so invalidation cannot split the generation check from its
+    /// side effects.
+    generation: u64,
+}
+
 pub struct ConfigService {
     config: Arc<ServerConfig>,
     db: Arc<DbConnection>,
@@ -540,7 +550,7 @@ pub struct ConfigService {
     /// would amplify any request flood into a Postgres QPS flood. Invalidated
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
-    settings_cache: tokio::sync::RwLock<Option<(AppSettings, std::time::Instant)>>,
+    settings_cache: tokio::sync::RwLock<SettingsCacheState>,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -555,7 +565,7 @@ impl ConfigService {
         Self {
             config,
             db,
-            settings_cache: tokio::sync::RwLock::new(None),
+            settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
         }
     }
@@ -844,12 +854,14 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // the proxy's per-request callers off the database (see field docs).
         {
             let cached = self.settings_cache.read().await;
-            if let Some((settings, fetched_at)) = cached.as_ref() {
+            if let Some((settings, fetched_at)) = cached.snapshot.as_ref() {
                 if fetched_at.elapsed() < SETTINGS_CACHE_TTL {
                     return Ok(settings.clone());
                 }
             }
         }
+
+        let generation = self.settings_cache.read().await.generation;
 
         // Cache miss or stale: load from the DB and repopulate.
         let record = settings::Entity::find_by_id(1)
@@ -859,13 +871,30 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let settings = record
             .map(|r| AppSettings::from_json(r.data))
             .unwrap_or_default();
-        // Republish process-wide TLS opt-in so server-side make_client()
-        // callsites (deployer, agent, providers) see the latest value
-        // without an explicit init step at startup.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
-
-        *self.settings_cache.write().await = Some((settings.clone(), std::time::Instant::now()));
+        self.cache_settings_if_current(generation, settings.clone())
+            .await;
         Ok(settings)
+    }
+
+    async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
+        let mut cache = self.settings_cache.write().await;
+        if cache.generation != generation {
+            return false;
+        }
+        // Publish the process-wide TLS opt-in under the same generation
+        // guard as the settings snapshot. A DB read started before an
+        // invalidation must not be able to restore stale TLS behavior after
+        // the newer settings have become authoritative.
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
+        true
+    }
+
+    async fn replace_settings_cache(&self, settings: AppSettings) {
+        let mut cache = self.settings_cache.write().await;
+        cache.generation = cache.generation.wrapping_add(1);
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
     }
 
     /// Update the application settings
@@ -1051,15 +1080,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         txn.commit().await?;
 
-        // Publish runtime settings only after the transaction commits. A
-        // failed policy replacement must not partially apply an unrelated TLS
-        // toggle in memory while the persisted settings remain unchanged.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
-
         // Write-through: refresh the cache with the just-written value so an
         // admin's change takes effect immediately in this process, rather than
-        // waiting out SETTINGS_CACHE_TTL.
-        *self.settings_cache.write().await = Some((settings, std::time::Instant::now()));
+        // waiting out SETTINGS_CACHE_TTL. Runtime TLS publication happens in
+        // the same generation-checked critical section.
+        self.replace_settings_cache(settings).await;
 
         Ok(())
     }
@@ -1070,7 +1095,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// reconnect-recovery (so a NOTIFY missed during a connection gap can't
     /// strand stale data). Takes the async write lock, so it must be awaited.
     pub async fn invalidate_settings_cache(&self) {
-        *self.settings_cache.write().await = None;
+        {
+            let mut cache = self.settings_cache.write().await;
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.snapshot = None;
+            // Fail closed until the authoritative row has been reloaded. This
+            // is important when the invalidated value had insecure TLS enabled.
+            temps_core::tls::set_insecure_tls(false);
+        }
+
+        // Reload immediately so cross-process settings changes (including an
+        // intentional insecure-TLS opt-in) become effective when the NOTIFY is
+        // processed, rather than waiting for an unrelated future caller.
+        if let Err(error) = self.get_settings().await {
+            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS remains enabled");
+        }
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
 
@@ -1915,5 +1954,70 @@ mod tests {
             "v2",
             "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidation_rejects_a_stale_in_flight_cache_publication() {
+        temps_core::tls::set_insecure_tls(false);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("new.example.com")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let stale_generation = svc.settings_cache.read().await.generation;
+
+        svc.invalidate_settings_cache().await;
+
+        let stale = AppSettings {
+            preview_domain: "old.example.com".to_string(),
+            insecure_tls: true,
+            ..AppSettings::default()
+        };
+        assert!(!svc.cache_settings_if_current(stale_generation, stale).await);
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "rejected stale settings must not mutate process-wide TLS behavior"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "new.example.com",
+            "a read started before invalidation must not republish stale settings"
+        );
+        temps_core::tls::set_insecure_tls(false);
+    }
+
+    #[tokio::test]
+    async fn invalidation_serializes_cache_and_tls_publication() {
+        temps_core::tls::set_insecure_tls(true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("strict.example.com")]])
+            .into_connection();
+        let svc = Arc::new(ConfigService::new(test_config(), Arc::new(db)));
+
+        // Hold the cache-publication lock while invalidation starts. The
+        // invalidator must not advance the generation or mutate TLS outside
+        // that lock; this is the check-to-publication interleaving that used to
+        // permit a stale insecure-TLS value to survive invalidation.
+        let cache_guard = svc.settings_cache.write().await;
+        let invalidation = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.invalidate_settings_cache().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !invalidation.is_finished(),
+            "invalidation must wait for the cache/TLS publication lock"
+        );
+        drop(cache_guard);
+
+        invalidation.await.expect("invalidation task");
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "invalidation must finish with the reloaded strict TLS setting"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "strict.example.com"
+        );
+        temps_core::tls::set_insecure_tls(false);
     }
 }

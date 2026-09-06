@@ -1014,6 +1014,18 @@ impl AgentCliAiService {
                 reason: "sandboxed harness model relay is not configured for this instance"
                     .to_string(),
             })?;
+        let sandbox_provider = self
+            .sandbox_provider
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: "sandboxed harness execution is not configured for this instance"
+                    .to_string(),
+            })?;
+        let relay_base_url = sandbox_provider
+            .model_relay_base_url(&handle, &credentials.internal_api_url)
+            .await
+            .map_err(|error| map_agent_error(&request.purpose, error))?;
         let (model_relay, model_relay_guard) = relay_service.register(
             self.provider.name(),
             request.principal_id.ok_or_else(|| AiError::Provider {
@@ -1022,6 +1034,7 @@ impl AgentCliAiService {
             })?,
             request.model.as_deref(),
             credentials,
+            &relay_base_url,
             timeout + Duration::from_secs(30),
         )?;
         let mut streamed_secrets = vec![model_relay.bearer.clone()];

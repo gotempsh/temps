@@ -166,6 +166,21 @@ fn sandbox_egress_proxy_name(container_name: &str) -> String {
     format!("{SANDBOX_EGRESS_PROXY_PREFIX}{container_name}")
 }
 
+fn sandbox_egress_proxy_extra_hosts() -> Vec<String> {
+    vec![SANDBOX_HOST_GATEWAY.to_string()]
+}
+
+fn container_has_extra_host(
+    container: &bollard::models::ContainerInspectResponse,
+    expected: &str,
+) -> bool {
+    container
+        .host_config
+        .as_ref()
+        .and_then(|config| config.extra_hosts.as_ref())
+        .is_some_and(|hosts| hosts.iter().any(|host| host == expected))
+}
+
 fn container_has_environment_value(
     container: &bollard::models::ContainerInspectResponse,
     expected_key: &str,
@@ -545,6 +560,13 @@ const SANDBOX_EGRESS_NETWORK: &str = "temps-sandbox-egress-v1";
 const SANDBOX_EGRESS_PROXY_PREFIX: &str = "temps-sandbox-egress-proxy-v2-";
 const SANDBOX_EGRESS_PROXY_ALIAS: &str = "temps-sandbox-egress-proxy";
 const SANDBOX_EGRESS_PROXY_PORT: u16 = 3128;
+const SANDBOX_CONTROL_PLANE_URL_ENV: &str = "TEMPS_CONTROL_PLANE_URL";
+const SANDBOX_HOST_GATEWAY: &str = "host.docker.internal:host-gateway";
+/// A direct, capability-only route exposed by the per-sandbox egress proxy.
+/// It is deliberately included in `NO_PROXY`: requests go to the sidecar
+/// itself, whose reverse-proxy handler accepts only model relay paths.
+pub const SANDBOX_MODEL_RELAY_BASE_URL: &str =
+    "http://temps-sandbox-egress-proxy:3128/.temps/model-relay";
 const SANDBOX_EGRESS_POLICY_LABEL: &str = "sh.temps.sandbox-egress-policy";
 const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 
@@ -558,8 +580,16 @@ const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
 /// carries no credentials and does not terminate TLS.
 const SANDBOX_EGRESS_PROXY_SCRIPT: &str = r#"
 const http = require("http");
+const https = require("https");
 const net = require("net");
 const dns = require("dns").promises;
+
+const proxyAuthority = "temps-sandbox-egress-proxy:3128";
+const controlPlane = new URL(process.env.TEMPS_CONTROL_PLANE_URL);
+if (!['http:', 'https:'].includes(controlPlane.protocol) ||
+    controlPlane.username || controlPlane.password) {
+  throw new Error("TEMPS_CONTROL_PLANE_URL must be an HTTP(S) origin without credentials");
+}
 
 function isPrivateAddress(address) {
   if (address.startsWith("::ffff:")) address = address.slice(7);
@@ -603,33 +633,65 @@ function parseAuthority(value, defaultPort) {
   return { hostname: parsed.hostname, port };
 }
 
+function modelRelayTarget(request) {
+  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+  if (request.method !== "POST" || incoming.host !== proxyAuthority) return null;
+  const match = incoming.pathname.match(
+    /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(v1\/messages(?:\/count_tokens)?)$/
+  );
+  if (!match) return null;
+  const basePath = controlPlane.pathname.replace(/\/$/, "");
+  const target = new URL(controlPlane.toString());
+  target.pathname = `${basePath}/api/ai/sandbox-models/${match[1]}/${match[2]}`;
+  target.search = "";
+  return target;
+}
+
+async function forward(request, response, target, allowPrivate) {
+  const answer = allowPrivate
+    ? (await dns.lookup(target.hostname, { all: true, verbatim: true }))[0]
+    : await resolvePublic(target.hostname);
+  if (!answer) throw new Error("destination did not resolve");
+  const port = Number(target.port || (target.protocol === "http:" ? 80 : 443));
+  const headers = { ...request.headers, host: target.host };
+  delete headers["proxy-authorization"];
+  delete headers["proxy-connection"];
+  const transport = target.protocol === "https:" ? https : http;
+  const upstream = transport.request({
+    host: answer.address,
+    port,
+    servername: target.hostname,
+    method: request.method,
+    path: `${target.pathname}${target.search}`,
+    headers,
+  }, (upstreamResponse) => {
+    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+    upstreamResponse.pipe(response);
+  });
+  upstream.on("error", () => {
+    if (!response.headersSent) response.writeHead(502);
+    response.end();
+  });
+  request.pipe(upstream);
+}
+
 const server = http.createServer(async (request, response) => {
   try {
+    const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
+    const relayTarget = modelRelayTarget(request);
+    if (incoming.host === proxyAuthority &&
+        incoming.pathname.startsWith("/.temps/model-relay/")) {
+      if (!relayTarget) throw new Error("model relay target is not allowed");
+      await forward(request, response, relayTarget, true);
+      return;
+    }
     const target = new URL(request.url);
     const port = Number(target.port || (target.protocol === "http:" ? 80 : 443));
     if (target.protocol !== "http:" || target.username || target.password ||
         ![80, 443].includes(port)) {
       throw new Error("request target is not allowed");
     }
-    const { address } = await resolvePublic(target.hostname);
-    const headers = { ...request.headers, host: target.host };
-    delete headers["proxy-authorization"];
-    delete headers["proxy-connection"];
-    const upstream = http.request({
-      host: address,
-      port,
-      method: request.method,
-      path: `${target.pathname}${target.search}`,
-      headers,
-    }, (upstreamResponse) => {
-      response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
-      upstreamResponse.pipe(response);
-    });
-    upstream.on("error", () => {
-      if (!response.headersSent) response.writeHead(502);
-      response.end();
-    });
-    request.pipe(upstream);
+    await forward(request, response, target, false);
   } catch (_) {
     response.writeHead(403, { "content-type": "text/plain" });
     response.end("destination denied\n");
@@ -1122,6 +1184,9 @@ pub struct DockerSandboxConfig {
     pub default_memory_limit_mb: u64,
     /// Network mode: "none" for full isolation, or a bridge name
     pub network_mode: String,
+    /// Host control-plane origin used only by the egress sidecar's
+    /// capability-scoped model-relay reverse route.
+    pub control_plane_url: String,
 }
 
 impl Default for DockerSandboxConfig {
@@ -1132,6 +1197,7 @@ impl Default for DockerSandboxConfig {
             default_cpu_limit: 4.0,
             default_memory_limit_mb: 8192,
             network_mode: "full".to_string(),
+            control_plane_url: "http://host.docker.internal:8080".to_string(),
         }
     }
 }
@@ -1821,6 +1887,7 @@ impl DockerSandboxProvider {
         &self,
         container_name: &str,
         sandbox_network: &str,
+        control_plane_url: &str,
     ) -> Result<(), AgentError> {
         if sandbox_network == "none" {
             return Ok(());
@@ -1831,7 +1898,7 @@ impl DockerSandboxProvider {
             .await?;
         self.ensure_isolated_sandbox_bridge(sandbox_network, container_name)
             .await?;
-        self.ensure_egress_proxy(container_name, sandbox_network)
+        self.ensure_egress_proxy(container_name, sandbox_network, control_plane_url)
             .await?;
         self.connect_preview_gateways(sandbox_network).await
     }
@@ -2253,6 +2320,7 @@ impl DockerSandboxProvider {
         &self,
         sandbox_container_name: &str,
         sandbox_network: &str,
+        control_plane_url: &str,
     ) -> Result<(), AgentError> {
         let image = image_name_for_runtime("node");
         self.ensure_image_for_runtime("node").await?;
@@ -2286,7 +2354,26 @@ impl DockerSandboxProvider {
                     && networks.contains_key(sandbox_network)
                     && networks.len() == 2
             });
-            if image_matches && policy_matches && networks_match {
+            let command_matches = info
+                .config
+                .as_ref()
+                .and_then(|config| config.cmd.as_ref())
+                .is_some_and(|command| {
+                    command == &vec!["-e".to_string(), SANDBOX_EGRESS_PROXY_SCRIPT.to_string()]
+                });
+            let control_plane_matches = container_has_environment_value(
+                info,
+                SANDBOX_CONTROL_PLANE_URL_ENV,
+                control_plane_url,
+            );
+            let host_gateway_matches = container_has_extra_host(info, SANDBOX_HOST_GATEWAY);
+            if image_matches
+                && policy_matches
+                && networks_match
+                && command_matches
+                && control_plane_matches
+                && host_gateway_matches
+            {
                 if info.state.as_ref().and_then(|state| state.running) != Some(true) {
                     self.docker
                         .start_container(
@@ -2334,6 +2421,10 @@ impl DockerSandboxProvider {
                 "-e".to_string(),
                 SANDBOX_EGRESS_PROXY_SCRIPT.to_string(),
             ]),
+            env: Some(vec![format!(
+                "{SANDBOX_CONTROL_PLANE_URL_ENV}={}",
+                control_plane_url
+            )]),
             labels: Some(HashMap::from([
                 (
                     SANDBOX_EGRESS_POLICY_LABEL.to_string(),
@@ -2346,6 +2437,7 @@ impl DockerSandboxProvider {
             ])),
             host_config: Some(bollard::models::HostConfig {
                 network_mode: Some(SANDBOX_EGRESS_NETWORK.to_string()),
+                extra_hosts: Some(sandbox_egress_proxy_extra_hosts()),
                 cap_drop: Some(vec!["ALL".to_string()]),
                 security_opt: Some(vec!["no-new-privileges:true".to_string()]),
                 readonly_rootfs: Some(true),
@@ -2591,6 +2683,23 @@ impl DockerSandboxProvider {
                     self.quarantine_container(container_reference, container_name)
                         .await?;
                     return Ok(None);
+                }
+                let network_mode = info
+                    .host_config
+                    .as_ref()
+                    .and_then(|config| config.network_mode.as_deref());
+                if network_mode != Some("none") {
+                    // Recovery must reconcile sidecars too. The sandbox
+                    // container's immutable proxy variables can still match
+                    // while the egress sidecar predates a stricter routing
+                    // policy; `ensure_network` replaces that drifted sidecar
+                    // without touching the persistent workspace volumes.
+                    self.ensure_network(
+                        container_name,
+                        &sandbox_network_name(container_name),
+                        &self.config.control_plane_url,
+                    )
+                    .await?;
                 }
                 let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                 let container_id = info.id.unwrap_or_default();
@@ -2873,7 +2982,14 @@ impl SandboxProvider for DockerSandboxProvider {
             }
         }
 
-        if let Err(error) = self.ensure_network(&container_name, &docker_network).await {
+        if let Err(error) = self
+            .ensure_network(
+                &container_name,
+                &docker_network,
+                &self.config.control_plane_url,
+            )
+            .await
+        {
             return Err(self.rollback_failed_create(&container_name, error).await);
         }
 
@@ -3168,6 +3284,20 @@ impl SandboxProvider for DockerSandboxProvider {
             backend: super::SandboxBackend::Docker,
             image: image.to_string(),
         })
+    }
+
+    async fn model_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        self.ensure_network(
+            &handle.sandbox_name,
+            &sandbox_network_name(&handle.sandbox_name),
+            control_plane_url,
+        )
+        .await?;
+        Ok(SANDBOX_MODEL_RELAY_BASE_URL.to_string())
     }
 
     async fn configure_application_network(
@@ -7089,6 +7219,45 @@ mod tests {
             sandbox_network_name("temps-sandbox-test")
         );
         assert_eq!(managed_sandbox_network("none", "ignored"), "none");
+    }
+
+    #[test]
+    fn sandbox_proxy_exposes_only_the_capability_scoped_model_relay_route() {
+        assert_eq!(
+            SANDBOX_MODEL_RELAY_BASE_URL,
+            "http://temps-sandbox-egress-proxy:3128/.temps/model-relay"
+        );
+        for required_guard in [
+            "request.method !== \"POST\"",
+            "incoming.host !== proxyAuthority",
+            "incoming.pathname.match",
+            "[a-f0-9]{32}",
+            "v1\\/messages(?:\\/count_tokens)?",
+            "/api/ai/sandbox-models/",
+            "target.search = \"\";",
+            "if (!relayTarget) throw new Error",
+        ] {
+            assert!(
+                SANDBOX_EGRESS_PROXY_SCRIPT.contains(required_guard),
+                "model relay reverse proxy is missing guard: {required_guard}"
+            );
+        }
+        assert!(!SANDBOX_EGRESS_PROXY_SCRIPT.contains("allowPrivate = true"));
+        assert_eq!(
+            sandbox_egress_proxy_extra_hosts(),
+            vec!["host.docker.internal:host-gateway"]
+        );
+        let matching_container = bollard::models::ContainerInspectResponse {
+            host_config: Some(bollard::models::HostConfig {
+                extra_hosts: Some(sandbox_egress_proxy_extra_hosts()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(container_has_extra_host(
+            &matching_container,
+            SANDBOX_HOST_GATEWAY
+        ));
     }
 
     // ---- legacy Linux iptables helper tests ---------------------------------

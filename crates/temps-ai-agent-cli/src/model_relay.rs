@@ -133,6 +133,7 @@ impl SandboxModelRelayService {
         principal_id: i32,
         selected_model: Option<&str>,
         credentials: SandboxHarnessCredentials,
+        relay_base_url: &str,
         lifetime: Duration,
     ) -> Result<(SandboxModelRelay, SandboxModelRelayGuard), AiError> {
         if provider != "claude_cli" {
@@ -143,10 +144,10 @@ impl SandboxModelRelayService {
                 ),
             });
         }
-        if credentials.internal_api_url.trim().is_empty() {
+        if relay_base_url.trim().is_empty() {
             return Err(AiError::Provider {
                 purpose: "chat.application.model_relay".to_string(),
-                reason: "the instance internal URL is empty".to_string(),
+                reason: "the sandbox model relay base URL is empty".to_string(),
             });
         }
         let selected_model = resolve_claude_model(selected_model)?;
@@ -172,10 +173,7 @@ impl SandboxModelRelayService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(relay_id.clone(), entry);
         let relay = SandboxModelRelay {
-            base_url: format!(
-                "{}/api/ai/sandbox-models/{relay_id}",
-                credentials.internal_api_url.trim_end_matches('/')
-            ),
+            base_url: format!("{}/{relay_id}", relay_base_url.trim_end_matches('/')),
             bearer,
         };
         let guard = SandboxModelRelayGuard {
@@ -471,6 +469,7 @@ mod tests {
                 7,
                 Some("claude-sonnet-5"),
                 credentials,
+                "http://sandbox-relay.test/.temps/model-relay",
                 Duration::from_secs(60),
             )
             .unwrap();
@@ -487,7 +486,14 @@ mod tests {
             "upstream-secret",
             "https://temps.example.test",
         );
-        let result = service.register("codex_cli", 7, None, credentials, Duration::from_secs(60));
+        let result = service.register(
+            "codex_cli",
+            7,
+            None,
+            credentials,
+            "http://sandbox-relay.test/.temps/model-relay",
+            Duration::from_secs(60),
+        );
         assert!(result.is_err());
     }
 
@@ -499,7 +505,14 @@ mod tests {
             "https://temps.example.test",
         );
         let (relay, _guard) = service
-            .register("claude_cli", 7, None, credentials, Duration::from_secs(60))
+            .register(
+                "claude_cli",
+                7,
+                None,
+                credentials,
+                "http://sandbox-relay.test/.temps/model-relay",
+                Duration::from_secs(60),
+            )
             .unwrap();
         let relay_id = relay.base_url.rsplit('/').next().unwrap();
 
@@ -525,7 +538,14 @@ mod tests {
             "https://temps.example.test",
         );
         let (relay, _guard) = service
-            .register("claude_cli", 7, None, credentials, Duration::from_secs(60))
+            .register(
+                "claude_cli",
+                7,
+                None,
+                credentials,
+                "http://sandbox-relay.test/.temps/model-relay",
+                Duration::from_secs(60),
+            )
             .unwrap();
         let relay_id = relay.base_url.rsplit('/').next().unwrap();
 
@@ -551,7 +571,14 @@ mod tests {
             "https://temps.example.test",
         );
         let (relay, _guard) = service
-            .register("claude_cli", 7, None, credentials, Duration::ZERO)
+            .register(
+                "claude_cli",
+                7,
+                None,
+                credentials,
+                "http://sandbox-relay.test/.temps/model-relay",
+                Duration::ZERO,
+            )
             .unwrap();
         let relay_id = relay.base_url.rsplit('/').next().unwrap();
 
@@ -588,5 +615,29 @@ mod tests {
         assert_eq!(resolve_claude_model(None).unwrap(), "claude-sonnet-5");
         assert_eq!(resolve_claude_model(Some("opus")).unwrap(), "claude-opus-5");
         assert!(resolve_claude_model(Some("unbounded-provider-model")).is_err());
+    }
+
+    #[test]
+    fn relay_uses_the_sandbox_visible_base_instead_of_the_private_control_plane() {
+        let service = SandboxModelRelayService::new().unwrap();
+        let credentials = SandboxHarnessCredentials::anthropic_api_key(
+            "upstream-secret",
+            "http://host.docker.internal:8080",
+        );
+        let (relay, _guard) = service
+            .register(
+                "claude_cli",
+                7,
+                None,
+                credentials,
+                "http://temps-sandbox-egress-proxy:3128/.temps/model-relay",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert!(relay
+            .base_url
+            .starts_with("http://temps-sandbox-egress-proxy:3128/.temps/model-relay/"));
+        assert!(!relay.base_url.contains("host.docker.internal"));
     }
 }

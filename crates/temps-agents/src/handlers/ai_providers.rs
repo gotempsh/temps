@@ -559,12 +559,40 @@ pub async fn save_ai_provider_credential(
             })
         })?;
 
+    persist_provider_credential_and_invalidate(
+        app_state.db.as_ref(),
+        app_state.platform_config_service.as_ref(),
+        &provider_id,
+        &request.auth_type,
+        encrypted,
+    )
+    .await
+    .map_err(Problem::from)?;
+
+    Ok(Json(SaveCredentialResponse {
+        saved: true,
+        provider_id,
+        auth_type: request.auth_type,
+    }))
+}
+
+/// Persist a provider credential and make the successful write a strict cache
+/// freshness boundary. Keeping both operations in one function prevents a
+/// future handler edit from accidentally restoring the old-token-for-one-turn
+/// behavior.
+async fn persist_provider_credential_and_invalidate(
+    db: &sea_orm::DatabaseConnection,
+    platform_config_service: &temps_config::ConfigService,
+    provider_id: &str,
+    auth_type: &str,
+    encrypted: String,
+) -> Result<(), AgentError> {
     // Read-modify-write the settings.data JSON. We only touch
     // `agent_sandbox.providers[provider_id]` so unrelated keys are preserved.
     let record = temps_entities::settings::Entity::find_by_id(1)
-        .one(app_state.db.as_ref())
+        .one(db)
         .await
-        .map_err(|e| Problem::from(AgentError::Database(e)))?;
+        .map_err(AgentError::Database)?;
 
     let mut settings_data = record
         .map(|r| r.data)
@@ -577,33 +605,29 @@ pub async fn save_ai_provider_credential(
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
         })
-        .ok_or_else(|| {
-            Problem::from(AgentError::Validation {
-                message: "agent_sandbox settings is not a JSON object".into(),
-            })
+        .ok_or_else(|| AgentError::Validation {
+            message: "agent_sandbox settings is not a JSON object".into(),
         })?;
 
     let providers_value = sandbox_value
         .entry("providers".to_string())
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .ok_or_else(|| {
-            Problem::from(AgentError::Validation {
-                message: "agent_sandbox.providers is not a JSON object".into(),
-            })
+        .ok_or_else(|| AgentError::Validation {
+            message: "agent_sandbox.providers is not a JSON object".into(),
         })?;
 
     // Preserve any fields we don't own (e.g. a previously-saved
     // `default_model`, or future per-provider extras) by merging on top of
     // the existing entry instead of replacing it outright.
     let existing = providers_value
-        .get(&provider_id)
+        .get(provider_id)
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let mut merged = existing.as_object().cloned().unwrap_or_default();
     merged.insert(
         "auth_type".into(),
-        serde_json::Value::String(request.auth_type.clone()),
+        serde_json::Value::String(auth_type.to_string()),
     );
     merged.insert(
         "credentials_encrypted".into(),
@@ -615,23 +639,21 @@ pub async fn save_ai_provider_credential(
     merged
         .entry("extra".to_string())
         .or_insert(serde_json::Value::Null);
-    providers_value.insert(provider_id.clone(), serde_json::Value::Object(merged));
+    providers_value.insert(provider_id.to_string(), serde_json::Value::Object(merged));
 
     let active = temps_entities::settings::ActiveModel {
         id: Set(1),
         data: Set(settings_data),
         ..Default::default()
     };
-    active
-        .update(app_state.db.as_ref())
-        .await
-        .map_err(|e| Problem::from(AgentError::Database(e)))?;
+    active.update(db).await.map_err(AgentError::Database)?;
 
-    Ok(Json(SaveCredentialResponse {
-        saved: true,
-        provider_id,
-        auth_type: request.auth_type,
-    }))
+    // The turn resolver reads through the shared ConfigService cache. Make
+    // the save response a strict freshness boundary: once it returns, the
+    // very next turn must re-read and decrypt this credential even if the
+    // Postgres NOTIFY listener is delayed or reconnecting.
+    platform_config_service.invalidate_settings_cache().await;
+    Ok(())
 }
 
 /// Activate a provider as the platform-wide default. Refuses to activate a
@@ -716,6 +738,11 @@ pub async fn activate_ai_provider(
         .update(app_state.db.as_ref())
         .await
         .map_err(|e| Problem::from(AgentError::Database(e)))?;
+
+    app_state
+        .platform_config_service
+        .invalidate_settings_cache()
+        .await;
 
     Ok(Json(ActivateProviderResponse {
         default_provider: provider_id,
@@ -892,6 +919,11 @@ pub async fn update_ai_provider(
         .await
         .map_err(|e| Problem::from(AgentError::Database(e)))?;
 
+    app_state
+        .platform_config_service
+        .invalidate_settings_cache()
+        .await;
+
     Ok(Json(UpdateProviderResponse {
         provider_id,
         default_model: new_model,
@@ -973,6 +1005,40 @@ fn runtime_option_name(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_config::ServerConfig;
+    use temps_core::{AppSettings, ProviderConfig};
+
+    fn provider_settings_row(encrypted: &str) -> temps_entities::settings::Model {
+        let mut settings = AppSettings::default();
+        settings.agent_sandbox.providers.insert(
+            "claude_cli".to_string(),
+            ProviderConfig {
+                auth_type: "subscription".to_string(),
+                credentials_encrypted: Some(encrypted.to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+        temps_entities::settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn provider_test_server_config() -> Arc<ServerConfig> {
+        Arc::new(
+            ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                Some("127.0.0.1:8000".to_string()),
+            )
+            .expect("valid test server config"),
+        )
+    }
 
     #[test]
     fn provider_catalog_reads_do_not_refresh_models_by_default() {
@@ -987,6 +1053,75 @@ mod tests {
         .expect("refresh query");
         assert!(refresh.refresh_models);
         assert!(refresh.catalog_only);
+    }
+
+    #[tokio::test]
+    async fn saving_provider_credential_invalidates_a_primed_old_credential() {
+        let old_row = provider_settings_row("encrypted-old-token");
+        let new_row = provider_settings_row("encrypted-new-token");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[old_row.clone()], [old_row], [new_row.clone()], [new_row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let config_service =
+            temps_config::ConfigService::new(provider_test_server_config(), db.clone());
+
+        let cached = config_service
+            .get_settings()
+            .await
+            .expect("prime settings cache");
+        assert_eq!(
+            cached
+                .agent_sandbox
+                .provider_config("claude_cli")
+                .credentials_encrypted
+                .as_deref(),
+            Some("encrypted-old-token")
+        );
+
+        persist_provider_credential_and_invalidate(
+            db.as_ref(),
+            &config_service,
+            "claude_cli",
+            "subscription",
+            "encrypted-new-token".to_string(),
+        )
+        .await
+        .expect("save replacement credential");
+
+        let refreshed = config_service
+            .get_settings()
+            .await
+            .expect("resolve settings for next turn");
+        assert_eq!(
+            refreshed
+                .agent_sandbox
+                .provider_config("claude_cli")
+                .credentials_encrypted
+                .as_deref(),
+            Some("encrypted-new-token"),
+            "the first resolver read after save must not return the primed credential"
+        );
+
+        drop(config_service);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sql.contains("encrypted-new-token"),
+            "the persisted settings update must contain the replacement credential"
+        );
     }
 
     #[test]
