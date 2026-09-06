@@ -12,7 +12,7 @@ import {
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
-   Backups · Git providers · Security on v5, from the real console's shapes:
+   Backups · Git providers · Security on v1, from the real console's shapes:
    S3SourceResponse, BackupScheduleResponse, BackupResponse (state,
    current_step, attempts/max_attempts, live_size_bytes), ConnectionResponse
    (health_status, is_expired, synced_repository_count, installation_id),

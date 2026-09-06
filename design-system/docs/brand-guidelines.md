@@ -407,6 +407,6 @@ Don't
 
 - Tokens and classes: `design-system/src/globals.css`, blocks `.operator.ink` and
   "Ink type hierarchy".
-- Reference render: `/brand#hierarchy` for the scale, `/v5` for the console, `/v5-landing` for the landing.
+- Reference render: `/brand#hierarchy` for the scale, `/v1` for the console, `/v1-landing` for the landing.
 - Landing application: `design-system/src/sections/InkLanding.tsx`, `Section`
   component (`tier`, `tone` props).

@@ -8,12 +8,12 @@ import { Kbd, Num, Status, Section, Columns, Lede, KeyValue, Segmented, Timeline
 import { Inbox, MailCheck, Send } from 'lucide-react'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /foundations — what v5 is made of, before any component exists: the
+   /foundations — what v1 is made of, before any component exists: the
    type hierarchy, the paper-and-ink token table, the five status states,
    density and rhythm, the frozen radius/border/motion decisions, the two
    faces, and the phone rules.
 
-   Everything here is rendered live under the v5 skin and cites only
+   Everything here is rendered live under the v1 skin and cites only
    classes and tokens that exist in src/globals.css. Where the handoff
    document and the code disagree, the code wins and the disagreement is
    noted in a muted line.
@@ -79,7 +79,7 @@ const SURFACE: readonly (readonly [string, string, string])[] = [
 
 function SwatchColumn({ label, dark }: { label: string; dark?: boolean }) {
   const body = (
-    <div className="operator ink v4 v5 min-w-0 border bg-background text-foreground">
+    <div className="operator ink v1 min-w-0 border bg-background text-foreground">
       <p className="op-label border-b px-3 py-2">{label}</p>
       <div className="op-rows">
         {SURFACE.map(([name, value, use]) => (
@@ -117,7 +117,7 @@ const LEDGER_COLS = '1.4fr 1fr 90px'
 
 function MiniLedger({ density }: { density: 'comfortable' | 'dense' }) {
   return (
-    <div className="operator ink v4 v5 min-w-0 border bg-background text-foreground" data-density={density}>
+    <div className="operator ink v1 min-w-0 border bg-background text-foreground" data-density={density}>
       <div className="op-row op-cols grid grid-cols-[1fr_auto] items-center gap-2 border-b" style={{ '--cols': LEDGER_COLS } as CSSProperties}>
         <span className="op-label truncate">project</span>
         <span className="op-label hidden truncate md:block">status</span>
@@ -166,14 +166,14 @@ const PHONE_RULES: readonly string[] = [
 export function FoundationsPage() {
   return (
     <DocPage
-      eyebrow="foundations · what v5 is made of"
+      eyebrow="foundations · what v1 is made of"
       intro={<>
         The layer under every component: type hierarchy, paper-and-ink tokens, the five status
         states, density, and the frozen decisions about radius, borders and motion. Applied by
-        putting <span className="font-mono">operator ink v4 v5</span> on a root element — this page
+        putting <span className="font-mono">operator ink v1</span> on a root element — this page
         included. The components built on top are on{' '}
         <Link to="/op-components" className="underline underline-offset-4">/op-components</Link>;
-        assembled into a console on <Link to="/v5" className="underline underline-offset-4">/v5</Link>.
+        assembled into a console on <Link to="/v1" className="underline underline-offset-4">/v1</Link>.
       </>}
       toc={TOC}
     >
@@ -305,7 +305,7 @@ sampled ◌  --muted-foreground`}
           </p>
         </Demo>
         <Demo label="the landing accent · once per viewport, landing only">
-          <div className="operator ink v4 v5 min-w-0 border bg-background p-4" data-accent="signal">
+          <div className="operator ink v1 min-w-0 border bg-background p-4" data-accent="signal">
             <p className="op-label">data-accent=&quot;signal&quot;</p>
             <div className="mt-3 flex flex-wrap items-center gap-3">
               <button type="button" className="op-primary inline-flex h-8 items-center gap-2 bg-primary px-3 text-sm text-primary-foreground">
@@ -356,7 +356,7 @@ data-density="dense"        --row-h: 1.75rem
         </Demo>
         <Note>
           <span className="font-mono">--row-h</span> and <span className="font-mono">data-density</span> live on the{' '}
-          <span className="font-mono">.operator.ink.v4</span> block, not v5 — v5 layers on top of v4 and both classes are always set together.
+          <span className="font-mono">.operator.ink.v1</span> block, alongside the rest of the skin — one class carries the whole system.
         </Note>
       </Block>
 
@@ -384,7 +384,7 @@ tiers        title 700/20 · lede 600/18 + glyph · section 600/14
         </>}
       >
         <Demo label="a record page · Lede → Columns(main: Content, Events · aside: Headers)">
-          <div className="operator ink v4 v5 min-w-0 space-y-4 border bg-background p-4 text-sm">
+          <div className="operator ink v1 min-w-0 space-y-4 border bg-background p-4 text-sm">
             <h1 className="op-title">Your order shipped</h1>
             <Lede state="ok" word="delivered" facts={[{ k: 'to', v: 'dana@example.com', mono: true }, { k: 'from', v: 'orders@acme.sh', mono: true }, { k: 'provider', v: 'ses-eu', mono: true }, { k: 'took', v: '1.2s', mono: true }]}>09:41:07 · to dana@example.com · via ses</Lede>
             <Columns>
@@ -433,7 +433,7 @@ focus-visible:outline-ring
 
 transition-duration: 100ms`}
         rule={<>
-          <p>Radius is frozen at 0.25rem and set twice — once on <code>.operator.ink</code>, again on <code>.operator.ink.v5</code> — so a v5 root cannot inherit anything softer. Selects are squared off entirely.</p>
+          <p>Radius is frozen at 0.25rem and set twice — once on <code>.operator.ink</code>, again on <code>.operator.ink.v1</code> — so a v1 root cannot inherit anything softer. Selects are squared off entirely.</p>
           <p>Borders are 1px ink. Depth is a hard offset shadow with no blur, and only <code>.op-raise</code> and <code>.op-primary</code> have one.</p>
           <p>Focus is a 2px inset outline in <code>--ring</code>, drawn inside the control so it never shifts layout: <code>focus-visible:outline-2 -outline-offset-2 outline-ring</code>. Tab into the button below to see it.</p>
           <p>Motion is 100ms and limited to transform, box-shadow, background-color and colour. Charts have no animation at all, and nothing has an entrance.</p>
@@ -523,7 +523,7 @@ font-feature-settings: 'tnum' 1
 @media (max-width: 767px)
   .op-row { height: auto }`}
         rule={<>
-          <p>Verified at 390 and 1440 wide on every v5 screen with a scrollWidth check. The phone is not a narrower desktop: a row that hides its cells has to fold the action it hid into what is left.</p>
+          <p>Verified at 390 and 1440 wide on every v1 screen with a scrollWidth check. The phone is not a narrower desktop: a row that hides its cells has to fold the action it hid into what is left.</p>
           <Rule state="ok">Every desktop-only cell is <code>hidden md:block</code>, and what mattered in it is folded into the first cell as a second line.</Rule>
           <Rule state="error">A row action that only exists in a column the phone does not render.</Rule>
         </>}

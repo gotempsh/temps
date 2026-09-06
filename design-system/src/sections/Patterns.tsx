@@ -39,7 +39,7 @@ import {
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /patterns — the PAGE patterns of v5. Where /op-components documents one
+   /patterns — the PAGE patterns of v1. Where /op-components documents one
    component at a time, this page documents the shapes a whole screen can
    take: the three templates, the four non-happy states, and the four
    cross-cutting patterns that every screen has to get right (promote and
@@ -49,7 +49,7 @@ import { cn } from '@/lib/utils'
    a screenshot and nothing is a placeholder box: if an example cannot be
    made to work, the pattern is not ready to be documented.
 
-   Data is copied from ConsoleV5*.tsx rather than imported, because those
+   Data is copied from ConsoleV1*.tsx rather than imported, because those
    files carry page state and hooks. Only the plain constants travel.
    ──────────────────────────────────────────────────────────────────────── */
 
@@ -1058,7 +1058,7 @@ $ temps env detach production STRIPE_TEST_KEY`}
 @media (max-width: 767px) { .op-row { height: auto } }`}
         rule={
           <>
-            <p>Verified at 390 and 1440 with a scrollWidth check on every v5 screen. Four rules cover it.</p>
+            <p>Verified at 390 and 1440 with a scrollWidth check on every v1 screen. Four rules cover it.</p>
             <Rule state="ok">A ledger row hides its cells below md and renders <code>mobile</code>: name, the note that explains the state, the glyph — and the row's primary action.</Rule>
             <Rule state="error">A desktop-only cell that carries the only promote or roll back button. A phone user cannot reach it.</Rule>
             <p>Tab strips scroll with <code>.op-scroll-x</code>. Action groups wrap and take full width below sm (<code>w-full sm:w-auto sm:ml-auto</code>), never <code>ml-auto</code> alone on three buttons. Rows are fixed height on desktop and grow with content on phones.</p>

@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils'
 import { writeToClipboard } from '@/lib/clipboard'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /agent — an agentic conversation on v5.
+   /agent — an agentic conversation on v1.
 
    The vocabulary is Vercel AI Elements (Conversation, Message, Reasoning /
    ChainOfThought, Plan, Tool with its six states, Confirmation, Task, Queue,
@@ -679,11 +679,11 @@ export function AgentChatPage() {
 
   return (
     // Fills the viewport under the docs header (h-14): the transcript column scrolls, the rail stays put.
-    <div className="operator ink v4 v5 -m-4 flex h-[calc(100dvh-3.5rem)] flex-col sm:-m-6 lg:-m-8">
+    <div className="operator ink v1 -m-4 flex h-[calc(100dvh-3.5rem)] flex-col sm:-m-6 lg:-m-8">
       <div className="shrink-0 border-b px-4 py-3 text-xs sm:px-6">
-        <p className="op-label">agent · an agentic conversation on v5</p>
+        <p className="op-label">agent · an agentic conversation on v1</p>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">
-          The <a href="https://elements.ai-sdk.dev" className="underline underline-offset-4">AI Elements</a> vocabulary (message, reasoning, plan, tool in its six states, confirmation, task, subagent, question, queue, checkpoint, sources, actions, context, prompt input) drawn with the v5 rules. Tool calls are rows, approvals are inline, the status line says what the agent is doing, the prompt bar says the model, thinking, permission mode and workspace in words. Everything here is clickable. Console at <Link to="/v5" className="underline underline-offset-4">/v5</Link>; components at <Link to="/op-components" className="underline underline-offset-4">/op-components</Link>.
+          The <a href="https://elements.ai-sdk.dev" className="underline underline-offset-4">AI Elements</a> vocabulary (message, reasoning, plan, tool in its six states, confirmation, task, subagent, question, queue, checkpoint, sources, actions, context, prompt input) drawn with the v1 rules. Tool calls are rows, approvals are inline, the status line says what the agent is doing, the prompt bar says the model, thinking, permission mode and workspace in words. Everything here is clickable. Console at <Link to="/v1" className="underline underline-offset-4">/v1</Link>; components at <Link to="/op-components" className="underline underline-offset-4">/op-components</Link>.
         </p>
       </div>
 

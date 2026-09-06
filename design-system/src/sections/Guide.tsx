@@ -402,51 +402,51 @@ function LiveFiveRules() {
  */
 const SURFACE_LINKS: Record<string, readonly (readonly [string, string])[]> = {
   '7b-redesigned-surfaces-on-the-templates': [
-    ['deploys · environments · variables', '/v5?p=api-gateway'],
-    ['sandboxes', '/v5?p=sandboxes'],
-    ['traces', '/v5?p=traces'],
-    ['metrics', '/v5?p=metrics'],
+    ['deploys · environments · variables', '/v1?p=api-gateway'],
+    ['sandboxes', '/v1?p=sandboxes'],
+    ['traces', '/v1?p=traces'],
+    ['metrics', '/v1?p=metrics'],
   ],
-  'backups-v5-p-backups': [['backups', '/v5?p=backups']],
-  'git-providers-v5-p-git-git-id': [['git providers', '/v5?p=git'], ['a provider', '/v5?p=git%3A1']],
-  'security-v5-p-security-scan-id': [['security', '/v5?p=security']],
-  'errors-v5-p-errors-issue-id': [
-    ['issues', '/v5?p=errors'],
-    ['an issue', '/v5?p=issue%3Ai_4821'],
-    ['store outage', '/v5?p=errors&fail=1'],
+  'backups-v1-p-backups': [['backups', '/v1?p=backups']],
+  'git-providers-v1-p-git-git-id': [['git providers', '/v1?p=git'], ['a provider', '/v1?p=git%3A1']],
+  'security-v1-p-security-scan-id': [['security', '/v1?p=security']],
+  'errors-v1-p-errors-issue-id': [
+    ['issues', '/v1?p=errors'],
+    ['an issue', '/v1?p=issue%3Ai_4821'],
+    ['store outage', '/v1?p=errors&fail=1'],
   ],
-  'settings-v5-p-settings-settings-slug': [
-    ['settings hub', '/v5?p=settings'],
-    ['api keys', '/v5?p=settings%3Akeys'],
-    ['builds', '/v5?p=settings%3Abuilds'],
+  'settings-v1-p-settings-settings-slug': [
+    ['settings hub', '/v1?p=settings'],
+    ['api keys', '/v1?p=settings%3Akeys'],
+    ['builds', '/v1?p=settings%3Abuilds'],
   ],
-  'uptime-monitor-v5-p-uptime-monitor-id-and-the-public-status-page': [
-    ['uptime', '/v5?p=uptime'],
-    ['a monitor', '/v5?p=monitor%3Amon_2'],
+  'uptime-monitor-v1-p-uptime-monitor-id-and-the-public-status-page': [
+    ['uptime', '/v1?p=uptime'],
+    ['a monitor', '/v1?p=monitor%3Amon_2'],
     ['public status page', '/status?project=acme-storefront'],
   ],
-  'proxy-v5-p-proxy': [['proxy', '/v5?p=proxy']],
+  'proxy-v1-p-proxy': [['proxy', '/v1?p=proxy']],
   'deployment-deploy-tag': [
-    ['live deploy', '/v5?p=deploy%3Adep_91a'],
-    ['failed build', '/v5?p=deploy%3Adep_92e'],
-    ['building', '/v5?p=deploy%3Adep_92b'],
+    ['live deploy', '/v1?p=deploy%3Adep_91a'],
+    ['failed build', '/v1?p=deploy%3Adep_92e'],
+    ['building', '/v1?p=deploy%3Adep_92b'],
   ],
-  'database-v5-p-databases-db-name': [
-    ['databases', '/v5?p=databases'],
-    ['a database', '/v5?p=db%3Aacme-pg'],
+  'database-v1-p-databases-db-name': [
+    ['databases', '/v1?p=databases'],
+    ['a database', '/v1?p=db%3Aacme-pg'],
   ],
-  'analytics-v5-p-analytics-event-name': [
-    ['analytics', '/v5?p=analytics'],
-    ['an event', '/v5?p=event%3Asignup'],
+  'analytics-v1-p-analytics-event-name': [
+    ['analytics', '/v1?p=analytics'],
+    ['an event', '/v1?p=event%3Asignup'],
   ],
-  'email-v5-p-email-email-id-domain-id': [
-    ['email', '/v5?p=email'],
-    ['a domain', '/v5?p=domain%3A3'],
+  'email-v1-p-email-email-id-domain-id': [
+    ['email', '/v1?p=email'],
+    ['a domain', '/v1?p=domain%3A3'],
   ],
   'nodes-settings-nodes-node-name-settings-cluster': [
-    ['nodes', '/v5?p=settings%3Anodes'],
-    ['a node', '/v5?p=node%3Ahetzner-3'],
-    ['cluster', '/v5?p=settings%3Acluster'],
+    ['nodes', '/v1?p=settings%3Anodes'],
+    ['a node', '/v1?p=node%3Ahetzner-3'],
+    ['cluster', '/v1?p=settings%3Acluster'],
   ],
   'landing-system-map-landing-one-engine-at-the-center': [['the landing', '/landing']],
   'agent-conversation-agent': [['agent conversation', '/agent']],
@@ -1041,7 +1041,7 @@ function BuildScreenSection() {
       </h3>
       <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
         All four import from <code className="font-mono">@temps-sdk/op</code>. Put{' '}
-        <code className="font-mono">operator ink v4 v5</code> on the root element and import{' '}
+        <code className="font-mono">operator ink v1</code> on the root element and import{' '}
         <code className="font-mono">@temps-sdk/op/op.css</code> before any other rule.
       </p>
       <Snippet title="ledger — many records of one kind" code={LEDGER_SNIPPET} />
@@ -1633,7 +1633,7 @@ export function GuidePage() {
   )
 
   return (
-    <div className="operator ink v4 v5 min-h-screen bg-background text-foreground">
+    <div className="operator ink v1 min-h-screen bg-background text-foreground">
       <header className="op-sticky sticky top-0 z-30 flex h-12 items-center gap-3 border-b bg-background px-3 sm:px-4">
         <LogoMark size={18} />
         <h1 className="shrink-0 text-sm font-semibold tracking-tight">Design system guide</h1>

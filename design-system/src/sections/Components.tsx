@@ -66,8 +66,8 @@ import { Block, Demo, DocPage, Rule } from '@/components/op-doc'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /components — the primitives (shadcn + plain elements) under the v5 ink
-   skin. One block per primitive: the rule, the sizes and variants v5
+   /components — the primitives (shadcn + plain elements) under the v1 ink
+   skin. One block per primitive: the rule, the sizes and variants v1
    actually uses, and the states.
 
    The COMPOSED operator components (Status, Num/Metric, PageState, Kbd,
@@ -78,7 +78,7 @@ import { cn } from '@/lib/utils'
 /** Portal content (dialog, popover, dropdown, select, palette) renders outside
  *  the `.operator` root, so it must carry the skin class or it renders
  *  unskinned. Same value EchoDialog defaults to. */
-const SKIN = 'operator ink v4 v5'
+const SKIN = 'operator ink v1'
 
 const TOC = [
   ['button', 'Button'],
@@ -164,18 +164,18 @@ export function ComponentsPage() {
       eyebrow="components · primitives under ink"
       intro={
         <>
-          The shadcn primitives and plain elements as v5 uses them: the sizes, the variants, the states. The composed
+          The shadcn primitives and plain elements as v1 uses them: the sizes, the variants, the states. The composed
           operator components live on{' '}
           <Link to="/op-components" className="underline underline-offset-4">
             /op-components
           </Link>
           , assembled into a console on{' '}
-          <Link to="/v5" className="underline underline-offset-4">
-            /v5
+          <Link to="/v1" className="underline underline-offset-4">
+            /v1
           </Link>
           . Rules that are not obeyed here are not rules, so every block states the one it enforces. Anything that
           renders in a portal — dialog, popover, dropdown, select, palette — carries{' '}
-          <span className="font-mono">operator ink v4 v5</span> on its content element or it renders unskinned.
+          <span className="font-mono">operator ink v1</span> on its content element or it renders unskinned.
         </>
       }
       toc={TOC}
@@ -393,7 +393,7 @@ export function ComponentsPage() {
 
 <Select>                                     // ≤7 fixed options
   <SelectTrigger className="h-8 rounded-none font-mono text-xs">…
-  <SelectContent className="operator ink v4 v5">…`}
+  <SelectContent className="operator ink v1">…`}
         rule={
           <>
             <p>
@@ -410,7 +410,7 @@ export function ComponentsPage() {
               the list instead of a spinner on the trigger.
             </p>
             <p>
-              Both trigger the same shape: <code>h-8</code>, ink border, radius 0 (v5 flattens{' '}
+              Both trigger the same shape: <code>h-8</code>, ink border, radius 0 (v1 flattens{' '}
               <code>select</code>), mono when the value is a value. Both need the skin class on their portal content.
             </p>
           </>
@@ -857,7 +857,7 @@ export function ComponentsPage() {
             </p>
             <p>
               All three render in a portal outside the <code>.operator</code> root, so all three take{' '}
-              <code>operator ink v4 v5</code> on their content element. Forget it and the menu renders in the app's
+              <code>operator ink v1</code> on their content element. Forget it and the menu renders in the app's
               default theme with a 0.5rem radius.
             </p>
             <p>
@@ -1384,7 +1384,7 @@ import { MOD } from '@/components/op'   // '⌘' | 'Ctrl'`}
         rule={
           <>
             <p>
-              These are the primitives v5 replaced, and what replaced them. They are not style preferences: each one
+              These are the primitives v1 replaced, and what replaced them. They are not style preferences: each one
               adds a surface treatment, a radius or a hue the system does not have, and the console's drift is what
               2,265 palette literals across 189 files looks like.
             </p>

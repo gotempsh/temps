@@ -40,7 +40,7 @@ export type PickerOption = {
   disabled?: boolean
 }
 
-export function Picker({ value, onChange, options, label, placeholder = 'choose…', searchPlaceholder = 'type to filter', allowCustom, loading, error, onRetry, skin = 'operator ink v4 v5', className, mono = true, width }: {
+export function Picker({ value, onChange, options, label, placeholder = 'choose…', searchPlaceholder = 'type to filter', allowCustom, loading, error, onRetry, skin = 'operator ink v1', className, mono = true, width }: {
   value: string | null | undefined
   onChange: (v: string) => void
   options: PickerOption[]

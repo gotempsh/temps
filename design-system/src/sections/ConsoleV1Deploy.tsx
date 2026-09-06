@@ -8,8 +8,8 @@ import {
   Callout, Columns, Detail, EchoDialog, KeyValue, Ledger, Lede, LogLines, Metric, MetricGrid, Phrase, Section, Stages, Status, StatusLine,
   type KV, type LedgerRow, type LogLine, type Stage, type State,
 } from '@/components/op'
-import type { Notify } from './ConsoleV5Observe'
-import { DEPS, ENVS } from './ConsoleV5Env'
+import type { Notify } from './ConsoleV1Observe'
+import { DEPS, ENVS } from './ConsoleV1Env'
 
 /**
  * A deployment is the record people open most, and usually because something

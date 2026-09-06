@@ -18,16 +18,16 @@ import {
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { LogoMark } from '@/components/Logo'
-import { ConsoleV5 } from '@/sections/ConsoleV5'
+import { ConsoleV1 } from '@/sections/ConsoleV1'
 import { PlatformLogo } from '@/components/platform-logos'
 import { SystemMapSection } from '@/components/system-map-section'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /v5-landing — temps.sh at its current depth (15 sections), drawn in the
-   "paper and ink" direction of the v5 skin. Copy and section order follow
+   /v1-landing — temps.sh at its current depth (15 sections), drawn in the
+   "paper and ink" direction of the v1 skin. Copy and section order follow
    the live page. Product screens use the same primitives the console does,
-   and the Dashboard tab embeds the real v5 console shell.
+   and the Dashboard tab embeds the real v1 console shell.
    ──────────────────────────────────────────────────────────────────────── */
 
 const NAV = ['Docs', 'Blog', 'Roadmap', 'Pricing', 'Managed', 'Enterprise', 'Security', 'Contact']
@@ -140,7 +140,7 @@ function Frame({ title, children }: { title: string; children: ReactNode }) {
 function Screen({ tab, view, setView }: { tab: Tour; view: string; setView: (v: string) => void }) {
   switch (tab) {
     case 'Dashboard':
-      return <div className="flex min-h-[520px] w-full"><ConsoleV5 view={view} go={setView} /></div>
+      return <div className="flex min-h-[520px] w-full"><ConsoleV1 view={view} go={setView} /></div>
     case 'Analytics':
       return (
         <Frame title="analytics · acme-storefront">
@@ -240,7 +240,7 @@ function Screen({ tab, view, setView }: { tab: Tour; view: string; setView: (v: 
 // ── Page ────────────────────────────────────────────────────────────────
 
 
-export function InkLandingV5Page({ full = false }: { /** Render without the sandbox layout: the landing as it would ship. Route `/landing`. */ full?: boolean }) {
+export function InkLandingV1Page({ full = false }: { /** Render without the sandbox layout: the landing as it would ship. Route `/landing`. */ full?: boolean }) {
   const [menu, setMenu] = useState(false)
   const [tab, setTab] = useState<Tour>('Dashboard')
   const [view, setView] = useState('projects')
@@ -249,10 +249,10 @@ export function InkLandingV5Page({ full = false }: { /** Render without the sand
   const SAVINGS: Record<string, string> = { 'Just me': '$3.1k', '2–5': '$9.8k', '6–15': '$31k', '16+': '$74k' }
 
   return (
-    <div className={full ? 'operator ink v4 v5 min-h-screen' : 'operator ink v4 v5 -m-4 sm:-m-6 lg:-m-8'} data-accent="signal">
+    <div className={full ? 'operator ink v1 min-h-screen' : 'operator ink v1 -m-4 sm:-m-6 lg:-m-8'} data-accent="signal">
       {/* Frozen: one accent (signal), on the primary CTA only. No switcher. */}
       {/* Sandbox control, not part of the landing: toggles the chrome-free route. */}
-      <Link to={full ? '/v5-landing' : '/landing'} aria-label={full ? 'Exit full screen' : 'Full screen'} title={full ? 'back to the sandbox page' : 'the landing alone, no sandbox chrome'} className="fixed bottom-4 right-4 z-40 inline-flex h-8 w-8 items-center justify-center border bg-background text-foreground shadow-sm hover:bg-muted [&_svg]:h-3.5 [&_svg]:w-3.5">{full ? <Minimize2 /> : <Maximize2 />}</Link>
+      <Link to={full ? '/v1-landing' : '/landing'} aria-label={full ? 'Exit full screen' : 'Full screen'} title={full ? 'back to the sandbox page' : 'the landing alone, no sandbox chrome'} className="fixed bottom-4 right-4 z-40 inline-flex h-8 w-8 items-center justify-center border bg-background text-foreground shadow-sm hover:bg-muted [&_svg]:h-3.5 [&_svg]:w-3.5">{full ? <Minimize2 /> : <Maximize2 />}</Link>
       {/* Nav */}
       <header className="sticky top-0 z-30 grid grid-cols-[auto_1fr_auto] border-b bg-background">
         <a href="#" className="flex h-12 items-center gap-2 border-r px-4"><LogoMark size={20} /><span className="text-sm font-semibold">Temps</span></a>
@@ -522,7 +522,7 @@ export function InkLandingV5Page({ full = false }: { /** Render without the sand
       {/* Footer */}
       <footer className="grid gap-6 border-t px-4 py-8 text-xs text-muted-foreground sm:px-8 md:grid-cols-[1fr_auto] md:items-center">
         <div className="flex flex-wrap gap-x-6 gap-y-2">{['Docs', 'Changelog', 'GitHub', 'Discord', 'Security', 'Status', 'Pricing', 'Enterprise'].map((l) => <a key={l} href="#" className="hover:text-foreground">{l}</a>)}</div>
-        <div className="flex items-center gap-3"><span className="font-mono">v0.1.0</span><span>·</span><Link to="/v5" className="underline underline-offset-4">console v5</Link></div>
+        <div className="flex items-center gap-3"><span className="font-mono">v0.1.0</span><span>·</span><Link to="/v1" className="underline underline-offset-4">console v1</Link></div>
       </footer>
     </div>
   )

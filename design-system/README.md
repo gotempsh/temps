@@ -2,8 +2,8 @@
 
 Standalone, browsable reference for the Temps operator design system: every
 foundation, component state and page pattern, rendered with the real
-primitives from [`@temps-sdk/op`](../web/packages/op) under the v5 skin
-(`operator ink v4 v5`). What you see here is what shipping it in `temps/web`
+primitives from [`@temps-sdk/op`](../web/packages/op) under the v1 skin
+(`operator ink v1`). What you see here is what shipping it in `temps/web`
 looks like — not a redrawn approximation.
 
 This is **not wired into the live console**. It's a separate app on purpose:
@@ -31,17 +31,17 @@ bun run dev      # http://localhost:5183
 | `/components` | The primitives under ink: button, input, picker vs select, checkbox/switch, tabs vs segmented, rows, palette, popover/menu, dialog, toast, skeleton, breadcrumb + page title, plus the banned list with replacements |
 | `/op-components` | Every operator component in `@temps-sdk/op`, every state, with props |
 | `/patterns` | The three page templates live (Ledger, Detail, Settings), PageState, promote/roll back, per-environment variables with bulk association, time and retention, keyboard model, responsive folds |
-| `/kitchen-sink` | Stress test: the whole v5 console at 390/768/1024/1280, pathological data, every state of every component, dark, dense, charts and forms at the limit, and the banned gallery (the old look, greyed, each item naming its replacement) |
-| `/v5` | Operator console v5 (three templates, PageState, sampled status, plan switcher) |
-| `/v5-landing` | Landing page in the same system, with pricing, limits table, mobile menu, frozen accent |
+| `/kitchen-sink` | Stress test: the whole v1 console at 390/768/1024/1280, pathological data, every state of every component, dark, dense, charts and forms at the limit, and the banned gallery (the old look, greyed, each item naming its replacement) |
+| `/v1` | Operator console v1 (three templates, PageState, sampled status, plan switcher) |
+| `/v1-landing` | Landing page in the same system, with pricing, limits table, mobile menu, frozen accent |
 | `/status-page` | The public status page for a project, inside the sandbox chrome |
-| `/agent` | Agentic conversation on v5: AI Elements vocabulary (tools in six states, approvals, subagent, plan, tasks, question, queue, checkpoint, prompt bar with model/thinking/mode/workspace/context) |
+| `/agent` | Agentic conversation on v1: AI Elements vocabulary (tools in six states, approvals, subagent, plan, tasks, question, queue, checkpoint, prompt bar with model/thinking/mode/workspace/context) |
 
 Three routes render the same surfaces chrome-free, as a real user would see
 them: `/console`, `/landing` and `/status?project=…`. The ⤢ button in the
 sandbox header toggles between each pair.
 
-`/` redirects to `/brand`. Every route renders under the v5 skin using the
+`/` redirects to `/brand`. Every route renders under the v1 skin using the
 shared scaffolding in `src/components/op-doc.tsx`; toggle light/dark in the
 header — every surface should look correct in both.
 

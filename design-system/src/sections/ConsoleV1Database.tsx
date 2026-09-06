@@ -11,9 +11,9 @@ import {
   StatusStrip, LogLines, Histogram, quantile,
   type KV, type LedgerRow, type State, type StatusBucket, type LogLine, type Pct, type HistBucket,
 } from '@/components/op'
-import type { Notify } from './ConsoleV5Observe'
+import type { Notify } from './ConsoleV1Observe'
 import { PROJECT_ICONS } from './console-projects'
-import { agoNum, sizeNum } from './ConsoleV5'
+import { agoNum, sizeNum } from './ConsoleV1'
 
 /**
  * A managed database is one record with a lot attached to it. The rule is

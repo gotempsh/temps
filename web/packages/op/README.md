@@ -29,9 +29,11 @@ tokens plus every `.op-*` rule):
 this package's own TSX and generates the utilities it uses. Consumers do not
 need to add the package to their own `@source` list.
 
-The skin is applied by putting `operator ink` (or `operator`, or
-`operator hardline`) on a root element — the tokens are scoped to `.operator`,
-not to `:root`, so the package never fights an app's existing theme.
+The skin is applied by putting `operator ink v1` on a root element — `v1` is
+the published system, layered on the `operator` and `operator ink` token
+blocks it builds from (`operator hardline` is the separate landing skin). The
+tokens are scoped to `.operator`, not to `:root`, so the package never fights
+an app's existing theme.
 
 ### Bundler note
 

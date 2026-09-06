@@ -11,11 +11,11 @@ import {
   type KV, type LedgerRow, type Page, type Series, type State, type StatusItem, type TimePoint, type TimeRange,
   Columns, Lede, type TimelineItem,
 } from '@/components/op'
-import { Toggle } from './ConsoleV5Admin'
+import { Toggle } from './ConsoleV1Admin'
 import { useFresh } from './console-fresh'
 
 /* ────────────────────────────────────────────────────────────────────────
-   Email on v5, from the real console's shapes: EmailProviderResponse
+   Email on v1, from the real console's shapes: EmailProviderResponse
    (provider_type ses | scaleway | smtp, region, is_active),
    EmailDomainResponse (+ DnsRecordResponse: record_type, name, value,
    status unknown | verified | pending | failed), EmailResponse (status
@@ -279,7 +279,7 @@ export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense:
           grid="minmax(8rem,1.2fr) minmax(10rem,2fr) minmax(9rem,1.6fr) minmax(8rem,1.2fr) minmax(90px,max-content) minmax(60px,max-content)"
           rows={mailRows} total={mails.length} filter={q} onFilter={(v) => { setQ(v); setPageNo(1) }} page={mailPage} placeholder="filter by recipient, subject, sender or project" hint={range ? `${filtered.length} in ${range.from} → ${range.to} · clear the selection on the chart to see all` : `${STATS.queued} queued · ${STATS.captured} captured from previews`}
           action={
-            <Picker skin="operator ink v4 v5" value={statusFilter} onChange={(v) => { setStatusFilter(v); setPageNo(1) }} placeholder="status" options={[{ value: 'all', meta: `${mails.length}` }, { value: 'problems', meta: `${mails.filter((m) => m.status === 'bounced' || m.status === 'failed').length}`, state: 'error' }, { value: 'delivered' }, { value: 'opened' }, { value: 'bounced', state: 'error' }, { value: 'failed', state: 'error' }, { value: 'queued', state: 'idle' }, { value: 'captured', state: 'sampled' }]} />
+            <Picker skin="operator ink v1" value={statusFilter} onChange={(v) => { setStatusFilter(v); setPageNo(1) }} placeholder="status" options={[{ value: 'all', meta: `${mails.length}` }, { value: 'problems', meta: `${mails.filter((m) => m.status === 'bounced' || m.status === 'failed').length}`, state: 'error' }, { value: 'delivered' }, { value: 'opened' }, { value: 'bounced', state: 'error' }, { value: 'failed', state: 'error' }, { value: 'queued', state: 'idle' }, { value: 'captured', state: 'sampled' }]} />
           }
           state={filtered.length === 0 ? <PageState state="empty" title="No emails match" reason={`Nothing ${statusFilter === 'all' ? '' : statusFilter + ' '}matches “${q}”.`} next={<button type="button" className="underline underline-offset-4" onClick={() => { setQ(''); setStatusFilter('all') }}>clear filters</button>} /> : undefined} />
         </div>
@@ -469,8 +469,8 @@ export function EmailDomainScreen({ id, dense, notify, go }: { id: string; dense
           state={shown.length === 0 ? <PageState state="empty" title="No records match" reason={`Nothing in this domain's DNS records matches “${recQ}”.`} next={<button type="button" className="underline underline-offset-4" onClick={() => setRecQ('')}>clear the filter</button>} /> : undefined} />
         <Section title="Sending" meta="who sends for this domain, and what receivers do with failures">
           <div className="@container space-y-4 border bg-background p-4">
-            <Field label="provider" help="which provider sends for this domain; changing it needs new DKIM records"><Picker skin="operator ink v4 v5" value={form.provider} onChange={(v) => setForm({ ...form, provider: v })} options={PROVIDERS.map((p) => ({ value: p.name, meta: PROVIDER_LABEL[p.provider_type], state: p.is_active ? 'ok' : 'idle' }))} /></Field>
-            <Field label="DMARC policy" help="what receivers do with mail that fails SPF and DKIM; start at none, move to quarantine once reports are clean"><Picker skin="operator ink v4 v5" value={form.dmarc} onChange={(v) => setForm({ ...form, dmarc: v })} options={[{ value: 'none', meta: 'monitor only' }, { value: 'quarantine', meta: 'to spam' }, { value: 'reject', meta: 'drop' }]} /></Field>
+            <Field label="provider" help="which provider sends for this domain; changing it needs new DKIM records"><Picker skin="operator ink v1" value={form.provider} onChange={(v) => setForm({ ...form, provider: v })} options={PROVIDERS.map((p) => ({ value: p.name, meta: PROVIDER_LABEL[p.provider_type], state: p.is_active ? 'ok' : 'idle' }))} /></Field>
+            <Field label="DMARC policy" help="what receivers do with mail that fails SPF and DKIM; start at none, move to quarantine once reports are clean"><Picker skin="operator ink v1" value={form.dmarc} onChange={(v) => setForm({ ...form, dmarc: v })} options={[{ value: 'none', meta: 'monitor only' }, { value: 'quarantine', meta: 'to spam' }, { value: 'reject', meta: 'drop' }]} /></Field>
             <div className="flex items-center gap-3 border-t pt-3 text-xs">
               <span className={dirty ? undefined : 'text-muted-foreground'}>{dirty ? 'unsaved changes · takes effect on the next send' : 'no changes'}</span>
               <Button size="sm" disabled={!dirty} onClick={() => { setSaved(form); notify('ok', 'domain settings saved', d.domain) }} className="op-primary ml-auto h-7 text-xs">save</Button>

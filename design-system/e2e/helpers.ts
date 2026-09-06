@@ -8,8 +8,8 @@ import type { Page, TestInfo } from '@playwright/test'
  * normalises a bare `:` in a query string, so encode it once, here, and let
  * every spec name views the way the docs do.
  */
-export function v5(view: string, extra = ''): string {
-  return `/v5?p=${view.replace(/:/g, '%3A')}${extra}`
+export function v1(view: string, extra = ''): string {
+  return `/v1?p=${view.replace(/:/g, '%3A')}${extra}`
 }
 
 /**
@@ -117,7 +117,7 @@ export const V5_VIEWS = [
 ] as const
 
 /** Views that need an extra flag to reach the state under test. */
-export const V5_VIEWS_WITH_FLAGS: ReadonlyArray<{ view: string; extra?: string; label: string }> = [
+export const V1_VIEWS_WITH_FLAGS: ReadonlyArray<{ view: string; extra?: string; label: string }> = [
   ...V5_VIEWS.map((view) => ({ view, label: view })),
   { view: 'errors', extra: '&fail=1', label: 'errors&fail=1' },
   { view: 'analytics', extra: '&fresh=1', label: 'analytics&fresh=1' },

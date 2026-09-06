@@ -2,12 +2,12 @@
 
 Machine-readable digest of `brand-guidelines.md` and `design-system-handoff.md`.
 Imperative only. When this file and those two disagree, they win — fix this file.
-Rendered at `/guide#tooling`. Reference implementation: `/v5`, `/op-components`.
+Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Setup
 
 - Import `@temps-sdk/op/op.css` before any rule in the stylesheet.
-- Put `operator ink v4 v5` on the root element you want skinned.
+- Put `operator ink v1` on the root element you want skinned.
 - Import primitives from `@temps-sdk/op`. Do not edit the package from a consumer.
 - Pass the skin class to portalled content (dialogs, toasts, command palettes).
 - Restart the dev server after introducing a Tailwind class new to the codebase.

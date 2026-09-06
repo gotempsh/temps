@@ -6,7 +6,7 @@ import {
   Breakdown, ChartFooter, Detail, Ledger, LogLines, Num, PageState, Phrase, Picker, RangePicker, Section, Status, StatusLine, TimeChart,
   type LedgerRow, type LogLine, type Range, type State,
 } from '@/components/op'
-import type { Notify, Plan } from './ConsoleV5Observe'
+import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
 import { PROJECT_ICONS } from './console-projects'
 import { ProjectMark } from '@/components/op'

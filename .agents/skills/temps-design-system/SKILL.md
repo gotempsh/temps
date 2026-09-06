@@ -2,7 +2,7 @@
 name: temps-design-system
 description: >
   Build or review console UI so it reads as Temps: the paper-and-ink operator
-  design system (`@temps-sdk/op` primitives, the `operator ink v4 v5` skin,
+  design system (`@temps-sdk/op` primitives, the `operator ink v1` skin,
   the Ledger / Detail / Settings page templates, the status vocabulary and
   the record recipe). Invoke when a task adds or redesigns a console screen,
   a landing section or a status page on the new design system, when the user
@@ -23,8 +23,8 @@ task needs is in the repo; do not invent tokens, colours or page shapes.
 | Brand guidelines (why the rules exist) | `design-system/docs/brand-guidelines.md` |
 | Handoff: tokens, primitive catalogue, page templates, responsive, keyboard | `design-system/docs/design-system-handoff.md` |
 | Component package consumed by screens | `web/packages/op` (`@temps-sdk/op`) |
-| Reference implementation of every screen | `design-system/src/sections/ConsoleV5*.tsx` |
-| Browsable guide, component gallery, console mockups | `cd design-system && bun install && bun run dev` → `/guide`, `/op-components`, `/v5` |
+| Reference implementation of every screen | `design-system/src/sections/ConsoleV1*.tsx` |
+| Browsable guide, component gallery, console mockups | `cd design-system && bun install && bun run dev` → `/guide`, `/op-components`, `/v1` |
 
 ## Scope boundary
 
@@ -46,12 +46,12 @@ task needs is in the repo; do not invent tokens, colours or page shapes.
    bottom → `Detail` + `Columns`; a configuration → `Settings`; nothing yet,
    not set up or failed → `PageState`.
 3. Find the closest reference screen in `design-system/src/sections/` and
-   start from its shape. Deployment (`ConsoleV5Deploy.tsx`), Nodes
-   (`ConsoleV5Nodes.tsx`), Database (`ConsoleV5Database.tsx`) and Settings
-   (`ConsoleV5Settings.tsx`) cover the record, list, tool and configuration
+   start from its shape. Deployment (`ConsoleV1Deploy.tsx`), Nodes
+   (`ConsoleV1Nodes.tsx`), Database (`ConsoleV1Database.tsx`) and Settings
+   (`ConsoleV1Settings.tsx`) cover the record, list, tool and configuration
    cases.
 4. Build with primitives from `@temps-sdk/op` only. Import the skin once
-   (`@import '@temps-sdk/op/op.css'`) and put `operator ink v4 v5` on the
+   (`@import '@temps-sdk/op/op.css'`) and put `operator ink v1` on the
    root you want skinned, including portalled content.
 5. Apply the record recipe: title + meta → status verdict → `Lede` with four
    to six facts → `Columns` (main: the thing and its timeline; aside: what is

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test, type Page } from '@playwright/test'
-import { ready, setTheme, v5 } from './helpers'
+import { ready, setTheme, v1 } from './helpers'
 
 /**
  * Visual baselines.
@@ -136,11 +136,11 @@ test('guide matches its baseline', async ({ page }, testInfo) => {
 })
 
 const RECORDS: ReadonlyArray<{ label: string; path: string }> = [
-  { label: 'deploy-dep_91a', path: v5('deploy:dep_91a') },
-  { label: 'db-acme-pg', path: v5('db:acme-pg') },
-  { label: 'issue-i_4821', path: v5('issue:i_4821') },
-  { label: 'node-hetzner-3', path: v5('node:hetzner-3') },
-  { label: 'settings-hub', path: v5('settings') },
+  { label: 'deploy-dep_91a', path: v1('deploy:dep_91a') },
+  { label: 'db-acme-pg', path: v1('db:acme-pg') },
+  { label: 'issue-i_4821', path: v1('issue:i_4821') },
+  { label: 'node-hetzner-3', path: v1('node:hetzner-3') },
+  { label: 'settings-hub', path: v1('settings') },
 ]
 
 for (const { label, path } of RECORDS) {

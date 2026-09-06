@@ -34,7 +34,7 @@ import { Kbd } from './kbd'
  * `skin` is the token class to apply to the portal content, since dialogs
  * render outside the `.operator` root.
  */
-export function EchoDialog({ trigger, title, description, confirmWord, steps, onDone, destructive, skin = 'operator ink v4 v5', stepMs = 600 }: {
+export function EchoDialog({ trigger, title, description, confirmWord, steps, onDone, destructive, skin = 'operator ink v1', stepMs = 600 }: {
   trigger: ReactNode
   /** Equivalent `temps` CLI command. Documented, not rendered. */
   echo?: string

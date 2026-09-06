@@ -146,7 +146,7 @@ Five components cover most screens: `Table` with density, `StatusLine`,
 
 - Lint: a script counting palette and hex literals, run in CI, fails on
   increase. Number goes in the PR check output.
-- Visual: the design-system app's `/v5` and `/brand` are the reference. A
+- Visual: the design-system app's `/v1` and `/brand` are the reference. A
   Playwright screenshot diff on those routes per PR. The console has no Playwright
   today; this is the first use.
 - Ownership: the design-system app and `docs/brand-guidelines.md` are the
@@ -172,7 +172,7 @@ Mechanics:
 4. Ratchet the rest: every touched file must reach zero literals.
 
 Done means: the ratchet count is zero, the three templates exist, and the two
-reference screens match `/v5` in the screenshot diff.
+reference screens match `/v1` in the screenshot diff.
 
 ## 12. What would we regret?
 
@@ -186,10 +186,10 @@ reference screens match `/v5` in the screenshot diff.
 
 ## Reference implementation
 
-`/v5` in the design-system app (`src/sections/ConsoleV5.tsx`) is these answers
+`/v1` in the design-system app (`src/sections/ConsoleV1.tsx`) is these answers
 as code: `Ledger`, `Detail` and `Settings` templates, one `PageState` with four
 states, the `sampled` status, retention horizon on the chart, `Metric` tiles
-that require a baseline, density remembered, no accent axis. `/v5-landing` is
+that require a baseline, density remembered, no accent axis. `/v1-landing` is
 the v3 landing plus pricing from `pricing.md`, the limits table, a mobile menu
 and the accent frozen to `signal` on the primary CTA.
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test } from '@playwright/test'
-import { ready, v5 } from './helpers'
+import { ready, v1 } from './helpers'
 
 /**
  * Transient surfaces: the header's attention panel (Drop + AttentionHost) and
@@ -45,7 +45,7 @@ async function clickOutside(page: import('@playwright/test').Page, panelSelector
 
 test.describe('attention panel', () => {
   test('opens from the header badge and closes on Escape, returning focus', async ({ page }) => {
-    await page.goto(v5('errors'))
+    await page.goto(v1('errors'))
     await ready(page)
 
     const button = page.locator('button[aria-haspopup="dialog"][aria-expanded]').first()
@@ -73,7 +73,7 @@ test.describe('attention panel', () => {
   })
 
   test('closes on a click outside', async ({ page }) => {
-    await page.goto(v5('errors'))
+    await page.goto(v1('errors'))
     await ready(page)
 
     const button = page.locator('button[aria-haspopup="dialog"][aria-expanded]').first()
@@ -88,7 +88,7 @@ test.describe('attention panel', () => {
   })
 
   test('a click inside the panel leaves it open', async ({ page }) => {
-    await page.goto(v5('errors'))
+    await page.goto(v1('errors'))
     await ready(page)
 
     const button = page.locator('button[aria-haspopup="dialog"][aria-expanded]').first()
@@ -113,7 +113,7 @@ test.describe('tooltip', () => {
   }
 
   test('opens on hover with no animation and closes when the pointer leaves', async ({ page }) => {
-    await page.goto(v5('db:acme-pg'))
+    await page.goto(v1('db:acme-pg'))
     await ready(page)
 
     const mark = await firstMark(page)
@@ -141,7 +141,7 @@ test.describe('tooltip', () => {
   })
 
   test('closes when the pointer moves straight off the trigger', async ({ page }) => {
-    await page.goto(v5('db:acme-pg'))
+    await page.goto(v1('db:acme-pg'))
     await ready(page)
 
     const mark = await firstMark(page)

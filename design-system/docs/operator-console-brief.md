@@ -27,7 +27,7 @@ The other four directions were reference points, not competing candidates; only 
 
 ### 3.1 Live reference (this repo)
 - Standalone sandbox app, not wired into the real console: `temps/design-system/`, React 19 + Tailwind v4 + shadcn/ui.
-- Operator console was prototyped as a token-only reskin in an exploration section (`OPERATOR_VARS`, `OperatorConsole()`); that exploration has since been superseded by the v5 skin and is no longer in the repo.
+- Operator console was prototyped as a token-only reskin in an exploration section (`OPERATOR_VARS`, `OperatorConsole()`); that exploration has since been superseded by the v1 skin and is no longer in the repo.
 - It is currently a **pure CSS-custom-property reskin** of the exact same `Button`/`Badge`/etc. components used everywhere else in the sandbox — same DOM, different tokens. That's a deliberate constraint carried over from `temps/DESIGN.md`: extend primitives via tokens/props, never fork them.
 - Only two surfaces have been mocked in this direction so far: a small deployments dashboard (metric tiles + status rows) and a landing hero (using temps.sh's real current copy). Everything else in section 5 below is unexplored.
 

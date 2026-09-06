@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test, type Page } from '@playwright/test'
-import { ready, v5 } from './helpers'
+import { ready, v1 } from './helpers'
 
 /**
  * The keyboard contract from docs/design-system-handoff.md §9.
@@ -48,7 +48,7 @@ async function openTab(page: Page, label: string) {
 
 test.describe('ledger keyboard', () => {
   test('j and k move DOM focus onto the marked row', async ({ page }) => {
-    await page.goto(v5('analytics'))
+    await page.goto(v1('analytics'))
     await ready(page)
     await openTab(page, 'events')
 
@@ -83,7 +83,7 @@ test.describe('ledger keyboard', () => {
   })
 
   test('arrow keys do what j and k do', async ({ page }) => {
-    await page.goto(v5('analytics'))
+    await page.goto(v1('analytics'))
     await ready(page)
     await openTab(page, 'events')
     await page.locator('body').click({ position: { x: 5, y: 5 } })
@@ -100,7 +100,7 @@ test.describe('ledger keyboard', () => {
   })
 
   test('Enter opens the record the cursor marks', async ({ page }) => {
-    await page.goto(v5('analytics'))
+    await page.goto(v1('analytics'))
     await ready(page)
     await openTab(page, 'events')
     await page.locator('body').click({ position: { x: 5, y: 5 } })
@@ -113,7 +113,7 @@ test.describe('ledger keyboard', () => {
   })
 
   test('Tab from the filter lands on the row the cursor marks', async ({ page }) => {
-    await page.goto(v5('analytics'))
+    await page.goto(v1('analytics'))
     await ready(page)
     await openTab(page, 'events')
 
@@ -139,7 +139,7 @@ test.describe('ledger keyboard', () => {
   })
 
   test('slash focuses the filter', async ({ page }) => {
-    await page.goto(v5('analytics'))
+    await page.goto(v1('analytics'))
     await ready(page)
     await openTab(page, 'events')
     await page.locator('body').click({ position: { x: 5, y: 5 } })
@@ -153,7 +153,7 @@ test.describe('ledger keyboard', () => {
   })
 
   test('keys are ignored while an input has focus', async ({ page }) => {
-    await page.goto(v5('analytics'))
+    await page.goto(v1('analytics'))
     await ready(page)
     await openTab(page, 'events')
 
@@ -182,7 +182,7 @@ test.describe('ledger keyboard', () => {
 
 test.describe('pager keyboard', () => {
   test('] pages the issue events ledger and the pager text changes', async ({ page }) => {
-    await page.goto(v5('issue:i_4821'))
+    await page.goto(v1('issue:i_4821'))
     await ready(page)
     await openTab(page, 'events')
 
@@ -203,7 +203,7 @@ test.describe('pager keyboard', () => {
 
 test.describe('detail keyboard', () => {
   test('digits switch facets', async ({ page }) => {
-    await page.goto(v5('issue:i_4821'))
+    await page.goto(v1('issue:i_4821'))
     await ready(page)
 
     const tabs = page.getByRole('tab')
@@ -221,7 +221,7 @@ test.describe('detail keyboard', () => {
   })
 
   test('digits are ignored while a filter has focus', async ({ page }) => {
-    await page.goto(v5('issue:i_4821'))
+    await page.goto(v1('issue:i_4821'))
     await ready(page)
     await openTab(page, 'events')
 

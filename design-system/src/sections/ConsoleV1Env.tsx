@@ -9,7 +9,7 @@ import { CalendarHeatmap, Columns, EchoDialog, Kbd, Ledger, PageState, Phrase, P
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
-   Redesign of three existing console surfaces, on v5, using the real API
+   Redesign of three existing console surfaces, on v1, using the real API
    shapes (EnvironmentResponse, DeploymentResponse,
    EnvironmentVariableResponse from web/src/api/client/types.gen.ts).
 
@@ -238,7 +238,7 @@ export function DeploysTab({ notify, dense, go }: { notify: Notify; dense: boole
       rows={rows} total={deps.length} filter={q} onFilter={setQ} placeholder="filter by tag, commit or message" dense={dense}
       action={
         <label className="flex min-w-0 items-center gap-2 text-xs"><span className="shrink-0 text-muted-foreground">in</span>
-          <Picker skin="operator ink v4 v5" value={String(env)} onChange={(v) => setEnv(v === 'all' ? 'all' : (Number(v) as number))} placeholder="environment" searchPlaceholder="environment…"
+          <Picker skin="operator ink v1" value={String(env)} onChange={(v) => setEnv(v === 'all' ? 'all' : (Number(v) as number))} placeholder="environment" searchPlaceholder="environment…"
             options={[
               { value: 'all', label: 'all environments', group: 'scope', meta: `${deps.length} deploys` },
               ...ENVS.map((e) => ({ value: String(e.id), label: e.name, group: 'environments', meta: `${deps.filter((d) => d.environment_id === e.id).length} deploys`, state: (e.sleeping ? 'idle' : 'ok') as State })),
@@ -325,7 +325,7 @@ export function VariablesTab({ notify, dense }: { notify: Notify; dense: boolean
           One row of tabs per page; scopes are pickers; 2–4 views of one list are a Segmented in the toolbar (handoff §7, "one axis per control"). */}
       <div className="flex flex-wrap items-center gap-2">
         <label className="flex items-center gap-2 text-xs"><span className="text-muted-foreground">in</span>
-          <Picker skin="operator ink v4 v5" value={String(view)} onChange={(v) => setView(v === 'matrix' ? 'matrix' : (Number(v) as VarView))} placeholder="environment" searchPlaceholder="environment…"
+          <Picker skin="operator ink v1" value={String(view)} onChange={(v) => setView(v === 'matrix' ? 'matrix' : (Number(v) as VarView))} placeholder="environment" searchPlaceholder="environment…"
             options={[
               ...ENVS.map((e) => ({ value: String(e.id), label: e.name, group: 'environments', meta: `${vars.filter((v) => v.environments.includes(e.id) || (e.is_preview && v.include_in_preview)).length} vars`, state: (e.is_preview ? 'idle' : 'ok') as State })),
               { value: 'matrix', label: 'all environments · matrix', group: 'compare', meta: `${vars.length} vars`, state: (missingInProd.length ? 'warn' : 'ok') as State },

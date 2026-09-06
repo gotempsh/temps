@@ -9,9 +9,9 @@ import {
   Callout, ChartFooter, Columns, Detail, EchoDialog, Field, KeyValue, Ledger, Lede, LogLines, Phrase, Section, Segmented, SecretValue, Settings, Status, StatusLine, TimeChart,
   type KV, type LedgerRow, type LogLine, type State,
 } from '@/components/op'
-import { Toggle } from './ConsoleV5Admin'
-import { EffectLegend, eff } from './ConsoleV5Settings'
-import type { Notify } from './ConsoleV5Observe'
+import { Toggle } from './ConsoleV1Admin'
+import { EffectLegend, eff } from './ConsoleV1Settings'
+import type { Notify } from './ConsoleV1Observe'
 
 /**
  * A node is a machine the fleet runs on. The question the list answers is

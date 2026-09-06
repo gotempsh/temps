@@ -13,7 +13,7 @@ import {
   ChartFooter, Detail, EchoDialog, Field, Kbd, Ledger, Metric, MetricGrid, Num, PageState, Phrase, RangePicker,
   PageTitle, Picker, Segmented, Settings, ShellSlotsProvider, Status, StatusLine, TimeChart, worst, type LedgerRow, type State,
 } from '@/components/op'
-import { BRANCHES } from './ConsoleV5'
+import { BRANCHES } from './ConsoleV1'
 
 
 // ── viz demo data (shapes follow docs/console-inventory.md) ────────────
@@ -180,11 +180,11 @@ export function OpComponentsPage() {
   ] as LedgerRow[]).filter((r) => r.id.includes(q))
 
   return (
-    <div className="operator ink v4 v5 -m-4 sm:-m-6 lg:-m-8">
+    <div className="operator ink v1 -m-4 sm:-m-6 lg:-m-8">
       <div className="border-b px-4 py-3 text-xs sm:px-6">
         <p className="op-label">operator components · src/components/op</p>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">
-          The components the three page templates are built from. Each block: the rule, the props that matter, every state. <Link to="/v5" className="underline underline-offset-4">/v5</Link> is these assembled into a console; the handoff document is <span className="font-mono">docs/design-system-handoff.md</span>.
+          The components the three page templates are built from. Each block: the rule, the props that matter, every state. <Link to="/v1" className="underline underline-offset-4">/v1</Link> is these assembled into a console; the handoff document is <span className="font-mono">docs/design-system-handoff.md</span>.
         </p>
       </div>
 

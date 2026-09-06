@@ -37,17 +37,17 @@ Routes that matter:
 | Route              | What it is                                                             |
 |--------------------|------------------------------------------------------------------------|
 | `/guide`           | The consolidated guide. One page over these documents. Read this first. |
-| `/v5`              | Operator console v5. The reference implementation. Start here.         |
-| `/v5?p=api-gateway`| Project detail: chart, metrics, incident thread, settings tab.         |
-| `/v5?p=settings:nodes` | Fleet: the nodes ledger with a status column (`hetzner-3` offline, `hetzner-1` under memory pressure); `node:<name>` the record; `settings:cluster` the join token, cluster DNS and CA. |
-| `/v5?p=deploy:dep_91a` | Deployment record: `dep_91a` live with an error-rate regression, `dep_92e` failed build with the compiler's words, `dep_92b` building live, `dep_90e` superseded (roll back), `dep_88c` cancelled. |
-| `/v5?p=errors`     | Issues ledger; `issue:<id>` the record. `&fail=1` shows the error-store outage with retry; **fresh** shows the no-DSN onboarding. |
+| `/v1`              | Operator console v1. The reference implementation. Start here.         |
+| `/v1?p=api-gateway`| Project detail: chart, metrics, incident thread, settings tab.         |
+| `/v1?p=settings:nodes` | Fleet: the nodes ledger with a status column (`hetzner-3` offline, `hetzner-1` under memory pressure); `node:<name>` the record; `settings:cluster` the join token, cluster DNS and CA. |
+| `/v1?p=deploy:dep_91a` | Deployment record: `dep_91a` live with an error-rate regression, `dep_92e` failed build with the compiler's words, `dep_92b` building live, `dep_90e` superseded (roll back), `dep_88c` cancelled. |
+| `/v1?p=errors`     | Issues ledger; `issue:<id>` the record. `&fail=1` shows the error-store outage with retry; **fresh** shows the no-DSN onboarding. |
 | `/console?p=…`     | The console alone, no sandbox layout or intro; same `p` views. The ⤢ button in the header toggles it. |
 | `/landing`         | The landing alone, no sandbox layout. The ⤢ button fixed bottom-right toggles it (sandbox control, not part of the page). |
-| `/v5?p=settings`   | Settings hub; `settings:<slug>` pages (domain, updates, builds, timeouts, users, teams, signin, keys, headers, traffic, routes, store, retention, alerts, nodes, plugins). |
-| `/status?project=` | The public status page for a project, chrome-free; `/status-page` inside the sandbox. `/v5?p=monitor:mon_2` is a monitor record. |
-| `/v5?p=sandboxes`, `?p=sandbox:sbx_7f21`, `?p=traces`, `?p=trace:3f9c1e7a8b2d4f60`, `?p=metrics` | Observe and sandbox surfaces (§7b). |
-| `/v5-landing`      | Landing page in the same system, with pricing.                         |
+| `/v1?p=settings`   | Settings hub; `settings:<slug>` pages (domain, updates, builds, timeouts, users, teams, signin, keys, headers, traffic, routes, store, retention, alerts, nodes, plugins). |
+| `/status?project=` | The public status page for a project, chrome-free; `/status-page` inside the sandbox. `/v1?p=monitor:mon_2` is a monitor record. |
+| `/v1?p=sandboxes`, `?p=sandbox:sbx_7f21`, `?p=traces`, `?p=trace:3f9c1e7a8b2d4f60`, `?p=metrics` | Observe and sandbox surfaces (§7b). |
+| `/v1-landing`      | Landing page in the same system, with pricing.                         |
 | `/op-components`   | Every operator component, every state, with props.                     |
 | `/brand#hierarchy` | The type scale rendered live.                                          |
 
@@ -56,7 +56,7 @@ Gotchas that cost time:
 - Tailwind only generates classes it has seen. After adding a class that is new
   to the codebase, restart the dev server or it will silently not apply.
 - Dialogs, toasts and command palettes render in portals outside the
-  `.operator` root. Pass the skin class (`operator ink v4 v5`) to their content.
+  `.operator` root. Pass the skin class (`operator ink v1`) to their content.
 - `data-accent` is set on the landing root only. The console has no accent.
 - Screenshots: `agent-browser` works well. Set the viewport, open, wait, capture.
 
@@ -116,7 +116,7 @@ fixed ones get deleted), and any *new* serious violation fails immediately.
 
 It is a token layer and a small component library that sit on top of the
 console's existing shadcn primitives (`temps/web/src/components/ui`). It is
-applied by putting `operator ink v4 v5` on a root element. Nothing under that
+applied by putting `operator ink v1` on a root element. Nothing under that
 root needs rewriting to pick up paper, ink, mono numerals and 0.25rem radius.
 
 It is not a fork of shadcn and not a new component kit. The console has 516 tsx
@@ -165,8 +165,7 @@ All in `src/globals.css`. Blocks, in cascade order:
 |------------------------------|----------------------------------------------------------------|
 | `.operator`                  | Base operator tokens (v2). Mono font, 16px inputs under 768px. |
 | `.operator.ink`              | Paper and ink palette, light and dark. Geist + Geist Mono. Utilities below. |
-| `.operator.ink.v4`           | Density axis (`data-density`), sticky status line, marker highlight. |
-| `.operator.ink.v5`           | Radius frozen at 0.25rem, sticky bottom bar, ledger column var, metric grid. |
+| `.operator.ink.v1`           | Density axis (`data-density`), sticky status line, marker highlight, radius frozen at 0.25rem, sticky bottom bar, ledger column var, metric grid. |
 | `.operator.ink[data-accent]` | Landing only. Swaps `--primary` / `--primary-foreground`.      |
 | "Ink type hierarchy"         | `.op-display` … `.op-label`, section rhythm.                    |
 
@@ -328,7 +327,7 @@ current value is marked ●. `allowCustom="use branch"` offers the typed text
 as a row for values not in the list. `loading` and `error` are states inside
 the list, not a spinner on the trigger: they say what was being fetched and
 from where, quote the source's error, and offer retry. Reference: branch
-picker in project settings (`/v5?p=api-gateway`, settings tab) and
+picker in project settings (`/v1?p=api-gateway`, settings tab) and
 `/op-components#picker`. The real console's `SearchableSelect` in
 `web/src/components/ui/searchable-select.tsx` is the migration target.
 
@@ -632,8 +631,8 @@ Enforcement, so it does not happen again:
 
 ## 7b. Redesigned surfaces on the templates
 
-`src/sections/ConsoleV5Env.tsx` rebuilds three existing console surfaces on
-v5, using the real API shapes from `web/src/api/client/types.gen.ts`
+`src/sections/ConsoleV1Env.tsx` rebuilds three existing console surfaces on
+v1, using the real API shapes from `web/src/api/client/types.gen.ts`
 (`EnvironmentResponse`, `DeploymentResponse`, `EnvironmentVariableResponse`).
 They answer user feedback recorded on 2026-09-04:
 
@@ -665,7 +664,7 @@ They answer user feedback recorded on 2026-09-04:
   opens the matrix.
 - **Search** on `/`, key only, never values.
 
-**Sandboxes, traces, metrics** (`src/sections/ConsoleV5Observe.tsx`), using
+**Sandboxes, traces, metrics** (`src/sections/ConsoleV1Observe.tsx`), using
 `SandboxInner`, `SandboxEvent`, `SandboxStatusResponse`, `TraceSummary`,
 `SpanRecord`, `SpanStats`, `MetricBucket`: On traces, the latency chart is the time filter: drag across it and the trace ledger narrows to traces whose start falls in the selected half-hours, the footer saying so; the verdict's "since dep_91a" link selects that window for you.
 
@@ -698,7 +697,7 @@ Real-console mapping: `components/project/ProjectDeployments.tsx`,
 (`deploy promote`, `env attach/detach/unset`) are proposals; check
 `apps/temps-cli` for the real names before wiring.
 
-### Backups (`/v5?p=backups`)
+### Backups (`/v1?p=backups`)
 
 One screen, three tabs: schedules, backups, sources. The live console shows
 only the S3 sources table and hides overdue schedules behind a header bell.
@@ -713,7 +712,7 @@ it. Sources carry
 "make default" as an EchoDialog. Retention is per schedule; PITR is per plan
 and said so in the footer.
 
-### Git providers (`/v5?p=git`, `git:<id>`)
+### Git providers (`/v1?p=git`, `git:<id>`)
 
 Every provider row and the provider page title start with the provider's
 mark (`GitProviderLogo`: GitHub, GitLab, Gitea, Bitbucket; `github_app`
@@ -730,7 +729,7 @@ No connection yet is PageState unconfigured ("Installation required") with an
 example of a connected account. Settings: default provider, auto-deploy new
 repos, webhook endpoint and secret rotation (EchoDialog), delete.
 
-### Security (`/v5?p=security`, `scan:<id>`)
+### Security (`/v1?p=security`, `scan:<id>`)
 
 Scans, headers and access rules under one title. Each environment's last scan
 is a row with critical/high/medium/low as sortable numeric columns; the
@@ -742,9 +741,9 @@ with a preset Picker that flips to custom on edit. Access tab covers rate
 limiting, attack mode (off/challenge/block), allow-list, password protection
 and geo restrictions; "block all" is the danger action.
 
-### Errors (`/v5?p=errors`, `issue:<id>`)
+### Errors (`/v1?p=errors`, `issue:<id>`)
 
-`src/sections/ConsoleV5Errors.tsx`. The Sentry shape with the noise removed;
+`src/sections/ConsoleV1Errors.tsx`. The Sentry shape with the noise removed;
 what a phone and a desktop both need is the same eight things, so the row
 and the record are built from those and nothing else.
 
@@ -782,9 +781,9 @@ and the record are built from those and nothing else.
   the DSN link. `?fail=1`: the error store itself is down; the page names
   the resource and retries.
 
-### Settings (`/v5?p=settings`, `settings:<slug>`)
+### Settings (`/v1?p=settings`, `settings:<slug>`)
 
-`src/sections/ConsoleV5Settings.tsx`. The live sidebar has twenty entries
+`src/sections/ConsoleV1Settings.tsx`. The live sidebar has twenty entries
 under General / Access / Infrastructure / Security, organised by which
 slice of the settings row a page writes: rate limiting is rendered on two
 pages, IP rules on two, "monitoring" is three pages that do different
@@ -835,9 +834,9 @@ sent, and says so.
   Nodes, Plugins): the Ledger template with the page's verdict, not a form
   with a table inside it.
 
-### Uptime monitor (`/v5?p=uptime`, `monitor:<id>`) and the public status page (`/status`)
+### Uptime monitor (`/v1?p=uptime`, `monitor:<id>`) and the public status page (`/status`)
 
-`src/sections/ConsoleV5Analytics.tsx` (MonitorScreen) and
+`src/sections/ConsoleV1Analytics.tsx` (MonitorScreen) and
 `src/sections/StatusPage.tsx`. The live monitor page is three cards (current
 status, uptime, average response), a strip of green blocks with a
 four-colour legend, and a "Configuration" card listing URL, type, project id,
@@ -870,9 +869,9 @@ word -- then the text) newest first with open ones on top, then subscribe (email
 glyph vocabulary as the console, state tones only, no console chrome,
 "powered by temps" in the footer. It is per project: `?project=<slug>`.
 
-### Proxy (`/v5?p=proxy`)
+### Proxy (`/v1?p=proxy`)
 
-`src/sections/ConsoleV5Proxy.tsx`. The live page is four metric cards and
+`src/sections/ConsoleV1Proxy.tsx`. The live page is four metric cards and
 four multi-line charts (status class, destination, error rate, latency
 percentiles), each with its own colour legend. Here it answers four
 questions in order and on one chart:
@@ -901,7 +900,7 @@ questions in order and on one chart:
 
 ### Deployment (`deploy:<tag>`)
 
-`src/sections/ConsoleV5Deploy.tsx`. The record people open most, usually
+`src/sections/ConsoleV1Deploy.tsx`. The record people open most, usually
 because something is wrong, so it follows the recipe strictly:
 
 - **Verdict** says whether traffic is on it and what changed since. Live
@@ -941,9 +940,9 @@ above the pipeline, and equal weight for the steps that decide whether the
 site is up and the ones that tidy up afterwards. Entry points: the deploys
 tab rows, the project overview's recent deploys, and "Building now".
 
-### Database (`/v5?p=databases`, `db:<name>`)
+### Database (`/v1?p=databases`, `db:<name>`)
 
-`src/sections/ConsoleV5Database.tsx`. The live page
+`src/sections/ConsoleV1Database.tsx`. The live page
 (`web/src/pages/DatabaseDetail.tsx` and its monitoring route) is a header with
 three badges, an uptime bar, then equal cards for Monitoring (seven tiles, a
 chart, collapsed alert rules), Configuration, Backups and Environment
@@ -988,9 +987,9 @@ Connect and Runs on: the reader wants "how do I reach it" and "what is it",
 not "parameters". The monitoring page is gone: the health section on the
 record and the metrics facet are the same strip at two sizes.
 
-### Analytics (`/v5?p=analytics`, `event:<name>`)
+### Analytics (`/v1?p=analytics`, `event:<name>`)
 
-`src/sections/ConsoleV5Analytics.tsx`.
+`src/sections/ConsoleV1Analytics.tsx`.
 
 First run (the **fresh** checkbox in the shell header, `?fresh=1`): the
 verdict is ○ "No visits recorded yet", the meta says "no data yet", the tabs
@@ -1047,12 +1046,12 @@ Firefox, Edge hand-drawn; Safari is lucide `compass`; everything else
 `megaphone`; devices `monitor` `smartphone` `tablet`. Kind is the icon, state
 is the glyph, and icons never take state colour (brand §6).
 
-### Email (`/v5?p=email`, `email:<id>`, `domain:<id>`)
+### Email (`/v1?p=email`, `email:<id>`, `domain:<id>`)
 
-`src/sections/ConsoleV5Email.tsx`, from EmailProviderResponse,
+`src/sections/ConsoleV1Email.tsx`, from EmailProviderResponse,
 EmailDomainResponse + DnsRecordResponse, EmailResponse, EmailStatsResponse and
 EmailTrackingSetupResponse. The live page (`web/src/pages/Email.tsx`) is five
-equal tabs of cards with the SDK docs inside the console. On v5:
+equal tabs of cards with the SDK docs inside the console. On v1:
 
 - First run (the **fresh** checkbox in the shell header, `?fresh=1`): every tab onboards instead of going
   blank. Mail: "Nothing has been sent yet" with the curl to send one and
@@ -1092,7 +1091,7 @@ equal tabs of cards with the SDK docs inside the console. On v5:
 
 ### Nodes (`settings:nodes`, `node:<name>`, `settings:cluster`)
 
-`src/sections/ConsoleV5Nodes.tsx`. The live Worker Nodes page is a table
+`src/sections/ConsoleV1Nodes.tsx`. The live Worker Nodes page is a table
 where every row says "Active" in a green pill, three unlabelled bars per row
 carry the pressure, and the join token, a how-to, Cluster DNS and Cluster
 trust are cards above and below it.
@@ -1146,7 +1145,7 @@ last run, and an onboarding state when unconfigured.
 
 The Vercel AI Elements vocabulary (Message, Reasoning / ChainOfThought, Plan,
 Tool with its six states, Confirmation, Task, Queue, Checkpoint, Sources,
-Actions, Suggestion, Context, PromptInput) drawn with the v5 rules, in
+Actions, Suggestion, Context, PromptInput) drawn with the v1 rules, in
 `src/sections/AgentChat.tsx`. Every block is a small component ready to move
 into `src/components/op` when the console grows an agent surface.
 
@@ -1232,7 +1231,7 @@ into `src/components/op` when the console grows an agent surface.
 
 ## 7c. Responsive rules
 
-Verified at 390 and 1440 wide on every v5 screen with a scrollWidth check.
+Verified at 390 and 1440 wide on every v1 screen with a scrollWidth check.
 
 - Actions go through `ActionBar` (Detail `actions`, Ledger `action`, or
   directly). From sm up it is the right-aligned wrapping row you expect.
@@ -1255,7 +1254,7 @@ Verified at 390 and 1440 wide on every v5 screen with a scrollWidth check.
   `mobile` node must carry the row's primary action too (promote, roll back);
   a phone user cannot reach a desktop-only cell.
 - Rows are fixed-height on desktop (`--row-h`) and grow with content on
-  phones (`@media (max-width: 767px)` in the v4 block). Never put multi-line
+  phones (`@media (max-width: 767px)` in the v1 block). Never put multi-line
   content in a row and rely on the desktop height.
 - Tab strips and action bars share `ScrollRow`: the row scrolls sideways
   and a fade appears on whichever edge is clipped. The active tab is
@@ -1314,7 +1313,7 @@ rule: never move a highlight without moving focus with it.
 
 ## 10. Plans as design input
 
-`ConsoleV5.tsx` has a `PlanContext` with self-hosted, Starter, Team, Business
+`ConsoleV1.tsx` has a `PlanContext` with self-hosted, Starter, Team, Business
 and a switcher in the header. It exists so the same screens can be seen under
 each plan's retention and ingest allowance. In the real console this comes
 from the license or Cloud subscription. What changes per plan:
@@ -1359,7 +1358,7 @@ Migration order:
 5. Enable the class by default. Ratchet the rest.
 
 Done means: literal count zero, the three templates in use, the two reference
-screens match `/v5` in a screenshot diff.
+screens match `/v1` in a screenshot diff.
 
 ## 12. Enforcement
 
@@ -1368,7 +1367,7 @@ direction will drift the way the console already has.
 
 - A script counting palette and hex literals in `temps/web/src`, run in CI,
   failing when the count rises. Print the number in the check output.
-- Playwright screenshot diff of `/v5`, `/v5?p=api-gateway`, `/brand` in the
+- Playwright screenshot diff of `/v1`, `/v1?p=api-gateway`, `/brand` in the
   design-system app on every PR that touches it.
 - `temps/web/CLAUDE.md` gets a pointer to `brand-guidelines.md` and the banned
   list, so agents read the same rules as humans.
@@ -1409,10 +1408,10 @@ design-system/
     components/ui/                shadcn primitives + sparkline, log-viewer, empty-placeholder
     components/platform-logos.tsx, system-map-section.tsx
                                   copied verbatim from temps-landing; do not edit here
-    sections/ConsoleV5.tsx        reference console (uses components/op)
-    sections/ConsoleV5Env.tsx     deploys + promote, environments, variables tabs (§7b)
-    sections/ConsoleV5Observe.tsx sandboxes, sandbox detail, traces, trace waterfall, metrics (§7b)
-    sections/InkLandingV5.tsx     reference landing
+    sections/ConsoleV1.tsx        reference console (uses components/op)
+    sections/ConsoleV1Env.tsx     deploys + promote, environments, variables tabs (§7b)
+    sections/ConsoleV1Observe.tsx sandboxes, sandbox detail, traces, trace waterfall, metrics (§7b)
+    sections/InkLandingV1.tsx     reference landing
     sections/Guide.tsx            /guide — renders docs/*.md into one consolidated page
     lib/md.ts                     the slicing helpers the guide cuts documents with
     sections/OpComponents.tsx     component reference page
@@ -1434,7 +1433,7 @@ design-system/
 4. Landing: the copied engine section keeps its own heading and soft cards. It
    is verbatim from the live site; restyling means diverging from it.
 5. Landing: links do not navigate; estimator numbers are placeholders.
-6. Dark mode of the v5 console has been token-checked but not screenshot
+6. Dark mode of the v1 console has been token-checked but not screenshot
    reviewed screen by screen.
 7. `EmptyPlaceholder` and `PageState.unconfigured` overlap. Retire the former
    once the landing stops using it.
@@ -1462,7 +1461,7 @@ Found by the kitchen-sink stress page (`/kitchen-sink`), not yet fixed:
 ## 16. How to hand back
 
 Before saying a change is done: `bunx tsc --noEmit -p .` is clean, the dev
-server has been restarted if a new class was introduced, `/v5` and
+server has been restarted if a new class was introduced, `/v1` and
 `/op-components` have been looked at in a browser at 1440 and 390 wide, and
 any rule you changed has been changed in `brand-guidelines.md` and on
 `/brand` in the same commit.

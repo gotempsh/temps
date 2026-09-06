@@ -8,7 +8,7 @@ import {
   Breakdown, ChartFooter, Detail, EchoDialog, Ledger, Lede, Num, PageState, Phrase, ProjectMark, RangePicker, Section, Segmented, KeyValue, Status, Timeline, Columns, Sparkline, StackTrace, StatusLine, TimeChart,
   type Frame, type KV, type LedgerRow, type Range, type State,
 } from '@/components/op'
-import type { Notify, Plan } from './ConsoleV5Observe'
+import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
 import { PROJECT_ICONS } from './console-projects'
 

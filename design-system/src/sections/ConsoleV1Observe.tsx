@@ -9,11 +9,11 @@ import {
   Callout, ChartFooter, Columns, Detail, EchoDialog, Histogram, KeyValue, Ledger, Lede, Metric, MetricGrid, Num, PageState, PageTitle, Phrase, RangePicker, Section, Segmented, Status, StatusLine, TimeChart, Waterfall, type Pct,
   type LedgerRow, type Range, type State, type TimeRange, type Span as VizSpan,
 } from '@/components/op'
-import { matches } from './ConsoleV5Admin'
+import { matches } from './ConsoleV1Admin'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
-   Observe + sandboxes on v5, using the real API shapes
+   Observe + sandboxes on v1, using the real API shapes
    (SandboxInner, SandboxEvent, SandboxStatusResponse, TraceSummary,
    SpanRecord, SpanStats, MetricBucket in web/src/api/client/types.gen.ts).
 

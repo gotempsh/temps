@@ -9,9 +9,9 @@ import {
   Callout, EchoDialog, Field, Ledger, PageTitle, Phrase, Picker, SecretValue, Section, Settings, Status, StatusLine, GLYPH, GLYPH_CLASS,
   type LedgerRow, type State,
 } from '@/components/op'
-import { Toggle } from './ConsoleV5Admin'
-import type { Notify } from './ConsoleV5Observe'
-import { NodesLedger, ClusterPage } from './ConsoleV5Nodes'
+import { Toggle } from './ConsoleV1Admin'
+import type { Notify } from './ConsoleV1Observe'
+import { NodesLedger, ClusterPage } from './ConsoleV1Nodes'
 
 /**
  * Settings, organised by what the operator is doing rather than by which

@@ -9,11 +9,11 @@ import {
   ChartFooter, Detail, Ledger, Lede, Live, Metric, MetricGrid, Num, Phrase, RangePicker, PageState, Section, Segmented, Columns, Status, StatusLine, GeoMap, EchoDialog, KeyValue, StatusStrip, TimeChart, Timeline,
   Breakdown, Sparkline, Funnel, Flow, type BreakdownRow, type KV, type LedgerRow, type State, type StatusBucket, type TimeRange,
 } from '@/components/op'
-import type { Notify, Plan } from './ConsoleV5Observe'
+import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
 
 /* ────────────────────────────────────────────────────────────────────────
-   Analytics and Uptime on v5, built on the observe primitives (viz.tsx).
+   Analytics and Uptime on v1, built on the observe primitives (viz.tsx).
    Shapes follow web: PropertyBreakdownResponse {items{value,count,percentage},
    total} per group_by with filter_country/filter_region for drill-down;
    PagePathsResponse + PagePathsSparklineResponse; FunnelMetricsResponse

@@ -7,7 +7,7 @@ import { cn } from '@/lib/utils'
 /* ────────────────────────────────────────────────────────────────────────
    Shared scaffolding for the design-system reference pages (Brand,
    Foundations, Components, Page patterns, Kitchen sink, Operator
-   components). Every reference page renders under the v5 skin so the
+   components). Every reference page renders under the v1 skin so the
    documentation looks like the thing it documents.
 
    DocPage   skin wrapper · header strip (eyebrow + intro) · content · TOC
@@ -18,7 +18,7 @@ import { cn } from '@/lib/utils'
 
 export function DocPage({ eyebrow, intro, toc, children }: { eyebrow: string; intro: ReactNode; toc: readonly (readonly [string, string])[]; children: ReactNode }) {
   return (
-    <div className="operator ink v4 v5 -m-4 sm:-m-6 lg:-m-8">
+    <div className="operator ink v1 -m-4 sm:-m-6 lg:-m-8">
       <div className="border-b px-4 py-3 text-xs sm:px-6">
         <p className="op-label">{eyebrow}</p>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">{intro}</p>

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test } from '@playwright/test'
-import { STANDALONE_ROUTES, V5_VIEWS_WITH_FLAGS, formatNotes, ready, v5, watchConsole } from './helpers'
+import { STANDALONE_ROUTES, V1_VIEWS_WITH_FLAGS, formatNotes, ready, v1, watchConsole } from './helpers'
 
 /**
  * Two things every route owes the reader, at every width the system claims to
@@ -20,7 +20,7 @@ import { STANDALONE_ROUTES, V5_VIEWS_WITH_FLAGS, formatNotes, ready, v5, watchCo
 type Route = { path: string; label: string }
 
 const ROUTES: Route[] = [
-  ...V5_VIEWS_WITH_FLAGS.map(({ view, extra, label }) => ({ path: v5(view, extra), label: `/v5?p=${label}` })),
+  ...V1_VIEWS_WITH_FLAGS.map(({ view, extra, label }) => ({ path: v1(view, extra), label: `/v1?p=${label}` })),
   ...STANDALONE_ROUTES,
 ]
 

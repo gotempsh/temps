@@ -3,7 +3,7 @@
 
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test } from '@playwright/test'
-import { ready, setTheme, v5 } from './helpers'
+import { ready, setTheme, v1 } from './helpers'
 
 /**
  * axe-core over the surfaces the handoff points people at, in both themes.
@@ -37,14 +37,14 @@ const PAGES: ReadonlyArray<{ label: string; path: string }> = [
   { label: '/op-components', path: '/op-components' },
   { label: '/guide', path: '/guide' },
   { label: '/guide#taste', path: '/guide#taste' },
-  { label: '/v5?p=projects', path: v5('projects') },
-  { label: '/v5?p=api-gateway', path: v5('api-gateway') },
-  { label: '/v5?p=deploy:dep_91a', path: v5('deploy:dep_91a') },
-  { label: '/v5?p=db:acme-pg', path: v5('db:acme-pg') },
-  { label: '/v5?p=errors', path: v5('errors') },
-  { label: '/v5?p=issue:i_4821', path: v5('issue:i_4821') },
-  { label: '/v5?p=settings', path: v5('settings') },
-  { label: '/v5?p=settings:cluster', path: v5('settings:cluster') },
+  { label: '/v1?p=projects', path: v1('projects') },
+  { label: '/v1?p=api-gateway', path: v1('api-gateway') },
+  { label: '/v1?p=deploy:dep_91a', path: v1('deploy:dep_91a') },
+  { label: '/v1?p=db:acme-pg', path: v1('db:acme-pg') },
+  { label: '/v1?p=errors', path: v1('errors') },
+  { label: '/v1?p=issue:i_4821', path: v1('issue:i_4821') },
+  { label: '/v1?p=settings', path: v1('settings') },
+  { label: '/v1?p=settings:cluster', path: v1('settings:cluster') },
   { label: '/status?project=acme-storefront', path: '/status?project=acme-storefront' },
 ]
 

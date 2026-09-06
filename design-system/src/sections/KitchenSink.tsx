@@ -16,14 +16,14 @@ import {
   Segmented, Settings, Status, StatusLine, TimeChart,
   type LedgerRow, type PickerOption, type State, type TimePoint,
 } from '@/components/op'
-import { ConsoleV5 } from '@/sections/ConsoleV5'
+import { ConsoleV1 } from '@/sections/ConsoleV1'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /kitchen-sink — the v5 stress test. Every other reference page shows the
+   /kitchen-sink — the v1 stress test. Every other reference page shows the
    system working; this one exists to break it on purpose: the real console
    squeezed into five widths, rows whose content is far past what a designer
    drew for, a status line past the character budget, 288 chart points, a
-   form in a 360px box, and a greyed gallery of the old look that v5
+   form in a 360px box, and a greyed gallery of the old look that v1
    replaces. Nothing here is a pattern to copy except the failures it names.
    ──────────────────────────────────────────────────────────────────────── */
 
@@ -74,7 +74,7 @@ function ConsoleFrame() {
       <div className="op-scroll-x min-w-0 overflow-x-auto border">
         <div style={{ width: width === 'full' ? '100%' : `${width}px` }} className="h-[640px] overflow-y-auto">
           <div className="flex min-h-full w-full">
-            <ConsoleV5 view={view} go={setView} />
+            <ConsoleV1 view={view} go={setView} />
           </div>
         </div>
       </div>
@@ -327,7 +327,7 @@ export function KitchenSinkPage() {
         <>
           The stress test. Everything on this page is deliberately past what the components were drawn for: a 90-character
           project name, a 200-character deploy message, 288 chart points, six deploy markers inside forty minutes, a form in a
-          360px box, and the real console from <Link to="/v5" className="underline underline-offset-4">/v5</Link> squeezed into five widths.
+          360px box, and the real console from <Link to="/v1" className="underline underline-offset-4">/v1</Link> squeezed into five widths.
           What holds is the system; what breaks is written down next to it. The greyed gallery at the bottom is the only place
           the old look (cards, badges, pill tabs, spinners) is allowed to appear.
         </>
@@ -339,20 +339,20 @@ export function KitchenSinkPage() {
         title="The console at every width"
         rule={
           <>
-            <p>The whole v5 shell, embedded exactly as the landing page embeds it. Pick a width and drive it: navigate, open the palette with <Kbd keys={['⌘', 'K']} />, toggle density with <Kbd keys="d" />.</p>
+            <p>The whole v1 shell, embedded exactly as the landing page embeds it. Pick a width and drive it: navigate, open the palette with <Kbd keys={['⌘', 'K']} />, toggle density with <Kbd keys="d" />.</p>
             <p>The frame scrolls horizontally, so a 1280 preset on a phone is a scrollable strip rather than a page that overflows.</p>
           </>
         }
-        api={`<ConsoleV5 view={view} go={setView} />
+        api={`<ConsoleV1 view={view} go={setView} />
 // density is remembered in localStorage:
-//   temps.ds.v5.density = 'dense' | 'comfortable'`}
+//   temps.ds.v1.density = 'dense' | 'comfortable'`}
       >
         <Demo label="resizable frame · 640px tall, scrolls in both axes" className="px-0 sm:px-0">
           <ConsoleFrame />
         </Demo>
-        <Rule state="ok">The console remembers density in <span className="font-mono">localStorage</span> under <span className="font-mono">temps.ds.v5.density</span>. Toggling it here changes it for <span className="font-mono">/v5</span> too, and it survives a reload.</Rule>
+        <Rule state="ok">The console remembers density in <span className="font-mono">localStorage</span> under <span className="font-mono">temps.ds.v1.density</span>. Toggling it here changes it for <span className="font-mono">/v1</span> too, and it survives a reload.</Rule>
         <Rule state="error">
-          The width presets change the console's available width, not the viewport. v5's responsive rules are media queries
+          The width presets change the console's available width, not the viewport. v1's responsive rules are media queries
           (<span className="font-mono">lg:</span> sidebar, <span className="font-mono">md:</span> ledger columns), so the 390 preset still renders the desktop layout
           inside a 390px box. To see the phone layout, narrow the browser window itself. Container queries would fix this; only <span className="font-mono">Field</span> uses them today.
         </Rule>
@@ -518,14 +518,14 @@ grid="minmax(0,1.6fr) 180px 120px minmax(0,2fr)"`}
           </>
         }
         api={`<div className="dark">
-  <div className="operator ink v4 v5 bg-background text-foreground">…</div>
+  <div className="operator ink v1 bg-background text-foreground">…</div>
 </div>`}
       >
         <Demo label="light · dark" className="px-0 sm:px-0">
           <div className="grid min-w-0 gap-4 lg:grid-cols-2">
             <div className="min-w-0 border p-3"><p className="op-label mb-3">light</p><MiniLedger dense={false} /></div>
             <div className="dark min-w-0">
-              <div className="operator ink v4 v5 min-w-0 border bg-background p-3 text-foreground">
+              <div className="operator ink v1 min-w-0 border bg-background p-3 text-foreground">
                 <p className="op-label mb-3">dark</p>
                 <MiniLedger dense={false} />
               </div>
@@ -534,7 +534,7 @@ grid="minmax(0,1.6fr) 180px 120px minmax(0,2fr)"`}
         </Demo>
         <Demo label="the five glyph colours on dark" className="px-0 sm:px-0">
           <div className="dark min-w-0">
-            <div className="operator ink v4 v5 flex flex-wrap gap-x-6 gap-y-2 border bg-background p-4 text-sm text-foreground">
+            <div className="operator ink v1 flex flex-wrap gap-x-6 gap-y-2 border bg-background p-4 text-sm text-foreground">
               {STATES.map((s) => <Status key={s} state={s} label={s} />)}
             </div>
           </div>
@@ -551,20 +551,20 @@ grid="minmax(0,1.6fr) 180px 120px minmax(0,2fr)"`}
         title="Dense vs comfortable"
         rule={
           <>
-            <p>Density is one attribute on the shell: <span className="font-mono">data-density</span> on the element that also carries <span className="font-mono">operator ink v4</span>. It moves <span className="font-mono">--row-h</span> and <span className="font-mono">--cell-px</span>, nothing else.</p>
+            <p>Density is one attribute on the shell: <span className="font-mono">data-density</span> on the element that also carries <span className="font-mono">operator ink v1</span>. It moves <span className="font-mono">--row-h</span> and <span className="font-mono">--cell-px</span>, nothing else.</p>
             <p>The same four rows, twice. The row height below is measured off the live box, not written down.</p>
           </>
         }
-        api={`<div data-density="dense" className="operator ink v4 v5">
+        api={`<div data-density="dense" className="operator ink v1">
   --row-h: 1.75rem   (comfortable: 2.25rem)`}
       >
         <Demo label="comfortable · dense" className="px-0 sm:px-0">
           <div className="grid min-w-0 gap-4 lg:grid-cols-2">
-            <div data-density="comfortable" className="operator ink v4 v5 min-w-0 border p-3">
+            <div data-density="comfortable" className="operator ink v1 min-w-0 border p-3">
               <p className="mb-3 flex flex-wrap items-baseline gap-2"><span className="op-label">comfortable</span><RowHeight /></p>
               <MiniLedger dense={false} />
             </div>
-            <div data-density="dense" className="operator ink v4 v5 min-w-0 border p-3">
+            <div data-density="dense" className="operator ink v1 min-w-0 border p-3">
               <p className="mb-3 flex flex-wrap items-baseline gap-2"><span className="op-label">dense</span><RowHeight /></p>
               <MiniLedger dense />
             </div>
@@ -663,7 +663,7 @@ grid="minmax(0,1.6fr) 180px 120px minmax(0,2fr)"`}
         title="Banned gallery"
         rule={
           <>
-            <p>The old look, once, small and greyed. Each item names what replaces it. These are the only imports from <span className="font-mono">@/components/ui</span> on this page that v5 forbids in new work.</p>
+            <p>The old look, once, small and greyed. Each item names what replaces it. These are the only imports from <span className="font-mono">@/components/ui</span> on this page that v1 forbids in new work.</p>
             <p>If you find yourself reaching for one of these, the replacement is in <span className="font-mono">src/components/op</span>.</p>
           </>
         }

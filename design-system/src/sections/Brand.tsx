@@ -11,7 +11,7 @@ import { ArrowUp, Pencil, RotateCcw, Terminal, X } from 'lucide-react'
 
 /* ────────────────────────────────────────────────────────────────────────
    /brand — who Temps is, before any token. This page states the decided
-   system (v5: paper + ink), not a survey of options. Everything here is
+   system (v1: paper + ink), not a survey of options. Everything here is
    fixed in docs/brand-guidelines.md and docs/design-system-handoff.md §3–§5;
    a rule changes by editing the doc and this page in the same PR.
    ──────────────────────────────────────────────────────────────────────── */
@@ -110,7 +110,7 @@ const DECISIONS = [
   },
   {
     k: 'radius 0.25rem',
-    v: 'Frozen in .operator.ink.v5. The live console is 0.5rem today.',
+    v: 'Frozen in .operator.ink.v1. The live console is 0.5rem today.',
     why: 'At 0.5rem a dense 28px row reads as a stack of pills. At 0.25rem the control still looks intentional but the grid reads as a grid. This is the change that touches every control, so it is frozen here and tested on the settings pages before it lands in the console.',
   },
   {
@@ -365,8 +365,8 @@ export function BrandPage() {
             </p>
           </>
         }
-        api={`root  class="operator ink v4 v5"        console: no accent
-root  class="operator ink v4 v5"        landing: data-accent="signal"
+        api={`root  class="operator ink v1"        console: no accent
+root  class="operator ink v1"        landing: data-accent="signal"
       data-density="dense"              optional, remembered
 --radius            0.25rem
 --primary           ink · landing signal oklch(0.64 0.21 32)
@@ -529,7 +529,7 @@ transition-duration 100ms`}
         </Demo>
 
         <Demo label="the landing accent — once, on the primary CTA">
-          <div className="operator ink v4 v5 flex flex-wrap items-center gap-3 border p-4" data-accent="signal">
+          <div className="operator ink v1 flex flex-wrap items-center gap-3 border p-4" data-accent="signal">
             <Button className="op-primary h-10 text-sm">Download for macOS</Button>
             <span className="text-xs text-muted-foreground">
               signal · oklch(0.64 0.21 32) on <code className="font-mono">--primary</code>, landing only

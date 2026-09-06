@@ -2,6 +2,11 @@
 
 ## 0.1.2
 
+- The skin class is now `operator ink v1`, the first published version of the
+  system. The unreleased `.v4` and `.v5` classes are gone; their rules are
+  consolidated unchanged into `.operator.ink.v1`, so a root that used to carry
+  `operator ink v4 v5` carries `operator ink v1` and renders identically.
+
 - `GeoMap` reads the hovered country at the pointer on a fine pointer and no
   longer renders a readout row under the map on desktop. Below md the row
   under the map stays and becomes the touch reader: tap a country to read it,

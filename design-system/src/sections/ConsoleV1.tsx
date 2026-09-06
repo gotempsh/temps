@@ -60,25 +60,25 @@ import {
   ChartFooter, Detail, EchoDialog, Field, Kbd, Ledger, Lede, Metric, MetricGrid, MOD, Num, PageState, PageTitle, Section, ShellSlotsProvider, Drop, AttentionHost, ProjectMark, Phrase, Picker, type PickerOption, RangePicker,
   Segmented, Settings, STATE_RANK, Status, StatusLine, TimeChart, type LedgerRow, type Range, type State,
 } from '@/components/op'
-import { DeploysTab, EnvironmentsTab, VariablesTab } from '@/sections/ConsoleV5Env'
-import { DeploymentScreen } from '@/sections/ConsoleV5Deploy'
-import { NodeScreen } from '@/sections/ConsoleV5Nodes'
-import { MetricsScreen, SandboxScreen, SandboxesScreen, TraceScreen, TracesScreen } from '@/sections/ConsoleV5Observe'
-import { EmailDetailScreen, EmailDomainScreen, EmailScreen } from './ConsoleV5Email'
-import { DatabaseScreen } from './ConsoleV5Database'
-import { ErrorsScreen, IssueScreen } from './ConsoleV5Errors'
-import { ProxyScreen } from './ConsoleV5Proxy'
-import { SettingsHub, SettingsPage } from './ConsoleV5Settings'
+import { DeploysTab, EnvironmentsTab, VariablesTab } from '@/sections/ConsoleV1Env'
+import { DeploymentScreen } from '@/sections/ConsoleV1Deploy'
+import { NodeScreen } from '@/sections/ConsoleV1Nodes'
+import { MetricsScreen, SandboxScreen, SandboxesScreen, TraceScreen, TracesScreen } from '@/sections/ConsoleV1Observe'
+import { EmailDetailScreen, EmailDomainScreen, EmailScreen } from './ConsoleV1Email'
+import { DatabaseScreen } from './ConsoleV1Database'
+import { ErrorsScreen, IssueScreen } from './ConsoleV1Errors'
+import { ProxyScreen } from './ConsoleV1Proxy'
+import { SettingsHub, SettingsPage } from './ConsoleV1Settings'
 import { useFresh } from './console-fresh'
 import { PROJECT_ICONS as ICONS } from './console-projects'
-import { AnalyticsScreen, EventScreen, MonitorScreen, UptimeScreen } from './ConsoleV5Analytics'
-import { BackupsScreen, GitProvidersScreen, GitProviderScreen, SecurityScreen, ScanScreen } from './ConsoleV5Admin'
+import { AnalyticsScreen, EventScreen, MonitorScreen, UptimeScreen } from './ConsoleV1Analytics'
+import { BackupsScreen, GitProvidersScreen, GitProviderScreen, SecurityScreen, ScanScreen } from './ConsoleV1Admin'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /v5 — the twelve answers, as code.
+   /v1 — the twelve answers, as code.
 
-   What is new versus v4 is structural, not visual:
+   What the system settles is structural, not visual:
    · Three page templates (Ledger, Detail, Settings). Every screen is one
      of them. No screen starts from a blank div.
    · One PageState component with four states: loading, empty,
@@ -96,7 +96,7 @@ import { cn } from '@/lib/utils'
      behave on self-hosted, Starter, Team and Business.
    ──────────────────────────────────────────────────────────────────────── */
 
-const SKIN = 'operator ink v5'
+const SKIN = 'operator ink v1'
 
 function seeded(seed: number) {
   let s = seed
@@ -653,9 +653,9 @@ function ObserveRoutes({ view, go, dense }: { view: string; go: (v: string) => v
   return null
 }
 
-const DENSITY_KEY = 'temps.ds.v5.density'
+const DENSITY_KEY = 'temps.ds.v1.density'
 
-export function ConsoleV5({ view, go, fullHref, full }: { view: string; go: (v: string) => void; /** Where the ⤢ button goes: the chrome-free route (or back to the sandbox page when already full). */ fullHref?: string; full?: boolean }) {
+export function ConsoleV1({ view, go, fullHref, full }: { view: string; go: (v: string) => void; /** Where the ⤢ button goes: the chrome-free route (or back to the sandbox page when already full). */ fullHref?: string; full?: boolean }) {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const [notesOpen, setNotesOpen] = useState(false)
@@ -774,7 +774,7 @@ export function ConsoleV5({ view, go, fullHref, full }: { view: string; go: (v: 
   )
 }
 
-export function ConsoleV5Page({ full = false }: { /** Render without the sandbox's layout and intro: the console as it would ship. Route `/console`. */ full?: boolean }) {
+export function ConsoleV1Page({ full = false }: { /** Render without the sandbox's layout and intro: the console as it would ship. Route `/console`. */ full?: boolean }) {
   const [params, setParams] = useSearchParams()
   const view = params.get('p') ?? 'projects'
   const go = useCallback((v: string) => {
@@ -784,16 +784,16 @@ export function ConsoleV5Page({ full = false }: { /** Render without the sandbox
     setParams(p)
   }, [params, setParams])
   const search = params.toString() ? `?${params.toString()}` : ''
-  const fullHref = (full ? '/v5' : '/console') + search
+  const fullHref = (full ? '/v1' : '/console') + search
   return (
-    <div className={cn('operator ink v4 v5 flex flex-col', full ? 'min-h-screen' : '-m-4 min-h-[calc(100vh-4.5rem)] sm:-m-6 lg:-m-8')}>
+    <div className={cn('operator ink v1 flex flex-col', full ? 'min-h-screen' : '-m-4 min-h-[calc(100vh-4.5rem)] sm:-m-6 lg:-m-8')}>
       {!full && <div className="border-b px-4 py-3 text-xs sm:px-6">
-        <p className="op-label">operator console · v5 · the twelve answers as code</p>
+        <p className="op-label">operator console · v1 · the twelve answers as code</p>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">
           Every screen is one of three templates: ledger (<a href="?p=projects" className="underline underline-offset-4">projects</a>, <a href="?p=databases" className="underline underline-offset-4">databases</a>, <a href="?p=errors" className="underline underline-offset-4">errors</a>), detail (<a href="?p=api-gateway" className="underline underline-offset-4">api-gateway</a>, with deploys + promote, environments, and per-environment variables as tabs 2–4), settings (tab 6 there, <Kbd keys={['⌘', 'S']} /> saves). One <span className="font-mono">PageState</span> with four states: loading, empty, unconfigured (<a href="?p=analytics" className="underline underline-offset-4">analytics</a>, <a href="?p=acme-web" className="underline underline-offset-4">acme-web</a>), error (<a href="?p=errors" className="underline underline-offset-4">errors</a>, with retry). A fifth status, <span className="font-mono">◌ sampled</span>, from the pricing promise. Retention horizon on every axis. Metric tiles must name their baseline. Sandboxes (<a href="?p=sandboxes" className="underline underline-offset-4">list</a>, <a href="?p=sandbox:sbx_7f21" className="underline underline-offset-4">detail</a>, <a href="?p=sandbox:sbx_e77b" className="underline underline-offset-4">failed</a>), <a href="?p=traces" className="underline underline-offset-4">traces</a> with operations, a <a href="?p=trace:3f9c1e7a8b2d4f60" className="underline underline-offset-4">trace waterfall</a>, and the <a href="?p=metrics" className="underline underline-offset-4">metrics explorer</a>. Backups (<a href="?p=backups" className="underline underline-offset-4">schedules, jobs, sources</a>), <a href="?p=git" className="underline underline-offset-4">git providers</a> with an expired installation, and <a href="?p=security" className="underline underline-offset-4">security</a> (scans, headers, access). Switch the plan in the header to see the same screens on self-hosted, Starter, Team and Business. No accent, radius frozen, density remembered.
         </p>
       </div>}
-      <ConsoleV5 view={view} go={go} fullHref={fullHref} full={full} />
+      <ConsoleV1 view={view} go={go} fullHref={fullHref} full={full} />
     </div>
   )
 }

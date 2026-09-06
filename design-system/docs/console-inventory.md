@@ -16,7 +16,7 @@ Libraries actually in use: `recharts` 3.10 (only charting lib, wrapped by
 `shiki`/`highlight.js` (code), `ghostty-web`/`xterm` (terminals),
 `@tanstack/react-virtual`. `@nivo/line` and `cobe` are installed but unused.
 
-## Coverage against the sandbox (`/v5`)
+## Coverage against the sandbox (`/v1`)
 
 | Area | In web | In sandbox | Gap |
 |---|---|---|---|
@@ -36,7 +36,7 @@ Libraries actually in use: `recharts` 3.10 (only charting lib, wrapped by
 
 Status 2026-09-06: items 1–7 and 9–11 (except the anomaly band chart) are
 built in `src/components/op/viz.tsx` and shown on `/op-components`; the
-analytics, uptime, metrics and deploys screens on `/v5` use them. Geo is
+analytics, uptime, metrics and deploys screens on `/v1` use them. Geo is
 built as `GeoMap` (choropleth by state, second view of the list). Open:
 anomaly band chart, replay player, data browser,
 role matrix, retention sliders, DNS challenge block, insight strip.

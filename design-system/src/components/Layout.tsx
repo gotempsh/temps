@@ -31,8 +31,8 @@ const NAV = [
   { to: '/op-components', label: 'Operator components', icon: Blocks },
   { to: '/patterns', label: 'Page patterns', icon: LayoutTemplate },
   { to: '/kitchen-sink', label: 'Kitchen sink', icon: Layers },
-  { to: '/v5', label: 'Operator console v5', icon: Layers2 },
-  { to: '/v5-landing', label: 'Landing (v5)', icon: Megaphone },
+  { to: '/v1', label: 'Operator console v1', icon: Layers2 },
+  { to: '/v1-landing', label: 'Landing (v1)', icon: Megaphone },
   { to: '/status-page', label: 'Status page (public)', icon: Megaphone },
   { to: '/agent', label: 'Agent conversation', icon: Terminal },
 ]
