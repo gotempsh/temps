@@ -282,7 +282,20 @@ async fn sweep(
                     Some(&reason),
                 )
                 .await?;
-                retry_required = true;
+                // Deliberately does NOT set `retry_required`. `Unsupported`
+                // means this specific backup already has its own long
+                // `retry_after` window from `mirror_retry_delay`, so it is
+                // excluded from `DUE_BACKUPS_SQL` on its own — it needs no
+                // help from the outer loop. Treating it the same as
+                // `StageError::Retry` here doubled the backoff: one
+                // permanently-unsupported backup (e.g. an empty RustFS
+                // mirror, or an old WAL-G repository missing the
+                // `temps_backup_id` tag) would ratchet the *whole* sweep's
+                // cadence up to `MAX_SWEEP_INTERVAL` and hold it there
+                // indefinitely, delaying discovery of every other backup on
+                // the instance — including brand new, healthy ones — by up
+                // to 15 minutes each tick, with no way to recover short of
+                // clearing the offending backup.
             }
             Err(StageError::Retry(error)) => {
                 warn!(backup_id = %backup.backup_id, error = %error, "Cloud backup mirror unavailable; will retry without affecting the local backup");
@@ -593,6 +606,21 @@ async fn mirror_backup(
     };
     let service = resources.service(external.service_id)?;
     match service.service_type.to_ascii_lowercase().as_str() {
+        // Postgres/Timescale falls back from `postgres_walg` to `postgres_pgdump`
+        // whenever the container doesn't have wal-g in it (`container_has_walg`
+        // in temps-backup's engine dispatch, e.g. a custom image supplied via
+        // `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES`). A pg_dump-produced backup has
+        // no WAL-G sentinel and never will, so routing it into
+        // `mirror_walg_backup` doesn't just fail once — it retries forever
+        // against a gate it can structurally never satisfy. `backups.metadata`
+        // records which engine actually ran (set at row-creation time in
+        // temps-backup's `services/backup.rs`), so check that before committing
+        // to a mirror path.
+        "postgres" | "postgresql" | "timescale" | "timescaledb"
+            if backup_engine_key(&backup.metadata).as_deref() == Some("postgres_pgdump") =>
+        {
+            mirror_native_backup(link, resources, backup, &external, &service, instance_id).await
+        }
         "postgres" | "postgresql" | "timescale" | "timescaledb" => {
             mirror_walg_backup(link, resources, backup, Some(external), instance_id).await
         }
@@ -603,6 +631,19 @@ async fn mirror_backup(
             "Cloud backup mirroring does not support engine {engine}"
         ))),
     }
+}
+
+/// The engine key `temps-backup` recorded on `backups.metadata` when it
+/// created this row (`{"engine": "postgres_walg" | "postgres_pgdump" | ...}`).
+/// Malformed or pre-dispatch-key legacy metadata yields `None`, which callers
+/// treat as "assume WAL-G" — the only engine that existed before Postgres
+/// backups could fall back to pg_dump.
+fn backup_engine_key(metadata: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()?
+        .get("engine")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn supports_native_mirror(service_type: &str) -> bool {
@@ -770,6 +811,54 @@ async fn mirror_native_backup(
                 },
             )
         }
+        "postgres" | "postgresql" | "timescale" | "timescaledb" => {
+            // pg_dump writes exactly two objects, siblings under one date/uuid
+            // directory: the dump itself (`location_key`, already the exact
+            // object key `postgres_pgdump.rs` uploaded via
+            // `build_external_service_s3_key`) and a `metadata.json` sidecar
+            // next to it (`v2_common::derive_metadata_key`: same parent,
+            // filename replaced). Unlike the RustFS arm below, the sidecar is
+            // included and declared with `Metadata` kind (auto-detected by the
+            // `.../metadata.json` suffix check further down) — pg_dump's
+            // restore needs it, the same way MariaDB's physical snapshot needs
+            // its own metadata sidecar for binlog position.
+            let root = location_key
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .ok_or_else(|| {
+                    StageError::Unsupported(format!(
+                        "pg_dump snapshot location {location_key} has no parent directory"
+                    ))
+                })?;
+            let metadata_key = format!("{root}/metadata.json");
+            let all = resources
+                .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+                .await?;
+            let selected = all
+                .iter()
+                .filter(|object| object.key == location_key || object.key == metadata_key)
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.len() < 2 || !selected.iter().any(|object| object.key == metadata_key) {
+                return Err(StageError::Retry(format!(
+                    "pg_dump snapshot {location_key} is incomplete or lacks {metadata_key}"
+                )));
+            }
+            let engine = match service_type.as_str() {
+                "postgres" | "postgresql" => BackupEngine::Postgres,
+                _ => BackupEngine::TimescaleDb,
+            };
+            (
+                root,
+                selected,
+                engine,
+                BackupFormat::PgDumpPlain,
+                BackupCompression::Gzip,
+                NativeSnapshotIdentity::ObjectSet {
+                    snapshot_name: backup.backup_id.clone(),
+                },
+            )
+        }
         "rustfs" | "s3" | "minio" | "blob" => {
             let root = location_key.trim_end_matches('/').to_string();
             let selected = resources
@@ -780,8 +869,18 @@ async fn mirror_native_backup(
                 .cloned()
                 .collect::<Vec<_>>();
             if selected.is_empty() {
-                return Err(StageError::Retry(format!(
-                    "RustFS snapshot {root} has no objects"
+                // Not transient: `root` is this specific backup's frozen,
+                // backup_id-keyed destination prefix — the `mc mirror` run
+                // that wrote (or didn't write) to it already finished, and
+                // nothing will ever appear under this exact prefix later.
+                // A source that was empty when the backup ran produces a
+                // permanently empty manifest, not a manifest that will
+                // eventually show up. `StageError::Retry` here meant this
+                // condition — which can never resolve — retried forever at
+                // the sweep's maximum interval, never declaring anything to
+                // Cloud and never freeing the backup from the retry queue.
+                return Err(StageError::Unsupported(format!(
+                    "RustFS snapshot {root} has no objects; the source was empty when this backup ran, so it can never be mirrored to Cloud"
                 )));
             }
             (
@@ -1964,13 +2063,13 @@ fn deferred_legacy_state(metadata: &str, tenant_id: Uuid) -> Option<LegacyMirror
 #[cfg(test)]
 mod tests {
     use super::{
-        append_source_object, contains_backup_identity, deferred_legacy_state,
+        append_source_object, backup_engine_key, contains_backup_identity, deferred_legacy_state,
         ensure_json_object_size, image_tag_version, manifest_digest, merge_mirror_state,
-        next_sweep_interval, parse_postgres_major, run, s3_key, select_due_backups, sentinel_lsn,
-        supports_native_mirror, sweep, timeline_from_backup_name, upload_native_object,
-        wal_segment_name, wal_segment_of, walg_root_key, SourceObject, StageError, SweepOutcome,
-        BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL, DUE_BACKUPS_SQL, MAX_SWEEP_INTERVAL,
-        MIRROR_STATE_VERSION,
+        mirror_backup, next_sweep_interval, parse_postgres_major, run, s3_key, select_due_backups,
+        sentinel_lsn, supports_native_mirror, sweep, timeline_from_backup_name,
+        upload_native_object, wal_segment_name, wal_segment_of, walg_root_key, SourceObject,
+        StageError, SweepOutcome, BASE_SWEEP_INTERVAL, DISCOVER_BACKUPS_SQL, DUE_BACKUPS_SQL,
+        MAX_SWEEP_INTERVAL, MIRROR_STATE_VERSION,
     };
     use std::{
         collections::HashMap,
@@ -2080,6 +2179,8 @@ mod tests {
             is_default: Set(false),
             // Only Cloud-managed sources are mirror candidates.
             managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -2229,6 +2330,8 @@ mod tests {
                 force_path_style: Set(Some(true)),
                 is_default: Set(false),
                 managed_by_cloud: Set(managed_by_cloud),
+                lifecycle_reconcile_failed_at: Set(None),
+                lifecycle_reconcile_generation: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
             };
@@ -2638,6 +2741,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: now,
             updated_at: now,
         };
@@ -2811,6 +2916,8 @@ mod tests {
             // Cloud's bucket without the operator choosing a destination.
             is_default: Set(true),
             managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -2954,6 +3061,202 @@ mod tests {
             .await
             .expect("mirror loop stops promptly on cancellation, not at the next tick")
             .expect("mirror loop does not panic");
+    }
+
+    #[test]
+    fn backup_engine_key_reads_the_dispatch_resolved_engine() {
+        assert_eq!(
+            backup_engine_key(r#"{"engine":"postgres_pgdump","other":1}"#).as_deref(),
+            Some("postgres_pgdump")
+        );
+        assert_eq!(
+            backup_engine_key(r#"{"engine":"postgres_walg"}"#).as_deref(),
+            Some("postgres_walg")
+        );
+        assert_eq!(backup_engine_key("{}"), None, "no engine key recorded");
+        assert_eq!(backup_engine_key("not json"), None, "malformed metadata");
+        assert_eq!(
+            backup_engine_key(r#"{"engine":42}"#),
+            None,
+            "non-string engine value"
+        );
+    }
+
+    /// A Postgres backup whose `backups.metadata.engine` reads
+    /// `"postgres_pgdump"` — the container had no wal-g in it, so
+    /// `temps-backup`'s dispatch fell back from `postgres_walg` at backup
+    /// time (`crates/temps-backup/src/engines/dispatch.rs`). Its S3 location
+    /// is therefore never a WAL-G repository and it never carries a
+    /// `_backup_stop_sentinel.json`.
+    ///
+    /// `mirror_backup` must recognize the recorded engine and route into
+    /// `mirror_native_backup` instead of `mirror_walg_backup`. Routed
+    /// correctly, dispatch reaches `mirror_native_backup`'s own S3 listing
+    /// call, which fails against the closed loopback source with a
+    /// *transient* `StageError::Retry` (connection refused). Routed
+    /// incorrectly — the bug this regression test guards against —
+    /// `mirror_walg_backup` rejects the location synchronously, with no I/O
+    /// at all, as a *permanent* `StageError::Unsupported("... is not a WAL-G
+    /// repository ...")`. The two failure shapes are distinguishable without
+    /// a working S3 backend, so this test needs no stub server.
+    #[tokio::test]
+    async fn postgres_backups_recorded_as_pgdump_route_to_native_mirror_not_walg() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+            schema.create_table_from_entity(temps_entities::external_service_backups::Entity),
+            schema.create_table_from_entity(temps_entities::external_services::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite fixture table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated foreign keys");
+
+        let encryption = temps_core::EncryptionService::new_from_password("pgdump-dispatch-test");
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("Temps Cloud managed backups".to_owned()),
+            bucket_name: Set("managed-bucket".to_owned()),
+            region: Set("test-1".to_owned()),
+            // A closed loopback port: any S3 call this test reaches fails
+            // fast with connection-refused instead of hanging or reaching
+            // real AWS, per the convention documented on `linked_link_fixture`.
+            endpoint: Set(Some("http://127.0.0.1:1".to_owned())),
+            bucket_path: Set(String::new()),
+            access_key_id: Set(encryption
+                .encrypt_string("test-access-key")
+                .expect("encrypt fixture access key")),
+            secret_key: Set(encryption
+                .encrypt_string("test-secret-key")
+                .expect("encrypt fixture secret key")),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("S3 source inserts");
+        temps_entities::external_services::Model {
+            id: 1,
+            name: "postgres".to_owned(),
+            service_type: "postgres".to_owned(),
+            version: Some("17".to_owned()),
+            status: "running".to_owned(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_owned(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service inserts");
+        let backup_uuid = Uuid::new_v4().to_string();
+        let s3_location = format!(
+            "s3://managed-bucket/external_services/postgres/postgres/2026/09/04/{backup_uuid}/dump.sql.gz"
+        );
+        temps_entities::external_service_backups::Model {
+            id: 1,
+            service_id: 1,
+            backup_id: 1,
+            backup_type: "full".to_owned(),
+            state: "completed".to_owned(),
+            started_at: now,
+            finished_at: Some(now),
+            size_bytes: Some(1),
+            s3_location: s3_location.clone(),
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "gzip".to_owned(),
+            created_by: 1,
+            expires_at: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service backup inserts");
+        let backup = temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("pgdump-fallback-backup".to_owned()),
+            backup_id: Set(backup_uuid),
+            schedule_id: Set(None),
+            backup_type: Set("full".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1)),
+            file_count: Set(Some(1)),
+            s3_source_id: Set(1),
+            s3_location: Set(s3_location),
+            error_message: Set(None),
+            metadata: Set(serde_json::json!({"engine": "postgres_pgdump"}).to_string()),
+            checksum: Set(None),
+            compression_type: Set("gzip".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("pg_dump-fallback backup inserts");
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        let instance_id = link.instance_id().expect("linked instance id");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("closed loopback source can never actually mirror in this test");
+        match error {
+            // `mirror_native_backup` reached its own repository-listing S3
+            // call and failed there (connection refused). The shared listing
+            // helper's error text says "WAL-G repository" regardless of which
+            // engine called it (RustFS and MariaDB hit the same string) — it
+            // is not evidence of taking the WAL-G *path*, only of the
+            // listing helper's generic naming, so this is exactly the
+            // "correctly routed, failed on unreachable S3" outcome under test.
+            StageError::Retry(_) => {}
+            StageError::Unsupported(reason) => panic!(
+                "pg_dump-tagged backup was rejected instead of routed to native mirroring \
+                 (this is the exact bug under test — dispatch fell through to WAL-G's synchronous \
+                 \"not a WAL-G repository\" check, which runs before any I/O and can only produce \
+                 Unsupported, never Retry): {reason}"
+            ),
+        }
     }
 
     #[test]
@@ -3688,5 +3991,217 @@ mod tests {
         assert_eq!(state.upload_attempts.load(Ordering::SeqCst), 2);
         assert!(state.upload_committed.load(Ordering::SeqCst));
         assert_eq!(state.completion_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Empty `ListBucketResult` — the response a real S3-compatible provider
+    /// returns for a prefix with no objects under it, e.g. an `mc mirror` run
+    /// whose source bucket was empty at backup time.
+    async fn empty_list_objects_stub() -> impl axum::response::IntoResponse {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/xml")],
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>source-bucket</Name>
+    <Prefix></Prefix>
+    <KeyCount>0</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+</ListBucketResult>"#,
+        )
+    }
+
+    /// Regression covering both halves of the empty-manifest fix:
+    ///
+    /// 1. A native-mirror snapshot that lists zero objects (the source was
+    ///    empty when `mc mirror`/the engine ran) is classified `unsupported`,
+    ///    not `transient` — this condition is permanent for this specific,
+    ///    already-finished backup, so it must never be reported as something
+    ///    that might resolve on a later attempt.
+    /// 2. `sweep` must not fold that permanent classification into the
+    ///    sweep-wide retry signal. Before the fix, one such backup pushed
+    ///    every future sweep's cadence to `MAX_SWEEP_INTERVAL` forever (see
+    ///    `next_sweep_interval`'s `Retry` arm) — starving discovery of every
+    ///    *other*, healthy backup on the instance of prompt reporting to
+    ///    Cloud, not just this one. `sweep` returning anything other than
+    ///    `SweepOutcome::Retry` here is the regression assertion for that.
+    #[tokio::test]
+    async fn empty_native_mirror_snapshot_is_permanent_not_transient_and_does_not_stall_the_sweep()
+    {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping empty-manifest sweep test");
+                return;
+            }
+            Err(error) => panic!("bind empty-manifest stub: {error}"),
+        };
+        let address = listener.local_addr().expect("empty-manifest stub address");
+        let app = Router::new()
+            .route("/{bucket}", get(empty_list_objects_stub))
+            .route("/{bucket}/", get(empty_list_objects_stub));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve empty-manifest stub");
+        });
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        link.set_feature_switches(CloudFeatureSwitches::default())
+            .expect("consent switches default to off");
+        link.set_managed_backup_destination(true);
+        let tenant_id = link.tenant_id().expect("fixture link carries a tenant");
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_states::Entity),
+            schema.create_table_from_entity(temps_entities::cloud_backup_mirror_cursors::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+            schema.create_table_from_entity(temps_entities::external_service_backups::Entity),
+            schema.create_table_from_entity(temps_entities::external_services::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite fixture table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated foreign keys");
+
+        let encryption =
+            temps_core::EncryptionService::new_from_password("empty-manifest-sweep-test");
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("Temps Cloud managed backups".to_owned()),
+            bucket_name: Set("source-bucket".to_owned()),
+            region: Set("test-1".to_owned()),
+            endpoint: Set(Some(format!("http://{address}"))),
+            bucket_path: Set(String::new()),
+            access_key_id: Set(encryption
+                .encrypt_string("test-access-key")
+                .expect("encrypt fixture access key")),
+            secret_key: Set(encryption
+                .encrypt_string("test-secret-key")
+                .expect("encrypt fixture secret key")),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("S3 source inserts");
+        temps_entities::external_services::Model {
+            id: 1,
+            name: "empty-mirror".to_owned(),
+            service_type: "s3".to_owned(),
+            version: None,
+            status: "running".to_owned(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_owned(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service inserts");
+        let backup_uuid = Uuid::new_v4().to_string();
+        let location = format!("external_services/s3/empty-mirror/{backup_uuid}");
+        temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("s3 backup (empty-mirror)".to_owned()),
+            backup_id: Set(backup_uuid.clone()),
+            schedule_id: Set(None),
+            backup_type: Set("scheduled".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(0)),
+            file_count: Set(Some(0)),
+            s3_source_id: Set(1),
+            s3_location: Set(location.clone()),
+            error_message: Set(None),
+            metadata: Set("{}".to_owned()),
+            checksum: Set(None),
+            compression_type: Set("none".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("empty s3-mirror backup inserts");
+        temps_entities::external_service_backups::Model {
+            id: 1,
+            service_id: 1,
+            backup_id: 1,
+            backup_type: "scheduled".to_owned(),
+            state: "completed".to_owned(),
+            started_at: now,
+            finished_at: Some(now),
+            size_bytes: Some(0),
+            s3_location: location,
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "none".to_owned(),
+            created_by: 1,
+            expires_at: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service backup link inserts");
+
+        let db = Arc::new(db);
+        let encryption = Arc::new(encryption);
+        let outcome = sweep(&link, &db, &encryption)
+            .await
+            .expect("sweep runs against the empty-manifest fixture");
+        let states = mirror_states(&db).await;
+        assert_ne!(
+            outcome,
+            SweepOutcome::Retry,
+            "a permanently-empty native-mirror snapshot must not degrade the shared sweep \
+             cadence — every other backup on the instance would wait behind it"
+        );
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].tenant_id, tenant_id);
+        assert_eq!(states[0].classification, "unsupported");
+        assert!(
+            states[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("has no objects")),
+            "unexpected reason: {:?}",
+            states[0].reason
+        );
     }
 }

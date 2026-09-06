@@ -48,6 +48,21 @@ pub struct Model {
     /// disconnect cleanup path may remove one.
     #[sea_orm(default_value = false)]
     pub managed_by_cloud: bool,
+    /// When the last S3 lifecycle reconcile attempt for this source failed.
+    /// `None` means the most recent attempt succeeded (or none has run yet).
+    /// Set by [`crate` consumers, see `temps-backup`'s `S3LifecycleService`],
+    /// and consulted by `sources_in_scope` so a source stays in the hourly
+    /// sweep until a retry actually converges — even if its last backup
+    /// schedule was disabled in the same moment the failure happened, which
+    /// would otherwise strand a stale lifecycle rule in S3 forever.
+    pub lifecycle_reconcile_failed_at: Option<DBDateTime>,
+    /// Monotonic counter bumped at the start of every reconcile attempt for
+    /// this source. Lets `S3LifecycleService::record_reconcile_attempt`
+    /// detect a stale write — an attempt that started before a newer one but
+    /// finishes after it — and drop it instead of clobbering the newer
+    /// attempt's outcome in `lifecycle_reconcile_failed_at`.
+    #[sea_orm(default_value = 0)]
+    pub lifecycle_reconcile_generation: i32,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -277,6 +292,8 @@ pub async fn insert_encrypted<C: ConnectionTrait>(
         force_path_style: Set(credentials.force_path_style),
         is_default: Set(is_default),
         managed_by_cloud: Set(managed_by_cloud),
+        lifecycle_reconcile_failed_at: Set(None),
+        lifecycle_reconcile_generation: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -367,6 +384,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: now,
             updated_at: now,
         }
