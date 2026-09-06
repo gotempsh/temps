@@ -13,8 +13,37 @@ use tracing::{debug, error, info, warn};
 
 use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
-use crate::providers::{DnsRecord, DnsRecordStatus, DomainIdentityDetails, VerificationStatus};
+use crate::providers::{
+    DnsRecord, DnsRecordStatus, DomainIdentityDetails, EmailProvider, VerificationStatus,
+};
 use crate::services::ProviderService;
+
+/// Trigger the provider's own check, then read back per-record verification
+/// details. A free function taking `&dyn EmailProvider` (rather than a
+/// `DomainService` method) so it can be unit-tested against
+/// `MockEmailProvider` without a live provider connection — mirroring
+/// `send_with_retry` in `email_service.rs`.
+///
+/// The trigger step matters for Scaleway: `verify_identity` POSTs to
+/// `/domains/{id}/check`, which is the only thing that ever moves Scaleway's
+/// own dashboard off "Unchecked". `get_identity_details` alone is a plain GET
+/// that never asks Scaleway to re-check anything, so calling it in isolation
+/// can leave Temps showing a domain as `verified` — from Temps' own
+/// independent SPF/DKIM DNS lookup — while Scaleway's side stays "Unchecked"
+/// forever and the domain still can't send through Scaleway. SES and SMTP
+/// have no separate trigger step, so this is a harmless extra read for them.
+async fn refresh_identity_details(
+    provider: &dyn EmailProvider,
+    domain: &str,
+    provider_identity_id: Option<&str>,
+) -> Result<DomainIdentityDetails, EmailError> {
+    provider
+        .verify_identity(domain, provider_identity_id)
+        .await?;
+    provider
+        .get_identity_details(domain, provider_identity_id)
+        .await
+}
 
 /// Service for managing email domains
 #[derive(Clone)]
@@ -666,14 +695,19 @@ impl DomainService {
             .create_provider_instance(&provider)
             .await?;
 
-        // Get identity details with DNS verification
-        let identity_details = provider_instance
-            .get_identity_details(&domain.domain, domain.provider_identity_id.as_deref())
-            .await
-            .map_err(|e| {
-                error!("Failed to get identity details: {}", e);
-                e
-            })?;
+        // Trigger the provider's own check, then read per-record status —
+        // see `refresh_identity_details`'s doc comment for why the order
+        // matters.
+        let identity_details = refresh_identity_details(
+            provider_instance.as_ref(),
+            &domain.domain,
+            domain.provider_identity_id.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to refresh domain identity details: {}", e);
+            e
+        })?;
 
         // Build DNS records list for response
         let mut dns_records = Vec::new();
@@ -861,7 +895,7 @@ fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{DnsRecordStatus, EmailProviderType, SesCredentials};
+    use crate::providers::{DnsRecordStatus, EmailProviderType, MockEmailProvider, SesCredentials};
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::EncryptionService;
@@ -1631,5 +1665,40 @@ mod tests {
         let result = provider_service.get(provider.id).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().id, provider.id);
+    }
+
+    /// Reproduces the reported bug: Temps could mark a domain `verified` from
+    /// its own DNS lookup without ever asking the provider (Scaleway) to
+    /// re-check the domain, leaving the provider's own dashboard stuck on
+    /// "Unchecked" forever. `refresh_identity_details` must call
+    /// `verify_identity` (the trigger) before `get_identity_details` (the
+    /// read), exactly once each.
+    #[tokio::test]
+    async fn refresh_identity_details_triggers_provider_check_before_reading_status() {
+        let mock = MockEmailProvider::new();
+
+        let result = refresh_identity_details(&mock, "example.com", None).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            mock.verify_identity_call_count(),
+            1,
+            "must trigger the provider's own check exactly once"
+        );
+    }
+
+    /// A provider that can't be reached or rejects the check request must
+    /// fail the whole verification — silently falling back to the read-only
+    /// `get_identity_details` would reintroduce the original bug.
+    #[tokio::test]
+    async fn refresh_identity_details_propagates_check_failure() {
+        let mock = MockEmailProvider::new().with_verify_failure();
+
+        let result = refresh_identity_details(&mock, "example.com", None).await;
+
+        assert!(
+            result.is_err(),
+            "a failed provider check must not be silently swallowed"
+        );
     }
 }
