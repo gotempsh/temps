@@ -446,6 +446,31 @@ body {
     animation: zoomOut 150ms ease-in;
   }
 
+  /* The keyframe utilities above are the copy of temps/web's globals.css and
+     stay as they are — but nothing in this file may animate for a reader who
+     asked it not to. `op.css` zeroes motion inside `.operator.ink`; this is
+     the same rule for the utilities that render outside the skin (portals,
+     the landing). `animate-pulse` and `animate-spin` are the two exceptions
+     motion.md keeps, and they are left iterating at zero duration rather than
+     removed, so a skeleton still reads as a skeleton. */
+  @media (prefers-reduced-motion: reduce) {
+    .animate-ping,
+    .animate-bounce,
+    .animate-confetti-fall,
+    .fade-in-0,
+    .fade-out-0,
+    .zoom-in-95,
+    .zoom-out-95 {
+      animation: none;
+    }
+
+    .animate-spin,
+    .animate-pulse {
+      animation-duration: 0s;
+      animation-iteration-count: 1;
+    }
+  }
+
   /* Dropdown backdrop support */
   .bg-popover {
     background-color: var(--popover);

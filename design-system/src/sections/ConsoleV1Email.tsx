@@ -11,6 +11,7 @@ import {
   type KV, type LedgerRow, type Page, type Series, type State, type StatusItem, type TimePoint, type TimeRange,
   Columns, Lede, type TimelineItem,
 } from '@/components/op'
+import { fmtCount, fmtNum, fmtPct } from '@/components/op'
 import { Toggle } from './ConsoleV1Admin'
 import { useFresh } from './console-fresh'
 
@@ -128,28 +129,16 @@ const SERIES: TimePoint[] = HOURS.map((t, i) => ({ t, sent: [38, 41, 44, 39, 47,
 const hourOf = (minutesAgo: number) => `${String(Math.max(NOW_H - 9, NOW_H - Math.floor(minutesAgo / 60))).padStart(2, '0')}:00`
 const inRange = (m: Mail, r: TimeRange | null) => !r || (HOURS.indexOf(hourOf(m.atNum)) >= HOURS.indexOf(r.from) && HOURS.indexOf(hourOf(m.atNum)) <= HOURS.indexOf(r.to))
 
-/** The two lines on the mail chart, declared once so the chart and its legend cannot drift apart. */
-const MAIL_SERIES: Series[] = [{ key: 'sent', name: 'sent' }, { key: 'bounced', name: 'bounced' }]
 /**
- * A chart legend is drawn from the series it describes, never typed by hand: same order, same
- * name, same stroke and width TimeChart uses (series[0] is chart-1 at 1.5, the rest chart-2 at 1).
+ * The two lines on the mail chart. `bounced` is a state series — it is read
+ * against the 1% threshold, not told apart from `sent` — so it takes the tone;
+ * `sent` is ink. TimeChart draws the legend from this array, so there is
+ * nothing to keep in step by hand.
  */
-function SeriesLegend({ series }: { series: Series[] }) {
-  return (
-    <>
-      {series.map((s, i) => (
-        <span key={s.key} className="inline-flex items-center gap-1.5">
-          <span
-            aria-hidden
-            className="inline-block w-4 shrink-0"
-            style={{ borderTopStyle: 'solid', borderTopWidth: s.width ?? (i === 0 ? 1.5 : 1), borderTopColor: s.stroke ?? (i === 0 ? 'var(--chart-1)' : 'var(--chart-2)') }}
-          />
-          {s.name}
-        </span>
-      ))}
-    </>
-  )
-}
+const MAIL_SERIES: Series[] = [
+  { key: 'sent', name: 'sent' },
+  { key: 'bounced', name: 'bounced', stroke: 'solid', weight: 'thin', state: 'warn' },
+]
 
 const TABS = ['mail', 'domains', 'providers', 'settings'] as const
 type Tab = (typeof TABS)[number]
@@ -174,7 +163,7 @@ export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense:
   const bounceRate = (STATS.bounced / STATS.total) * 100
   const noProvider = providers.filter((p) => p.is_active).length === 0
   const items: StatusItem[] = []
-  if (bounceRate > 1) items.push({ state: 'warn', children: <>Bounce rate <Num value={bounceRate.toFixed(1)} unit="%" /> over 30d, above the 1% threshold, most since dep_91a.</> })
+  if (bounceRate > 1) items.push({ state: 'warn', children: <>Bounce rate <Num value={fmtNum(bounceRate, { digits: 1 })} unit="%" /> over 30d, above the 1% threshold, most since dep_91a.</> })
   if (pendingDomain) items.push({ state: 'warn', children: <><Phrase onClick={() => go(`domain:${pendingDomain.id}`)}>{pendingDomain.domain}</Phrase> is waiting on one DKIM record.</> })
   if (STATS.captured > 0) items.push({ state: 'sampled', children: <>{STATS.captured} preview emails were captured, not sent.</> })
   const status = noProvider
@@ -248,12 +237,12 @@ export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense:
     mobile: <><span className="font-mono">{p.name}</span> · {PROVIDER_LABEL[p.provider_type]}<span className="block text-muted-foreground">{p.region} · {p.is_active ? 'active' : 'inactive'}</span><span className="mt-1 flex gap-3 text-[11px]"><button type="button" className="underline underline-offset-4" onClick={(e) => { e.stopPropagation(); notify('ok', 'test email sent', `${p.name} → maya@acme.sh`) }}>send test</button>{toggleActive(p)}</span></>,
   }))
 
-  const deliveredPct = ((STATS.delivered / STATS.total) * 100).toFixed(1)
-  const openPct = ((STATS.opened / STATS.delivered) * 100).toFixed(0)
+  const deliveredPct = fmtNum((STATS.delivered / STATS.total) * 100, { digits: 1 })
+  const openPct = fmtNum((STATS.opened / STATS.delivered) * 100, { digits: 0 })
   const trackingDirty = JSON.stringify(tracking) !== JSON.stringify(savedTracking)
 
   return (
-    <Detail title="Email" meta={`${providers.filter((p) => p.is_active).length} active provider${providers.filter((p) => p.is_active).length === 1 ? '' : 's'} · ${domains.length} domains · ${(fresh ? 0 : STATS.total).toLocaleString()} sent · 30d`} status={status} tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
+    <Detail title="Email" meta={`${fmtCount(providers.filter((p) => p.is_active).length, 'active provider')} · ${fmtCount(domains.length, 'domain')} · ${fmtNum(fresh ? 0 : STATS.total)} sent · 30d`} status={status} tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
       actions={<a href="https://temps.sh/docs/email" target="_blank" rel="noreferrer" className="inline-flex h-7 items-center gap-1 text-xs text-muted-foreground hover:text-foreground">SDK docs <ExternalLink className="h-3 w-3" /></a>}>
       {tab === 'mail' && mails.length === 0 && !q && statusFilter === 'all' && !range && (
         <PageState state="unconfigured" title="Nothing has been sent yet"
@@ -265,14 +254,15 @@ export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense:
       {tab === 'mail' && !(mails.length === 0 && !q && statusFilter === 'all' && !range) && (
         <div className="space-y-4">
           <MetricGrid cols={4}>
-            <Metric label="sent · 30d" value={STATS.total.toLocaleString()} delta="+18%" baseline="vs previous 30d" />
-            <Metric label="delivered" value={deliveredPct} unit="%" baseline={`${STATS.delivered.toLocaleString()} of ${STATS.total.toLocaleString()}`} />
-            <Metric label="bounced" value={STATS.bounced} delta={`${bounceRate.toFixed(1)}%`} baseline="threshold 1% · 11 since dep_91a" state="warn" />
+            <Metric label="sent · 30d" value={fmtNum(STATS.total)} delta="+18%" baseline="vs previous 30d" />
+            <Metric label="delivered" value={deliveredPct} unit="%" baseline={`${fmtNum(STATS.delivered)} of ${fmtNum(STATS.total)}`} />
+            <Metric label="bounced" value={STATS.bounced} delta={fmtPct(bounceRate)} baseline="threshold 1% · 11 since dep_91a" state="warn" />
             <Metric label="opened" value={openPct} unit="%" baseline={`${STATS.clicked} clicked · tracking on`} />
           </MetricGrid>
           <div className="border p-3">
-            <TimeChart data={SERIES} series={MAIL_SERIES} markers={[{ id: 'dep_90e', x: HOURS[2] }, { id: 'dep_91a', x: HOURS[7], note: 'billing-worker · invoice template' }]} unit="/h" height={160} onOpen={(id) => go(`deploy:${id}`)} selection={range} onSelect={(r) => { setRange(r); setPageNo(1) }} />
-            <ChartFooter><span>last 10h · hourly</span><SeriesLegend series={MAIL_SERIES} /><span>┆ deploy</span><span className="ml-auto">drag to narrow the list below</span></ChartFooter>
+            <TimeChart data={SERIES} series={MAIL_SERIES} markers={[{ id: 'dep_90e', x: HOURS[2] }, { id: 'dep_91a', x: HOURS[7], note: 'billing-worker · invoice template' }]} unit="/h" height={160} onOpen={(id) => go(`deploy:${id}`)} selection={range} onSelect={(r) => { setRange(r); setPageNo(1) }}
+              title="mail sent and bounced" range="last 10h" verdict={`${STATS.bounced} bounces on ${fmtNum(STATS.total)} sent, ${bounceRate > 1 ? 'above' : 'under'} the 1% threshold since dep_91a.`} />
+            <ChartFooter><span>last 10h · hourly</span><span>┆ deploy</span><span className="ml-auto">drag to narrow the list below</span></ChartFooter>
           </div>
         <Ledger status={null} dense={dense}
           columns={[{ label: 'to', key: 'to' }, { label: 'subject', key: 'subject' }, { label: 'status', key: 'status' }, { label: 'from', key: 'from' }, 'project', { label: 'when', key: 'at', numeric: true }]}
@@ -450,7 +440,7 @@ export function EmailDomainScreen({ id, dense, notify, go }: { id: string; dense
   const [saved, setSaved] = useState(form)
   const dirty = JSON.stringify(form) !== JSON.stringify(saved)
   return (
-    <Detail title={d.domain} meta={`${prov ? PROVIDER_LABEL[prov.provider_type] + ' · ' + prov.name : 'no provider'} · ${d.sent_30d.toLocaleString()} sent · 30d`} status={status}
+    <Detail title={d.domain} meta={`${prov ? PROVIDER_LABEL[prov.provider_type] + ' · ' + prov.name : 'no provider'} · ${fmtNum(d.sent_30d)} sent · 30d`} status={status}
       actions={<Button size="sm" className="op-primary h-7 text-xs" onClick={verify} disabled={verifying}><RefreshCw className={verifying ? 'animate-spin' : ''} /> {verifying ? 'checking DNS…' : 'verify now'}</Button>}>
       <div className="space-y-6">
         {d.status === 'failed' && (

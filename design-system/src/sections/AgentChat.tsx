@@ -6,6 +6,7 @@ import { Link } from 'react-router'
 import { ArrowUp, Bot, Box, Brain, Check, ChevronDown, Container, ShieldOff, Zap, ChevronRight, Copy, Pencil, X, FilePen, FileText, GitBranch, Globe, HelpCircle, ListChecks, ListOrdered, Paperclip, RotateCcw, Search, Square, Terminal, ThumbsDown, ThumbsUp, type LucideIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Drop, EchoDialog, Kbd, MOD, Phrase, Picker, Section, Status, StatusLine, GLYPH, GLYPH_CLASS, type State } from '@/components/op'
+import { fmtNum } from '@/components/op'
 import { PAGE_BLEED } from '@/components/shell-context'
 import { cn } from '@/lib/utils'
 import { writeToClipboard } from '@/lib/clipboard'
@@ -418,14 +419,14 @@ function ContextBadge({ used, max }: { used: number; max: number }) {
   }, [open])
   return (
     <span ref={wrap} className="relative">
-      <button ref={btn} type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-haspopup="dialog" aria-label={`context: ${used.toLocaleString()} of ${max.toLocaleString()} tokens, ${pct}%`} className={cn('inline-flex h-7 items-center gap-1.5 px-2 font-mono text-[11px] hover:bg-muted', pct >= 75 ? 'text-warning' : 'text-muted-foreground')}>
-        <span aria-hidden>{glyph}</span> {(used / 1000).toFixed(1)}k · {pct}%
+      <button ref={btn} type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-haspopup="dialog" aria-label={`context: ${fmtNum(used)} of ${fmtNum(max)} tokens, ${pct}%`} className={cn('inline-flex h-7 items-center gap-1.5 px-2 font-mono text-[11px] hover:bg-muted', pct >= 75 ? 'text-warning' : 'text-muted-foreground')}>
+        <span aria-hidden>{glyph}</span> {fmtNum(used / 1000, { digits: 1 })}k · {pct}%
       </button>
       <Drop anchor={btn} open={open} side="above" width={256} label="context" className="p-2 font-mono text-[11px]">
         <div ref={panel} tabIndex={-1} className="outline-none">
-          <p className="mb-1 flex justify-between"><span>context</span><span>{used.toLocaleString()} / {(max / 1000).toFixed(0)}k</span></p>
+          <p className="mb-1 flex justify-between"><span>context</span><span>{fmtNum(used)} / {fmtNum(max / 1000, { digits: 0 })}k</span></p>
           <div className="mb-2 h-1 w-full bg-muted"><div className="h-1 bg-foreground" style={{ width: `${pct}%` }} /></div>
-          {[['input', 31204, '$0.09'], ['output', 6118, '$0.09'], ['reasoning', 9420, '$0.14'], ['cached', 2083, '$0.00']].map(([k, v, c]) => <p key={String(k)} className="flex justify-between text-muted-foreground"><span>{k}</span><span>{Number(v).toLocaleString()} · {c}</span></p>)}
+          {[['input', 31204, '$0.09'], ['output', 6118, '$0.09'], ['reasoning', 9420, '$0.14'], ['cached', 2083, '$0.00']].map(([k, v, c]) => <p key={String(k)} className="flex justify-between text-muted-foreground"><span>{k}</span><span>{fmtNum(Number(v))} · {c}</span></p>)}
           <p className="mt-1 flex justify-between border-t pt-1"><span>this conversation</span><span>$0.32 · 41 credits</span></p>
           <p className="mt-1 text-muted-foreground">compacts automatically at 90%; <a href="#" onClick={(e) => e.preventDefault()}>compact now</a></p>
         </div>

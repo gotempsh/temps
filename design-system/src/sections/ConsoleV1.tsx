@@ -64,6 +64,7 @@ import {
   ChartFooter, Detail, EchoDialog, Field, Kbd, Ledger, Lede, Metric, MetricGrid, MOD, Num, PageState, PageTitle, Section, ShellSlotsProvider, Drop, AttentionHost, ProjectMark, Phrase, Picker, type PickerOption, RangePicker,
   Segmented, Settings, STATE_RANK, Status, StatusLine, TimeChart, type LedgerRow, type Range, type State,
 } from '@/components/op'
+import { fmtNum } from '@/components/op'
 import { DeploysTab, EnvironmentsTab, VariablesTab } from '@/sections/ConsoleV1Env'
 import { DeploymentScreen } from '@/sections/ConsoleV1Deploy'
 import { NodeScreen } from '@/sections/ConsoleV1Nodes'
@@ -296,7 +297,7 @@ function ProjectsScreen({ go, dense }: { go: (v: string) => void; dense: boolean
       <Status state={p.state} label={p.note || `${p.kind} · ${p.env}`} />,
       <span className="text-muted-foreground">{p.deployed}{p.dep !== '—' && <span className="font-mono"> · {p.dep}</span>}</span>,
       <span className="flex items-center justify-between gap-2"><Num value={p.visitors || null} />{p.visitors > 0 && <Sparkline values={p.spark} height={dense ? 10 : 14} />}</span>,
-      <Num value={p.dep === '—' ? null : p.err.toFixed(2)} unit="%" />,
+      <Num value={p.dep === '—' ? null : fmtNum(p.err, { digits: 2 })} unit="%" />,
       <Num value={p.cert === '—' ? null : p.cert} />,
     ],
   }))
@@ -357,7 +358,7 @@ function RequestsChart({ hot, onHot, compare, deploys }: { hot: string | null; o
         series={compare ? [{ key: 'req', name: 'requests' }, { key: 'prev', name: 'yesterday' }] : [{ key: 'req', name: 'requests' }]}
         markers={deploys.filter((d) => d.x).map((d) => ({ id: d.id, x: d.x }))} hot={hot} onHot={onHot}
         sampled={plan.sampled ? { from: '14:00', to: '23:30', label: 'sampled 1 in 4' } : undefined}
-        readoutFormat={(p) => `${p.t} · ${Number(p.req).toLocaleString()} req${compare ? ` · yesterday ${Number(p.prev).toLocaleString()}` : ''}`}
+        readoutFormat={(p) => `${p.t} · ${fmtNum(Number(p.req))} req${compare ? ` · yesterday ${fmtNum(Number(p.prev))}` : ''}`}
       />
       <ChartFooter>
         <span>showing {range}</span>
@@ -439,7 +440,7 @@ function ProjectScreen({ name, dense, go }: { name: string; dense: boolean; go: 
   const prev = deploys[1]
   const thread = threadOf(project)
   const incident = project.state !== 'ok'
-  const errValue = rolledBack ? '0.12' : project.err.toFixed(2)
+  const errValue = rolledBack ? '0.12' : fmtNum(project.err, { digits: 2 })
   const currentDep = rolledBack && prev ? prev.id : project.dep
 
   const errState: State = rolledBack ? 'ok' : project.state
@@ -466,7 +467,7 @@ function ProjectScreen({ name, dense, go }: { name: string; dense: boolean; go: 
         { k: 'last deploy', v: project.deployed },
         { k: 'error rate · 24h', v: `${errValue}%`, state: Number(errValue) > 1 ? 'error' : Number(errValue) > 0.5 ? 'warn' : undefined },
       ]}>
-      {project.env} · {project.visitors > 0 ? `${(project.visitors / 1000).toFixed(1)}k visitors in 24h` : 'no public traffic'}
+      {project.env} · {project.visitors > 0 ? `${fmtNum(project.visitors / 1000, { digits: 1 })}k visitors in 24h` : 'no public traffic'}
     </Lede>
   )
   const rollback = (trigger: ReactNode) => (
@@ -519,7 +520,7 @@ function ProjectScreen({ name, dense, go }: { name: string; dense: boolean; go: 
           <div className="space-y-6">
             <RequestsChart hot={hot} onHot={setHot} compare={compare === 'yesterday'} deploys={deploys} />
             <MetricGrid cols={4}>
-              <Metric label={project.kind === 'worker' ? 'jobs · 24h' : 'requests · 24h'} value={project.kind === 'worker' ? '18.4k' : `${(project.visitors / 1000).toFixed(1)}k`} delta={compare === 'yesterday' ? '+12%' : '+9%'} baseline={compare === 'yesterday' ? 'vs yesterday' : `since ${project.dep}`} />
+              <Metric label={project.kind === 'worker' ? 'jobs · 24h' : 'requests · 24h'} value={project.kind === 'worker' ? '18.4k' : `${fmtNum(project.visitors / 1000, { digits: 1 })}k`} delta={compare === 'yesterday' ? '+12%' : '+9%'} baseline={compare === 'yesterday' ? 'vs yesterday' : `since ${project.dep}`} />
               <Metric label="error rate" value={errValue} unit="%" delta={rolledBack ? '↓' : incident ? '+0.2pt' : '−0.01pt'} baseline={rolledBack ? 'since rollback' : `since ${project.dep}`} state={rolledBack ? 'ok' : Number(errValue) > 0.5 ? 'warn' : 'ok'} />
               <Metric label="p95 latency" value={184} unit="ms" delta="−9ms" baseline={prev ? `vs ${prev.id}` : 'first deploy'} />
               <Metric label="uptime · 90d" value="99.94" unit="%" baseline="2 incidents · 90d window" />

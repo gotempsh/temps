@@ -14,6 +14,15 @@ import {
   PageTitle, Picker, Segmented, Settings, ShellSlotsProvider, Status, StatusLine, TimeChart, worst, type LedgerRow, type State,
 } from '@/components/op'
 import { BRANCHES } from './ConsoleV1'
+// The five blocks files are the live half of docs/{forms,notifications,content,
+// data-viz,motion,icons}.md. The guide mounts the same components section by
+// section; the gallery mounts them all, so no primitive is documented in only
+// one of the two places.
+import { ContentBlocks } from './blocks/ContentBlocks'
+import { DataVizBlocks } from './blocks/DataVizBlocks'
+import { FormBlocks } from './blocks/FormBlocks'
+import { NotificationBlocks } from './blocks/NotificationBlocks'
+import { TokenBlocks } from './blocks/TokenBlocks'
 
 
 // ── viz demo data (shapes follow docs/console-inventory.md) ────────────
@@ -82,6 +91,22 @@ const TOC = [
   ['strip', 'StatusStrip · ScoreRing · Heatmap · Live'],
   ['trace', 'Waterfall · StackTrace'],
   ['logs', 'LogLines · Stages · Histogram'],
+  ['form-field', 'Field · hint, error, optional'],
+  ['form-validation', 'FormErrors · validation and save'],
+  ['form-disabled', 'Disabled and unavailable'],
+  ['notify-table', 'Which surface says it'],
+  ['notify-toast', 'Toasts'],
+  ['notify-attention', 'The bell · AttentionHost'],
+  ['viz-choice', 'Pick the chart from the question'],
+  ['viz-series', 'TimeChart · legend and table view'],
+  ['viz-legend', 'Series without a second hue'],
+  ['viz-a11y', 'Charts read without the picture'],
+  ['content-error', 'Error messages'],
+  ['content-time', 'Time and the id beside it'],
+  ['content-fmt', 'fmt · the formatters'],
+  ['tokens-table', 'Tokens · tokens.json'],
+  ['motion-tiers', 'Motion utilities'],
+  ['icons-vocabulary', 'Icons · the vocabulary'],
 ] as const
 
 function Block({ id, title, rule, api, children }: { id: string; title: string; rule: ReactNode; api: string; children: ReactNode }) {
@@ -186,7 +211,7 @@ export function OpComponentsPage() {
     <DocPage
       eyebrow="operator components · @temps-sdk/op"
       intro={<>
-        The components the three page templates are built from. Each block: the rule, the props that matter, every state. <Link to="/v1" className="underline underline-offset-4">/v1</Link> is these assembled into a console; the handoff document is <span className="font-mono">docs/design-system-handoff.md</span>.
+        The components the three page templates are built from. Each block: the rule, the props that matter, every state. <Link to="/v1" className="underline underline-offset-4">/v1</Link> is these assembled into a console; the handoff document is <span className="font-mono">docs/design-system-handoff.md</span>. The last five groups — forms, notifications, charts, content and the token, motion and icon tables — are the same blocks <Link to="/guide#forms" className="underline underline-offset-4">/guide</Link> mounts beside their documents.
       </>}
       toc={TOC}
     >
@@ -504,6 +529,12 @@ served from /api/projects/{id}/icon · fetched after a deploy · monogram until 
             <Demo label="Stages · build is running"><Stages stages={VZ_STAGES} /></Demo>
             <Demo label="Histogram · http.server.request.duration"><Histogram buckets={VZ_HIST} unit="ms" value={pct} onChange={setPct} /></Demo>
       </Block>
+
+          <FormBlocks />
+          <NotificationBlocks />
+          <DataVizBlocks />
+          <ContentBlocks />
+          <TokenBlocks />
     </DocPage>
   )
 }

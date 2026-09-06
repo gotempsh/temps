@@ -18,8 +18,12 @@ bun install
 bun run dev      # http://localhost:5183
 ```
 
-`bun run build` and `bun run lint` (`tsc --noEmit` plus
-`scripts/audit-records.mjs`) also work standalone.
+`bun run build` and `bun run lint` also work standalone. `lint` is three
+checks: `tsc --noEmit`, `scripts/audit-records.mjs` (the eight record rules)
+and `node ../web/packages/op/scripts/tokens.mjs check`, which reads
+`web/packages/op/tokens.json` against `op.css` and fails with a diff when a
+value, a name or the order of the two disagrees (`bun run tokens:check` runs
+it alone).
 
 ## Routes
 
@@ -44,7 +48,7 @@ sandbox header toggles between each pair.
 
 `/` redirects to `/guide`. Every route above renders inside one shell,
 `src/components/Layout.tsx`: top bar (mark, filter, light/dark), a left rail
-listing the guide's 15 sections and then the reference pages, the page itself
+listing the guide's sections and then the reference pages, the page itself
 starting at the column's left edge, and one "on this page" rail on the right
 that the guide and `src/components/op-doc.tsx` both feed. Toggle light/dark in
 the header — every surface should look correct in both.
@@ -102,6 +106,21 @@ in.
   `/guide#tooling`.
 - `ux-audit-2026-09-06.md` — the audit the guide's "open questions" section
   is cut from.
+- `forms.md` — field anatomy, validation timing, saving, long submits,
+  destructive submits, secrets. Live at `/guide#forms`.
+- `notifications.md` — which surface says it: status line, Callout, toast,
+  bell, EchoDialog. Live at `/guide#notifications`.
+- `content.md` — the words: capitalisation, one term per concept, the shape of
+  an error, buttons, numbers and time. Live at `/guide#content`.
+- `localisation.md` — text expansion, no sentences built from fragments,
+  logical properties, RTL readiness. Rendered at `/guide#locale`.
+- `data-viz.md` — which chart answers which question, series told apart by
+  pattern instead of hue, axes, annotations, the footer contract. Live at
+  `/guide#dataviz`.
+- `motion.md` — the three duration tokens, what may move, what never moves,
+  reduced motion, the two exceptions. Live at `/guide#motion`.
+- `icons.md` — lucide only, two sizes, and the concept → icon vocabulary that
+  stops two screens using two icons for one thing. Live at `/guide#icons`.
 - `console-inventory.md`, `design-system-answers.md`,
   `operator-console-brief.md` — background: what the console contains, the
   twelve questions a design system must answer, and the original brief

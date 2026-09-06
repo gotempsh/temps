@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { GLYPH, GLYPH_CLASS, StatusStrip, type State, type StatusBucket } from '@/components/op'
 import { ProjectMark } from '@/components/op'
+import { fmtPct } from '@/components/op'
 import { PROJECT_ICONS } from './console-projects'
 import { PAGE_BLEED } from '@/components/shell-context'
 
@@ -94,7 +95,7 @@ export function StatusPage({ full = false }: { full?: boolean }) {
                 <li key={c.name} className="px-4 py-3">
                   <div className="flex items-baseline justify-between gap-3 text-sm">
                     <span className="flex items-baseline gap-2"><span aria-hidden className={GLYPH_CLASS[c.state]}>{GLYPH[c.state]}</span><span className="font-medium">{c.name}</span><span className={`text-xs ${c.state === 'ok' ? 'text-muted-foreground' : GLYPH_CLASS[c.state]}`}>{WORD[c.state]}</span></span>
-                    <span className="font-mono text-xs text-muted-foreground">{c.uptime90.toFixed(2)}%</span>
+                    <span className="font-mono text-xs text-muted-foreground">{fmtPct(c.uptime90, { digits: 2 })}</span>
                   </div>
                   <StatusStrip buckets={c.buckets} height={14} className="mt-2" />
                 </li>

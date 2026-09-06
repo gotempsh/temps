@@ -10,6 +10,7 @@ import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
 import { PROJECT_ICONS } from './console-projects'
 import { ProjectMark } from '@/components/op'
+import { fmtNum, fmtPct } from '@/components/op'
 
 /**
  * The proxy is the hot path: every request to every project passes through
@@ -49,10 +50,10 @@ const LOGS: LogLine[] = Array.from({ length: 60 }, (_, i) => {
 })
 
 const TILES = [
-  { key: 'requests', label: 'requests', value: `${SUM.toLocaleString()}`, baseline: `${(SUM / 3600).toFixed(2)}/s · 24% project · 76% console`, series: [{ key: 'total', name: 'requests' }, { key: 'e5', name: '5xx', width: 1 }], unit: 'req', fmt: (p: Record<string, unknown>) => `${p.total} requests · ${p.e5} 5xx · ${p.e4} 4xx` },
-  { key: 'errors', label: 'error rate', value: `${((E5 / SUM) * 100).toFixed(2)}%`, baseline: `${E5} × 5xx · all at 10:44`, series: [{ key: 'err', name: '5xx %' }], unit: '%', state: 'warn' as State, thresholds: [{ y: 1, label: '1%', state: 'warn' as const }], fmt: (p: Record<string, unknown>) => `${p.err}% 5xx` },
-  { key: 'latency', label: 'p95 latency', value: '50 ms', baseline: 'p50 8 ms · p99 74 ms', series: [{ key: 'p99', name: 'p99', width: 1 }, { key: 'p95', name: 'p95', width: 1.5 }, { key: 'p50', name: 'p50', width: 2 }], unit: 'ms', fmt: (p: Record<string, unknown>) => `p50 ${p.p50} · p95 ${p.p95} · p99 ${p.p99} ms` },
-  { key: 'destination', label: 'to projects', value: '24%', baseline: '76% console · 0% proxy itself', series: [{ key: 'project', name: 'project routes' }, { key: 'console', name: 'console', width: 1 }], unit: 'req', fmt: (p: Record<string, unknown>) => `${p.project} to projects · ${p.console} to the console` },
+  { key: 'requests', label: 'requests', value: fmtNum(SUM), baseline: `${fmtNum(SUM / 3600, { digits: 2 })}/s · 24% project · 76% console`, series: [{ key: 'total', name: 'requests' }, { key: 'e5', name: '5xx', stroke: 'solid' as const, weight: 'thin' as const, state: 'error' as const }], unit: 'req', fmt: (p: Record<string, unknown>) => `${p.total} requests · ${p.e5} 5xx · ${p.e4} 4xx` },
+  { key: 'errors', label: 'error rate', value: fmtPct(E5 / SUM, { basis: 'ratio', digits: 2 }), baseline: `${E5} × 5xx · all at 10:44`, series: [{ key: 'err', name: '5xx %' }], unit: '%', state: 'warn' as State, thresholds: [{ y: 1, label: '1%', state: 'warn' as const }], fmt: (p: Record<string, unknown>) => `${p.err}% 5xx` },
+  { key: 'latency', label: 'p95 latency', value: '50 ms', baseline: 'p50 8 ms · p99 74 ms', series: [{ key: 'p50', name: 'p50' }, { key: 'p95', name: 'p95' }, { key: 'p99', name: 'p99' }], unit: 'ms', fmt: (p: Record<string, unknown>) => `p50 ${p.p50} · p95 ${p.p95} · p99 ${p.p99} ms` },
+  { key: 'destination', label: 'to projects', value: '24%', baseline: '76% console · 0% proxy itself', series: [{ key: 'project', name: 'project routes' }, { key: 'console', name: 'console' }], unit: 'req', fmt: (p: Record<string, unknown>) => `${p.project} to projects · ${p.console} to the console` },
 ] as const
 type TileKey = (typeof TILES)[number]['key']
 
@@ -75,7 +76,7 @@ export function ProxyScreen({ dense, plan, notify, go }: { dense: boolean; plan:
   const routeRows: LedgerRow[] = ROUTES.filter((r) => (project === 'all' || r.project === project) && (!q || `${r.host}${r.path} ${r.upstream} ${r.project}`.toLowerCase().includes(q.toLowerCase()))).map((r) => ({
     id: `${r.host}${r.path}`, state: r.state, onOpen: () => notify('ok', `open route ${r.host}${r.path}`, 'the same page filtered to this route'),
     sort: { route: r.host + r.path, req: r.req, e5: r.e5 / r.req, p95: r.p95 },
-    mobile: <><span className="block truncate font-mono">{r.host}<span className="text-muted-foreground">{r.path}</span></span><span className="block text-[11px] text-muted-foreground">{r.note ?? `${r.req.toLocaleString()} req · p95 ${r.p95} ms`}</span></>,
+    mobile: <><span className="block truncate font-mono">{r.host}<span className="text-muted-foreground">{r.path}</span></span><span className="block text-[11px] text-muted-foreground">{r.note ?? `${fmtNum(r.req)} req · p95 ${r.p95} ms`}</span></>,
     cells: [
       <span className="truncate font-mono">{r.host}<span className="text-muted-foreground">{r.path}</span></span>,
       r.project === '—' ? <span className="text-muted-foreground">console</span> : <span className="flex items-center gap-1.5"><ProjectMark name={r.project} icon={PROJECT_ICONS[r.project]} /><span className="truncate">{r.project}</span></span>,
@@ -83,8 +84,8 @@ export function ProxyScreen({ dense, plan, notify, go }: { dense: boolean; plan:
       <Num value={r.req} />,
       // Colour never sits on a bare number: a cell that is not fine carries the glyph with it.
       r.e5
-        ? <Status state="error" label={`${((r.e5 / r.req) * 100).toFixed(2)}%`} className="w-full justify-end font-mono tabular-nums" />
-        : <Num value={((r.e5 / r.req) * 100).toFixed(2)} unit="%" />,
+        ? <Status state="error" label={fmtPct(r.e5 / r.req, { basis: 'ratio', digits: 2 })} className="w-full justify-end font-mono tabular-nums" />
+        : <Num value={fmtNum((r.e5 / r.req) * 100, { digits: 2 })} unit="%" />,
       r.p95 > 1000
         ? <Status state="warn" label={`${r.p95} ms`} className="w-full justify-end font-mono tabular-nums" />
         : <Num value={r.p95} unit="ms" />,
@@ -92,7 +93,7 @@ export function ProxyScreen({ dense, plan, notify, go }: { dense: boolean; plan:
     ],
   }))
   return (
-    <Detail title="Proxy" meta={fresh ? 'control plane · hetzner-1 · no traffic yet' : `control plane · hetzner-1 · ${SUM.toLocaleString()} requests · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(tb) => { setTab(tb); setQ('') }}
+    <Detail title="Proxy" meta={fresh ? 'control plane · hetzner-1 · no traffic yet' : `control plane · hetzner-1 · ${fmtNum(SUM)} requests · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(tb) => { setTab(tb); setQ('') }}
       actions={<>
         <Picker value={project} onChange={setProject} options={PROJECT_OPTS} mono={false} className="h-7 text-xs" width="220px" />
         <RangePicker ranges={RANGES} value={range} onChange={setRange} retentionDays={plan.retentionDays} retentionLabel={plan.retention} onGated={(r) => notify('warn', `${r.label} is beyond this plan's retention`, `currently ${plan.retention}`)} />
@@ -111,9 +112,11 @@ export function ProxyScreen({ dense, plan, notify, go }: { dense: boolean; plan:
           </div>
           <div className="space-y-2">
             <div className="border bg-background p-3">
-              <TimeChart data={T} series={[...t.series]} unit={t.unit} height={200} xInterval={9} markers={[{ id: 'dep_91a', x: '10:41' }]} thresholds={'thresholds' in t ? [...t.thresholds] : undefined} readoutFormat={(p) => `${p.t} · ${t.fmt(p as Record<string, unknown>)}`} />
+              <TimeChart data={T} series={[...t.series]} unit={t.unit} height={200} xInterval={9} markers={[{ id: 'dep_91a', x: '10:41' }]} thresholds={'thresholds' in t ? [...t.thresholds] : undefined} readoutFormat={(p) => `${p.t} · ${t.fmt(p as Record<string, unknown>)}`}
+                title={t.label} range={range} verdict={`api:8080 reset ${E5} connections at 10:44; 16% of requests got a 502 for two minutes, and nothing since.`} />
             </div>
-            <ChartFooter><span>{t.label} / minute · {range}</span><span>· ┆ deploy</span>{tile === 'latency' && <span>· thick p50, thin p99</span>}{tile === 'requests' && <span>· thin line 5xx</span>}</ChartFooter>
+            {/* The legend is the chart's own, drawn from `series`. The footer says what the plot cannot: window, resolution, marker. */}
+            <ChartFooter><span>{t.label} / minute · {range}</span><span>· ┆ deploy</span></ChartFooter>
           </div>
           <div className="op-grid grid gap-6 md:grid-cols-2 xl:grid-cols-4">
             <Section title="Status" meta="share of requests"><Breakdown rows={[{ label: '2xx', count: SUM - E5 - 7 }, { label: '3xx', count: 0 }, { label: '4xx', count: 7 }, { label: '5xx', count: E5, state: 'error' }]} total={SUM} unit="requests" /></Section>

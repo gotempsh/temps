@@ -11,8 +11,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "lint": "tsc --noEmit && node scripts/audit-records.mjs",
+    "lint": "tsc --noEmit && node scripts/audit-records.mjs && node ../web/packages/op/scripts/tokens.mjs check",
     "audit:records": "node scripts/audit-records.mjs",
+    "tokens:check": "node ../web/packages/op/scripts/tokens.mjs check",
     "e2e": "playwright test",
     "e2e:ui": "playwright test --ui",
     "e2e:update": "playwright test --update-snapshots"

@@ -4,7 +4,7 @@
 /**
  * Markdown slicing for the consolidated guide (`/guide`).
  *
- * The four documents in `docs/` stay the single source of truth: the guide
+ * The documents in `docs/` stay the single source of truth: the guide
  * imports them with Vite's `?raw` and renders them. Nothing here rewrites
  * prose — it only cuts a document at heading boundaries, reads its headings
  * for the search index, and splits a bullet list into addressable entries.

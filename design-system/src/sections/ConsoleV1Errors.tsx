@@ -8,6 +8,7 @@ import {
   Breakdown, ChartFooter, Detail, EchoDialog, Ledger, Lede, Num, PageState, Phrase, ProjectMark, RangePicker, Section, Segmented, KeyValue, Status, Timeline, Columns, Sparkline, StackTrace, StatusLine, TimeChart,
   type Frame, type KV, type LedgerRow, type Range, type State,
 } from '@/components/op'
+import { fmtNum } from '@/components/op'
 import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
 import { PROJECT_ICONS } from './console-projects'
@@ -78,7 +79,7 @@ export function ErrorsScreen({ dense, plan, notify, go }: { dense: boolean; plan
     sort: { title: i.type, events: i.events24h, users: i.users, last: i.last, first: i.first },
     mobile: <>
       <span className="block truncate"><span className="font-medium">{i.type}</span> <span className="text-muted-foreground">{i.message}</span></span>
-      <span className="mt-0.5 flex items-center gap-2 text-[11px] text-muted-foreground"><ProjectMark name={i.project} icon={PROJECT_ICONS[i.project]} /><span className="truncate font-mono">{i.culprit}</span><span className="ml-auto shrink-0 font-mono">{i.events24h.toLocaleString()} · {i.users} users · {i.last}</span></span>
+      <span className="mt-0.5 flex items-center gap-2 text-[11px] text-muted-foreground"><ProjectMark name={i.project} icon={PROJECT_ICONS[i.project]} /><span className="truncate font-mono">{i.culprit}</span><span className="ml-auto shrink-0 font-mono">{fmtNum(i.events24h)} · {i.users} users · {i.last}</span></span>
     </>,
     cells: [
       <span className="block min-w-0">
@@ -101,7 +102,7 @@ export function ErrorsScreen({ dense, plan, notify, go }: { dense: boolean; plan
     ? <StatusLine state="idle">No errors reported yet. No project has a DSN installed.</StatusLine>
     : phase !== 'ok' ? null
       : <StatusLine state="error" more={{ label: '+1 warning', items: [{ state: 'warn', children: <><Phrase onClick={() => go('issue:i_4830')}>ECONNRESET</Phrase> on api-gateway is new since dep_91a: 44 events in 3h, handled, no users affected.</> }] }}>
-        <Phrase onClick={() => go(`issue:${worst.id}`)}>{worst.type} in {worst.culprit}</Phrase> regressed after dep_91a: {worst.events24h.toLocaleString()} events from {worst.users} users in 2h. It was fixed in {worst.resolvedIn}.
+        <Phrase onClick={() => go(`issue:${worst.id}`)}>{worst.type} in {worst.culprit}</Phrase> regressed after dep_91a: {fmtNum(worst.events24h)} events from {worst.users} users in 2h. It was fixed in {worst.resolvedIn}.
       </StatusLine>
   return (
     <Ledger
@@ -144,7 +145,7 @@ export function IssueScreen({ id, dense, notify, go }: { id: string; dense: bool
           ? <>Assigned to {i.assignee} and open for {i.first.replace(' ago', '')}: resolve it in a release, or hand it back.</>
           : <>Unassigned for {i.first.replace(' ago', '')}: assign it, or resolve it in {i.release} — it reopens by itself if it comes back later.</>}</StatusLine>
   const facts: KV[] = [
-    { k: 'events 24h', v: i.events24h.toLocaleString(), mono: true }, { k: 'users', v: String(i.users), mono: true },
+    { k: 'events 24h', v: fmtNum(i.events24h), mono: true }, { k: 'users', v: String(i.users), mono: true },
     { k: 'first seen', v: `${i.first} · ${state === 'regressed' ? i.resolvedIn : i.release}`, mono: true }, { k: 'last seen', v: i.last, mono: true },
     { k: 'release', v: i.release, mono: true, state: state === 'regressed' ? 'error' : undefined }, { k: 'handled', v: i.handled ? 'yes' : 'no', mono: true, state: i.handled ? undefined : 'warn' },
   ]
@@ -175,11 +176,13 @@ export function IssueScreen({ id, dense, notify, go }: { id: string; dense: bool
       {tab === 'overview' && (
         <Columns>
           <div>
-            <Section title="Events" meta="24h · ┆ deploy · users below">
+            <Section title="Events" meta="24h · ┆ deploy">
               <div className="border bg-background p-3">
-                <TimeChart data={HOURLY} series={[{ key: 'events', name: 'events' }, { key: 'users', name: 'users' }]} unit="" height={150} xInterval={11} markers={[{ id: 'dep_91a', x: '20:00' }]} readoutFormat={(p) => `${p.t} · ${p.events} events · ${p.users} users`} />
+                {/* Two lines, one ink: events solid, users dashed. The chart draws its own legend. */}
+                <TimeChart data={HOURLY} series={[{ key: 'events', name: 'events' }, { key: 'users', name: 'users' }]} unit="" height={150} xInterval={11} markers={[{ id: 'dep_91a', x: '20:00' }]} readoutFormat={(p) => `${p.t} · ${p.events} events · ${p.users} users`}
+                  title="events and users affected" range="last 24h" verdict={`${fmtNum(i.events24h)} events from ${fmtNum(i.users)} users in 24h, all since ${i.release}.`} />
               </div>
-              <ChartFooter><span>events / 30 min</span><span>· the thin line is users</span></ChartFooter>
+              <ChartFooter><span>events / 30 min</span></ChartFooter>
             </Section>
             <Section title="Stack trace" meta="in-app frames open · source mapped from dep_91a" action={<a href="#" onClick={(e) => { e.preventDefault(); notify('ok', 'raw event JSON', '14 KB · copied') }} className="text-xs">raw</a>}>
               <StackTrace frames={FRAMES} />
@@ -211,7 +214,7 @@ export function IssueScreen({ id, dense, notify, go }: { id: string; dense: bool
           columns={['event', 'when', 'user', 'browser', 'url', 'release']}
           grid="minmax(6rem,1fr) minmax(64px,max-content) minmax(6rem,1fr) minmax(10rem,1.4fr) minmax(6rem,1fr) minmax(64px,max-content)"
           rows={eventRows} total={matched.length} filter={q} onFilter={(v) => { setQ(v); setPage(1) }} placeholder="filter by event id" page={{ page, pageSize: EVENT_PAGE, total: matched.length, onPage: setPage }}
-          hint={q ? `${matched.length.toLocaleString()} of ${i.events24h.toLocaleString()} events match · newest first` : `${i.events24h.toLocaleString()} events in 24h · newest first`}
+          hint={q ? `${fmtNum(matched.length)} of ${fmtNum(i.events24h)} events match · newest first` : `${fmtNum(i.events24h)} events in 24h · newest first`}
           footer={<span>each event is one occurrence with its own stack, breadcrumbs and tags · ⏎ opens it</span>} />
       )}
 

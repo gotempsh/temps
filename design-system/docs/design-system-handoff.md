@@ -22,8 +22,10 @@ bunx tsc --noEmit -p .              # must be clean before any hand-back
 ```
 
 The reading entry point is `/guide`: one page, in the same chrome as every
-reference page, that renders these markdown files — this one, `brand-guidelines.md` and `ux-audit-2026-09-06.md` —
-in the order someone building a screen needs them, with live token swatches,
+reference page, that renders these markdown files — this one, `brand-guidelines.md`,
+`ux-audit-2026-09-06.md`, and the seven documents that own a rule each
+(`forms.md`, `notifications.md`, `content.md`, `localisation.md`, `data-viz.md`,
+`motion.md`, `icons.md`) — in the order someone building a screen needs them, with live token swatches,
 the type scale in its real classes, the five status glyphs and an example
 primitive beside the rule it illustrates. The markdown files stay the single
 source of truth; the guide never copies their text, it imports them with Vite's
@@ -51,6 +53,7 @@ Routes that matter:
 | `/v1-landing`      | Landing page in the same system, with pricing.                         |
 | `/op-components`   | Every operator component, every state, with props.                     |
 | `/brand#hierarchy` | The type scale rendered live.                                          |
+| Docs | `docs/forms.md` · `notifications.md` · `content.md` · `localisation.md` · `data-viz.md` · `motion.md` · `icons.md`. One document per rule set, each a `/guide` section (`#forms`, `#notifications`, `#content`, `#locale`, `#dataviz`, `#motion`, `#icons`) with its live blocks from `src/sections/blocks/` mounted under the prose. `/op-components` mounts the same blocks. |
 
 Gotchas that cost time:
 
@@ -162,6 +165,31 @@ change is wrong, not the rule.
 
 All in `op.css`, shipped with the components in `@temps-sdk/op`; the sandbox's
 `src/globals.css` imports it. Blocks, in cascade order:
+
+`web/packages/op/tokens.json` is the same layer as data (W3C DTCG, exported as
+`@temps-sdk/op/tokens.json`): `base` is the raw material — the paper/ink pair,
+the five state hues, the faces, radius, border, the 4/8/12/16/20/24/32 scale,
+the six type tiers and motion — and `semantic` is exactly the custom properties
+`.operator.ink` declares, light and dark, aliased to base with `{base.x.y}`.
+`node web/packages/op/scripts/tokens.mjs check` parses both files and fails with
+a diff on any differing value, any name present on one side only, and any
+ordering difference; it runs inside the design system's `bun run lint`
+(`bun run tokens:check` alone). `tokens.mjs build` prints the block it would
+generate — op.css is still hand-written and still the source of truth, so this
+release enforces the mirror rather than generating it. The token table at
+`/guide#tokens` and `/op-components#tokens-table` is built from the JSON, not
+from a copy of it.
+
+Motion is three tokens and one curve: `--op-duration-fast` (80ms, hover),
+`--op-duration` (100ms, the default for a control's own state change),
+`--op-duration-slow` (200ms, for something arriving on top of the page) and
+`--op-ease` (`cubic-bezier(0.2, 0, 0, 1)`). `.op-motion` / `.op-motion-fast` /
+`.op-motion-slow` opt one element into a tier. A literal duration in a tsx file
+is a bug: `[transition-duration:var(--op-duration-slow)]` is how the dialog and
+alert-dialog surfaces say 200ms. One media rule in `op.css` zeroes all three
+under `prefers-reduced-motion: reduce` — motion is never gated in JavaScript.
+`docs/motion.md` has what may move, what never moves, and the two exceptions
+(`.op-raise`'s hard 3px offset, and `animate-pulse` / `animate-spin`).
 
 | Block                        | What it sets                                                   |
 |------------------------------|----------------------------------------------------------------|
@@ -382,6 +410,31 @@ call and must be audit-logged, which is why it stays an explicit click.
 
 ### TimeChart, RangePicker, ChartFooter
 
+Series are told apart by pattern, never by hue. `Series` takes
+`stroke` (`'solid' | 'dashed' | 'dotted'`) and `weight` (`'thin' | 'regular'`),
+defaulted by position (solid regular, then dashed, dotted, solid, each thin).
+**`stroke` used to be a CSS colour and is now the dash pattern**; `width` still
+takes an exact pixel width and still wins. `--chart-1` / `--chart-2` are gone
+from the component: every line is ink, and a line takes a tone only when
+`series.state` says the series *is* a state — an error rate read against its
+threshold band, not a line told apart from its neighbour.
+
+The legend is generated from `series`: the swatch is a sample of the real line
+(same dash, same weight, same ink), the name is muted, and the value at the
+cursor rides the label, so the legend is a readout too. A legend typed into a
+`ChartFooter` ("thick p50, thin p99", "the thin line is users") is now always
+wrong — it cannot be matched to a line and it drifts. `legend` defaults to on
+with more than one series; more than four series logs a dev warning, because
+four dash patterns is what the eye separates.
+
+`table` (default on) puts a "table" toggle beside the legend that swaps the plot
+for the same buckets as an `.op-rows` table — bucket · value per series, deploy
+markers in the bucket cell, same height, no animation. Every chart is readable
+as numbers. The plot is `role="img"` with an `aria-label` sentence built from
+`title`, `range` and `verdict`, falling back to the series names and the axis
+bounds, so a chart is never an unlabelled graphic. `docs/data-viz.md` is the
+whole rule set; `/guide#dataviz` draws it.
+
 `thresholds={[{ y, label, state }]}` draws dashed horizontal reference lines
 labelled at the right edge in the state tone (a vital's good / poor line).
 
@@ -411,6 +464,42 @@ edge; a strip under the plot states the bounds, the point count, and "clear
 Email page's ledger shows only mail sent in the selected hours and its footer
 says so. A click without a drag clears; the selection never changes the
 chart's own range (that is the RangePicker), it filters what is below.
+
+### Field, FormErrors
+
+`Field` carries the whole anatomy: `label` (always visible, weight 500), `hint`
+(`help` is kept as the older name for the same line), `error`, and `optional` —
+the console's forms are mostly required, so the exception is what gets marked.
+The error renders under the hint as glyph + sentence in the destructive tone,
+the one place a field carries colour, and the hint stays put while it shows,
+because advice and fault are different things. Pass `id`, or use the render-prop
+form (`{(c) => <Input {...c} />}` with
+`FieldControl = { id, 'aria-describedby', 'aria-invalid' }`), and the control is
+wired: the hint and the error are described-by, never folded into the control's
+accessible name, and the label switches from wrapping to `htmlFor`. A field with
+neither hint nor error renders exactly as before, at the same height.
+
+`FormErrors` is the summary a form shows when more than one field fails on
+submit: one error `Callout` at the top, each entry a button that moves focus to
+the field it names (`errors={[{ id, label, message }]}`, `min` failures before
+it appears, default 2). The inline message under each field stays where it is —
+the summary is a way in, not a second copy of the truth. Validation timing,
+disabled controls, long submits, destructive submits and secrets are all in
+`docs/forms.md`; `/guide#forms` and `/op-components#form-field` show them live.
+
+### fmt (`fmt.ts`)
+
+`fmtNum`, `fmtPct`, `fmtBytes`, `fmtDuration`, `fmtRelative`, `fmtAbsolute`,
+`fmtCount` and `EMPTY`: pure functions, no React, no state, one locale argument,
+holding the number, date and duration rules of `docs/content.md` in one place.
+Locale grouping through `Intl` (never a hand-rolled separator), decimal bytes by
+default and binary on request (`MiB`, where the kernel counts), percentages at
+one decimal, durations in at most two units, time relative under 24 hours and
+absolute after, plurals through `Intl.PluralRules` (never `+ 's'`), nothing as
+an en dash and zero as `0` — different facts. `Num`, `Pager`, `Breakdown`,
+`Funnel`, `Flow`, `Histogram` and `TimeChart` / `RangePicker` format through
+them, and so do the sandbox screens: `toFixed` and `toLocaleString` in a screen
+are banned. `/op-components#content-fmt` prints the output table.
 
 ### Sparkline, LogViewer, EmptyPlaceholder
 
@@ -1425,6 +1514,12 @@ direction will drift the way the console already has.
   list, so agents read the same rules as humans.
 - A rule changes only by editing the doc and the reference page in one PR.
 
+What exists today, in `bun run lint`: `tsc --noEmit`, `scripts/audit-records.mjs`
+(the eight record rules), and `node ../web/packages/op/scripts/tokens.mjs check`
+(`tokens.json` against `op.css`, value by value and name by name, in order).
+The token check is the first of these that guards a token rather than a
+structure, and it fails with a printed diff rather than a count.
+
 ## 13. Banned
 
 Enforced once §12 exists; documented until then.
@@ -1450,6 +1545,13 @@ design-system/
     design-system-handoff.md      this file
     brand-guidelines.md           direction, type scale, colour, moves
     RULES.md                      imperative digest for coding agents (rendered at /guide#tooling)
+    forms.md                      field anatomy, validation timing, saving, secrets (/guide#forms)
+    notifications.md              which surface says it: verdict, callout, toast, bell, dialog
+    content.md                    the words: capitalisation, terms, errors, buttons, numbers
+    localisation.md               expansion, no concatenation, logical properties, RTL readiness
+    data-viz.md                   which chart answers which question; series without a hue
+    motion.md                     the three duration tokens, what may move, the two exceptions
+    icons.md                      lucide only, two sizes, the concept → icon vocabulary
     design-system-answers.md      the twelve questions, answered
     operator-console-brief.md     original brief (historical, do not edit)
   src/
@@ -1457,6 +1559,10 @@ design-system/
     components/op/                the operator library (§6, §7)
       index.ts  kbd.tsx  status.tsx  num.tsx  page-state.tsx
       echo-dialog.tsx  templates.tsx  time-chart.tsx  picker.tsx
+      fmt.ts    the formatters content.md's number rules live in
+      form.tsx  FormErrors, the multi-field submit summary
+    ../web/packages/op/tokens.json    the token layer as data (§4)
+    ../web/packages/op/scripts/tokens.mjs  check / build, wired into bun run lint
     components/ui/                shadcn primitives + sparkline, log-viewer, empty-placeholder
     components/platform-logos.tsx, system-map-section.tsx
                                   copied verbatim from temps-landing; do not edit here
@@ -1467,6 +1573,9 @@ design-system/
     sections/Guide.tsx            /guide — renders docs/*.md into one consolidated page
     lib/md.ts                     the slicing helpers the guide cuts documents with
     sections/OpComponents.tsx     component reference page
+    sections/blocks/              the live half of the seven documents above:
+      FormBlocks NotificationBlocks ContentBlocks DataVizBlocks TokenBlocks
+      (mounted by both /guide and /op-components — one implementation)
     sections/Brand.tsx            brand page incl. hierarchy block
 ```
 
@@ -1499,8 +1608,11 @@ Found by the kitchen-sink stress page (`/kitchen-sink`), not yet fixed:
   with one screen mounted; on a reference page with several ledgers `j`/`k`
   move every cursor. Scope handlers to focus-within before the real console
   mounts more than one template per route.
-- Field has no error slot; an invalid input's message goes in `help`, which
-  reads as advice. Add `error` and let Settings block save while any is set.
+- ~~Field has no error slot; an invalid input's message goes in `help`, which
+  reads as advice.~~ Done: `Field` has `error`, `hint`, `optional` and `id`, and
+  `FormErrors` summarises a multi-field failure (§6, `docs/forms.md`). Settings
+  still does not block save while an error is set — and should not: a save
+  button disabled because the form is invalid explains nothing (`docs/forms.md`).
 - Density has two sources of truth: `data-density` on the root and the `dense`
   boolean on Ledger. Derive one from the other.
 - Ledger cursor: shown on load and following the mouse it reads as a selection

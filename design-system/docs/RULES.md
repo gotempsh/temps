@@ -1,7 +1,9 @@
 # Temps design system: rules for agents
 
-Machine-readable digest of `brand-guidelines.md` and `design-system-handoff.md`.
-Imperative only. When this file and those two disagree, they win — fix this file.
+Machine-readable digest of `brand-guidelines.md`, `design-system-handoff.md`,
+`content.md`, `localisation.md`, `forms.md`, `notifications.md`, `data-viz.md`,
+`motion.md` and `icons.md`.
+Imperative only. When this file and those documents disagree, they win — fix this file.
 Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Setup
@@ -23,9 +25,18 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Use Geist and Geist Mono. No other faces.
 - Set numbers in mono, tabular, unit after the value in muted.
 
+## Tokens
+
+- Take every value from a token. A hex, an `oklch()` or a `ms` literal in a tsx file is a bug.
+- Name only semantic tokens in a component (`--muted-foreground`), never a base token.
+- Edit `web/packages/op/tokens.json` and `op.css` in one commit. `bun run lint` fails when they disagree.
+- Add a token to light; add it to dark only when the value actually changes. Dark cascades.
+- Keep the scale closed: radius 0.25rem, borders 1px, spacing 4/8/12/16/20/24/32, six type tiers, three durations.
+
 ## Banned
 
-- Tailwind palette literals (`text-red-500`) and hex in tsx.
+- Tailwind palette literals (`text-red-500`), a hex or an `oklch()` in tsx.
+- A literal duration in a tsx file. `duration-150`, `transition-all`.
 - A second hue. `data-accent` is landing-only, one filled element per viewport.
 - Spinners as page state. Use `PageState state="loading"` (skeleton rows).
 - Blank empty states. Every non-happy state is `PageState`.
@@ -33,7 +44,8 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - `<select>` for branches, images, regions, environments, or >7 options. Use `Picker`.
 - Titles at weight 500. Titles 600–800, body 400, labels 500.
 - Cards as layout. Stock shadcn card look.
-- Sparkles, gradients, wands, the word "magic", `Loader2` as a page.
+- Sparkles, gradients, wands, the word "magic", `Loader2` as a page. `Sparkles`, `Wand2`,
+  `WandSparkles` by name — AI is `Bot` and `Brain`.
 - Hiding a feature because it is unconfigured. Show it, say what is missing, link the fix.
 - Hand-rolled hovers on filled controls. Use `.op-fill-ink` / `.op-fill-destructive`.
 - `href="#"` with `preventDefault`. A `Kbd` badge with no handler. A filter that filters nothing.
@@ -41,6 +53,25 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Red on a confirmation that is reversible. Red means irreversible loss only.
 - A mixed-kind list with no kind icons.
 - A kind icon in the state glyph's slot, or a kind icon carrying a state colour.
+- Filled icons, emoji, icons as bullets, two icons for one concept.
+- A per-icon `strokeWidth` or `size` prop. A brand-coloured logo that is not `GitProviderLogo` or `ProjectMark`.
+- A token in `tokens.json` that `op.css` does not declare, or the reverse.
+- A skeleton that shimmers, a chart that draws itself, a number that counts up.
+- "Something went wrong", "an unexpected error occurred", "please try again later", "contact support".
+- `OK` / `Yes` / `No` / `Submit` / `Confirm` as a button label, and `Are you sure?` as a dialog title.
+- `toFixed`, `toLocaleString`, a hand-rolled thousands separator, or `+ 's'` for a plural in a screen. Use `fmt.ts`.
+- A time with no id beside it, an ISO string in a row, and "just now".
+- `pl-*` / `pr-*` / `left-*` / `right-*` / `text-left` in layout, and any fixed-width text container.
+- A toast for a fault that persists. If it has to be read, it is a Callout.
+- A toast and a Callout for the same event. A red dot with no count.
+- A disabled control with no reason beside it. A save button disabled because the form is invalid.
+- Validation on every keystroke, before the field has ever been left.
+- "Success", "Done" or "Error" as the whole message.
+- A stored secret prefilled into an input. A banner that pushes the page down.
+- Pie charts, donuts, treemaps, stacked areas. A truncated y axis on bars.
+- A colour legend, or two series told apart by `--chart-1` / `--chart-2`.
+- A chart with no table view, or more than four series on one plot.
+- Hover-only readouts (the `GeoMap` desktop pointer readout is the one exception, because the list beside it carries the keyboard).
 
 ## Type
 
@@ -52,6 +83,15 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - `.op-lead` 400 muted — the sentence under a title.
 - `.op-label` 500 uppercase tracked — eyebrow, column header, key badge. Never a section title.
 - Give one page one display headline. Two biggest things means neither leads.
+
+## Motion
+
+- Move a control's own state, a drop opening, a row entering focus, a live value updating. Nothing else.
+- Never move layout, a page transition, a chart drawing itself, or a skeleton shimmering.
+- Use `--op-duration` (100ms) by default, `--op-duration-fast` (80ms) for hover, `--op-duration-slow` (200ms) only for something arriving on top of the page.
+- Use one curve, `--op-ease`. Change the tier with `.op-motion-fast` / `.op-motion-slow`, never with a literal.
+- Reduced motion is one media rule in `op.css` that zeroes all three durations. Never gate motion in JavaScript.
+- Leave the two exceptions alone: `.op-raise`'s hard 3px offset never lifts, and `animate-pulse` / `animate-spin` are the only surviving animations.
 
 ## Status vocabulary
 
@@ -74,6 +114,9 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Leave the icon off a single-kind list whose title already names the kind.
 - Use `LedgerRow.icon`, `PickerOption.icon`, the `Breakdown` row `icon`, and the
   leading icon on a palette `CommandItem`. Never colour an icon.
+- Use lucide only, stroke 1.75, `size-4` in a row and `size-3.5` in a label or button.
+- Give a concept one icon and one only. Check the table in `docs/icons.md` before adding a second.
+- Add a concept in one PR: one row in the `docs/icons.md` table, plus a real call site.
 
 ## Page structure
 
@@ -102,6 +145,28 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 7. Actions do, facets go. Nothing in the actions row may only switch tab.
 8. A drawn control is a wired control. Typed destinations (`/${string}`), never `#`.
 
+## Forms
+
+- Give every control a `Field`: visible label at 500, hint, control, error. A placeholder is an example, never a name.
+- Validate a field on blur, the form on submit, and a field already in error on every keystroke until it clears.
+- Write an error as a state word and a sentence that names the resource and the fix. Never "invalid" alone.
+- Put the message under its field; add a `FormErrors` Callout only when more than one field fails, each entry focusing its field.
+- Mark the exception: the console's forms are mostly required, so mark `optional` and never "required".
+- Never disable a control without the reason beside it. A control that needs configuration onboards; it does not disappear.
+- Give a form one save: the `Settings` sticky bar, `save ⌘S`, discard beside it while dirty, "no changes" after.
+- Keep a long submit on the form: progress on the button, fields locked, never a spinner page, nothing typed thrown away.
+- Route destructive submits through `EchoDialog`; ask for the typed echo, and use red, only when the loss is irreversible.
+- Never prefill a stored secret. `SecretValue` shows it is set, with reveal and copy; replacing says what breaks.
+- `⏎` submits a single-field form only. `esc` closes what is open and discards nothing.
+
+## Notifications
+
+- One surface per message: verdict → `StatusLine`; fault in context → `Callout`; result of an action → toast; missed while away → the bell; blocking decision → `EchoDialog`.
+- Write a toast as state · headline · fact, six words or fewer, naming the object: `api-gateway deploying · dep_93a`.
+- Use `ok` `warn` `error` and their glyphs (● ◐ ×) and no other severity words.
+- Count unread by state in the bell, with a number. Quiet is one green glyph and nothing else.
+- Let nothing move the layout to speak. The `Settings` sticky save bar is the only exception.
+
 ## Data
 
 - Time: relative under a day (`41m ago`), absolute after, with the deploy id beside it.
@@ -110,6 +175,44 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - A chart with no data says which of four reasons: no traffic, not configured, sampled, past retention.
 - State the retention horizon in the chart footer. Strike gated ranges through, never hide them.
 - Render logs with `LogViewer` / `LogLines`, never a `<pre>`.
+
+## Charts
+
+- Pick the chart from the question: over time → `TimeChart`; share or rank → `Breakdown`; steps → `Funnel`; from→to → `Flow`; distribution → `Histogram`; by bucket → `StatusStrip`; 0–100 → `ScoreRing`; by day → `CalendarHeatmap`; nested timing → `Waterfall`; by country → the ranked list, `GeoMap` second.
+- Separate series by pattern, never hue: `stroke` solid · dashed · dotted, `weight` thin · regular.
+- Let `TimeChart` draw the legend from `series`. Never type one in a footer.
+- Give a series a tone only when the series is itself a state (`series.state`): an error rate against its threshold band.
+- Start count axes at zero, and never truncate the y axis on bars.
+- Label a log scale `log` on the axis, or do not use one.
+- Give every chart `role="img"` and an `aria-label` sentence built from `title`, `range` and `verdict`.
+- Ship a table view with every chart (`TimeChart` `table`, on by default) and make the readout row navigable with `←` `→`.
+- Put touch readouts under the chart; hatch a partial bucket and say so.
+- Say the unit once in the header, never on every tick; numbers stay mono and tabular.
+- State range · retention · sampled · the baseline of every delta in `ChartFooter`.
+- Keep one plot to four series. More is small multiples or a table.
+
+## Content
+
+- Write everything in sentence case. Spell product names as their owners do; never re-case an identifier.
+- Use one term per concept: deployment, project, environment, node, provider, backup, variable, issue, run, member. No synonyms.
+- Say `roll back` for the verb and `rollback` for the noun; `sign in`, never `log in`.
+- Say `remove` when the thing survives and `delete` when data dies. Only `delete` goes red.
+- Shape every error as what failed · on what · why · what to do next, with the id. Never "something went wrong".
+- Quote the other system verbatim in mono; translate and paraphrase nothing a machine wrote.
+- Say what did not change when nothing did ("Staging stayed on dep_89f").
+- Label a button verb first, object second. Never `OK`, `Yes`, `Submit`, `Confirm`, `Done`.
+- Name the loss in a destructive action ("Delete project and 14 backups"). Say how to undo it when it can be undone.
+- Write empty states as fact then next step; write unconfigured states as what is missing, an example, and the link that fixes it.
+- Separate facts with a spaced middle dot (`·`). No trailing period on a label, cell, button or tab. No exclamation marks. `…` only for truncation.
+- Format numbers, percentages, bytes, durations, counts and times through `fmt.ts`. Nothing is `–`; zero is `0`.
+- Give every relative time a `title` with the absolute stamp, and an id beside it.
+
+## Locale
+
+- Design labels at 130% and buttons at 200% of their English length; never fix the width of a text container.
+- Build no sentence by concatenation: one template per sentence, named slots, `fmtCount` for every count.
+- Use logical properties (`ps-`/`pe-`/`ms-`/`me-`/`start`/`end`/`text-start`) in layout; flip direction icons, never thing icons.
+- Keep charts, logs, code, ids and stack traces LTR and untranslated; translate the sentence around the quote, never the quote.
 
 ## Keyboard
 
@@ -129,8 +232,8 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Before you ship
 
-- `bun run lint` (tsc + `scripts/audit-records.mjs`) is clean.
+- `bun run lint` (tsc + `scripts/audit-records.mjs` + `tokens.mjs check`) is clean.
 - `bun run e2e` is green: overflow at 390 and 1440, keyboard, drop focus, axe light and dark, visual baselines.
 - Look at the screen at 1440 and 390, in light and dark.
 - Fix dev warnings from `Lede` (fewer than three facts) and `Detail` (lede without meta or status).
-- Change a rule only by editing `brand-guidelines.md`, `design-system-handoff.md`, this file and the reference page in one commit.
+- Change a rule only by editing the document that owns it, this file and the reference page in one commit.

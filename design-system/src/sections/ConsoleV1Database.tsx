@@ -11,6 +11,7 @@ import {
   StatusStrip, LogLines, Histogram, quantile,
   type KV, type LedgerRow, type State, type StatusBucket, type LogLine, type Pct, type HistBucket,
 } from '@/components/op'
+import { EMPTY, fmtNum, fmtPct } from '@/components/op'
 import type { Notify } from './ConsoleV1Observe'
 import { PROJECT_ICONS } from './console-projects'
 import { agoNum, sizeNum } from './ConsoleV1'
@@ -40,25 +41,25 @@ type MetricDef = { key: string; label: string; unit: string; fmt: (v: number) =>
 const series = (base: number, amp: number, seed: number) => Array.from({ length: 48 }, (_, i) => +(base + Math.abs(Math.sin((i + seed) / 4.2)) * amp).toFixed(2))
 const METRICS: Record<string, MetricDef[]> = {
   Redis: [
-    { key: 'mem', label: 'memory used', unit: 'MB', fmt: (v) => `${v.toFixed(2)} MB`, series: series(1.1, 0.3, 1) },
+    { key: 'mem', label: 'memory used', unit: 'MB', fmt: (v) => `${fmtNum(v, { digits: 2 })} MB`, series: series(1.1, 0.3, 1) },
     { key: 'clients', label: 'clients', unit: '', fmt: (v) => String(Math.round(v)), series: series(1, 0, 0) },
-    { key: 'hit', label: 'hit ratio', unit: '%', fmt: (v) => (v ? `${v.toFixed(1)}%` : '—'), series: series(0, 0, 0), state: 'idle' },
+    { key: 'hit', label: 'hit ratio', unit: '%', fmt: (v) => (v ? fmtPct(v) : EMPTY), series: series(0, 0, 0), state: 'idle' },
     { key: 'evicted', label: 'evicted keys', unit: '', fmt: (v) => String(Math.round(v)), series: series(0, 0, 0) },
-    { key: 'cpu', label: 'cpu', unit: '%', fmt: (v) => `${v.toFixed(1)}%`, series: series(0.8, 0.6, 3) },
+    { key: 'cpu', label: 'cpu', unit: '%', fmt: (v) => fmtPct(v), series: series(0.8, 0.6, 3) },
   ],
   PostgreSQL: [
     { key: 'conn', label: 'connections', unit: '', fmt: (v) => `${Math.round(v)} / 100`, series: series(34, 22, 2) },
     { key: 'tps', label: 'transactions', unit: '/s', fmt: (v) => `${Math.round(v)}/s`, series: series(210, 160, 5) },
-    { key: 'cache', label: 'cache hit', unit: '%', fmt: (v) => `${v.toFixed(1)}%`, series: series(98.2, 1.2, 1) },
-    { key: 'size', label: 'size', unit: 'GB', fmt: (v) => `${v.toFixed(2)} GB`, series: series(4.1, 0.1, 0) },
-    { key: 'cpu', label: 'cpu', unit: '%', fmt: (v) => `${v.toFixed(1)}%`, series: series(12, 18, 3), state: 'ok' },
+    { key: 'cache', label: 'cache hit', unit: '%', fmt: (v) => fmtPct(v), series: series(98.2, 1.2, 1) },
+    { key: 'size', label: 'size', unit: 'GB', fmt: (v) => `${fmtNum(v, { digits: 2 })} GB`, series: series(4.1, 0.1, 0) },
+    { key: 'cpu', label: 'cpu', unit: '%', fmt: (v) => fmtPct(v), series: series(12, 18, 3), state: 'ok' },
   ],
   ClickHouse: [
     { key: 'qps', label: 'queries', unit: '/s', fmt: (v) => `${Math.round(v)}/s`, series: series(40, 30, 4) },
-    { key: 'mem', label: 'memory used', unit: 'GB', fmt: (v) => `${v.toFixed(2)} GB`, series: series(3.1, 0.7, 2), state: 'warn' },
+    { key: 'mem', label: 'memory used', unit: 'GB', fmt: (v) => `${fmtNum(v, { digits: 2 })} GB`, series: series(3.1, 0.7, 2), state: 'warn' },
     { key: 'parts', label: 'active parts', unit: '', fmt: (v) => String(Math.round(v)), series: series(120, 40, 1) },
-    { key: 'size', label: 'size', unit: 'GB', fmt: (v) => `${v.toFixed(1)} GB`, series: series(38, 0.4, 0) },
-    { key: 'cpu', label: 'cpu', unit: '%', fmt: (v) => `${v.toFixed(1)}%`, series: series(30, 25, 3) },
+    { key: 'size', label: 'size', unit: 'GB', fmt: (v) => `${fmtNum(v, { digits: 1 })} GB`, series: series(38, 0.4, 0) },
+    { key: 'cpu', label: 'cpu', unit: '%', fmt: (v) => fmtPct(v), series: series(30, 25, 3) },
   ],
 }
 const uptime = (flaky: boolean): StatusBucket[] => Array.from({ length: 48 }, (_, i) => { const down = flaky && i >= 18 && i <= 20; return { start: `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`, state: down ? 'error' : 'ok', checks: 60, down: down ? 60 : 0, p50_ms: down ? undefined : 2, p95_ms: down ? undefined : 4 } })
@@ -103,7 +104,7 @@ export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: b
       : <StatusLine state="ok">Healthy. Last backup {db.backups[0]?.at}{db.pitr ? ', point-in-time recovery to any second in the last 7 days' : ''}.</StatusLine>
 
   const facts: KV[] = [
-    { k: 'uptime 24h', v: `${(100 - (downtime / 1440) * 100).toFixed(2)}%`, mono: true, state: downtime ? 'warn' : undefined },
+    { k: 'uptime 24h', v: fmtPct(100 - (downtime / 1440) * 100, { digits: 2 }), mono: true, state: downtime ? 'warn' : undefined },
     { k: 'response', v: '2 ms', mono: true },
     { k: metrics[0].label, v: metrics[0].fmt(last(metrics[0])) + (metrics[0].key === 'mem' ? ` of ${db.memLimit}` : ''), mono: true },
     { k: metrics[1].label, v: metrics[1].fmt(last(metrics[1])), mono: true },

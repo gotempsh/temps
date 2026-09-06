@@ -16,13 +16,26 @@ import { writeToClipboard } from '@/lib/clipboard'
 import { bullets, headings, markedItems, plain, slice, slug, unique } from '@/lib/md'
 import { cn } from '@/lib/utils'
 
+import { ContentBlocks } from './blocks/ContentBlocks'
+import { DataVizBlocks } from './blocks/DataVizBlocks'
+import { FormBlocks } from './blocks/FormBlocks'
+import { NotificationBlocks } from './blocks/NotificationBlocks'
+import { IconsBlock, MotionBlock, TokensBlock } from './blocks/TokenBlocks'
+
 import brandMd from '../../docs/brand-guidelines.md?raw'
 import handoffMd from '../../docs/design-system-handoff.md?raw'
 import auditMd from '../../docs/ux-audit-2026-09-06.md?raw'
 import rulesMd from '../../docs/RULES.md?raw'
+import contentMd from '../../docs/content.md?raw'
+import localisationMd from '../../docs/localisation.md?raw'
+import formsMd from '../../docs/forms.md?raw'
+import notificationsMd from '../../docs/notifications.md?raw'
+import dataVizMd from '../../docs/data-viz.md?raw'
+import motionMd from '../../docs/motion.md?raw'
+import iconsMd from '../../docs/icons.md?raw'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /guide — the consolidated design-system guide. One page that reads the four
+   /guide — the consolidated design-system guide. One page that reads the
    markdown documents in `docs/` and puts them in the order a designer or
    engineer actually needs them. It renders inside the app's one shell
    (`src/components/Layout.tsx`): the shell draws the top bar, the section rail
@@ -36,7 +49,10 @@ import rulesMd from '../../docs/RULES.md?raw'
    type scale in its real classes, the five glyphs from `Status`, a primitive
    rendered beside the rule it illustrates — and those live blocks hang off a
    heading id through the LIVE map below, so an editor can see exactly where
-   each one lands.
+   each one lands. The seven newer documents (forms, notifications, content,
+   data viz, motion, icons, localisation) carry a whole blocks component from
+   `src/sections/blocks/` instead, mounted under their prose by `LiveBlocks`;
+   `/op-components` mounts the same components.
 
    The page obeys the rules it documents: ink skin, no cards, rules between
    sections, the `.op-*` type tiers, mono for values, tables framed with soft
@@ -78,8 +94,27 @@ const HANDOFF_CHECKLIST = slice(handoffMd, '### Record page checklist', '## 7b. 
 const HANDOFF_RESPONSIVE = slice(handoffMd, '## 7c. Responsive rules', '## 8. Data rules')
 const HANDOFF_BANNED = slice(handoffMd, '## 13. Banned', '## 14. File map')
 
+/** A whole document without its own H1: the section heading above it already says the name. */
+const withoutTitle = (md: string) => md.split('\n').slice(1).join('\n').trim()
+
 /** The agent digest, without its own H1 (the page supplies the heading). */
-const RULES_BODY = rulesMd.split('\n').slice(1).join('\n').trim()
+const RULES_BODY = withoutTitle(rulesMd)
+
+/**
+ * The seven documents that arrived with the forms, content, notification,
+ * chart, token, motion and icon rules. Each is rendered whole under its own
+ * section, with the matching blocks component mounted as the live example —
+ * except `icons.md`, whose vocabulary table is the block itself, so the doc is
+ * cut around it.
+ */
+const DOC_CONTENT = withoutTitle(contentMd)
+const DOC_LOCALE = withoutTitle(localisationMd)
+const DOC_FORMS = withoutTitle(formsMd)
+const DOC_NOTIFICATIONS = withoutTitle(notificationsMd)
+const DOC_DATAVIZ = withoutTitle(dataVizMd)
+const DOC_MOTION = withoutTitle(motionMd)
+const ICONS_SET = slice(iconsMd, '## The set', '## The vocabulary')
+const ICONS_ADDING = slice(iconsMd, '## Adding a concept')
 
 // ── live blocks ────────────────────────────────────────────────────────
 
@@ -91,6 +126,16 @@ function Live({ label, children, className }: { label: string; children: ReactNo
       {children}
     </div>
   )
+}
+
+/**
+ * A blocks component mounted under a section's prose. The blocks in
+ * `src/sections/blocks/` are the live half of the seven new documents, and
+ * `/op-components` mounts the same components — one implementation, two places
+ * to meet it.
+ */
+function LiveBlocks({ children }: { children: ReactNode }) {
+  return <div className="mt-12 min-w-0 space-y-12">{children}</div>
 }
 
 const STATES: readonly State[] = ['ok', 'warn', 'error', 'idle', 'sampled']
@@ -541,6 +586,14 @@ const DOC_ANCHORS: Record<string, string | null> = {
   'brand-guidelines.md': '#brand',
   'design-system-handoff.md': '#start',
   'ux-audit-2026-09-06.md': '#open',
+  'content.md': '#content',
+  'localisation.md': '#locale',
+  'forms.md': '#forms',
+  'notifications.md': '#notifications',
+  'data-viz.md': '#dataviz',
+  'motion.md': '#motion',
+  'icons.md': '#icons',
+  'RULES.md': '#tooling',
   'console-inventory.md': null,
   'design-system-answers.md': null,
   'operator-console-brief.md': null,
@@ -1262,8 +1315,9 @@ function DoDontSection() {
 // ── before you ship ────────────────────────────────────────────────────
 
 const SHIP_COMMANDS: readonly (readonly [string, string])[] = [
-  ['bun run lint', 'tsc --noEmit plus scripts/audit-records.mjs. Must be clean before any hand-back.'],
+  ['bun run lint', 'tsc --noEmit, scripts/audit-records.mjs and the token check. Must be clean before any hand-back.'],
   ['bun run audit:records', 'The record-recipe audit alone, when you want the failure without the type check.'],
+  ['bun run tokens:check', 'tokens.json against op.css: every value, every name, in order. Fails with a diff when the two disagree.'],
   ['bun run e2e', 'The whole Playwright suite (~1 min): overflow at 390 and 1440, keyboard, drop focus, axe in light and dark, visual baselines.'],
   ['bunx playwright test e2e/a11y.spec.ts', 'Just axe. The KNOWN map at the top of the file is empty and must stay empty.'],
   ['bun run e2e:update', 'Rewrite visual baselines — then look at the diff before committing it. Only from a quiet dev server.'],
@@ -1283,7 +1337,7 @@ const SHIP_CHECKS: readonly (readonly [string, string])[] = [
   ['390 and 1440', 'No horizontal document scroll at either width. Actions scroll sideways, ledger rows render `mobile` with the primary action.'],
   ['light and dark', 'Dark is a second set of token values. Look at the screen in both.'],
   ['axe clean', 'No new serious or critical violation, in either theme.'],
-  ['the doc changed too', 'If you changed a rule, it changed in brand-guidelines.md, design-system-handoff.md, docs/RULES.md and on the reference page in the same commit.'],
+  ['the doc changed too', 'If you changed a rule, it changed in the document that owns it (brand-guidelines.md, design-system-handoff.md, or one of content.md, localisation.md, forms.md, notifications.md, data-viz.md, motion.md, icons.md), in docs/RULES.md, and on the reference page — one commit.'],
 ]
 
 function BeforeShipSection() {
@@ -1483,13 +1537,6 @@ const SECTIONS: readonly Section[] = [
     body: <DoDontSection />,
   },
   {
-    id: 'tokens',
-    label: 'Tokens',
-    source: 'design-system-handoff.md §4 · swatches read live',
-    md: [HANDOFF_TOKENS],
-    body: <Md prefix="tokens">{HANDOFF_TOKENS}</Md>,
-  },
-  {
     id: 'status',
     label: 'Status vocabulary',
     source: 'design-system-handoff.md §5 · glyphs rendered live',
@@ -1509,6 +1556,100 @@ const SECTIONS: readonly Section[] = [
     source: 'design-system-handoff.md §6 · each name links to /op-components',
     md: [HANDOFF_COMPONENTS],
     body: <Md prefix="components">{HANDOFF_COMPONENTS}</Md>,
+  },
+  {
+    id: 'forms',
+    label: 'Forms',
+    source: 'forms.md · Field, FormErrors and the sticky save, live',
+    md: [DOC_FORMS],
+    body: (
+      <>
+        <Md prefix="forms">{DOC_FORMS}</Md>
+        <LiveBlocks><FormBlocks /></LiveBlocks>
+      </>
+    ),
+  },
+  {
+    id: 'notifications',
+    label: 'Notifications',
+    source: 'notifications.md · the five surfaces, live',
+    md: [DOC_NOTIFICATIONS],
+    body: (
+      <>
+        <Md prefix="notifications">{DOC_NOTIFICATIONS}</Md>
+        <LiveBlocks><NotificationBlocks /></LiveBlocks>
+      </>
+    ),
+  },
+  {
+    id: 'content',
+    label: 'Content',
+    source: 'content.md · the shapes an error, a time and a number take',
+    md: [DOC_CONTENT],
+    body: (
+      <>
+        <Md prefix="content">{DOC_CONTENT}</Md>
+        <LiveBlocks><ContentBlocks /></LiveBlocks>
+      </>
+    ),
+  },
+  {
+    id: 'dataviz',
+    label: 'Data viz',
+    source: 'data-viz.md · the charts drawn with the real primitives',
+    md: [DOC_DATAVIZ],
+    body: (
+      <>
+        <Md prefix="dataviz">{DOC_DATAVIZ}</Md>
+        <LiveBlocks><DataVizBlocks /></LiveBlocks>
+      </>
+    ),
+  },
+  {
+    id: 'tokens',
+    label: 'Tokens',
+    source: 'design-system-handoff.md §4 · the table built from tokens.json, swatches read live',
+    md: [HANDOFF_TOKENS],
+    body: (
+      <>
+        <Md prefix="tokens">{HANDOFF_TOKENS}</Md>
+        <LiveBlocks><TokensBlock /></LiveBlocks>
+      </>
+    ),
+  },
+  {
+    id: 'motion',
+    label: 'Motion',
+    source: 'motion.md · the three duration tokens, on one control',
+    md: [DOC_MOTION],
+    body: (
+      <>
+        <Md prefix="motion">{DOC_MOTION}</Md>
+        <LiveBlocks><MotionBlock /></LiveBlocks>
+      </>
+    ),
+  },
+  {
+    id: 'icons',
+    label: 'Icons',
+    source: 'icons.md · the vocabulary table rendered as icons',
+    md: [ICONS_SET, ICONS_ADDING],
+    body: (
+      <>
+        <Md prefix="icons">{ICONS_SET}</Md>
+        <LiveBlocks><IconsBlock /></LiveBlocks>
+        <div className="mt-12">
+          <Md prefix="icons">{ICONS_ADDING}</Md>
+        </div>
+      </>
+    ),
+  },
+  {
+    id: 'locale',
+    label: 'Localisation',
+    source: 'localisation.md · expansion, no concatenation, logical properties',
+    md: [DOC_LOCALE],
+    body: <Md prefix="locale">{DOC_LOCALE}</Md>,
   },
   {
     id: 'keyboard',
@@ -1677,7 +1818,7 @@ export function GuidePage() {
           </p>
           {results.length === 0 ? (
             <p className="mt-4 text-sm text-muted-foreground">
-              Nothing matches. The guide indexes headings and the 23 taste rules, not every sentence.
+              Nothing matches. The guide indexes headings and the {TASTE_ENTRIES.length} taste rules, not every sentence.
             </p>
           ) : (
             <ul className="op-rows mt-4 border">

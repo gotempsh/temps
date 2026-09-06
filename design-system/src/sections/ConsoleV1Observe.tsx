@@ -9,6 +9,7 @@ import {
   Callout, ChartFooter, Columns, Detail, EchoDialog, Histogram, KeyValue, Ledger, Lede, Metric, MetricGrid, Num, PageState, PageTitle, Phrase, RangePicker, Section, Segmented, Status, StatusLine, TimeChart, Waterfall, type Pct,
   type LedgerRow, type Range, type State, type TimeRange, type Span as VizSpan,
 } from '@/components/op'
+import { fmtNum, fmtPct } from '@/components/op'
 import { matches } from './ConsoleV1Admin'
 import { cn } from '@/lib/utils'
 
@@ -131,8 +132,8 @@ export function SandboxScreen({ id, notify, dense, go }: { id: string; notify: N
       lede={
         <Lede state={st} word={s.status} facts={[
           { k: 'cpu', v: `${s.status === 'running' ? s.cpu_pct : 0}% of ${s.vcpus} vCPU`, state: s.status === 'running' && s.cpu_pct > 80 ? 'warn' : undefined },
-          { k: 'memory', v: `${s.status === 'running' ? ((s.memory * s.mem_pct) / 100 / 1024).toFixed(1) : '0'} of ${s.memory / 1024} GB` },
-          { k: 'disk', v: `${((s.disk_size_mb * s.disk_pct) / 100 / 1024).toFixed(1)} of ${s.disk_size_mb / 1024} GB` },
+          { k: 'memory', v: `${s.status === 'running' ? fmtNum((s.memory * s.mem_pct) / 100 / 1024, { digits: 1 }) : '0'} of ${s.memory / 1024} GB` },
+          { k: 'disk', v: `${fmtNum((s.disk_size_mb * s.disk_pct) / 100 / 1024, { digits: 1 })} of ${s.disk_size_mb / 1024} GB` },
           { k: 'uptime', v: s.status === 'running' ? '2h 14m' : '–' },
           { k: 'lifecycle', v: s.lifecycle === 'ephemeral' ? `ephemeral · ${s.timeout / 60}m` : 'persistent' },
           { k: 'agent run', v: s.agent_run_id ? `#${s.agent_run_id} · finished` : 'none' },
@@ -301,8 +302,8 @@ export function TracesScreen({ go, dense, plan, notify }: { go: (v: string) => v
                 <span className="hidden md:block"><Num value={o.p50} unit="ms" /></span>
                 <Num value={o.p95} unit="ms" />
                 <span className="hidden md:block"><Num value={o.p99} unit="ms" /></span>
-                <span className="hidden md:block">{o.error_rate > 1 ? <Status state="error" label={`${o.error_rate.toFixed(1)}%`} /> : <Num value={o.error_rate ? o.error_rate.toFixed(1) : null} unit="%" />}</span>
-                <span className="hidden items-center gap-2 md:flex">{o.tail_ratio > 10 ? <Status state="warn" label={`${o.tail_ratio.toFixed(1)}×`} /> : <Num value={o.tail_ratio.toFixed(1)} unit="×" />}</span>
+                <span className="hidden md:block">{o.error_rate > 1 ? <Status state="error" label={fmtPct(o.error_rate)} /> : <Num value={o.error_rate ? fmtNum(o.error_rate, { digits: 1 }) : null} unit="%" />}</span>
+                <span className="hidden items-center gap-2 md:flex">{o.tail_ratio > 10 ? <Status state="warn" label={`${fmtNum(o.tail_ratio, { digits: 1 })}×`} /> : <Num value={fmtNum(o.tail_ratio, { digits: 1 })} unit="×" />}</span>
               </div>
             ))}
           </div>
@@ -483,7 +484,7 @@ export function MetricsScreen({ dense, plan, notify }: { dense: boolean; plan: P
               <div className="op-row op-cols hidden items-center md:grid" style={{ '--cols': '1.6fr 1fr 100px 100px' } as CSSProperties}>{[metric.series[0], '', agg, 'count'].map((h, i) => <span key={i} className="op-label">{h}</span>)}</div>
               {BREAKDOWN.map(([k, p95, n]) => (
                 <div key={k} className={cn('op-row op-cols grid grid-cols-[1fr_auto] items-center gap-x-3 text-xs', !dense && 'py-1 md:py-0')} style={{ '--cols': '1.6fr 1fr 100px 100px' } as CSSProperties}>
-                  <span className="font-mono">{k}<span className="ml-2 text-[11px] text-muted-foreground md:hidden">{n.toLocaleString()} req</span></span>
+                  <span className="font-mono">{k}<span className="ml-2 text-[11px] text-muted-foreground md:hidden">{fmtNum(n)} req</span></span>
                   <span className="hidden h-1.5 bg-muted md:block"><span className="block h-full bg-foreground" style={{ width: `${(p95 / 400) * 100}%` }} /></span>
                   {p95 > 380 ? <Status state="warn" label={`${p95}${metric.unit}`} /> : <Num value={p95} unit={metric.unit} />}
                   <span className="hidden md:block"><Num value={n} /></span>

@@ -9,6 +9,7 @@ import {
   ChartFooter, Detail, Ledger, Lede, Live, Metric, MetricGrid, Num, Phrase, RangePicker, PageState, Section, Segmented, Columns, Status, StatusLine, GeoMap, EchoDialog, KeyValue, StatusStrip, TimeChart, Timeline,
   Breakdown, Sparkline, Funnel, Flow, type BreakdownRow, type KV, type LedgerRow, type State, type StatusBucket, type TimeRange,
 } from '@/components/op'
+import { fmtNum, fmtPct } from '@/components/op'
 import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
 
@@ -126,7 +127,7 @@ const VITALS: Vital[] = [
 const VITAL = Object.fromEntries(VITALS.map((v) => [v.k, v])) as Record<VitalKey, Vital>
 const rate = (k: VitalKey, v: number): State => (v > VITAL[k].poor ? 'error' : v > VITAL[k].good ? 'warn' : 'ok')
 const RATE_WORD: Record<State, string> = { ok: 'good', warn: 'needs work', error: 'poor', idle: 'no samples', sampled: 'sampled' }
-const fmtV = (k: VitalKey, v: number) => (k === 'CLS' ? v.toFixed(2) : v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${Math.round(v)}ms`)
+const fmtV = (k: VitalKey, v: number) => (k === 'CLS' ? fmtNum(v, { digits: 2 }) : v >= 1000 ? `${fmtNum(v / 1000, { digits: 2 })}s` : `${Math.round(v)}ms`)
 type Vitals = Record<VitalKey, number>
 const P75: Record<'desktop' | 'mobile', Vitals> = { desktop: { TTFB: 880, FCP: 1120, LCP: 1540, INP: 64, CLS: 0.01 }, mobile: { TTFB: 1230, FCP: 1980, LCP: 2710, INP: 210, CLS: 0.06 } }
 const vitalSpark = (k: VitalKey, seed: number) => spark(seed).map((x) => (VITAL[k].good * (0.35 + x / 120)))
@@ -251,7 +252,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
   const perfRows: LedgerRow[] = [...PERF[perfDim]].filter((r) => matchesQ(q, r.label)).sort((a, b) => b.v[vital] - a.v[vital]).map((r) => ({
     id: r.label, state: worst(r.v), onOpen: () => notify('ok', `filter speed by ${r.label}`, `${r.samples} samples`),
     sort: { label: r.label, samples: r.samples, ...r.v },
-    mobile: <><span className="block truncate font-mono">{r.label}</span><span className="block text-[11px] text-muted-foreground">{vital} {fmtV(vital, r.v[vital])} · {RATE_WORD[rate(vital, r.v[vital])]} · {r.samples.toLocaleString()} samples</span></>,
+    mobile: <><span className="block truncate font-mono">{r.label}</span><span className="block text-[11px] text-muted-foreground">{vital} {fmtV(vital, r.v[vital])} · {RATE_WORD[rate(vital, r.v[vital])]} · {fmtNum(r.samples)} samples</span></>,
     cells: [
       <span className="flex min-w-0 items-center gap-2">{r.icon && <span className="flex w-4 shrink-0 justify-center text-muted-foreground [&_svg]:h-3.5 [&_svg]:w-3.5">{r.icon}</span>}<span className="truncate font-mono">{r.label}</span></span>,
       <Num value={r.samples} />,
@@ -286,14 +287,14 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
   const campaignRows: LedgerRow[] = CAMPAIGNS.filter((c) => matchesQ(q, c.name, c.source, c.medium)).map((c) => ({
     id: c.id, state: c.signups / c.visitors < 0.01 ? 'warn' : 'ok', onOpen: () => notify('ok', `open campaign ${c.name}`, c.variants ? `${c.variants.length} variants by ${c.variants[0].term ? 'term' : 'content'}` : 'no variants'),
     sort: { name: c.name, visitors: c.visitors, signups: c.signups, conv: c.signups / c.visitors, last: c.last },
-    mobile: <><span className="block truncate font-mono">{c.name} <span className="text-muted-foreground">· {c.source}</span></span><span className="block text-[11px] text-muted-foreground"><Num value={c.visitors} /> visitors · {((c.signups / c.visitors) * 100).toFixed(1)}% signed up</span></>,
+    mobile: <><span className="block truncate font-mono">{c.name} <span className="text-muted-foreground">· {c.source}</span></span><span className="block text-[11px] text-muted-foreground"><Num value={c.visitors} /> visitors · {fmtPct(c.signups / c.visitors, { basis: 'ratio' })} signed up</span></>,
     cells: [
       <span className="flex min-w-0 items-center gap-2"><span className="flex w-4 shrink-0 justify-center text-muted-foreground [&_svg]:h-3.5 [&_svg]:w-3.5">{CHANNEL_ICON[c.medium === 'cpc' ? 'paid' : c.medium === 'sponsor' ? 'paid' : c.medium] ?? <Tag />}</span><span className="truncate font-mono">{c.name}</span>{c.variants && <span className="shrink-0 border px-1 text-[10px] text-muted-foreground">{c.variants.length} variants</span>}</span>,
       <span className="truncate text-muted-foreground">{c.source} <span className="text-[11px]">· {c.medium}</span></span>,
       <span className="block w-full"><Sparkline points={c.spark} /></span>,
       <Num value={c.visitors} />,
       <Num value={c.signups} />,
-      c.signups / c.visitors < 0.01 ? <Status state="warn" label={`${((c.signups / c.visitors) * 100).toFixed(1)}%`} /> : <Num value={((c.signups / c.visitors) * 100).toFixed(1)} unit="%" />,
+      c.signups / c.visitors < 0.01 ? <Status state="warn" label={fmtPct(c.signups / c.visitors, { basis: 'ratio' })} /> : <Num value={fmtNum((c.signups / c.visitors) * 100, { digits: 1 })} unit="%" />,
       <span className="text-muted-foreground">{c.last}</span>,
     ],
   }))
@@ -311,7 +312,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
   }))
   const tagged = CAMPAIGNS.reduce((a, c) => a + c.visitors, 0)
   return (
-    <Detail title="Analytics" meta={fresh ? 'acme-storefront · production · no data yet' : `acme-storefront · production · ${TOTAL.toLocaleString()} visitors · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
+    <Detail title="Analytics" meta={fresh ? 'acme-storefront · production · no data yet' : `acme-storefront · production · ${fmtNum(TOTAL)} visitors · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
       actions={<>
         <label className="inline-flex h-7 items-center gap-1.5 text-xs"><input type="checkbox" checked={compare} onChange={(e) => setCompare(e.target.checked)} className="accent-foreground" /> compare with previous {range}</label>
         <RangePicker ranges={RANGES} value={range} onChange={setRange} retentionDays={plan.retentionDays} retentionLabel={plan.retention} onGated={(r) => notify('warn', `${r.label} is beyond this plan's retention`, `currently ${plan.retention}`)} />
@@ -342,7 +343,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
             <TimeChart data={HOURLY} unit="visitors" height={200} xInterval={11}
               series={compare ? [{ key: 'visitors', name: 'visitors' }, { key: 'prev', name: 'previous' }] : [{ key: 'visitors', name: 'visitors' }]}
               markers={[{ id: 'dep_91a', x: '20:30' }]} selection={sel} onSelect={setSel}
-              readoutFormat={(p) => `${p.t} · ${Number(p.visitors).toLocaleString()} visitors${compare ? ` · previous ${Number(p.prev).toLocaleString()}` : ''}`} />
+              readoutFormat={(p) => `${p.t} · ${fmtNum(Number(p.visitors))} visitors${compare ? ` · previous ${fmtNum(Number(p.prev))}` : ''}`} />
             <ChartFooter><span>visitors / 30 min · {range}</span><span>· ┆ deploy</span><span>· drag to measure a window</span>{sel && <span>· {sel.from} → {sel.to} selected · the lists below cover the whole range</span>}</ChartFooter>
           </div>
           <div className="op-grid grid gap-6 md:grid-cols-2 xl:grid-cols-4">
@@ -356,7 +357,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
 
       {!fresh && tab === 'audience' && (
         <div className="space-y-6">
-          <p className="text-xs text-muted-foreground">Who the visitors are. Every list ranks by visitors and opens in place; the share is of all {TOTAL.toLocaleString()} visitors in {range}.</p>
+          <p className="text-xs text-muted-foreground">Who the visitors are. Every list ranks by visitors and opens in place; the share is of all {fmtNum(TOTAL)} visitors in {range}.</p>
           <div className="op-grid grid gap-6 md:grid-cols-2 xl:grid-cols-4">
             <Section title="Where" meta="country → region → city"><Breakdown rows={locations} total={TOTAL} limit={8} /></Section>
             <Section title="Language" meta="language → locale"><Breakdown rows={LANGUAGES} total={TOTAL} limit={8} /></Section>
@@ -372,7 +373,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
           columns={[{ label: 'campaign', key: 'name' }, 'source · medium', range, { label: 'visitors', key: 'visitors', numeric: true }, { label: 'signups', key: 'signups', numeric: true }, { label: 'signed up', key: 'conv', numeric: true }, { label: 'last seen', key: 'last' }]}
           grid="minmax(12rem,1.6fr) minmax(10rem,1.4fr) minmax(7rem,1fr) minmax(70px,max-content) minmax(70px,max-content) minmax(80px,max-content) minmax(80px,max-content)"
           rows={campaignRows} total={CAMPAIGNS.length} filter={q} onFilter={setQ} placeholder="filter campaigns, sources, mediums"
-          hint={<><Num value={UNTAGGED} /> of {(UNTAGGED + tagged).toLocaleString()} visits carried no utm tags and are counted under channels, not here · <a href="#" onClick={(e) => { e.preventDefault(); notify('ok', 'link builder', 'utm_source, utm_medium, utm_campaign filled from a form; copies the URL') }}>build a tagged link</a></>}
+          hint={<><Num value={UNTAGGED} /> of {fmtNum(UNTAGGED + tagged)} visits carried no utm tags and are counted under channels, not here · <a href="#" onClick={(e) => { e.preventDefault(); notify('ok', 'link builder', 'utm_source, utm_medium, utm_campaign filled from a form; copies the URL') }}>build a tagged link</a></>}
           action={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'link builder', 'utm_source, utm_medium, utm_campaign filled from a form; copies the URL')}><Tag /> tagged link</Button>}
           footer={<span>a campaign is source · medium · campaign together; term and content are its variants, inside the row · ◐ under 1% signed up</span>} />
       )}
@@ -410,7 +411,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
       {!fresh && tab === 'funnels' && (
         <div className="op-grid grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
           <div>
-            <Section title={FUNNELS[funnel].name} meta={`${FUNNELS[funnel].steps[0].count.toLocaleString()} entered · ${completed(FUNNELS[funnel].steps).toFixed(1)}% completed · ${range}`} action={<a href="#" onClick={(e) => { e.preventDefault(); notify('ok', 'would open the funnel editor') }} className="text-xs">edit steps</a>}>
+            <Section title={FUNNELS[funnel].name} meta={`${fmtNum(FUNNELS[funnel].steps[0].count)} entered · ${fmtNum(completed(FUNNELS[funnel].steps), { digits: 1 })}% completed · ${range}`} action={<a href="#" onClick={(e) => { e.preventDefault(); notify('ok', 'would open the funnel editor') }} className="text-xs">edit steps</a>}>
               <Funnel steps={FUNNELS[funnel].steps} />
             </Section>
           </div>
@@ -421,7 +422,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
                   <li key={f.id}>
                     <button type="button" onClick={() => setFunnel(i)} className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-muted/40">
                       <span className="truncate underline underline-offset-4">{f.name}</span>
-                      <span className="shrink-0 font-mono text-muted-foreground">{completed(f.steps).toFixed(1)}%</span>
+                      <span className="shrink-0 font-mono text-muted-foreground">{fmtNum(completed(f.steps), { digits: 1 })}%</span>
                     </button>
                   </li>
                 ))}
@@ -456,7 +457,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
             {geoView === 'list' ? (
               <Breakdown rows={[...PERF.countries].sort((a, b) => b.v[vital] - a.v[vital]).map((r) => ({ label: r.label, icon: r.icon, count: r.v[vital], state: rate(vital, r.v[vital]) === 'ok' ? undefined : rate(vital, r.v[vital]), onOpen: () => notify('ok', `filter speed by ${r.label}`, `${r.samples} samples`) }))} total={Math.max(...PERF.countries.map((r) => r.v[vital]))} unit={VITAL[vital].unit || 'cls'} percent={false} limit={8} />
             ) : (
-              <GeoMap rows={PERF.countries.map((r) => ({ geo: r.geo ?? r.label, label: r.label, value: `${vital} ${fmtV(vital, r.v[vital])} · ${RATE_WORD[rate(vital, r.v[vital])]}`, state: rate(vital, r.v[vital]), note: `${r.samples.toLocaleString()} samples` }))} onOpen={(r) => notify('ok', `filter speed by ${r.label}`, r.value)} />
+              <GeoMap rows={PERF.countries.map((r) => ({ geo: r.geo ?? r.label, label: r.label, value: `${vital} ${fmtV(vital, r.v[vital])} · ${RATE_WORD[rate(vital, r.v[vital])]}`, state: rate(vital, r.v[vital]), note: `${fmtNum(r.samples)} samples` }))} onOpen={(r) => notify('ok', `filter speed by ${r.label}`, r.value)} />
             )}
           </Section>
           <Ledger status={null} dense={dense}
@@ -479,9 +480,9 @@ export function EventScreen({ name, go }: { name: string; go: (v: string) => voi
   const e = EVENTS.find((x) => x.name === name) ?? EVENTS[0]
   const series = e.spark.map((v, i) => ({ t: `${String(i).padStart(2, '0')}:00`, fires: Math.round(v) }))
   const evFacts: KV[] = [
-    { k: 'fires 24h', v: e.fires.toLocaleString(), mono: true, state: e.state === 'error' ? 'error' : undefined },
+    { k: 'fires 24h', v: fmtNum(e.fires), mono: true, state: e.state === 'error' ? 'error' : undefined },
     { k: 'usual', v: e.state === 'error' ? '41 / h' : e.note.replace(/^steady · |^half of usual · /, '').split(',')[0], mono: true },
-    { k: 'visitors', v: e.visitors.toLocaleString(), mono: true },
+    { k: 'visitors', v: fmtNum(e.visitors), mono: true },
     { k: 'last fired', v: e.last, mono: true },
     { k: 'pages', v: e.pages.map((p) => String(p.label)).join(', '), mono: true },
     { k: 'properties', v: e.props.length ? e.props.map((p) => p.key).join(', ') : 'none', mono: true, state: e.props.length ? undefined : 'idle' },
@@ -490,7 +491,7 @@ export function EventScreen({ name, go }: { name: string; go: (v: string) => voi
     ? <Lede state="error" word="stopped" facts={evFacts}>last fired {e.last} · was 41 an hour · the drop starts at dep_91a</Lede>
     : e.state === 'warn'
       ? <Lede state="warn" word="below usual" facts={evFacts}>{e.note} · last {e.last}</Lede>
-      : <Lede state="ok" word="firing" facts={evFacts}>{e.note} · last {e.last} · {e.visitors.toLocaleString()} visitors in 24h</Lede>
+      : <Lede state="ok" word="firing" facts={evFacts}>{e.note} · last {e.last} · {fmtNum(e.visitors)} visitors in 24h</Lede>
   // The verdict says what to do; the lede already says how it is doing.
   const status = e.state === 'error'
     ? <StatusLine state="error">Stopped right after <Phrase onClick={() => go('api-gateway')}>dep_91a</Phrase>: the call site in <span className="font-mono">src/checkout/Cart.tsx</span> is gone from that build. Roll back or restore the call.</StatusLine>
@@ -594,10 +595,10 @@ export function MonitorScreen({ id, notify, go }: { id: string; notify: Notify; 
     : m.state === 'error'
       ? <StatusLine state="error">Down for 30 minutes at 20:30, right after <Phrase onClick={() => go('api-gateway')}>dep_91a</Phrase>: connection refused from all 3 regions. Up again since dep_91b; 60 checks failed.</StatusLine>
       : m.state === 'warn'
-        ? <StatusLine state="warn">Answering, but p95 is {(m.p95 / 1000).toFixed(1)}s over the last hour, above the 1s threshold. Slow is not down: the status page shows "degraded".</StatusLine>
+        ? <StatusLine state="warn">Answering, but p95 is {fmtNum(m.p95 / 1000, { digits: 1 })}s over the last hour, above the 1s threshold. Slow is not down: the status page shows "degraded".</StatusLine>
         : <StatusLine state="ok">Up. Every check in the last {range} passed; p95 {m.p95} ms.</StatusLine>
   const facts: KV[] = [
-    { k: `uptime ${range}`, v: `${up[range].toFixed(2)}%`, mono: true, state: up[range] < 99.9 ? 'warn' : undefined },
+    { k: `uptime ${range}`, v: fmtPct(up[range], { digits: 2 }), mono: true, state: up[range] < 99.9 ? 'warn' : undefined },
     { k: 'p50', v: `${m.p50} ms`, mono: true }, { k: 'p95', v: `${m.p95} ms`, mono: true, state: m.p95 > 1000 ? 'warn' : undefined },
     { k: 'last check', v: paused ? 'paused' : '12s ago · 200 · 96 ms', mono: true },
     { k: 'incidents 30d', v: String(INCIDENTS.length), mono: true, state: INCIDENTS.length ? 'warn' : undefined },

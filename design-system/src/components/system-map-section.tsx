@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   BarChart3,
@@ -305,11 +305,22 @@ export function SystemMapSection() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [paused, setPaused] = useState(false);
   const [autoAdvance, setAutoAdvance] = useState(true);
+  const root = useRef<HTMLElement>(null);
   const active = CATEGORIES[activeIndex];
+
+  // Reduced motion is decided once, in CSS: `op.css` zeroes the three duration
+  // tokens under `prefers-reduced-motion: reduce`. This reads that token back
+  // rather than asking `matchMedia` a second time, so the stylesheet stays the
+  // one answer and nothing here can drift from it (docs/motion.md).
+  useEffect(() => {
+    const el = root.current;
+    if (!el) return;
+    const still = getComputedStyle(el).getPropertyValue("--op-duration").trim();
+    if (still === "0s") setAutoAdvance(false);
+  }, []);
 
   useEffect(() => {
     if (paused || !autoAdvance) return;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const id = setInterval(() => {
       setActiveIndex((i) => (i + 1) % CATEGORIES.length);
     }, AUTO_ADVANCE_MS);
@@ -323,7 +334,7 @@ export function SystemMapSection() {
   const activeClusters = new Set<string>(active.clusters);
 
   return (
-    <section id="system-map" className="op-section w-full px-4 sm:px-8">
+    <section ref={root} id="system-map" className="op-section w-full px-4 sm:px-8">
       <div className="mx-auto max-w-6xl">
         <p className="op-label">architecture</p>
         <h2 className="op-h1 mt-3 max-w-3xl">One engine at the center of everything.</h2>
@@ -354,8 +365,8 @@ export function SystemMapSection() {
                 strokeWidth={1.5}
                 className={
                   activeEdges.has(edge.id)
-                    ? "text-foreground transition-colors duration-300"
-                    : "text-border transition-colors duration-300"
+                    ? "text-foreground transition-colors [transition-duration:var(--op-duration-slow)]"
+                    : "text-border transition-colors [transition-duration:var(--op-duration-slow)]"
                 }
               />
             ))}
@@ -375,7 +386,7 @@ export function SystemMapSection() {
             return (
               <span
                 key={`${edge.id}-label`}
-                className={`absolute -translate-x-1/2 -translate-y-1/2 text-[11px] font-mono px-1.5 py-0.5 bg-background transition-colors duration-300 ${
+                className={`absolute -translate-x-1/2 -translate-y-1/2 text-[11px] font-mono px-1.5 py-0.5 bg-background transition-colors [transition-duration:var(--op-duration-slow)] ${
                   isActive ? "text-foreground" : "text-muted-foreground"
                 }`}
                 style={{ left: pct(labelX, VB_W), top: pct(edge.labelYAbs, VB_H) }}
@@ -392,7 +403,7 @@ export function SystemMapSection() {
             return (
               <div
                 key={node.id}
-                className={`absolute flex flex-col items-center justify-center text-center gap-1 px-3 border bg-background transition-colors duration-300 ${
+                className={`absolute flex flex-col items-center justify-center text-center gap-1 px-3 border bg-background transition-colors [transition-duration:var(--op-duration-slow)] ${
                   isEngine ? "op-raise" : ""
                 } ${isActive ? "border-foreground" : "border-border"}`}
                 style={{
@@ -423,7 +434,7 @@ export function SystemMapSection() {
             return (
               <div
                 key={cluster.id}
-                className={`absolute border bg-background px-4 py-3 transition-colors duration-300 ${
+                className={`absolute border bg-background px-4 py-3 transition-colors [transition-duration:var(--op-duration-slow)] ${
                   isActive ? "border-foreground" : "border-border"
                 }`}
                 style={{

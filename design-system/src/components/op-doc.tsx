@@ -40,7 +40,16 @@ export function Block({ id, title, rule, api, children }: { id: string; title: s
         <div className="min-w-0">
           <h2 className="op-h2">{title}</h2>
           <div className="op-prose mt-2 space-y-2 text-sm text-muted-foreground">{rule}</div>
-          {api && <pre className="op-inset mt-4 overflow-auto border p-3 font-mono text-[11px] leading-5">{api}</pre>}
+          {/* Focusable: a scrollable region a keyboard cannot reach is a serious
+              axe violation, and these panes scroll at narrow widths. */}
+          {api && (
+            <pre
+              tabIndex={0}
+              className="op-inset mt-4 overflow-auto border p-3 font-mono text-[11px] leading-5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+            >
+              {api}
+            </pre>
+          )}
         </div>
         <div className="min-w-0 space-y-4">{children}</div>
       </div>

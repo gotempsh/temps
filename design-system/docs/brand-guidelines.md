@@ -383,6 +383,16 @@ the same way every time.
   state, no shadows but the hard one, no rounded corners, no gradients. When
   a screen feels flat, the answer is a better first shape, not more colour.
 
+- **Series live in one ink.** Two lines are told apart by their pattern — solid,
+  dashed, dotted, thin against regular — never by a second hue, and the chart
+  draws its own legend from the series so a footer never has to describe them.
+  A line takes a state tone only when the series *is* a state. `docs/data-viz.md`.
+
+- **One surface per message.** A verdict about the page is the status line, a
+  fault with evidence is a Callout, the result of an action is a toast, what was
+  missed is the bell, a blocking decision is an EchoDialog. Two surfaces for one
+  event is one of them lying. `docs/notifications.md`.
+
 ## 7. Do and don't
 
 Do
