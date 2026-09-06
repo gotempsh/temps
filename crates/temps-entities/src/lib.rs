@@ -36,12 +36,6 @@ pub mod cli_login_sessions;
 pub mod cloud_analytics_write_mode;
 pub mod cloud_backup_mirror_cursors;
 pub mod cloud_backup_mirror_states;
-// cloud_span_outbox was renamed to cloud_telemetry_outbox in ADR-043
-// (migration m20260903_000001_generalize_cloud_telemetry_outbox).
-// The old file is retained here as a compatibility shim that re-exports from
-// the canonical module so existing import paths continue to resolve without a
-// breaking change. New code should import from cloud_telemetry_outbox directly.
-pub mod cloud_span_outbox;
 pub mod cloud_telemetry_backfills;
 pub mod cloud_telemetry_bulk_job_projects;
 pub mod cloud_telemetry_bulk_jobs;

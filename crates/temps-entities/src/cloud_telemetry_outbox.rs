@@ -148,13 +148,6 @@ pub enum CloudTelemetryOutboxState {
     SpilledToLocal,
 }
 
-impl CloudTelemetryOutboxState {
-    /// Whether a row in this state still owes the customer a delivery attempt.
-    pub fn is_outstanding(&self) -> bool {
-        matches!(self, CloudTelemetryOutboxState::Pending)
-    }
-}
-
 impl std::fmt::Display for CloudTelemetryOutboxState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -220,16 +213,6 @@ impl ActiveModelBehavior for ActiveModel {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_pending_rows_are_outstanding() {
-        // The queue-depth number an operator reads must not silently include
-        // rows nothing will ever attempt again.
-        assert!(CloudTelemetryOutboxState::Pending.is_outstanding());
-        assert!(!CloudTelemetryOutboxState::Delivered.is_outstanding());
-        assert!(!CloudTelemetryOutboxState::DeadLetter.is_outstanding());
-        assert!(!CloudTelemetryOutboxState::SpilledToLocal.is_outstanding());
-    }
 
     #[test]
     fn the_default_state_is_pending() {

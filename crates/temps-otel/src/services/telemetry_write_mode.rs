@@ -265,8 +265,6 @@ pub enum CloudWriteSuspension {
     QuotaExhausted = 1,
     /// The credential was refused.
     CredentialRejected = 2,
-    /// The outbox reached its byte cap.
-    QueueOverflow = 3,
 }
 
 impl CloudWriteSuspension {
@@ -274,7 +272,6 @@ impl CloudWriteSuspension {
         match value {
             1 => CloudWriteSuspension::QuotaExhausted,
             2 => CloudWriteSuspension::CredentialRejected,
-            3 => CloudWriteSuspension::QueueOverflow,
             _ => CloudWriteSuspension::None,
         }
     }
@@ -289,7 +286,6 @@ impl CloudWriteSuspension {
             CloudWriteSuspension::CredentialRejected => {
                 TelemetryWriteIntervalReason::CredentialRejected
             }
-            CloudWriteSuspension::QueueOverflow => TelemetryWriteIntervalReason::QueueOverflowSpill,
         }
     }
 
@@ -1560,10 +1556,6 @@ mod tests {
             CloudWriteSuspension::CredentialRejected.interval_reason(),
             TelemetryWriteIntervalReason::CredentialRejected
         );
-        assert_eq!(
-            CloudWriteSuspension::QueueOverflow.interval_reason(),
-            TelemetryWriteIntervalReason::QueueOverflowSpill
-        );
     }
 
     #[test]
@@ -1571,7 +1563,6 @@ mod tests {
         assert!(!CloudWriteSuspension::None.is_suspended());
         assert!(CloudWriteSuspension::QuotaExhausted.is_suspended());
         assert!(CloudWriteSuspension::CredentialRejected.is_suspended());
-        assert!(CloudWriteSuspension::QueueOverflow.is_suspended());
     }
 
     #[test]
