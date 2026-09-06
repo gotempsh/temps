@@ -81,6 +81,22 @@ impl BackupEngine for PostgresWalgEngine {
                 reason: format!("service {} not found", service_id),
             })?;
 
+        temps_providers::continuous_archive::ensure_continuous_archive_source_pin(
+            deps.db.as_ref(),
+            &service,
+            s3_source_id,
+            "WAL-G continuous archiving",
+        )
+        .await
+        .map_err(|e| match e {
+            temps_providers::continuous_archive::ContinuousArchiveError::Mismatch(reason) => {
+                BackupError::PermanentFailure { reason }
+            }
+            temps_providers::continuous_archive::ContinuousArchiveError::Database(reason) => {
+                BackupError::Failed { reason }
+            }
+        })?;
+
         let s3_source = v2_common::load_s3_source(deps.db.as_ref(), s3_source_id).await?;
         let s3_client = v2_common::build_s3_client(
             &s3_source,
@@ -320,7 +336,6 @@ impl BackupEngine for PostgresWalgEngine {
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
-
 struct PgParams {
     username: String,
     password: String,

@@ -24,6 +24,21 @@ pub struct ExternalServiceUpdatedAudit {
     pub updated_parameter_names: Vec<String>,
 }
 
+/// A deliberate, operator-initiated move of a service's continuous
+/// archiving process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) to
+/// a different S3 source. Audited both directions since it's consequential:
+/// data archived before this call under `previous_s3_source_id` will no
+/// longer be verifiable or replayable once archiving points at
+/// `new_s3_source_id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContinuousArchiveSourceRepointedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub previous_s3_source_id: Option<i32>,
+    pub new_s3_source_id: i32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceParameterRevealedAudit {
     pub context: AuditContext,
@@ -245,6 +260,29 @@ pub struct ExternalServiceClusterMemberPromotedAudit {
 impl AuditOperation for ExternalServiceCreatedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ContinuousArchiveSourceRepointedAudit {
+    fn operation_type(&self) -> String {
+        "CONTINUOUS_ARCHIVE_SOURCE_REPOINTED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

@@ -13277,6 +13277,8 @@ mod tests {
             ai_data_access: Set(false),
             container_name: Set(None),
             created_by_user_id: Set(None),
+            continuous_archive_s3_source_id: Set(None),
+            continuous_archive_pinned_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         };
@@ -13461,6 +13463,8 @@ mod tests {
             ai_data_access: Set(false),
             container_name: Set(None),
             created_by_user_id: Set(None),
+            continuous_archive_s3_source_id: Set(None),
+            continuous_archive_pinned_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13912,6 +13916,8 @@ mod tests {
             ai_data_access: Set(false),
             container_name: Set(None),
             created_by_user_id: Set(None),
+            continuous_archive_s3_source_id: Set(None),
+            continuous_archive_pinned_at: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

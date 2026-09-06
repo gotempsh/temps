@@ -89,6 +89,22 @@ impl BackupEngine for MariadbPhysicalEngine {
                 reason: format!("service {} not found", service_id),
             })?;
 
+        temps_providers::continuous_archive::ensure_continuous_archive_source_pin(
+            deps.db.as_ref(),
+            &service,
+            s3_source_id,
+            "MariaDB binlog archiving",
+        )
+        .await
+        .map_err(|e| match e {
+            temps_providers::continuous_archive::ContinuousArchiveError::Mismatch(reason) => {
+                BackupError::PermanentFailure { reason }
+            }
+            temps_providers::continuous_archive::ContinuousArchiveError::Database(reason) => {
+                BackupError::Failed { reason }
+            }
+        })?;
+
         let (s3_source, s3_client) = v2_common::load_and_build_s3_client(
             deps.db.as_ref(),
             &deps.encryption_service,
