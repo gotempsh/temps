@@ -476,14 +476,16 @@ only and say "more" instead of the total; do not invent a count.
 footer with counts and keys. Rows sort attention first. `grid` is the CSS
 `grid-template-columns` for md and up; phones get name + note + glyph. Pass a
 `PageState` as `state` to replace the rows. A row takes an `icon`: the kind of
-record it is (app / worker / static project, database engine, control plane /
-worker node, span kind), drawn in a fixed 16px slot at the head of the first
-cell and before the name on a phone, in muted ink. It rides the first cell
-rather than taking a column of its own, so no `grid` string changes and no
-single-kind ledger carries an empty slot. It is required when the list mixes
-kinds and left off when the ledger's title already names the kind (the deploys
-of one project). The state glyph stays where it is; an icon never carries a
-state colour. Used for projects, databases,
+record it is (database engine, control plane / worker node, span kind), drawn
+in a fixed 16px slot at the head of the first cell and before the name on a
+phone, in muted ink. It rides the first cell rather than taking a column of
+its own, so no `grid` string changes and no single-kind ledger carries an
+empty slot. It is required when the list mixes kinds and left off when the
+ledger's title already names the kind (the deploys of one project) or when the
+row already carries an identity mark: the projects ledger shows the project
+mark and says `worker · production` in the meta rather than stacking two marks
+before the name. The state glyph stays where it is; an icon never carries a
+state colour. Used for databases,
 errors; intended for deploys, domains, users, backups, sandboxes, email.
 
 **The observe primitives** (`src/components/op/viz.tsx`, demos on

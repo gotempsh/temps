@@ -65,8 +65,10 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Icons
 
-- Give every mixed-kind list a kind icon: palette pages and resources, projects
-  (app / worker / static / database), environments, nodes, providers, settings rows.
+- Give every mixed-kind list a kind icon: palette pages and resources, databases
+  by engine, nodes by role, providers, settings rows.
+- One mark before a name. A row that carries an identity mark (a project's
+  mark) gets no kind icon; its kind is a word in the meta (`worker · production`).
 - Put it in a fixed 16px slot (`size-4 shrink-0`) before the name, in muted ink.
 - Keep the state glyph in its own slot. Icons and glyphs never share one.
 - Leave the icon off a single-kind list whose title already names the kind.

@@ -288,12 +288,12 @@ function ProjectsScreen({ go, dense }: { go: (v: string) => void; dense: boolean
   const list = useMemo(() => PROJECTS.filter((p) => matches(q, p.name, p.note)).sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state]), [q])
   const attention = PROJECTS.filter((p) => p.state === 'warn' || p.state === 'error')
   const rows: LedgerRow[] = list.map((p) => ({
-    id: p.name, state: p.state, onOpen: () => go(p.name), icon: (() => { const K = projectKind(p); return <K aria-hidden /> })(),
+    id: p.name, state: p.state, onOpen: () => go(p.name),
     sort: { name: p.name, deployed: agoNum(p.deployed), visitors: p.visitors || null, err: p.dep === '—' ? null : p.err, cert: p.cert === '—' ? null : Number(p.cert) },
-    mobile: <><span className="flex items-center gap-2 truncate font-medium"><ProjectMark name={p.name} icon={p.icon} />{p.name}</span><span className="block truncate text-[11px] text-muted-foreground">{p.note || `${p.env} · deployed ${p.deployed}`}</span></>,
+    mobile: <><span className="flex items-center gap-2 truncate font-medium"><ProjectMark name={p.name} icon={p.icon} />{p.name}</span><span className="block truncate text-[11px] text-muted-foreground">{p.note || `${p.kind} · ${p.env} · deployed ${p.deployed}`}</span></>,
     cells: [
       <span className="flex min-w-0 items-center gap-2 font-medium"><ProjectMark name={p.name} icon={p.icon} /><span className="truncate">{p.name}</span></span>,
-      <Status state={p.state} label={p.note || p.env} />,
+      <Status state={p.state} label={p.note || `${p.kind} · ${p.env}`} />,
       <span className="text-muted-foreground">{p.deployed}{p.dep !== '—' && <span className="font-mono"> · {p.dep}</span>}</span>,
       <span className="flex items-center justify-between gap-2"><Num value={p.visitors || null} />{p.visitors > 0 && <Sparkline values={p.spark} height={dense ? 10 : 14} />}</span>,
       <Num value={p.dep === '—' ? null : p.err.toFixed(2)} unit="%" />,
