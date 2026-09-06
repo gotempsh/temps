@@ -1547,8 +1547,6 @@ fn apply_sandbox_runtime_options(
     match provider {
         "claude_cli" => {
             let permission = match request.permission_mode.as_deref() {
-                Some("full-access") => "bypassPermissions",
-                Some("accept-edits") => "acceptEdits",
                 Some("plan") => "plan",
                 _ => "default",
             };
@@ -1577,10 +1575,7 @@ fn apply_sandbox_runtime_options(
         }
         "codex_cli" => {
             match request.permission_mode.as_deref() {
-                Some("full-access") => {
-                    command.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-                }
-                Some("auto-review") | Some("auto") | None => {
+                Some("full-access") | Some("auto-review") | Some("auto") | None => {
                     command.extend([
                         "--sandbox".to_string(),
                         "workspace-write".to_string(),
@@ -1610,7 +1605,11 @@ fn apply_sandbox_runtime_options(
             // OpenCode calls its permission selection an agent and its
             // reasoning selection a variant. Both precede the positional
             // prompt, which `sandbox_harness_command` appends afterwards.
-            if let Some(agent) = request.permission_mode.as_deref() {
+            if let Some(agent) = request
+                .permission_mode
+                .as_deref()
+                .filter(|agent| *agent != "full-access")
+            {
                 command.push("--agent".to_string());
                 command.push(agent.to_string());
             }
@@ -3360,6 +3359,37 @@ mod tests {
                 .any(|arg| arg == "--dangerously-skip-permissions"),
             "a selected permission mode must not be silently bypassed"
         );
+    }
+
+    #[test]
+    fn sandbox_full_access_never_bypasses_the_server_authorization_gate() {
+        let request = ChatTurnRequest {
+            purpose: "chat.application".into(),
+            permission_mode: Some("full-access".into()),
+            ..Default::default()
+        };
+
+        let claude = sandbox_harness_command("claude_cli", "build it", &request)
+            .expect("Claude sandbox command should build");
+        assert!(claude
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "default"]));
+        assert!(!claude.iter().any(|arg| arg == "bypassPermissions"));
+
+        let codex = sandbox_harness_command("codex_cli", "build it", &request)
+            .expect("Codex sandbox command should build");
+        assert!(!codex
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(codex
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+
+        let opencode = sandbox_harness_command("opencode", "build it", &request)
+            .expect("OpenCode sandbox command should build");
+        assert!(!opencode
+            .windows(2)
+            .any(|pair| pair == ["--agent", "full-access"]));
     }
 
     #[test]

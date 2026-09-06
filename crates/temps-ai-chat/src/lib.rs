@@ -55,6 +55,8 @@ pub enum ChatError {
     Db(#[from] sea_orm::DbErr),
     #[error("AI provider error: {0}")]
     Ai(String),
+    #[error(transparent)]
+    AuthorizationRefresh(#[from] ToolAuthorizationRefreshError),
     #[error("the assistant claimed a proposal was staged without a write-tool receipt")]
     ProposalNotStaged,
     #[error("conversation '{conversation_id}' already has an active AI turn")]
@@ -76,6 +78,26 @@ pub enum ChatError {
         expected_kind: String,
         received: String,
     },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToolAuthorizationRefreshError {
+    #[error("the authenticated browser session has no durable identity")]
+    MissingSessionIdentity,
+    #[error("the authenticated principal or credential is no longer active")]
+    PrincipalInactive,
+    #[error("deployment credentials cannot execute conversation tools")]
+    UnsupportedCredential,
+    #[error("stored API-key role '{0}' is invalid")]
+    InvalidRole(String),
+    #[error("stored API-key permissions are invalid")]
+    InvalidPermissions,
+    #[error("permission to execute in the harness workspace has been revoked")]
+    HarnessPermissionRevoked,
+    #[error("could not verify current application project access")]
+    ProjectAccessCheckFailed,
+    #[error("failed to refresh tool authorization: {0}")]
+    Database(#[from] sea_orm::DbErr),
 }
 
 /// A browser-safe explanation of a chat failure.
@@ -125,6 +147,12 @@ impl ChatError {
                 title: "A turn is already running",
                 detail: "This conversation is already processing a message. Wait for it to finish or stop it before retrying.",
                 retryable: true,
+            },
+            Self::AuthorizationRefresh(_) => PublicChatFailure {
+                code: "authorization_changed",
+                title: "Authorization changed",
+                detail: "Temps stopped the tool call because the session, API key, role, or permissions changed after this turn started. Sign in again or retry with current access.",
+                retryable: false,
             },
             _ => PublicChatFailure {
                 code: "chat_request_failed",

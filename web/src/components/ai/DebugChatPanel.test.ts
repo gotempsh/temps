@@ -34,6 +34,8 @@ import {
   toolLabel,
   turnStateNeedsResync,
 } from './DebugChatPanel'
+import { revokeAttachmentPreviews } from './attachment-previews'
+import { chatDraftStorageKey } from './chat-runtime-options'
 
 const completedTool = {
   id: 'tool-call-1',
@@ -68,6 +70,40 @@ describe('assistantParts', () => {
     }
 
     expect(assistantParts(message)).toEqual(message.parts!)
+  })
+})
+
+describe('conversation-local client state', () => {
+  test('uses durable conversation ids to isolate drafts in one context', () => {
+    const common = {
+      userScoped: true,
+      contextType: 'application',
+      contextId: 'app_1',
+    }
+    expect(
+      chatDraftStorageKey({ ...common, conversationPublicId: 'thread_1' })
+    ).not.toBe(
+      chatDraftStorageKey({ ...common, conversationPublicId: 'thread_2' })
+    )
+    expect(chatDraftStorageKey(common)).toBe(
+      'temps.ai.draft.user:context:application:app_1'
+    )
+  })
+
+  test('revokes every local attachment preview', () => {
+    const original = URL.revokeObjectURL
+    const revoked: string[] = []
+    URL.revokeObjectURL = (url) => revoked.push(url)
+    try {
+      revokeAttachmentPreviews([
+        { preview_url: 'blob:first' },
+        { preview_url: undefined },
+        { preview_url: 'blob:second' },
+      ])
+      expect(revoked).toEqual(['blob:first', 'blob:second'])
+    } finally {
+      URL.revokeObjectURL = original
+    }
   })
 })
 

@@ -25,7 +25,250 @@ use temps_ai::{
     AiRequest, AiService, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest,
     HarnessMcpServer, ToolCall, ToolExecutor,
 };
+use temps_auth::{AuthSource, Permission, Role};
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
+
+use crate::ToolAuthorizationRefreshError;
+
+async fn current_user_role(
+    db: &DatabaseConnection,
+    user_id: i32,
+) -> Result<Role, ToolAuthorizationRefreshError> {
+    let admin_role = temps_entities::roles::Entity::find()
+        .filter(temps_entities::roles::Column::Name.eq("admin"))
+        .one(db)
+        .await?;
+    let is_admin = if let Some(admin_role) = admin_role {
+        temps_entities::user_roles::Entity::find()
+            .filter(temps_entities::user_roles::Column::UserId.eq(user_id))
+            .filter(temps_entities::user_roles::Column::RoleId.eq(admin_role.id))
+            .one(db)
+            .await?
+            .is_some()
+    } else {
+        false
+    };
+    Ok(if is_admin { Role::Admin } else { Role::User })
+}
+
+async fn active_user(
+    db: &DatabaseConnection,
+    user_id: i32,
+) -> Result<temps_entities::users::Model, ToolAuthorizationRefreshError> {
+    temps_entities::users::Entity::find_by_id(user_id)
+        .filter(temps_entities::users::Column::DeletedAt.is_null())
+        .one(db)
+        .await?
+        .ok_or(ToolAuthorizationRefreshError::PrincipalInactive)
+}
+
+/// Re-resolve a stable credential identity immediately before a tool call.
+/// A long-running turn may outlive a role edit, logout, or API-key revocation;
+/// the request-time `AuthContext` is therefore never itself execution authority.
+async fn refresh_tool_authorization(
+    db: &DatabaseConnection,
+    captured: &AuthContext,
+) -> Result<AuthContext, ToolAuthorizationRefreshError> {
+    match &captured.source {
+        AuthSource::Session {
+            user,
+            session_id: Some(session_id),
+        } => {
+            let session = temps_entities::sessions::Entity::find_by_id(*session_id)
+                .filter(temps_entities::sessions::Column::UserId.eq(user.id))
+                .filter(temps_entities::sessions::Column::MfaPending.eq(false))
+                .one(db)
+                .await?
+                .filter(|session| session.expires_at > Utc::now())
+                .ok_or(ToolAuthorizationRefreshError::PrincipalInactive)?;
+            let user = active_user(db, session.user_id).await?;
+            let role = current_user_role(db, user.id).await?;
+            Ok(AuthContext::new_persisted_session(user, role, session.id))
+        }
+        AuthSource::Session {
+            session_id: None, ..
+        } => Err(ToolAuthorizationRefreshError::MissingSessionIdentity),
+        AuthSource::ApiKey { user, key_id, .. } => {
+            let key = temps_entities::api_keys::Entity::find_by_id(*key_id)
+                .filter(temps_entities::api_keys::Column::UserId.eq(user.id))
+                .filter(temps_entities::api_keys::Column::IsActive.eq(true))
+                .one(db)
+                .await?
+                .filter(|key| {
+                    key.expires_at
+                        .is_none_or(|expires_at| expires_at > Utc::now())
+                })
+                .ok_or(ToolAuthorizationRefreshError::PrincipalInactive)?;
+            let user = active_user(db, key.user_id).await?;
+            let (role, permissions) = if key.role_type == "custom" {
+                let values: Vec<String> = serde_json::from_str(
+                    key.permissions
+                        .as_deref()
+                        .ok_or(ToolAuthorizationRefreshError::InvalidPermissions)?,
+                )
+                .map_err(|_| ToolAuthorizationRefreshError::InvalidPermissions)?;
+                let permissions = values
+                    .into_iter()
+                    .map(|value| {
+                        Permission::from_str(&value)
+                            .ok_or(ToolAuthorizationRefreshError::InvalidPermissions)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (None, Some(permissions))
+            } else {
+                let role = Role::from_str(&key.role_type).ok_or_else(|| {
+                    ToolAuthorizationRefreshError::InvalidRole(key.role_type.clone())
+                })?;
+                (Some(role), None)
+            };
+            Ok(AuthContext::new_api_key(
+                user,
+                role,
+                permissions,
+                key.name,
+                key.id,
+            ))
+        }
+        AuthSource::CliToken { user } => {
+            let user = active_user(db, user.id).await?;
+            let role = current_user_role(db, user.id).await?;
+            Ok(AuthContext::new_cli_token(user, role))
+        }
+        AuthSource::DeploymentToken { .. } => {
+            Err(ToolAuthorizationRefreshError::UnsupportedCredential)
+        }
+    }
+}
+
+/// Refresh every authorization boundary used to start a native harness turn.
+/// Native harnesses can read and write checked-out source directly, so these
+/// checks must remain true while the provider is active, not only when the
+/// HTTP request begins. Application topology is reloaded on every check so a
+/// project linked during a turn is covered immediately.
+async fn refresh_harness_authorization(
+    db: &DatabaseConnection,
+    captured: &AuthContext,
+    checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    application_id: Option<i64>,
+    fallback_project_ids: &[i32],
+    provider_id: &str,
+    permission_mode: &str,
+) -> Result<AuthContext, ToolAuthorizationRefreshError> {
+    let auth = refresh_tool_authorization(db, captured).await?;
+    if !harness_runtime_authorized(&auth, provider_id, permission_mode) {
+        return Err(ToolAuthorizationRefreshError::HarnessPermissionRevoked);
+    }
+    let project_ids = if let Some(application_id) = application_id {
+        let application = temps_entities::ai_applications::Entity::find_by_id(application_id)
+            .filter(temps_entities::ai_applications::Column::CreatedBy.eq(auth.user_id()))
+            .filter(temps_entities::ai_applications::Column::Status.eq("active"))
+            .one(db)
+            .await?
+            .ok_or(ToolAuthorizationRefreshError::HarnessPermissionRevoked)?;
+        temps_entities::ai_application_projects::Entity::find()
+            .filter(
+                temps_entities::ai_application_projects::Column::ApplicationId.eq(application.id),
+            )
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|link| link.project_id)
+            .collect::<Vec<_>>()
+    } else {
+        fallback_project_ids.to_vec()
+    };
+    let mut instance_required = vec![Permission::ProjectsRead, Permission::SandboxesWrite];
+    if application_id.is_some() {
+        instance_required.push(Permission::ProjectsWrite);
+    }
+    if instance_required
+        .iter()
+        .any(|permission| !auth.has_permission(permission))
+    {
+        return Err(ToolAuthorizationRefreshError::HarnessPermissionRevoked);
+    }
+    if project_ids.is_empty() {
+        return Ok(auth);
+    }
+    if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(auth);
+    }
+    let Some(checker) = checker else {
+        return Ok(auth);
+    };
+    let user_id = auth
+        .user_id_opt()
+        .ok_or(ToolAuthorizationRefreshError::HarnessPermissionRevoked)?;
+    let permissions = checker
+        .effective_project_permissions_batch(user_id, &project_ids)
+        .await
+        .map_err(|error| {
+            tracing::error!(user_id, %error, "failed to refresh application project permissions");
+            ToolAuthorizationRefreshError::ProjectAccessCheckFailed
+        })?;
+    let membership = checker
+        .user_can_access_projects(user_id, &project_ids)
+        .await
+        .map_err(|error| {
+            tracing::error!(user_id, %error, "failed to refresh application project membership");
+            ToolAuthorizationRefreshError::ProjectAccessCheckFailed
+        })?;
+    let project_required = [
+        Permission::ProjectsRead,
+        Permission::ProjectsWrite,
+        Permission::SandboxesWrite,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    let allowed = project_ids
+        .iter()
+        .all(|project_id| match permissions.get(project_id) {
+            Some(Some(granted)) => project_required
+                .iter()
+                .all(|required| granted.iter().any(|permission| permission == required)),
+            Some(None) => membership.get(project_id).copied().unwrap_or(false),
+            None => false,
+        });
+    if !allowed {
+        return Err(ToolAuthorizationRefreshError::HarnessPermissionRevoked);
+    }
+    Ok(auth)
+}
+
+fn harness_runtime_authorized(
+    auth: &AuthContext,
+    provider_id: &str,
+    permission_mode: &str,
+) -> bool {
+    let Some(provider) = temps_agents::ai_cli::find_provider(provider_id) else {
+        return false;
+    };
+    let has_host_access = match provider.host_access_requirement {
+        temps_agents::ai_cli::HostAccessRequirement::AiGatewayWrite => {
+            auth.has_permission(&Permission::AiGatewayWrite)
+        }
+        temps_agents::ai_cli::HostAccessRequirement::SystemAdmin => {
+            auth.has_permission(&Permission::SystemAdmin)
+        }
+    };
+    let Some(mode) = provider
+        .permission_modes
+        .iter()
+        .find(|mode| mode.id == permission_mode)
+    else {
+        return false;
+    };
+    has_host_access
+        && (!mode.requires_system_admin || auth.has_permission(&Permission::SystemAdmin))
+}
+
+fn active_permission_mode(mode: &Arc<Mutex<String>>) -> String {
+    match mode.lock() {
+        Ok(mode) => mode.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
 
 /// One entry in the pending-permission registry (ADR-038 Phase 2).
 ///
@@ -635,6 +878,7 @@ struct ActiveTurn {
     /// The CLI launch mode is fixed, but this server-owned flag can safely
     /// elevate later sandbox tool requests from "ask" to "auto" mid-turn.
     auto_approve_provider_tools: Arc<AtomicBool>,
+    permission_mode: Arc<Mutex<String>>,
 }
 
 /// Owns conversation persistence + AI turn streaming. Construct once with the
@@ -1733,16 +1977,33 @@ impl ConversationService {
                 Ok(turns) => turns,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            turns
-                .get(&conversation_id)
-                .map(|turn| turn.auto_approve_provider_tools.clone())
+            turns.get(&conversation_id).map(|turn| {
+                (
+                    turn.auto_approve_provider_tools.clone(),
+                    turn.permission_mode.clone(),
+                )
+            })
         };
-        let Some(active) = active else {
+        let Some((active, active_mode)) = active else {
             return ActivePermissionModeUpdate {
                 applied_to_active_turn: false,
                 auto_approved: Vec::new(),
             };
         };
+        match active_mode.lock() {
+            Ok(mut mode) => {
+                mode.clear();
+                mode.push_str(permission_mode);
+            }
+            Err(poisoned) => {
+                let mut mode = poisoned.into_inner();
+                mode.clear();
+                mode.push_str(permission_mode);
+            }
+        }
+        // Publish Auto only after the corresponding mode is visible. A native
+        // permission request that observes `true` must never validate against
+        // the previous, less-privileged mode.
         active.store(auto, Ordering::Release);
         if !auto {
             return ActivePermissionModeUpdate {
@@ -2237,6 +2498,7 @@ impl ConversationService {
         }
         log_phase("provider_readiness_checked");
         let mut application_seed_title = None;
+        let mut harness_project_ids = Vec::new();
         let sandbox_environment = temps_ai::SensitiveEnvironment::default();
         let harness_workspace = if conv.context_type == "application" {
             let workspaces = self.application_workspaces.as_ref().ok_or_else(|| {
@@ -2275,6 +2537,7 @@ impl ConversationService {
                 .iter()
                 .map(|project| project.id)
                 .collect::<Vec<_>>();
+            harness_project_ids.clone_from(&project_ids);
             let sandbox = sandboxes
                 .get_or_create_application_workspace_with_config(
                     auth.user_id(),
@@ -2578,6 +2841,7 @@ impl ConversationService {
                 auth,
                 request_metadata,
                 project_access_checker,
+                harness_project_ids,
                 harness_workspace,
                 sandbox_environment,
                 Some(turn_id.to_string()),
@@ -2784,6 +3048,7 @@ impl ConversationService {
             auth,
             &request_metadata,
             None,
+            Vec::new(),
             None,
             temps_ai::SensitiveEnvironment::default(),
             None,
@@ -2803,6 +3068,7 @@ impl ConversationService {
         auth: &AuthContext,
         request_metadata: &RequestMetadata,
         project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+        harness_project_ids: Vec<i32>,
         harness_workspace: Option<temps_ai::HarnessWorkspace>,
         sandbox_environment: temps_ai::SensitiveEnvironment,
         active_turn_id: Option<String>,
@@ -2898,6 +3164,9 @@ impl ConversationService {
             permission_mode_auto_approves_provider_tools(&ai_permission_mode),
         ));
         let task_auto_approve_provider_tools = auto_approve_provider_tools.clone();
+        let permission_mode = Arc::new(Mutex::new(ai_permission_mode.clone()));
+        let task_permission_mode = permission_mode.clone();
+        let application_id = conv.application_id;
         let initial_conversation_title = conv.title.clone();
         let auth = auth.clone();
         let request_metadata = request_metadata.clone();
@@ -3013,11 +3282,50 @@ impl ConversationService {
             });
             let provider_interaction_registrar = interaction_registrar.clone();
             let provider_auto_approve = task_auto_approve_provider_tools.clone();
+            let provider_auto_auth = auth.clone();
+            let provider_auto_db = db.clone();
+            let provider_auto_checker = project_access_checker.clone();
+            let provider_auto_application_id = application_id;
+            let provider_auto_project_ids = harness_project_ids.clone();
+            let provider_auto_provider = ai_provider.clone();
+            let provider_auto_permission_mode = task_permission_mode.clone();
+            let provider_auto_uses_harness = harness_workspace.is_some();
             let interactions: temps_ai::InteractionExecutor = Arc::new(move |request| {
                 if provider_auto_approve.load(Ordering::Acquire)
                     && request.kind == PermissionKind::ToolApproval
                 {
-                    return Box::pin(async { Ok(PermissionDecision::AllowTool) });
+                    let auth = provider_auto_auth.clone();
+                    let db = provider_auto_db.clone();
+                    let checker = provider_auto_checker.clone();
+                    let project_ids = provider_auto_project_ids.clone();
+                    let provider = provider_auto_provider.clone();
+                    let permission_mode = active_permission_mode(&provider_auto_permission_mode);
+                    return Box::pin(async move {
+                        let refreshed = if provider_auto_uses_harness {
+                            refresh_harness_authorization(
+                                db.as_ref(),
+                                &auth,
+                                checker.as_ref(),
+                                provider_auto_application_id,
+                                &project_ids,
+                                &provider,
+                                &permission_mode,
+                            )
+                            .await
+                        } else {
+                            refresh_tool_authorization(db.as_ref(), &auth).await
+                        };
+                        refreshed
+                            .map_err(|error| {
+                                tracing::warn!(%error, "denied native tool auto-approval after authorization refresh failed");
+                                temps_ai::AiError::Provider {
+                                    purpose: "chat.permission.authorization".to_string(),
+                                    reason: "the initiating credential is no longer authorized"
+                                        .to_string(),
+                                }
+                            })?;
+                        Ok(PermissionDecision::AllowTool)
+                    });
                 }
                 let request_kind = request.kind.clone();
                 let pending =
@@ -3032,7 +3340,38 @@ impl ConversationService {
                     && request_kind == PermissionKind::ToolApproval
                 {
                     drop(pending);
-                    return Box::pin(async { Ok(PermissionDecision::AllowTool) });
+                    let auth = provider_auto_auth.clone();
+                    let db = provider_auto_db.clone();
+                    let checker = provider_auto_checker.clone();
+                    let project_ids = provider_auto_project_ids.clone();
+                    let provider = provider_auto_provider.clone();
+                    let permission_mode = active_permission_mode(&provider_auto_permission_mode);
+                    return Box::pin(async move {
+                        let refreshed = if provider_auto_uses_harness {
+                            refresh_harness_authorization(
+                                db.as_ref(),
+                                &auth,
+                                checker.as_ref(),
+                                provider_auto_application_id,
+                                &project_ids,
+                                &provider,
+                                &permission_mode,
+                            )
+                            .await
+                        } else {
+                            refresh_tool_authorization(db.as_ref(), &auth).await
+                        };
+                        refreshed
+                            .map_err(|error| {
+                                tracing::warn!(%error, "denied native tool auto-approval after authorization refresh failed");
+                                temps_ai::AiError::Provider {
+                                    purpose: "chat.permission.authorization".to_string(),
+                                    reason: "the initiating credential is no longer authorized"
+                                        .to_string(),
+                                }
+                            })?;
+                        Ok(PermissionDecision::AllowTool)
+                    });
                 }
                 Box::pin(async move { Ok(pending.await?.decision) })
             });
@@ -3041,14 +3380,11 @@ impl ConversationService {
             let sandbox_interaction_registry = interactions.clone();
             let sandbox_auto_approve = task_auto_approve_provider_tools.clone();
             let sandbox_interactions: temps_ai::InteractionExecutor = Arc::new(move |request| {
-                if sandbox_auto_approve.load(Ordering::Acquire)
-                    && request.kind == PermissionKind::ToolApproval
-                {
-                    return Box::pin(async { Ok(PermissionDecision::AllowTool) });
-                }
                 // Calling the registry closure synchronously installs the
                 // waiter before the event becomes visible, preventing a fast
-                // approval click from racing a missing permission id.
+                // approval click from racing a missing permission id. The
+                // underlying interaction performs the authorization refresh
+                // even when Auto mode will approve without showing a card.
                 let pending = sandbox_interaction_registry(request.clone());
                 // `interactions` performs its own post-registration policy
                 // check. Mirror it here so an approval that was automatically
@@ -3077,12 +3413,24 @@ impl ConversationService {
             let platform_auto_approve = task_auto_approve_provider_tools.clone();
             let platform_auto_auth = auth.clone();
             let platform_auto_metadata = request_metadata.clone();
+            let platform_auto_db = db.clone();
             let platform_interactions: PlatformInteractionExecutor = Arc::new(move |request| {
                 if platform_auto_approve.load(Ordering::Acquire) {
                     if let Some(decision) = automatic_platform_decision(&request) {
                         let auth = platform_auto_auth.clone();
                         let metadata = platform_auto_metadata.clone();
+                        let db = platform_auto_db.clone();
                         return Box::pin(async move {
+                            let auth = refresh_tool_authorization(db.as_ref(), &auth)
+                                .await
+                                .map_err(|error| {
+                                    tracing::warn!(%error, "denied platform auto-approval after authorization refresh failed");
+                                    temps_ai::AiError::Provider {
+                                        purpose: "chat.permission.authorization".to_string(),
+                                        reason: "the initiating credential is no longer authorized"
+                                            .to_string(),
+                                    }
+                                })?;
                             Ok(PermissionResolution {
                                 decision,
                                 auth,
@@ -3106,7 +3454,18 @@ impl ConversationService {
                         drop(pending);
                         let auth = platform_auto_auth.clone();
                         let metadata = platform_auto_metadata.clone();
+                        let db = platform_auto_db.clone();
                         return Box::pin(async move {
+                            let auth = refresh_tool_authorization(db.as_ref(), &auth)
+                                .await
+                                .map_err(|error| {
+                                    tracing::warn!(%error, "denied platform auto-approval after authorization refresh failed");
+                                    temps_ai::AiError::Provider {
+                                        purpose: "chat.permission.authorization".to_string(),
+                                        reason: "the initiating credential is no longer authorized"
+                                            .to_string(),
+                                    }
+                                })?;
                             Ok(PermissionResolution {
                                 decision,
                                 auth,
@@ -3139,6 +3498,7 @@ impl ConversationService {
             let executor_interactions = platform_interactions.clone();
             let executor_context_id = context_id.clone();
             let executor_auth = auth.clone();
+            let executor_db = db.clone();
             let executor_project_access_checker = project_access_checker.clone();
             let turn_tool_executor: ToolExecutor = Arc::new(move |call: ToolCall| {
                 let state = executor_state.clone();
@@ -3151,8 +3511,25 @@ impl ConversationService {
                 let interactions = executor_interactions.clone();
                 let context_id = executor_context_id.clone();
                 let auth = executor_auth.clone();
+                let db = executor_db.clone();
                 let project_access_checker = executor_project_access_checker.clone();
                 Box::pin(async move {
+                    let auth = match refresh_tool_authorization(db.as_ref(), &auth).await {
+                        Ok(auth) => auth,
+                        Err(error) => {
+                            tracing::warn!(
+                                conversation_id = conv_id,
+                                tool = %call.name,
+                                %error,
+                                "denied conversation tool after authorization refresh failed"
+                            );
+                            return Err(temps_ai::AiError::Provider {
+                                purpose: "chat.tool.authorization".to_string(),
+                                reason: "the initiating credential is no longer authorized"
+                                    .to_string(),
+                            });
+                        }
+                    };
                     let mut state = state.lock().await;
                     Ok(dispatch_conversation_tool(
                         &call,
@@ -3243,6 +3620,32 @@ impl ConversationService {
                 if turn_started.elapsed() >= max_turn_duration {
                     stop_reason = Some(TURN_TIMEOUT_REASON);
                     break 'rounds;
+                }
+                if harness_workspace.is_some() {
+                    let permission_mode = active_permission_mode(&task_permission_mode);
+                    if let Err(error) = refresh_harness_authorization(
+                        db.as_ref(),
+                        &auth,
+                        project_access_checker.as_ref(),
+                        application_id,
+                        &harness_project_ids,
+                        &ai_provider,
+                        &permission_mode,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            conversation_id = conv_id,
+                            %error,
+                            "stopped AI turn before provider execution because authorization changed"
+                        );
+                        emit_turn_event(
+                            &tx,
+                            &turn_live,
+                            Err(ChatError::AuthorizationRefresh(error)),
+                        );
+                        return true;
+                    }
                 }
                 let req = ChatTurnRequest {
                     trace_id: task_turn_id.clone(),
@@ -3336,7 +3739,47 @@ impl ConversationService {
                 // Did anything this round return usable data (vs. only rejections)?
                 let mut round_produced_something = false;
                 let mut first_delta_seen = false;
-                while let Some(item) = stream.next().await {
+                let mut authorization_check = tokio::time::interval(Duration::from_secs(1));
+                authorization_check
+                    .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The turn was checked immediately before provider startup.
+                // Consume the interval's immediate first tick so subsequent
+                // checks happen once per second while native commands run.
+                authorization_check.tick().await;
+                loop {
+                    let item = tokio::select! {
+                        item = stream.next() => match item {
+                            Some(item) => item,
+                            None => break,
+                        },
+                        _ = authorization_check.tick(), if harness_workspace.is_some() => {
+                            let permission_mode = active_permission_mode(&task_permission_mode);
+                            match refresh_harness_authorization(
+                                db.as_ref(),
+                                &auth,
+                                project_access_checker.as_ref(),
+                                application_id,
+                                &harness_project_ids,
+                                &ai_provider,
+                                &permission_mode,
+                            ).await {
+                                Ok(_) => continue,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        conversation_id = conv_id,
+                                        %error,
+                                        "stopped active native harness after authorization changed"
+                                    );
+                                    emit_turn_event(
+                                        &tx,
+                                        &turn_live,
+                                        Err(ChatError::AuthorizationRefresh(error)),
+                                    );
+                                    return true;
+                                }
+                            }
+                        }
+                    };
                     if !first_delta_seen {
                         first_delta_seen = true;
                         let delta_kind = match &item {
@@ -3639,25 +4082,41 @@ impl ConversationService {
                     // otherwise to the context provider. `project_id` is always the
                     // conversation's project, never anything the model supplied — so
                     // a tool can't be steered to another tenant's data.
-                    let result = {
-                        let mut state = execution_state.lock().await;
-                        dispatch_conversation_tool(
-                            tc,
-                            project_id,
-                            conv_id,
-                            &context_id,
-                            &auth,
-                            project_access_checker.as_ref(),
-                            provider.as_ref(),
-                            api_tools.as_ref(),
-                            repo_tools.as_ref(),
-                            write_handle_opt.as_deref(),
-                            pending_svc_opt.as_deref(),
-                            write_support_audit.as_deref(),
-                            Some(&platform_interactions),
-                            &mut state,
-                        )
-                        .await
+                    let result = match refresh_tool_authorization(db.as_ref(), &auth).await {
+                        Ok(fresh_auth) => {
+                            let mut state = execution_state.lock().await;
+                            dispatch_conversation_tool(
+                                tc,
+                                project_id,
+                                conv_id,
+                                &context_id,
+                                &fresh_auth,
+                                project_access_checker.as_ref(),
+                                provider.as_ref(),
+                                api_tools.as_ref(),
+                                repo_tools.as_ref(),
+                                write_handle_opt.as_deref(),
+                                pending_svc_opt.as_deref(),
+                                write_support_audit.as_deref(),
+                                Some(&platform_interactions),
+                                &mut state,
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                conversation_id = conv_id,
+                                tool = %tc.name,
+                                %error,
+                                "denied conversation tool after authorization refresh failed"
+                            );
+                            emit_turn_event(
+                                &tx,
+                                &turn_live,
+                                Err(ChatError::AuthorizationRefresh(error)),
+                            );
+                            return true;
+                        }
                     };
                     let display_arguments = redact_json_string(&tc.arguments);
                     let display_result = public_tool_result(&tc.name, &result);
@@ -3768,6 +4227,32 @@ impl ConversationService {
             // call so the model answers from the evidence it gathered. The result
             // is persisted even when no browser is currently attached.
             if !answered && !tools_meta.is_empty() {
+                if harness_workspace.is_some() {
+                    let permission_mode = active_permission_mode(&task_permission_mode);
+                    if let Err(error) = refresh_harness_authorization(
+                        db.as_ref(),
+                        &auth,
+                        project_access_checker.as_ref(),
+                        application_id,
+                        &harness_project_ids,
+                        &ai_provider,
+                        &permission_mode,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            conversation_id = conv_id,
+                            %error,
+                            "stopped salvage response because authorization changed"
+                        );
+                        emit_turn_event(
+                            &tx,
+                            &turn_live,
+                            Err(ChatError::AuthorizationRefresh(error)),
+                        );
+                        return true;
+                    }
+                }
                 let mut final_messages = messages;
                 final_messages.push(ChatMessage::user(FINAL_DIRECTIVE));
                 let req = ChatTurnRequest {
@@ -3800,7 +4285,44 @@ impl ConversationService {
                 }
                 if let Ok(mut stream) = salvage {
                     let mut salvage_text = String::new();
-                    while let Some(item) = stream.next().await {
+                    let mut authorization_check = tokio::time::interval(Duration::from_secs(1));
+                    authorization_check
+                        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    authorization_check.tick().await;
+                    loop {
+                        let item = tokio::select! {
+                            item = stream.next() => match item {
+                                Some(item) => item,
+                                None => break,
+                            },
+                            _ = authorization_check.tick(), if harness_workspace.is_some() => {
+                                let permission_mode = active_permission_mode(&task_permission_mode);
+                                match refresh_harness_authorization(
+                                    db.as_ref(),
+                                    &auth,
+                                    project_access_checker.as_ref(),
+                                    application_id,
+                                    &harness_project_ids,
+                                    &ai_provider,
+                                    &permission_mode,
+                                ).await {
+                                    Ok(_) => continue,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            conversation_id = conv_id,
+                                            %error,
+                                            "stopped active salvage harness after authorization changed"
+                                        );
+                                        emit_turn_event(
+                                            &tx,
+                                            &turn_live,
+                                            Err(ChatError::AuthorizationRefresh(error)),
+                                        );
+                                        return true;
+                                    }
+                                }
+                            }
+                        };
                         if let Ok(ChatStreamDelta::Text(t)) = item {
                             if salvage_text.is_empty()
                                 && !content.is_empty()
@@ -4026,6 +4548,7 @@ impl ConversationService {
                 turn_id: turn_id.clone(),
                 abort: turn_task.abort_handle(),
                 auto_approve_provider_tools: auto_approve_provider_tools.clone(),
+                permission_mode: permission_mode.clone(),
             };
             match active_turns.lock() {
                 Ok(mut turns) => {
@@ -4055,6 +4578,12 @@ impl ConversationService {
                         permission_mode_auto_approves_provider_tools(&current.ai_permission_mode),
                         Ordering::Release,
                     );
+                    match permission_mode.lock() {
+                        Ok(mut mode) => mode.clone_from(&current.ai_permission_mode),
+                        Err(poisoned) => poisoned
+                            .into_inner()
+                            .clone_from(&current.ai_permission_mode),
+                    }
                     current.turn_status == "running"
                         && current.active_turn_id.as_deref() == Some(turn_id)
                 }
@@ -4297,6 +4826,7 @@ fn tool_result_is_productive(result: &str) -> bool {
                 "Unknown operation",
                 "Unknown command",
                 "is not available",
+                "authorization could not be verified",
                 "You already ran",
                 "Not staged",
                 "Invalid `temps_write` arguments",
@@ -5781,6 +6311,12 @@ mod tests {
 
     struct ReadOnlyProjectAccessChecker;
 
+    struct RevokingProjectAccessChecker {
+        checks: std::sync::atomic::AtomicUsize,
+    }
+
+    struct ProjectEightRevokedChecker;
+
     #[async_trait]
     impl temps_core::ProjectAccessChecker for RevokedProjectAccessChecker {
         async fn user_can_access_project(
@@ -5810,6 +6346,28 @@ mod tests {
             Ok(Some(vec![
                 temps_auth::permissions::Permission::ProjectsRead.to_string(),
             ]))
+        }
+    }
+
+    #[async_trait]
+    impl temps_core::ProjectAccessChecker for RevokingProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.checks.fetch_add(1, Ordering::SeqCst) == 0)
+        }
+    }
+
+    #[async_trait]
+    impl temps_core::ProjectAccessChecker for ProjectEightRevokedChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(project_id != 8)
         }
     }
 
@@ -5944,6 +6502,510 @@ mod tests {
             updated_at: now,
         };
         AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
+    }
+
+    #[tokio::test]
+    async fn tool_authorization_rejects_a_revoked_session() {
+        let user = test_auth().user.expect("test user");
+        let auth = AuthContext::new_persisted_session(user, Role::Admin, 41);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::sessions::Model>::new()])
+            .into_connection();
+
+        let result = refresh_tool_authorization(&db, &auth).await;
+        assert!(matches!(
+            result,
+            Err(ToolAuthorizationRefreshError::PrincipalInactive)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_authorization_rejects_a_revoked_api_key() {
+        let user = test_auth().user.expect("test user");
+        let auth =
+            AuthContext::new_api_key(user, Some(Role::Admin), None, "revoked".to_string(), 71);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::api_keys::Model>::new()])
+            .into_connection();
+
+        let result = refresh_tool_authorization(&db, &auth).await;
+        assert!(matches!(
+            result,
+            Err(ToolAuthorizationRefreshError::PrincipalInactive)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoked_api_key_stops_the_turn_before_tool_dispatch() {
+        let user = test_auth().user.expect("test user");
+        let auth =
+            AuthContext::new_api_key(user, Some(Role::Admin), None, "revoked".to_string(), 71);
+        let ai = Arc::new(ScriptedAi::new(vec![Ok(vec![ChatStreamDelta::ToolCall(
+            ToolCall {
+                id: "must-not-run".to_string(),
+                name: "echo".to_string(),
+                arguments: "{}".to_string(),
+            },
+        )])]));
+        let provider = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let tool_calls = provider.tool_calls.clone();
+        let provider_calls = ai.chat_calls.clone();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::api_keys::Model>::new()])
+            .into_connection();
+        let service = service_with_db(ai, db);
+        let provider: Arc<dyn ConversationContextProvider> = provider;
+        let mut stream = service
+            .try_tool_loop(
+                &test_conversation(),
+                vec![],
+                Some(provider),
+                echo_tools(),
+                &auth,
+            )
+            .await;
+
+        let first = stream.next().await.expect("provider tool-call event");
+        assert!(matches!(first, Ok(ChatStreamEvent::ToolCall { .. })));
+        let error = stream
+            .next()
+            .await
+            .expect("authorization failure event")
+            .expect_err("revoked key must fail before dispatch");
+        assert!(matches!(
+            error,
+            ChatError::AuthorizationRefresh(ToolAuthorizationRefreshError::PrincipalInactive)
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authorization_revocation_stops_an_active_native_provider_stream() {
+        let now = Utc::now();
+        let user = test_auth().user.expect("test user");
+        let key = temps_entities::api_keys::Model {
+            id: 74,
+            name: "active-turn".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test_".to_string(),
+            user_id: user.id,
+            role_type: "admin".to_string(),
+            permissions: None,
+            is_active: true,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let auth = AuthContext::new_api_key(
+            user.clone(),
+            Some(Role::Admin),
+            None,
+            key.name.clone(),
+            key.id,
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ai = Arc::new(PendingStreamAi {
+            calls: calls.clone(),
+        });
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[key]])
+            .append_query_results([[user]])
+            .append_query_results([Vec::<temps_entities::api_keys::Model>::new()])
+            .into_connection();
+        let service = service_with_db(ai, db);
+        let provider: Arc<dyn ConversationContextProvider> = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_permission_mode = "default".to_string();
+        let mut stream = service
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                Some(provider),
+                echo_tools(),
+                &auth,
+                &test_request_metadata(),
+                None,
+                Vec::new(),
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_auth_monitor".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_auth_monitor"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("authorization monitor must stop the provider promptly")
+            .expect("authorization failure event")
+            .expect_err("revoked key must fail the active turn");
+        assert!(matches!(
+            error,
+            ChatError::AuthorizationRefresh(ToolAuthorizationRefreshError::PrincipalInactive)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn project_revocation_stops_an_active_native_provider_stream() {
+        let now = Utc::now();
+        let user = test_auth().user.expect("test user");
+        let key = temps_entities::api_keys::Model {
+            id: 75,
+            name: "project-turn".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test_".to_string(),
+            user_id: user.id,
+            role_type: "custom".to_string(),
+            permissions: Some(
+                "[\"projects:read\",\"projects:write\",\"sandboxes:write\",\"ai_gateway:write\"]"
+                    .to_string(),
+            ),
+            is_active: true,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let auth = AuthContext::new_api_key(
+            user.clone(),
+            None,
+            Some(vec![
+                Permission::ProjectsRead,
+                Permission::ProjectsWrite,
+                Permission::SandboxesWrite,
+                Permission::AiGatewayWrite,
+            ]),
+            key.name.clone(),
+            key.id,
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ai = Arc::new(PendingStreamAi {
+            calls: calls.clone(),
+        });
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[key.clone()]])
+            .append_query_results([[user.clone()]])
+            .append_query_results([[key]])
+            .append_query_results([[user]])
+            .into_connection();
+        let service = service_with_db(ai, db);
+        let provider: Arc<dyn ConversationContextProvider> = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let checker: Arc<dyn temps_core::ProjectAccessChecker> =
+            Arc::new(RevokingProjectAccessChecker {
+                checks: std::sync::atomic::AtomicUsize::new(0),
+            });
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_permission_mode = "default".to_string();
+        let mut stream = service
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                Some(provider),
+                echo_tools(),
+                &auth,
+                &test_request_metadata(),
+                Some(checker),
+                vec![7],
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_project_monitor".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_project_monitor"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("project monitor must stop the provider promptly")
+            .expect("project authorization failure event")
+            .expect_err("revoked project membership must fail the active turn");
+        assert!(matches!(
+            error,
+            ChatError::AuthorizationRefresh(
+                ToolAuthorizationRefreshError::HarnessPermissionRevoked
+            )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_permission_downgrade_stops_an_active_native_provider_stream() {
+        let now = Utc::now();
+        let user = test_auth().user.expect("test user");
+        let active_key = temps_entities::api_keys::Model {
+            id: 76,
+            name: "runtime-turn".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test_".to_string(),
+            user_id: user.id,
+            role_type: "custom".to_string(),
+            permissions: Some(
+                "[\"projects:read\",\"sandboxes:write\",\"ai_gateway:write\"]".to_string(),
+            ),
+            is_active: true,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let mut downgraded_key = active_key.clone();
+        downgraded_key.permissions = Some("[\"projects:read\",\"sandboxes:write\"]".to_string());
+        let auth = AuthContext::new_api_key(
+            user.clone(),
+            None,
+            Some(vec![
+                Permission::ProjectsRead,
+                Permission::SandboxesWrite,
+                Permission::AiGatewayWrite,
+            ]),
+            active_key.name.clone(),
+            active_key.id,
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ai = Arc::new(PendingStreamAi {
+            calls: calls.clone(),
+        });
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[active_key]])
+            .append_query_results([[user.clone()]])
+            .append_query_results([[downgraded_key]])
+            .append_query_results([[user]])
+            .into_connection();
+        let service = service_with_db(ai, db);
+        let mut conversation = test_conversation();
+        conversation.context_type = "global".to_string();
+        conversation.project_id = None;
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_permission_mode = "default".to_string();
+        let mut stream = service
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                None,
+                vec![],
+                &auth,
+                &test_request_metadata(),
+                None,
+                Vec::new(),
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "global_runtime_monitor".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/global_runtime_monitor"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("runtime monitor must stop the provider promptly")
+            .expect("runtime authorization failure event")
+            .expect_err("losing provider access must fail the active turn");
+        assert!(matches!(
+            error,
+            ChatError::AuthorizationRefresh(
+                ToolAuthorizationRefreshError::HarnessPermissionRevoked
+            )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn newly_linked_project_is_authorized_during_an_active_native_provider_stream() {
+        let now = Utc::now();
+        let user = test_auth().user.expect("test user");
+        let key = temps_entities::api_keys::Model {
+            id: 77,
+            name: "topology-turn".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test_".to_string(),
+            user_id: user.id,
+            role_type: "custom".to_string(),
+            permissions: Some(
+                "[\"projects:read\",\"projects:write\",\"sandboxes:write\",\"ai_gateway:write\"]"
+                    .to_string(),
+            ),
+            is_active: true,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let auth = AuthContext::new_api_key(
+            user.clone(),
+            None,
+            Some(vec![
+                Permission::ProjectsRead,
+                Permission::ProjectsWrite,
+                Permission::SandboxesWrite,
+                Permission::AiGatewayWrite,
+            ]),
+            key.name.clone(),
+            key.id,
+        );
+        let application = temps_entities::ai_applications::Model {
+            id: 99,
+            public_id: "app-topology".to_string(),
+            name: "Topology app".to_string(),
+            description: None,
+            status: "active".to_string(),
+            created_by: user.id,
+            created_at: now,
+            updated_at: now,
+        };
+        let project_seven = temps_entities::ai_application_projects::Model {
+            id: 1,
+            application_id: application.id,
+            project_id: 7,
+            is_primary: true,
+            created_at: now,
+        };
+        let project_eight = temps_entities::ai_application_projects::Model {
+            id: 2,
+            application_id: application.id,
+            project_id: 8,
+            is_primary: false,
+            created_at: now,
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ai = Arc::new(PendingStreamAi {
+            calls: calls.clone(),
+        });
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[key.clone()]])
+            .append_query_results([[user.clone()]])
+            .append_query_results([[application.clone()]])
+            .append_query_results([[project_seven.clone()]])
+            .append_query_results([[key]])
+            .append_query_results([[user]])
+            .append_query_results([[application]])
+            .append_query_results([[project_seven, project_eight]])
+            .into_connection();
+        let service = service_with_db(ai, db);
+        let checker: Arc<dyn temps_core::ProjectAccessChecker> =
+            Arc::new(ProjectEightRevokedChecker);
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        conversation.application_id = Some(99);
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_permission_mode = "default".to_string();
+        let mut stream = service
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                None,
+                vec![],
+                &auth,
+                &test_request_metadata(),
+                Some(checker),
+                vec![7],
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_topology_monitor".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_topology_monitor"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("topology monitor must stop the provider promptly")
+            .expect("new project authorization failure event")
+            .expect_err("an inaccessible newly linked project must fail the active turn");
+        assert!(matches!(
+            error,
+            ChatError::AuthorizationRefresh(
+                ToolAuthorizationRefreshError::HarnessPermissionRevoked
+            )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn harness_runtime_authorization_rejects_unknown_and_elevated_modes() {
+        let user = test_auth().user.expect("test user");
+        let auth = AuthContext::new_api_key(
+            user,
+            None,
+            Some(vec![Permission::AiGatewayWrite]),
+            "runtime".to_string(),
+            78,
+        );
+
+        assert!(harness_runtime_authorized(&auth, "claude_cli", "default"));
+        assert!(!harness_runtime_authorized(
+            &auth,
+            "claude_cli",
+            "full-access"
+        ));
+        assert!(!harness_runtime_authorized(&auth, "claude_cli", "unknown"));
+        assert!(!harness_runtime_authorized(&auth, "codex_cli", "auto"));
+    }
+
+    #[tokio::test]
+    async fn tool_authorization_uses_current_api_key_permissions() {
+        let now = Utc::now();
+        let user = test_auth().user.expect("test user");
+        let key = temps_entities::api_keys::Model {
+            id: 72,
+            name: "current".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test_".to_string(),
+            user_id: user.id,
+            role_type: "custom".to_string(),
+            permissions: Some("[\"projects:read\"]".to_string()),
+            is_active: true,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let captured = AuthContext::new_api_key(
+            user.clone(),
+            None,
+            Some(vec![Permission::ProjectsWrite]),
+            key.name.clone(),
+            key.id,
+        );
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[key]])
+            .append_query_results([[user]])
+            .into_connection();
+
+        let refreshed = refresh_tool_authorization(&db, &captured)
+            .await
+            .expect("current API-key authorization");
+        assert!(refreshed.has_permission(&Permission::ProjectsRead));
+        assert!(!refreshed.has_permission(&Permission::ProjectsWrite));
     }
 
     fn test_request_metadata() -> RequestMetadata {
@@ -6081,19 +7143,8 @@ mod tests {
         }
     }
 
-    /// Build a service whose only DB interaction (the final assistant insert) is
-    /// satisfied by one mocked query result, plus the `echo` tool list to drive
-    /// the loop. The provider is passed directly to `try_tool_loop` per test.
-    fn service_with(ai: Arc<dyn AiService>) -> (ConversationService, Vec<ChatTool>) {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![assistant_msg_model()]])
-            .into_connection();
-        let tools = vec![ChatTool {
-            name: "echo".to_string(),
-            description: "Echoes its input.".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
-        }];
-        let svc = ConversationService {
+    fn service_with_db(ai: Arc<dyn AiService>, db: DatabaseConnection) -> ConversationService {
+        ConversationService {
             db: Arc::new(db),
             ai,
             providers: HashMap::new(),
@@ -6106,8 +7157,70 @@ mod tests {
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             harness_mcp_entries: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn echo_tools() -> Vec<ChatTool> {
+        let tools = vec![ChatTool {
+            name: "echo".to_string(),
+            description: "Echoes its input.".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        tools
+    }
+
+    /// Build a service whose only DB interaction (the final assistant insert)
+    /// is satisfied by one mocked query result. The provider is passed directly
+    /// to `try_tool_loop` per test.
+    fn service_with(ai: Arc<dyn AiService>) -> (ConversationService, Vec<ChatTool>) {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![assistant_msg_model()]])
+            .into_connection();
+        (service_with_db(ai, db), echo_tools())
+    }
+
+    /// Tool-loop tests use the same durable API-key identity as production.
+    /// The mock rows prove authorization is refreshed before the dispatch; a
+    /// request-only test session would now (correctly) fail closed.
+    fn service_with_current_tool_auth(
+        ai: Arc<dyn AiService>,
+    ) -> (ConversationService, Vec<ChatTool>, AuthContext) {
+        let now = Utc::now();
+        let user = test_auth().user.expect("test user");
+        let key = temps_entities::api_keys::Model {
+            id: 73,
+            name: "tool-loop".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test_".to_string(),
+            user_id: user.id,
+            role_type: "admin".to_string(),
+            permissions: None,
+            is_active: true,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
         };
-        (svc, tools)
+        let auth = AuthContext::new_api_key(
+            user.clone(),
+            Some(Role::Admin),
+            None,
+            key.name.clone(),
+            key.id,
+        );
+        let mut db = MockDatabase::new(DatabaseBackend::Postgres);
+        // Match the production turn backstop so long-running loop tests never
+        // fall through to an unauthenticated fixture halfway through a turn.
+        for _ in 0..500 {
+            db = db
+                .append_query_results([[key.clone()]])
+                .append_query_results([[user.clone()]]);
+        }
+        let db = db
+            .append_query_results([[assistant_msg_model()]])
+            .into_connection();
+        (service_with_db(ai, db), echo_tools(), auth)
     }
 
     async fn drain(
@@ -6124,6 +7237,33 @@ mod tests {
     }
 
     struct StreamErrorAi;
+
+    struct PendingStreamAi {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AiService for PendingStreamAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            _request: ChatTurnRequest,
+        ) -> Result<ChatTurnStream, AiError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
 
     #[async_trait]
     impl AiService for StreamErrorAi {
@@ -6261,7 +7401,7 @@ mod tests {
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
         let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
         let mut stream = svc
             .try_tool_loop(
@@ -6269,7 +7409,7 @@ mod tests {
                 vec![],
                 Some(provider_dyn),
                 tools,
-                &test_auth(),
+                &auth,
             )
             .await;
 
@@ -6326,6 +7466,8 @@ mod tests {
         };
         let mut conversation = test_conversation();
         conversation.context_type = "application".to_string();
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_permission_mode = "default".to_string();
         conversation.title = Some("test-nextjs".to_string());
         let mut live = svc.subscribe_conversation(conversation.id);
 
@@ -6338,6 +7480,7 @@ mod tests {
                 &test_auth(),
                 &test_request_metadata(),
                 None,
+                Vec::new(),
                 None,
                 temps_ai::SensitiveEnvironment::default(),
                 None,
@@ -6386,12 +7529,12 @@ mod tests {
         });
         let tool_count = provider.tool_calls.clone();
         let chat_count = ai.chat_calls.clone();
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
 
         let conv = test_conversation();
         let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
         let stream = svc
-            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &auth)
             .await;
         let out = drain(stream).await;
 
@@ -6432,12 +7575,12 @@ mod tests {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let chat_count = ai.chat_calls.clone();
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
 
         let conv = test_conversation();
         let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
         let stream = svc
-            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &auth)
             .await;
         let out = drain(stream).await;
 
@@ -6514,18 +7657,21 @@ mod tests {
         let ai: Arc<dyn AiService> = Arc::new(NativeToolThenErrorAi {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
         let mut conversation = test_conversation();
         conversation.context_type = "application".to_string();
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_permission_mode = "default".to_string();
         let stream = svc
             .try_tool_loop_in_workspace(
                 &conversation,
                 vec![],
                 None,
                 tools,
-                &test_auth(),
+                &auth,
                 &test_request_metadata(),
                 None,
+                Vec::new(),
                 Some(temps_ai::HarnessWorkspace {
                     sandbox_label: "app_test".to_string(),
                     host_work_dir: std::path::PathBuf::from("/tmp/app_test"),
@@ -6568,12 +7714,12 @@ mod tests {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let chat_count = ai.chat_calls.clone();
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
 
         let conv = test_conversation();
         let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
         let stream = svc
-            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &auth)
             .await;
         let out = drain(stream).await;
 
@@ -6618,12 +7764,12 @@ mod tests {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let chat_count = ai.chat_calls.clone();
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
 
         let conv = test_conversation();
         let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
         let stream = svc
-            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &auth)
             .await;
         drain(stream).await;
 
@@ -6658,12 +7804,12 @@ mod tests {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let chat_count = ai.chat_calls.clone();
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
 
         let conv = test_conversation();
         let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
         let stream = svc
-            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &auth)
             .await;
         let out = drain(stream).await;
 
@@ -6703,12 +7849,12 @@ mod tests {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let chat_count = ai.chat_calls.clone();
-        let (svc, tools) = service_with(ai);
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
 
         let conv = test_conversation();
         let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
         let stream = svc
-            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &auth)
             .await;
         let out = drain(stream).await;
 
@@ -7091,6 +8237,7 @@ mod tests {
                 &test_auth(),
                 &test_request_metadata(),
                 None,
+                Vec::new(),
                 None,
                 temps_ai::SensitiveEnvironment::default(),
                 Some("turn-cancelled-during-setup".to_string()),
@@ -7861,6 +9008,7 @@ mod tests {
                 turn_id: "turn-7".to_string(),
                 abort: running.abort_handle(),
                 auto_approve_provider_tools: auto.clone(),
+                permission_mode: Arc::new(Mutex::new("default".to_string())),
             },
         );
 
@@ -7937,6 +9085,17 @@ mod tests {
             .iter()
             .all(|approval| approval.delivered));
         assert!(auto.load(Ordering::Acquire));
+        assert_eq!(
+            active_permission_mode(
+                &svc.active_turns
+                    .lock()
+                    .unwrap()
+                    .get(&7)
+                    .expect("active turn")
+                    .permission_mode
+            ),
+            "full-access"
+        );
         assert!(matches!(
             provider_rx.await.unwrap().decision,
             PermissionDecision::AllowTool

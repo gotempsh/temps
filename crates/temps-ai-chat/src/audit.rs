@@ -160,6 +160,38 @@ pub struct ApplicationWorkspaceDeployedAudit {
     pub deployment_id: i32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplicationPreviewLinkCreatedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub sandbox_id: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplicationWorkspaceSourceImportedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub project_id: i32,
+    pub used_git_connection: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplicationWorkspaceFilesWrittenAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub project_id: i32,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationAttachmentUploadedAudit {
+    pub context: AuditContext,
+    pub conversation_id: String,
+    pub attachment_id: String,
+    pub size_bytes: u64,
+}
+
 impl_audit_operation!(
     ApplicationTopologyChangedAudit,
     "ai.application.topology_changed"
@@ -171,6 +203,22 @@ impl_audit_operation!(
 impl_audit_operation!(
     ApplicationWorkspaceDeployedAudit,
     "ai.application.workspace_deployed"
+);
+impl_audit_operation!(
+    ApplicationPreviewLinkCreatedAudit,
+    "ai.application.preview_link.created"
+);
+impl_audit_operation!(
+    ApplicationWorkspaceSourceImportedAudit,
+    "ai.application.workspace_source.imported"
+);
+impl_audit_operation!(
+    ApplicationWorkspaceFilesWrittenAudit,
+    "ai.application.workspace_files.written"
+);
+impl_audit_operation!(
+    ConversationAttachmentUploadedAudit,
+    "ai.conversation.attachment.uploaded"
 );
 
 // --- Pending-action audit events -------------------------------------------

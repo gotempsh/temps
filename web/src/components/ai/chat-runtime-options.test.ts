@@ -183,8 +183,7 @@ test('harness catalog options preserve resolved runtime controls', () => {
       {
         id: 'claude_cli',
         name: 'Claude Code',
-        credential_saved: true,
-        host_authenticated: false,
+        workspace_ready: true,
         runtime_models: [
           {
             id: 'default',
@@ -219,6 +218,22 @@ test('harness catalog options preserve resolved runtime controls', () => {
       default_permission_mode_id: 'full-access',
     },
   ])
+})
+
+test('harness catalog excludes a host-only CLI without a workspace relay', () => {
+  expect(
+    chatHarnessProviderOptions([
+      {
+        id: 'codex_cli',
+        name: 'Codex',
+        workspace_ready: false,
+        runtime_models: [],
+        default_runtime_model_id: null,
+        permission_modes: [],
+        default_permission_mode_id: 'default',
+      },
+    ])
+  ).toEqual([])
 })
 
 test('a model refresh drops a stale thinking sentinel without switching harnesses', () => {

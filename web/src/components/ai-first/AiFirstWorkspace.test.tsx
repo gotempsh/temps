@@ -11,6 +11,7 @@ import {
   WorkspaceFilesPanel,
   WorkspaceStatusIndicator,
   WorkspaceViewTabs,
+  mergeConversationPages,
 } from './AiFirstWorkspace'
 import { problemDetail } from './problem-detail'
 import {
@@ -85,6 +86,21 @@ describe('HarnessPicker', () => {
     ])
 
     expect(harnesses.map((harness) => harness.id)).toEqual(['claude_cli'])
+  })
+})
+
+describe('workspace pagination', () => {
+  test('retains more than one hundred uniquely paged workspaces', () => {
+    const first = Array.from({ length: 50 }, (_, index) => ({
+      public_id: `app_${index}`,
+    }))
+    const rest = Array.from({ length: 76 }, (_, index) => ({
+      public_id: `app_${index + 49}`,
+    }))
+
+    const merged = mergeConversationPages(first, rest)
+    expect(merged).toHaveLength(125)
+    expect(merged[merged.length - 1]?.public_id).toBe('app_124')
   })
 })
 

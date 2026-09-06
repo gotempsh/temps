@@ -93,6 +93,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { useAiAssistant } from './AiAssistantContext'
 import {
+  chatDraftStorageKey,
   chatHarnessProviderOptions,
   chatModelLabel,
   chatPermissionLabel,
@@ -123,10 +124,15 @@ import {
   restoredHistoryScrollTop,
   shouldLoadEarlierMessages,
 } from './chat-history-pagination'
+
 import {
   projectCollectionFromApplicationProjectWrite,
   projectCollectionFromTool,
 } from './tool-result-presentation'
+import {
+  createPendingAttachment,
+  revokeAttachmentPreviews,
+} from './attachment-previews'
 // highlight.js token theme for fenced code blocks. github-dark reads well on the
 // dark code surface used in both light and dark app themes.
 import 'highlight.js/styles/github-dark.css'
@@ -2011,7 +2017,6 @@ function AssistantBody({
   streaming,
   activityLabel,
   turnStartedAt,
-  conversationBasePath,
   conversationPublicId,
   userScoped,
   projectId,
@@ -2022,7 +2027,6 @@ function AssistantBody({
   streaming: boolean
   activityLabel: string
   turnStartedAt?: string | null
-  conversationBasePath: string
   conversationPublicId: string | null
   userScoped: boolean
   projectId?: number
@@ -2056,9 +2060,10 @@ function AssistantBody({
           // ADR-038 Phase 2: interactive bridge permission request
           <PermissionCard
             key={`perm-${part.permission.id}`}
-            conversationBasePath={conversationBasePath}
             conversationPublicId={conversationPublicId ?? ''}
             permission={part.permission}
+            projectId={projectId}
+            userScoped={userScoped}
             onResolved={onPermissionResolved}
           />
         ) : (
@@ -2441,7 +2446,13 @@ export function DebugChatPanel({
   const ctxId = String(contextId)
   // Per-chat draft key: a half-typed message survives closing the dock,
   // switching chats, and reloads.
-  const draftKey = `temps.ai.draft.${userScoped ? 'user' : projectId}:${contextType}:${ctxId}`
+  const draftKey = chatDraftStorageKey({
+    userScoped,
+    projectId,
+    contextType,
+    contextId: ctxId,
+    conversationPublicId,
+  })
   // Current page context (what the user is viewing). Shown as a chip by the
   // input; the user can toggle whether it's attached.
   const { pageContext } = useAiAssistant()
@@ -2487,6 +2498,8 @@ export function DebugChatPanel({
   const [pendingAttachments, setPendingAttachments] = useState<
     ChatAttachment[]
   >([])
+  const pendingAttachmentsRef = useRef<ChatAttachment[]>([])
+  const attachmentsMountedRef = useRef(true)
   const [attachmentUploads, setAttachmentUploads] = useState(0)
   const attachmentInputRef = useRef<HTMLInputElement>(null)
   const [input, setInput] = useState(() => {
@@ -2788,7 +2801,9 @@ export function DebugChatPanel({
     return () => observer.disconnect()
   }, [input])
 
-  // Persist the draft as the user types; clear it once sent (input → '').
+  // Every caller keys this component by the durable conversation id. Draft
+  // hydration therefore happens in the state initializer above, while this
+  // effect only mirrors edits into the already-selected conversation key.
   useEffect(() => {
     try {
       if (input) localStorage.setItem(draftKey, input)
@@ -2797,6 +2812,15 @@ export function DebugChatPanel({
       /* storage unavailable — non-fatal */
     }
   }, [input, draftKey])
+
+  useEffect(() => {
+    attachmentsMountedRef.current = true
+    return () => {
+      attachmentsMountedRef.current = false
+      revokeAttachmentPreviews(pendingAttachmentsRef.current)
+      pendingAttachmentsRef.current = []
+    }
+  }, [])
 
   const send = useCallback(
     async (text: string, conversationId?: string) => {
@@ -2969,6 +2993,8 @@ export function DebugChatPanel({
           return
         }
         setInput('')
+        revokeAttachmentPreviews(attachments)
+        pendingAttachmentsRef.current = []
         setPendingAttachments([])
         if (typeof responsePayload.turn_started_at === 'string') {
           setTurnStartedAt(responsePayload.turn_started_at)
@@ -3072,13 +3098,17 @@ export function DebugChatPanel({
                   `Could not upload ${file.name} (HTTP ${response?.status ?? 'unknown'}).`
               )
             }
-            const attachment: ChatAttachment = {
-              ...payload,
-              preview_url: payload.is_image
-                ? URL.createObjectURL(file)
-                : undefined,
-            }
-            setPendingAttachments((current) => [...current, attachment])
+            const attachment = createPendingAttachment(
+              payload,
+              file,
+              () => attachmentsMountedRef.current
+            )
+            if (!attachment) return
+            setPendingAttachments((current) => {
+              const next = [...current, attachment]
+              pendingAttachmentsRef.current = next
+              return next
+            })
           } catch (cause) {
             setError(
               localChatFailure(
@@ -3101,8 +3131,10 @@ export function DebugChatPanel({
   const removePendingAttachment = useCallback((id: string) => {
     setPendingAttachments((current) => {
       const removed = current.find((attachment) => attachment.id === id)
-      if (removed?.preview_url) URL.revokeObjectURL(removed.preview_url)
-      return current.filter((attachment) => attachment.id !== id)
+      if (removed) revokeAttachmentPreviews([removed])
+      const next = current.filter((attachment) => attachment.id !== id)
+      pendingAttachmentsRef.current = next
+      return next
     })
   }, [])
 
@@ -3688,7 +3720,6 @@ export function DebugChatPanel({
                       streaming={liveTurn && isTrailing}
                       activityLabel={activityLabel}
                       turnStartedAt={turnStartedAt}
-                      conversationBasePath={base}
                       conversationPublicId={publicId}
                       userScoped={userScoped}
                       projectId={projectId}

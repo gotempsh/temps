@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { ProviderCatalogDto } from '@/api/client'
+
 export interface ChatSelectOption {
   id: string
   name: string
@@ -30,22 +32,16 @@ export interface ChatRuntimeSelection {
   permissionModeId: string | null
 }
 
-export interface ChatHarnessCatalogOption {
-  id: string
-  name: string
-  credential_saved: boolean
-  host_authenticated: boolean
-  runtime_models?: Array<{
-    id: string
-    name: string
-    thinking_modes: ChatSelectOption[]
-    tool_thinking_modes?: ChatSelectOption[] | null
-    default_thinking_mode_id?: string | null
-  }>
-  default_runtime_model_id?: string | null
-  permission_modes?: ChatSelectOption[]
-  default_permission_mode_id?: string | null
-}
+export type ChatHarnessCatalogOption = Pick<
+  ProviderCatalogDto,
+  | 'id'
+  | 'name'
+  | 'workspace_ready'
+  | 'runtime_models'
+  | 'default_runtime_model_id'
+  | 'permission_modes'
+  | 'default_permission_mode_id'
+>
 
 /** Host CLI threads use the Agent Sandbox catalog, regardless of scope. */
 export function usesHarnessCatalog(contextType: string): boolean {
@@ -57,9 +53,7 @@ export function chatHarnessProviderOptions(
   providers: ChatHarnessCatalogOption[]
 ): ChatProviderOption[] {
   return providers
-    .filter(
-      (provider) => provider.credential_saved || provider.host_authenticated
-    )
+    .filter((provider) => provider.workspace_ready)
     .map((provider) => ({
       id: provider.id,
       name: provider.name,
@@ -81,6 +75,31 @@ export function chatHarnessProviderOptions(
       permission_modes: provider.permission_modes ?? [],
       default_permission_mode_id: provider.default_permission_mode_id,
     }))
+}
+
+/**
+ * Isolate drafts by durable conversation identity. Before the first message
+ * creates a conversation, retain a context-scoped key so lazy-create drafts
+ * still survive a reload.
+ */
+export function chatDraftStorageKey({
+  userScoped,
+  projectId,
+  contextType,
+  contextId,
+  conversationPublicId,
+}: {
+  userScoped: boolean
+  projectId?: number
+  contextType: string
+  contextId: string
+  conversationPublicId?: string | null
+}): string {
+  const owner = userScoped ? 'user' : String(projectId)
+  const target = conversationPublicId
+    ? `conversation:${conversationPublicId}`
+    : `context:${contextType}:${contextId}`
+  return `temps.ai.draft.${owner}:${target}`
 }
 
 function firstValidId(

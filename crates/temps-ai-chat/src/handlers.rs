@@ -48,11 +48,13 @@ use temps_ai::streaming::{PermissionDecision, PermissionKind, PermissionRequest}
 
 use crate::audit::{
     AiActionConfirmedAudit, AiActionRejectedAudit, ApplicationArchivedAudit,
-    ApplicationCreatedAudit, ApplicationRestoredAudit, ApplicationTopologyChangedAudit,
-    ApplicationWorkspaceChangedAudit, ApplicationWorkspaceDeployedAudit, ChatMessageSentAudit,
-    ConversationArchivedAudit, ConversationCreatedAudit, ConversationPermissionModeChangedAudit,
-    ConversationRenamedAudit, ConversationRestoredAudit, PermissionResolvedAudit,
-    ThreadArtifactCreatedAudit,
+    ApplicationCreatedAudit, ApplicationPreviewLinkCreatedAudit, ApplicationRestoredAudit,
+    ApplicationTopologyChangedAudit, ApplicationWorkspaceChangedAudit,
+    ApplicationWorkspaceDeployedAudit, ApplicationWorkspaceFilesWrittenAudit,
+    ApplicationWorkspaceSourceImportedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
+    ConversationAttachmentUploadedAudit, ConversationCreatedAudit,
+    ConversationPermissionModeChangedAudit, ConversationRenamedAudit, ConversationRestoredAudit,
+    PermissionResolvedAudit, ThreadArtifactCreatedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
 use crate::sensitive::{
@@ -886,6 +888,16 @@ impl From<ChatError> for Problem {
                 problemdetails::new(axum::http::StatusCode::CONFLICT)
                     .with_title("AI Turn Already Running")
                     .with_detail(e.to_string())
+            }
+            chat_error @ ChatError::AuthorizationRefresh(_) => {
+                let failure = chat_error.public_failure();
+                error!(
+                    failure_code = failure.code,
+                    "AI chat authorization refresh failed: {chat_error}"
+                );
+                problemdetails::new(axum::http::StatusCode::UNAUTHORIZED)
+                    .with_title(failure.title)
+                    .with_detail(failure.detail)
             }
             chat_error @ (ChatError::ProjectLookup { .. } | ChatError::Db(_)) => {
                 let failure = chat_error.public_failure();
@@ -3043,6 +3055,7 @@ pub async fn create_application_conversation(
 pub async fn create_application_preview_link(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(application_public_id): Path<String>,
     Json(request): Json<CreateApplicationPreviewLinkRequest>,
 ) -> Result<Json<ApplicationPreviewLinkResponse>, Problem> {
@@ -3066,6 +3079,14 @@ pub async fn create_application_preview_link(
         )
         .await
         .map_err(Problem::from)?;
+    state
+        .audit(&ApplicationPreviewLinkCreatedAudit {
+            context: audit_context(&auth, &metadata),
+            application_id: application_public_id,
+            sandbox_id: sandbox_public_id,
+            port: request.port,
+        })
+        .await;
     Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
 }
 
@@ -3138,6 +3159,7 @@ fn application_project(
 pub async fn import_application_workspace_git(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path((application_public_id, project_id)): Path<(String, i32)>,
     Json(request): Json<ImportApplicationWorkspaceGitRequest>,
 ) -> Result<StatusCode, Problem> {
@@ -3155,6 +3177,7 @@ pub async fn import_application_workspace_git(
             .with_title("Application Sandbox Unavailable")
             .with_detail("The instance sandbox service is not configured.")
     })?;
+    let used_git_connection = request.git_connection_id.is_some();
     let source = temps_sandbox::services::SandboxSource::Git {
         url: request.url,
         revision: request.revision,
@@ -3169,6 +3192,14 @@ pub async fn import_application_workspace_git(
         .clone_source(&sandbox_public_id, auth.user_id(), &source)
         .await
         .map_err(Problem::from)?;
+    state
+        .audit(&ApplicationWorkspaceSourceImportedAudit {
+            context: audit_context(&auth, &metadata),
+            application_id: application_public_id,
+            project_id,
+            used_git_connection,
+        })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3189,6 +3220,7 @@ pub async fn import_application_workspace_git(
 pub async fn write_application_workspace_files(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path((application_public_id, project_id)): Path<(String, i32)>,
     Json(request): Json<WriteApplicationWorkspaceFilesRequest>,
 ) -> Result<Json<WriteApplicationWorkspaceFilesResponse>, Problem> {
@@ -3248,6 +3280,14 @@ pub async fn write_application_workspace_files(
         )
         .await
         .map_err(Problem::from)?;
+    state
+        .audit(&ApplicationWorkspaceFilesWrittenAudit {
+            context: audit_context(&auth, &metadata),
+            application_id: application_public_id,
+            project_id,
+            file_count: written,
+        })
+        .await;
     Ok(Json(WriteApplicationWorkspaceFilesResponse { written }))
 }
 
@@ -5226,15 +5266,29 @@ async fn ensure_user_conversation_mutation_access(
     if conversation.context_type == "application" {
         ensure_application_conversation_access(state, auth, conversation).await?;
     } else {
-        if let Some(project_id) = conversation.project_id {
-            ensure_application_project_permission(
-                auth,
-                &state.project_access_checker,
-                &[project_id],
-                &Permission::ProjectsWrite,
-            )
-            .await?;
-        }
+        ensure_legacy_conversation_mutation_access(
+            auth,
+            &state.project_access_checker,
+            conversation.project_id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_legacy_conversation_mutation_access(
+    auth: &AuthContext,
+    project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_id: Option<i32>,
+) -> Result<(), Problem> {
+    if let Some(project_id) = project_id {
+        ensure_application_project_permission(
+            auth,
+            project_access_checker,
+            &[project_id],
+            &Permission::ProjectsWrite,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -5876,6 +5930,7 @@ fn attachment_prompt_context(attachments: &[ChatAttachmentResponse]) -> Option<S
 pub async fn upload_user_conversation_attachment(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(public_id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ChatAttachmentResponse>), Problem> {
@@ -5886,7 +5941,21 @@ pub async fn upload_user_conversation_attachment(
         .service
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
-    ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    ensure_user_conversation_mutation_access(&state, &auth, &conversation).await?;
+    ensure_application_conversation_permission(
+        &state,
+        &auth,
+        &conversation,
+        &Permission::SandboxesWrite,
+    )
+    .await?;
+    ensure_application_conversation_permission(
+        &state,
+        &auth,
+        &conversation,
+        &Permission::ProjectsWrite,
+    )
+    .await?;
     let workspace_id = conversation_workspace_id(&state, &auth, &conversation).await?;
 
     let field = multipart
@@ -5967,6 +6036,14 @@ pub async fn upload_user_conversation_attachment(
         ),
         is_image: mime_type.starts_with("image/"),
     };
+    state
+        .audit(&ConversationAttachmentUploadedAudit {
+            context: audit_context(&auth, &metadata),
+            conversation_id: conversation.public_id,
+            attachment_id,
+            size_bytes: bytes.len() as u64,
+        })
+        .await;
     Ok((StatusCode::CREATED, Json(attachment)))
 }
 
@@ -8416,6 +8493,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_attachment_upload_requires_scoped_sandbox_and_project_write() {
+        let auth = custom_auth(vec![
+            Permission::ProjectsRead,
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+        ]);
+        let missing_sandbox: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsRead.to_string(),
+                    Permission::ProjectsWrite.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+        let error = ensure_application_project_permission(
+            &auth,
+            &missing_sandbox,
+            &[7],
+            &Permission::SandboxesWrite,
+        )
+        .await
+        .expect_err("attachment bytes must not enter a sandbox without scoped sandbox write");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+
+        let missing_project_write: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsRead.to_string(),
+                    Permission::SandboxesWrite.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+        let error = ensure_application_project_permission(
+            &auth,
+            &missing_project_write,
+            &[7],
+            &Permission::ProjectsWrite,
+        )
+        .await
+        .expect_err("application attachment mutation also requires scoped project write");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+
+        let allowed: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsRead.to_string(),
+                    Permission::ProjectsWrite.to_string(),
+                    Permission::SandboxesWrite.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+        ensure_application_project_permission(&auth, &allowed, &[7], &Permission::SandboxesWrite)
+            .await
+            .expect("scoped sandbox write allows the attachment workspace mutation");
+        ensure_application_project_permission(&auth, &allowed, &[7], &Permission::ProjectsWrite)
+            .await
+            .expect("scoped project write allows the application mutation");
+    }
+
+    #[tokio::test]
     async fn application_list_visibility_honors_scoped_projects_read() {
         let auth = custom_auth(vec![Permission::ProjectsRead]);
         let denied: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
@@ -8468,6 +8608,27 @@ mod tests {
                 .expect("project access check"),
             "access to one project must not authorize a multi-project application"
         );
+    }
+
+    #[tokio::test]
+    async fn revoked_project_membership_denies_user_conversation_mutations() {
+        let auth = custom_auth(vec![
+            Permission::ProjectsRead,
+            Permission::ProjectsWrite,
+            Permission::SandboxesWrite,
+        ]);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![Permission::ProjectsWrite.to_string()]),
+                member: true,
+                denied_project_id: Some(42),
+            }));
+
+        let error = ensure_legacy_conversation_mutation_access(&auth, &checker, Some(42))
+            .await
+            .expect_err("attachment uploads and other mutations must re-check current membership");
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

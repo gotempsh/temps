@@ -3711,15 +3711,27 @@ fn source_import_staging_dir(
 ) -> String {
     let private_root = match backend {
         temps_agents::sandbox::SandboxBackend::Local => "/tmp",
-        _ => "/root",
+        temps_agents::sandbox::SandboxBackend::Docker => "/run/temps-source-import",
+        temps_agents::sandbox::SandboxBackend::Firecracker => "/root",
     };
     format!("{private_root}/.temps-source-import-{internal_id}")
 }
 
 fn source_import_staging_prepare_script(staging_dir: &str) -> String {
     let staging_dir = shell_escape_service(staging_dir);
+    let require_hard_limit = if staging_dir.starts_with("/run/temps-source-import/") {
+        "grep -q ' /run/temps-source-import ' /proc/self/mountinfo || { echo 'secure source-import staging is unavailable; rebuild this sandbox before importing' >&2; exit 69; }; "
+    } else if staging_dir.starts_with("/run/secrets/") {
+        "grep -q ' /run/secrets ' /proc/self/mountinfo || { echo 'secure source-import credential storage is unavailable; rebuild this sandbox before importing' >&2; exit 69; }; "
+    } else {
+        // Local and Firecracker do not currently expose a provider-enforced,
+        // size-bounded staging filesystem. Sampling `du` after extraction is
+        // not a quota and can exhaust the host/VM disk between samples, so
+        // reject the import instead of pretending the soft monitor is safe.
+        "echo 'secure source-import staging is unavailable for this sandbox backend' >&2; exit 69; "
+    };
     format!(
-        "find {staging_dir} -depth -delete 2>/dev/null || true; mkdir -m 700 -p {staging_dir}; \
+        "{require_hard_limit}find {staging_dir} -depth -delete 2>/dev/null || true; mkdir -m 700 -p {staging_dir}; \
          test ! -L {staging_dir} || {{ echo 'source staging directory must not be a symbolic link' >&2; exit 64; }};"
     )
 }
@@ -3856,16 +3868,35 @@ mod tests {
     fn source_imports_use_bounded_staging_and_process_deadlines() {
         let nested_stage =
             source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Docker, 42);
-        assert_eq!(nested_stage, "/root/.temps-source-import-42");
+        assert_eq!(
+            nested_stage,
+            "/run/temps-source-import/.temps-source-import-42"
+        );
         let local_stage =
             source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Local, 42);
         assert_eq!(local_stage, "/tmp/.temps-source-import-42");
 
         let command = source_import_command_script(&nested_stage, "git clone repo target");
         assert!(command.contains("timeout -k 5 120"));
-        assert!(command.contains("find /root/.temps-source-import-42 -mindepth 1"));
+        assert!(
+            command.contains("find /run/temps-source-import/.temps-source-import-42 -mindepth 1")
+        );
         assert!(command.contains("kill -TERM"));
-        assert!(command.contains("find /root/.temps-source-import-42 -depth -delete"));
+        assert!(command
+            .contains("find /run/temps-source-import/.temps-source-import-42 -depth -delete"));
+
+        let prepare = source_import_staging_prepare_script(&nested_stage);
+        assert!(prepare.contains(" /run/temps-source-import "));
+        assert!(prepare.contains("rebuild this sandbox before importing"));
+
+        let local_prepare = source_import_staging_prepare_script(&local_stage);
+        assert!(local_prepare.contains("unavailable for this sandbox backend"));
+        assert!(local_prepare.contains("exit 69"));
+
+        let auth_prepare =
+            source_import_staging_prepare_script("/run/secrets/.temps-source-auth-42");
+        assert!(auth_prepare.contains(" /run/secrets "));
+        assert!(auth_prepare.contains("credential storage is unavailable"));
 
         let bounds = source_import_bounds_script(&nested_stage);
         assert!(bounds.contains("-mindepth 1"));
@@ -3874,8 +3905,10 @@ mod tests {
 
     #[test]
     fn source_import_quota_includes_existing_workspace_content() {
-        let bounds =
-            source_import_aggregate_bounds_script("/workspace", "/root/.temps-source-import-7");
+        let bounds = source_import_aggregate_bounds_script(
+            "/workspace",
+            "/run/temps-source-import/.temps-source-import-7",
+        );
         assert!(bounds.contains("existing_count + staged_count"));
         assert!(bounds.contains("existing_bytes + staged_bytes"));
         assert!(bounds.contains("aggregate 5000 entry or 256 MiB"));

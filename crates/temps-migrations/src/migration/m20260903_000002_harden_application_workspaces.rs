@@ -15,12 +15,18 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
-                "UPDATE ai_application_workspaces SET runtime = 'node', image = NULL \
-                 WHERE runtime = 'custom' OR image IS NOT NULL; \
-                 UPDATE ai_application_workspaces SET cpu_limit = LEAST(cpu_limit, 8), \
-                   memory_limit_mb = LEAST(memory_limit_mb, 16384), \
-                   pids_limit = LEAST(pids_limit, 2048), \
-                   disk_limit_mb = LEAST(disk_limit_mb, 65536); \
+                "DO $$ \
+                 DECLARE incompatible_count BIGINT; \
+                 BEGIN \
+                   SELECT COUNT(*) INTO incompatible_count \
+                   FROM ai_application_workspaces \
+                   WHERE runtime = 'custom' OR image IS NOT NULL \
+                      OR cpu_limit > 8 OR memory_limit_mb > 16384 \
+                      OR pids_limit > 2048 OR disk_limit_mb > 65536; \
+                   IF incompatible_count > 0 THEN \
+                     RAISE EXCEPTION 'cannot harden application workspaces: % row(s) use a custom image or exceed the safe resource ceilings; update those workspace settings before retrying', incompatible_count; \
+                   END IF; \
+                 END $$; \
                  ALTER TABLE ai_application_workspaces \
                    DROP CONSTRAINT IF EXISTS ai_application_workspaces_runtime_check, \
                    DROP CONSTRAINT IF EXISTS ai_application_workspaces_cpu_check, \
@@ -77,5 +83,32 @@ impl MigrationTrait for Migration {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    #[tokio::test]
+    async fn incompatible_workspace_settings_fail_without_being_rewritten() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([Default::default()])
+            .into_connection();
+        Migration
+            .up(&SchemaManager::new(&db))
+            .await
+            .expect("mock migration");
+        let sql = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("RAISE EXCEPTION 'cannot harden application workspaces"));
+        assert!(!sql.contains("SET runtime = 'node'"));
+        assert!(!sql.contains("LEAST("));
     }
 }

@@ -2585,6 +2585,19 @@ impl DockerSandboxProvider {
         ]
     }
 
+    fn container_tmpfs() -> HashMap<String, String> {
+        let mut tmpfs = HashMap::new();
+        tmpfs.insert(
+            "/run/secrets".to_string(),
+            format!("size=1m,mode=0710,gid={SANDBOX_GID}"),
+        );
+        tmpfs.insert(
+            "/run/temps-source-import".to_string(),
+            format!("size=256m,nr_inodes=5001,mode=0700,uid={SANDBOX_UID},gid={SANDBOX_GID}"),
+        );
+        tmpfs
+    }
+
     async fn quarantine_container(
         &self,
         container_reference: &str,
@@ -3067,15 +3080,9 @@ impl SandboxProvider for DockerSandboxProvider {
         let binds = Self::container_binds(&host_work_dir, &home_volume_name);
 
         // tmpfs mount for secrets — in-memory only, never written to disk
-        let mut tmpfs = HashMap::new();
-        // The directory stays non-listable to the runtime user (group execute,
-        // no group read), while turn-scoped files are owned 0600 by that user.
-        // This lets the harness open a capability only when Temps gives it the
-        // unpredictable exact path, without exposing a directory listing.
-        tmpfs.insert(
-            "/run/secrets".to_string(),
-            format!("size=1m,mode=0710,gid={SANDBOX_GID}"),
-        );
+        // Both secret capabilities and source-import staging use explicit
+        // tmpfs mounts. The latter gives imports synchronous byte/inode caps.
+        let tmpfs = Self::container_tmpfs();
 
         let host_config = bollard::models::HostConfig {
             binds: Some(binds),
@@ -5912,6 +5919,16 @@ mod tests {
         );
         // And the work dir is still mounted where the sandbox expects it.
         assert!(binds.contains(&format!("/host/work:{}", CONTAINER_WORK_DIR)));
+    }
+
+    #[test]
+    fn sandbox_source_import_staging_has_hard_byte_and_inode_limits() {
+        let tmpfs = DockerSandboxProvider::container_tmpfs();
+        assert_eq!(
+            tmpfs.get("/run/temps-source-import").map(String::as_str),
+            Some("size=256m,nr_inodes=5001,mode=0700,uid=1000,gid=1000")
+        );
+        assert!(tmpfs.contains_key("/run/secrets"));
     }
 
     /// No name this build generates may land in the pre-fix namespace.

@@ -3303,3 +3303,249 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
 
     Ok(())
 }
+
+/// The AI workspace feature is a seven-migration chain whose later steps
+/// depend on columns, constraints, and indexes installed by earlier steps.
+/// Exercise the chain as PostgreSQL actually sees it, including rollback and
+/// re-application, instead of relying only on MockDatabase SQL-shape tests.
+#[tokio::test]
+async fn test_ai_workspace_migration_chain_up_down_and_reapply() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping AI workspace migration-chain test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping AI workspace migration-chain test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let chain = [
+        "m20260831_000001_ai_first_applications",
+        "m20260901_000001_persist_ai_turn_state",
+        "m20260901_000002_user_owned_ai_conversations",
+        "m20260903_000001_application_workspace_topology",
+        "m20260903_000002_harden_application_workspaces",
+        "m20260903_000003_application_workspace_quarantine",
+        "m20260903_000004_repair_application_primary_projects",
+    ];
+    let migrations = Migrator::migrations();
+    let first = migrations
+        .iter()
+        .position(|migration| migration.name() == chain[0])
+        .expect("first AI workspace migration is registered");
+    let registered = migrations[first..first + chain.len()]
+        .iter()
+        .map(|migration| migration.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        registered,
+        chain
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+
+    Migrator::up(&db, Some(first as u32)).await?;
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO users (name, email, created_at, updated_at) \
+             VALUES ('AI migration user', 'ai-workspace-migration@example.test', now(), now()) \
+             RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted AI migration user");
+    let user_id: i32 = user.try_get("", "id")?;
+    let project = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug) \
+             VALUES ('AI migration project', '', '', '.', 'main', 'nodejs', now(), now(), \
+                     'ai-workspace-migration') RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted AI migration project");
+    let project_id: i32 = project.try_get("", "id")?;
+
+    // Seed rows between the first migration and the topology migrations so
+    // the real database exercises the legacy data backfills, not only the
+    // final empty-schema shape.
+    Migrator::up(&db, Some(1)).await?;
+    let application = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO ai_applications (public_id, name, created_by) \
+                 VALUES ('app_migration', 'Migration app', {user_id}) RETURNING id"
+            ),
+        ))
+        .await?
+        .expect("inserted legacy application");
+    let application_id: i64 = application.try_get("", "id")?;
+    db.execute_unprepared(&format!(
+        "INSERT INTO ai_application_projects (application_id, project_id) \
+         VALUES ({application_id}, {project_id}); \
+         INSERT INTO ai_conversations \
+           (public_id, project_id, application_id, context_type, context_id, created_by) \
+         VALUES ('conversation_migration', {project_id}, {application_id}, \
+                 'application', 'app_migration', {user_id});"
+    ))
+    .await?;
+    // Advance through the topology migration, then prove the hardening step
+    // refuses incompatible production data transactionally. This sequence is
+    // intentionally separate from the later migrations: applying the whole
+    // remainder at once only exercises safe topology defaults.
+    Migrator::up(&db, Some(3)).await?;
+    db.execute_unprepared(&format!(
+        "UPDATE ai_application_workspaces \
+         SET runtime = 'custom', image = 'registry.example/custom:latest', \
+             cpu_limit = 12 \
+         WHERE application_id = {application_id}"
+    ))
+    .await?;
+    let hardening_refusal = Migrator::up(&db, Some(1))
+        .await
+        .expect_err("hardening must refuse incompatible workspace settings");
+    assert!(
+        hardening_refusal
+            .to_string()
+            .contains("cannot harden application workspaces"),
+        "hardening refusal must tell the operator what to repair: {hardening_refusal}"
+    );
+    let refused_state = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT runtime, image, cpu_limit, \
+                   NOT EXISTS (SELECT 1 FROM seaql_migrations \
+                     WHERE version = '{}') AS migration_unapplied \
+                 FROM ai_application_workspaces WHERE application_id = {application_id}",
+                chain[4]
+            ),
+        ))
+        .await?
+        .expect("workspace survives refused hardening");
+    assert_eq!(refused_state.try_get::<String>("", "runtime")?, "custom");
+    assert_eq!(
+        refused_state.try_get::<Option<String>>("", "image")?,
+        Some("registry.example/custom:latest".to_string())
+    );
+    assert_eq!(refused_state.try_get::<f64>("", "cpu_limit")?, 12.0);
+    assert!(refused_state.try_get::<bool>("", "migration_unapplied")?);
+
+    db.execute_unprepared(&format!(
+        "UPDATE ai_application_workspaces \
+         SET runtime = 'node', image = NULL, cpu_limit = 2 \
+         WHERE application_id = {application_id}"
+    ))
+    .await?;
+    Migrator::up(&db, Some(3)).await?;
+
+    async fn schema_ready(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT \
+                   to_regclass('ai_applications') IS NOT NULL \
+                   AND to_regclass('ai_application_workspaces') IS NOT NULL \
+                   AND to_regclass('uq_sandboxes_active_application_workspace') IS NOT NULL \
+                   AND EXISTS (SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = 'ai_conversations' AND column_name = 'turn_status') \
+                   AND EXISTS (SELECT 1 FROM pg_constraint \
+                     WHERE conname = 'ai_application_workspaces_image_check') \
+                   AND EXISTS (SELECT 1 FROM pg_constraint \
+                     WHERE conname = 'chk_ai_conversations_single_context') AS ready"
+                    .to_string(),
+            ))
+            .await?
+            .expect("AI workspace schema state");
+        Ok(row.try_get("", "ready")?)
+    }
+
+    assert!(schema_ready(&db).await?);
+    let backfill = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT \
+                   (SELECT project_id IS NULL FROM ai_conversations \
+                     WHERE public_id = 'conversation_migration') AS conversation_unscoped, \
+                   (SELECT count(*)::int = 1 FROM ai_application_projects \
+                     WHERE application_id = {application_id} AND is_primary) AS one_primary, \
+                   EXISTS (SELECT 1 FROM ai_application_workspaces \
+                     WHERE application_id = {application_id}) AS workspace_created"
+            ),
+        ))
+        .await?
+        .expect("AI workspace backfill state");
+    assert!(backfill.try_get::<bool>("", "conversation_unscoped")?);
+    assert!(backfill.try_get::<bool>("", "one_primary")?);
+    assert!(backfill.try_get::<bool>("", "workspace_created")?);
+
+    let unsafe_limit = db
+        .execute_unprepared(&format!(
+            "UPDATE ai_application_workspaces SET disk_limit_mb = 65537 \
+             WHERE application_id = {application_id}"
+        ))
+        .await;
+    assert!(
+        unsafe_limit.is_err(),
+        "the hardened resource ceiling must be enforced by PostgreSQL"
+    );
+
+    // Remove the application fixture (and its cascading conversation), then
+    // prove the user-owned migration refuses a destructive rollback while a
+    // global conversation still exists. Earlier reverse migrations may
+    // complete before that refusal, so finish the remaining three only after
+    // the protected row is removed.
+    db.execute_unprepared(&format!(
+        "DELETE FROM ai_applications WHERE id = {application_id}; \
+         INSERT INTO ai_conversations \
+           (public_id, project_id, application_id, context_type, context_id, created_by) \
+         VALUES ('global_migration', NULL, NULL, 'global', 'global', {user_id});"
+    ))
+    .await?;
+    let refusal = Migrator::down(&db, Some(chain.len() as u32))
+        .await
+        .expect_err("rollback must preserve global conversation history");
+    assert!(
+        refusal
+            .to_string()
+            .contains("cannot roll back user-owned AI conversations"),
+        "rollback should explain how to preserve or reassign history: {refusal}"
+    );
+    db.execute_unprepared("DELETE FROM ai_conversations WHERE public_id = 'global_migration'")
+        .await?;
+    Migrator::down(&db, Some(3)).await?;
+    assert!(!schema_ready(&db).await?);
+    Migrator::up(&db, Some(chain.len() as u32)).await?;
+    assert!(schema_ready(&db).await?);
+
+    Ok(())
+}

@@ -17,9 +17,9 @@ function renderPermission(input: Record<string, unknown>) {
   return renderToStaticMarkup(
     <MemoryRouter>
       <PermissionCard
-        conversationBasePath="/api/ai/conversations"
         conversationPublicId="conversation-1"
         permission={permission}
+        userScoped
       />
     </MemoryRouter>
   )

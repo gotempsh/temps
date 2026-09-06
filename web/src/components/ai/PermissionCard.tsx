@@ -39,6 +39,11 @@ import {
   serviceLinkProposalViewModel,
   serviceProposalViewModel,
 } from '@/components/ai/GeneratedServiceProposal'
+import {
+  resolvePermission as resolveProjectPermission,
+  resolveUserPermission,
+  type PermissionDecision,
+} from '@/api/client'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -78,37 +83,6 @@ interface PlanApprovalInput {
 // ─── Resolve helpers ──────────────────────────────────────────────────────────
 
 // Match the Rust PermissionDecision: #[serde(tag = "type", rename_all = "snake_case")]
-type PermissionDecision =
-  | { type: 'allow_tool' }
-  | { type: 'deny_tool'; reason?: string }
-  | { type: 'answer_question'; answers: Record<string, string> }
-  | { type: 'approve_plan' }
-  | { type: 'reject_plan'; feedback?: string }
-
-async function resolvePermission(
-  conversationBasePath: string,
-  publicId: string,
-  permissionId: string,
-  decision: PermissionDecision
-): Promise<void> {
-  const res = await fetch(
-    `${conversationBasePath}/${publicId}/permissions/${permissionId}/resolve`,
-    {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision }),
-    }
-  )
-  if (!res.ok) {
-    const body = await res.json().catch(() => null)
-    const detail =
-      (body as { detail?: string } | null)?.detail ??
-      `Resolve failed (HTTP ${res.status})`
-    throw new Error(detail)
-  }
-}
-
 // ─── Prose classes (mirrors DebugChatPanel) ───────────────────────────────────
 
 const proseClasses =
@@ -617,7 +591,13 @@ function resolvedSummary(decision: PermissionDecision): string {
         ? `You denied this tool — ${decision.reason}`
         : 'You denied this tool.'
     case 'answer_question': {
-      const pairs = Object.entries(decision.answers)
+      const answers =
+        decision.answers &&
+        typeof decision.answers === 'object' &&
+        !Array.isArray(decision.answers)
+          ? (decision.answers as Record<string, unknown>)
+          : {}
+      const pairs = Object.entries(answers)
         .map(([q, a]) => `${q}: ${a}`)
         .join('; ')
       return `You answered: ${pairs}`
@@ -634,10 +614,11 @@ function resolvedSummary(decision: PermissionDecision): string {
 // ─── Public component ─────────────────────────────────────────────────────────
 
 export interface PermissionCardProps {
-  /** Base API path. User-owned AI workspace chats use `/api/ai/conversations`; legacy project chats use the project route. */
-  conversationBasePath: string
   /** Public ID of the conversation this permission belongs to. */
   conversationPublicId: string
+  /** User-owned chats use the global endpoint; project chats require projectId. */
+  userScoped: boolean
+  projectId?: number
   permission: PermissionRequest
   /**
    * Called after the decision is accepted by the server (204). The model's
@@ -658,9 +639,10 @@ export interface PermissionCardProps {
  * error and remains interactive so the user can retry.
  */
 export function PermissionCard({
-  conversationBasePath,
   conversationPublicId,
   permission,
+  userScoped,
+  projectId,
   onResolved,
 }: PermissionCardProps) {
   const [busy, setBusy] = useState(false)
@@ -672,12 +654,29 @@ export function PermissionCard({
     setBusy(true)
     setResolveError(null)
     try {
-      await resolvePermission(
-        conversationBasePath,
-        conversationPublicId,
-        permission.id,
-        decision
-      )
+      if (userScoped) {
+        await resolveUserPermission({
+          body: { decision },
+          path: {
+            public_id: conversationPublicId,
+            permission_id: permission.id,
+          },
+          throwOnError: true,
+        })
+      } else {
+        if (projectId == null) {
+          throw new Error('Project permission resolution requires a project.')
+        }
+        await resolveProjectPermission({
+          body: { decision },
+          path: {
+            project_id: projectId,
+            public_id: conversationPublicId,
+            permission_id: permission.id,
+          },
+          throwOnError: true,
+        })
+      }
       setResolvedDecision(decision)
       onResolved?.()
     } catch (e) {

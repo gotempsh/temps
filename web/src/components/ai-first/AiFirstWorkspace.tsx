@@ -14,6 +14,7 @@ import {
   Loader2,
   LockKeyhole,
   MonitorPlay,
+  PanelLeft,
   Plus,
   RefreshCw,
   Server,
@@ -25,7 +26,12 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  type InfiniteData,
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   archiveUserConversation,
   archiveApplication,
@@ -40,7 +46,6 @@ import {
   listAiProviders,
   listAllConversations,
   listApplicationConversations,
-  listApplications,
   listConnections,
   listGitProviders,
   restoreUserConversation,
@@ -57,11 +62,12 @@ import {
   type ProviderResponse,
 } from '@/api/client'
 import {
+  getApplicationOptions,
   getApplicationWorkspaceOptions,
   getGlobalAiWorkspaceOptions,
+  listApplicationsInfiniteOptions,
   listAllConversationsOptions,
   listApplicationConversationsOptions,
-  listApplicationsOptions,
   listThreadArtifactsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DebugChatPanel } from '@/components/ai/DebugChatPanel'
@@ -93,6 +99,11 @@ import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSetting
 import { GlobalWorkspaceStatusPanel } from './GlobalWorkspaceStatusPanel'
 import { WorkspaceDiffViewer } from './WorkspaceDiffViewer'
 import { shouldRefreshArtifactsForLiveEvent } from './artifact-refresh'
+import {
+  applicationsFromPages,
+  nextApplicationPage,
+  resolveApplicationSelection,
+} from './application-list'
 import { problemDetail } from './problem-detail'
 import {
   defaultWorkspaceSelection,
@@ -119,6 +130,7 @@ import {
 const WORKSPACE_FILES_PAGE_SIZE = 100
 const WORKSPACE_CLIENT_TIMEOUT_MS = 35_000
 const THREADS_PAGE_SIZE = 50
+const APPLICATIONS_PAGE_SIZE = 50
 
 type RightView = 'generated' | 'files' | 'preview' | 'projects' | 'workspace'
 type ThreadListMode = 'active' | 'archived'
@@ -201,9 +213,6 @@ export function AiFirstWorkspace() {
     useState(true)
   const [archivedGlobalHasMore, setArchivedGlobalHasMore] = useState(true)
   const [threadPageLoading, setThreadPageLoading] = useState(false)
-  const [archivedApplications, setArchivedApplications] = useState<
-    ApplicationResponse[]
-  >([])
   const [applicationListMode, setApplicationListMode] =
     useState<ApplicationListMode>('active')
   const [applicationActionPending, setApplicationActionPending] = useState<
@@ -230,6 +239,11 @@ export function AiFirstWorkspace() {
   const [globalStartOpen, setGlobalStartOpen] = useState(false)
   const [rightView, setRightView] = useState<RightView>('generated')
   const [rightPanelOpen, setRightPanelOpen] = useState(false)
+  const [leftPanelOpen, setLeftPanelOpen] = useState(false)
+  const leftNavigationRef = useRef<HTMLElement | null>(null)
+  const leftNavigationTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const leftNavigationCloseRef = useRef<HTMLButtonElement | null>(null)
+  const restoreLeftNavigationFocusRef = useRef(true)
   const [workspaceChanges, setWorkspaceChanges] =
     useState<ApplicationWorkspaceChangesResponse | null>(null)
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
@@ -249,8 +263,63 @@ export function AiFirstWorkspace() {
   const harnessRequestGeneration = useRef(0)
   const workspaceWakeInFlight = useRef<string | null>(null)
 
-  const applicationsOptions = listApplicationsOptions({
-    query: { page: 1, page_size: 100, status: 'active' },
+  useEffect(() => {
+    if (!leftPanelOpen) return
+    const navigation = leftNavigationRef.current
+    const trigger = leftNavigationTriggerRef.current
+    leftNavigationCloseRef.current?.focus()
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setLeftPanelOpen(false)
+        return
+      }
+      if (event.key !== 'Tab' || !navigation) return
+      const focusable = Array.from(
+        navigation.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((element) => !element.hasAttribute('hidden'))
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (!first || !last) return
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      if (restoreLeftNavigationFocusRef.current) trigger?.focus()
+      restoreLeftNavigationFocusRef.current = true
+    }
+  }, [leftPanelOpen])
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return
+    const desktop = window.matchMedia('(min-width: 768px)')
+    const closeMobileDrawer = (event: MediaQueryListEvent | MediaQueryList) => {
+      if (!event.matches || !leftPanelOpen) return
+      restoreLeftNavigationFocusRef.current = false
+      setLeftPanelOpen(false)
+      window.requestAnimationFrame(() => leftNavigationRef.current?.focus())
+    }
+    desktop.addEventListener('change', closeMobileDrawer)
+    return () => desktop.removeEventListener('change', closeMobileDrawer)
+  }, [leftPanelOpen])
+
+  const applicationsOptions = listApplicationsInfiniteOptions({
+    query: { page: 1, page_size: APPLICATIONS_PAGE_SIZE, status: 'active' },
+  })
+  const archivedApplicationsOptions = listApplicationsInfiniteOptions({
+    query: { page: 1, page_size: APPLICATIONS_PAGE_SIZE, status: 'archived' },
+  })
+  const selectedApplicationOptions = getApplicationOptions({
+    path: { application_public_id: applicationFromUrl ?? '' },
   })
   const applicationConversationsOptions = listApplicationConversationsOptions({
     path: { application_public_id: activeApplicationId ?? '' },
@@ -275,7 +344,23 @@ export function AiFirstWorkspace() {
     },
   })
 
-  const applicationsQuery = useQuery(applicationsOptions)
+  const applicationsQuery = useInfiniteQuery({
+    ...applicationsOptions,
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, pages) =>
+      nextApplicationPage(lastPage, pages.length, APPLICATIONS_PAGE_SIZE),
+  })
+  const archivedApplicationsQuery = useInfiniteQuery({
+    ...archivedApplicationsOptions,
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, pages) =>
+      nextApplicationPage(lastPage, pages.length, APPLICATIONS_PAGE_SIZE),
+    enabled: applicationListMode === 'archived',
+  })
+  const selectedApplicationQuery = useQuery({
+    ...selectedApplicationOptions,
+    enabled: Boolean(applicationFromUrl && !globalScopeFromUrl),
+  })
   const applicationConversationsQuery = useQuery({
     ...applicationConversationsOptions,
     enabled: Boolean(activeApplicationId),
@@ -313,7 +398,18 @@ export function AiFirstWorkspace() {
     enabled: Boolean(activeApplicationId && activeConversationId),
   })
 
-  const applications = applicationsQuery.data ?? []
+  const applications = useMemo(
+    () =>
+      applicationsFromPages(
+        applicationsQuery.data?.pages ?? [],
+        selectedApplicationQuery.data
+      ),
+    [applicationsQuery.data, selectedApplicationQuery.data]
+  )
+  const archivedApplications = useMemo(
+    () => archivedApplicationsQuery.data?.pages.flat() ?? [],
+    [archivedApplicationsQuery.data]
+  )
   const conversations = useMemo(
     () =>
       mergeConversationPages(
@@ -347,6 +443,10 @@ export function AiFirstWorkspace() {
   const loading = applicationsQuery.isLoading
   const queryError =
     applicationsQuery.error ??
+    (applicationListMode === 'archived'
+      ? archivedApplicationsQuery.error
+      : null) ??
+    selectedApplicationQuery.error ??
     applicationConversationsQuery.error ??
     globalConversationsQuery.error
   const error = queryError
@@ -355,9 +455,10 @@ export function AiFirstWorkspace() {
       : 'Could not load the AI workspace.'
     : null
 
-  const activeApplication = applications.find(
-    (application) => application.public_id === activeApplicationId
-  )
+  const activeApplication =
+    applications.find(
+      (application) => application.public_id === activeApplicationId
+    ) ?? selectedApplicationQuery.data
   const workspaceStatusTarget = workspaceStatusClickTarget(
     Boolean(activeApplication),
     activeWorkspaceStatus
@@ -365,12 +466,21 @@ export function AiFirstWorkspace() {
 
   const handleApplicationChange = useCallback(
     (next: ApplicationResponse) => {
-      queryClient.setQueryData<ApplicationResponse[]>(
+      queryClient.setQueryData<InfiniteData<ApplicationResponse[]>>(
         applicationsOptions.queryKey,
-        (current = []) =>
-          current.map((application) =>
-            application.public_id === next.public_id ? next : application
-          )
+        (current) =>
+          current
+            ? {
+                ...current,
+                pages: current.pages.map((page) =>
+                  page.map((application) =>
+                    application.public_id === next.public_id
+                      ? next
+                      : application
+                  )
+                ),
+              }
+            : current
       )
     },
     [applicationsOptions.queryKey, queryClient]
@@ -394,7 +504,18 @@ export function AiFirstWorkspace() {
       : globalConversations
   ).find((conversation) => conversation.public_id === activeConversationId)
 
-  const { refetch: refetchApplications } = applicationsQuery
+  const {
+    fetchNextPage: fetchNextApplications,
+    hasNextPage: activeApplicationsCanLoadMore,
+    isFetchingNextPage: activeApplicationPageLoading,
+    refetch: refetchApplications,
+  } = applicationsQuery
+  const {
+    fetchNextPage: fetchNextArchivedApplications,
+    hasNextPage: archivedApplicationsCanLoadMore,
+    isFetchingNextPage: archivedApplicationPageLoading,
+    refetch: refetchArchivedApplications,
+  } = archivedApplicationsQuery
   const { refetch: refetchApplicationConversations } =
     applicationConversationsQuery
   const { refetch: refetchGlobalConversations } = globalConversationsQuery
@@ -402,64 +523,30 @@ export function AiFirstWorkspace() {
   const { refetch: refetchGlobalWorkspace } = globalWorkspaceQuery
   const { refetch: refetchArtifacts } = artifactsQuery
 
+  const activeApplicationConversationsCanLoadMore =
+    activeApplicationConversationPage === 1
+      ? (applicationConversationsQuery.data?.length ?? 0) === THREADS_PAGE_SIZE
+      : activeApplicationHasMore
+  const activeGlobalConversationsCanLoadMore =
+    activeGlobalConversationPage === 1
+      ? (globalConversationsQuery.data?.length ?? 0) === THREADS_PAGE_SIZE
+      : activeGlobalHasMore
+
   useEffect(() => {
-    setActiveApplicationConversationPages([])
-    setActiveApplicationConversationPage(1)
-    setActiveApplicationHasMore(true)
-    setArchivedConversations([])
-    setArchivedApplicationConversationPage(1)
-    setArchivedApplicationHasMore(true)
+    const timer = window.setTimeout(() => {
+      setActiveApplicationConversationPages([])
+      setActiveApplicationConversationPage(1)
+      setActiveApplicationHasMore(true)
+      setArchivedConversations([])
+      setArchivedApplicationConversationPage(1)
+      setArchivedApplicationHasMore(true)
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [activeApplicationId])
-
-  useEffect(() => {
-    if (
-      activeApplicationConversationPage !== 1 ||
-      !applicationConversationsQuery.data
-    )
-      return
-    setActiveApplicationHasMore(
-      applicationConversationsQuery.data.length === THREADS_PAGE_SIZE
-    )
-  }, [
-    activeApplicationConversationPage,
-    activeApplicationId,
-    applicationConversationsQuery.data,
-  ])
-
-  useEffect(() => {
-    if (activeGlobalConversationPage !== 1 || !globalConversationsQuery.data)
-      return
-    setActiveGlobalHasMore(
-      globalConversationsQuery.data.length === THREADS_PAGE_SIZE
-    )
-  }, [activeGlobalConversationPage, globalConversationsQuery.data])
 
   const loadApplications = useCallback(async () => {
     await refetchApplications()
   }, [refetchApplications])
-
-  const loadArchivedApplications = useCallback(async () => {
-    setApplicationActionError(null)
-    try {
-      const { data } = await listApplications({
-        query: { status: 'archived', page: 1, page_size: 100 },
-        throwOnError: true,
-      })
-      setArchivedApplications(data)
-    } catch (cause) {
-      setApplicationActionError(
-        cause instanceof Error
-          ? cause.message
-          : 'Could not load archived workspaces.'
-      )
-    }
-  }, [])
-
-  useEffect(() => {
-    if (applicationListMode !== 'archived') return
-    const timer = window.setTimeout(() => void loadArchivedApplications(), 0)
-    return () => window.clearTimeout(timer)
-  }, [applicationListMode, loadArchivedApplications])
 
   const handleApplicationArchive = useCallback(
     async (application: ApplicationResponse) => {
@@ -485,7 +572,10 @@ export function AiFirstWorkspace() {
             { replace: true }
           )
         }
-        await refetchApplications()
+        await Promise.all([
+          refetchApplications(),
+          refetchArchivedApplications(),
+        ])
       } catch (cause) {
         setApplicationActionError(
           cause instanceof Error
@@ -496,7 +586,12 @@ export function AiFirstWorkspace() {
         setApplicationActionPending(null)
       }
     },
-    [activeApplicationId, refetchApplications, setSearchParams]
+    [
+      activeApplicationId,
+      refetchApplications,
+      refetchArchivedApplications,
+      setSearchParams,
+    ]
   )
 
   const handleApplicationRestore = useCallback(
@@ -508,7 +603,10 @@ export function AiFirstWorkspace() {
           path: { application_public_id: application.public_id },
           throwOnError: true,
         })
-        await Promise.all([refetchApplications(), loadArchivedApplications()])
+        await Promise.all([
+          refetchApplications(),
+          refetchArchivedApplications(),
+        ])
       } catch (cause) {
         setApplicationActionError(
           cause instanceof Error
@@ -519,29 +617,39 @@ export function AiFirstWorkspace() {
         setApplicationActionPending(null)
       }
     },
-    [loadArchivedApplications, refetchApplications]
+    [refetchApplications, refetchArchivedApplications]
   )
 
   useEffect(() => {
-    const next = applicationsQuery.data
-    if (!next) return
+    if (!applicationsQuery.data) return
+    const next = applications
+    if (
+      applicationFromUrl &&
+      !next.some(
+        (application) => application.public_id === applicationFromUrl
+      ) &&
+      selectedApplicationQuery.isLoading
+    ) {
+      return
+    }
     const syncTimer = window.setTimeout(() => {
       setActiveApplicationId((current) =>
-        globalScopeFromUrl
-          ? null
-          : current &&
-              next.some((application) => application.public_id === current)
-            ? current
-            : applicationFromUrl &&
-                next.some(
-                  (application) => application.public_id === applicationFromUrl
-                )
-              ? applicationFromUrl
-              : (next[0]?.public_id ?? null)
+        resolveApplicationSelection(
+          next,
+          applicationFromUrl,
+          current,
+          globalScopeFromUrl
+        )
       )
     }, 0)
     return () => window.clearTimeout(syncTimer)
-  }, [applicationFromUrl, applicationsQuery.data, globalScopeFromUrl])
+  }, [
+    applicationFromUrl,
+    applications,
+    applicationsQuery.data,
+    globalScopeFromUrl,
+    selectedApplicationQuery.isLoading,
+  ])
 
   useEffect(() => {
     if (!globalConversationsQuery.data) return
@@ -848,10 +956,10 @@ export function AiFirstWorkspace() {
   const visibleConversationsHaveMore = activeApplication
     ? threadListMode === 'archived'
       ? archivedApplicationHasMore
-      : activeApplicationHasMore
+      : activeApplicationConversationsCanLoadMore
     : threadListMode === 'archived'
       ? archivedGlobalHasMore
-      : activeGlobalHasMore
+      : activeGlobalConversationsCanLoadMore
 
   const refreshArtifacts = useCallback(async () => {
     if (!activeApplicationId || !activeConversationId) {
@@ -1083,10 +1191,11 @@ export function AiFirstWorkspace() {
     application: ApplicationResponse,
     conversation: ConversationResponse
   ) => {
-    queryClient.setQueryData<ApplicationResponse[]>(
-      applicationsOptions.queryKey,
-      (current = []) => [application, ...current]
-    )
+    // Keep server pages authoritative. Mutating a full first page to 51 rows
+    // makes the infinite-query cursor believe there is no next page. The
+    // deep-link query keeps the new application visible while this refetch
+    // obtains correctly bounded pages from the server.
+    void refetchApplications()
     const nextConversationOptions = listApplicationConversationsOptions({
       path: { application_public_id: application.public_id },
       query: { page: 1, page_size: THREADS_PAGE_SIZE, status: 'active' },
@@ -1107,6 +1216,7 @@ export function AiFirstWorkspace() {
       { replace: true }
     )
     setApplicationDialogOpen(false)
+    setLeftPanelOpen(false)
   }
 
   const selectApplication = (applicationId: string) => {
@@ -1118,6 +1228,7 @@ export function AiFirstWorkspace() {
     setWorkspaceChanges(null)
     setSelectedWorkspacePath(null)
     setWorkspaceDiff(null)
+    setLeftPanelOpen(false)
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
@@ -1138,6 +1249,7 @@ export function AiFirstWorkspace() {
     setRightView('generated')
     setWorkspaceChanges(null)
     setActiveConversationId(conversationId)
+    setLeftPanelOpen(false)
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
@@ -1240,6 +1352,7 @@ export function AiFirstWorkspace() {
 
   const selectApplicationConversation = (conversationId: string) => {
     setActiveConversationId(conversationId)
+    setLeftPanelOpen(false)
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current)
@@ -1376,17 +1489,33 @@ export function AiFirstWorkspace() {
 
   return (
     <div className="fixed inset-0 z-40 overflow-hidden bg-background text-foreground antialiased">
-      <header className="flex h-14 items-center justify-between border-b border-border bg-card px-4">
-        <div className="flex items-center gap-3">
+      <header className="flex h-14 items-center justify-between gap-1 border-b border-border bg-card px-2 sm:px-4">
+        <div className="flex min-w-0 items-center gap-1.5 sm:gap-3">
+          <Button
+            aria-label="Open workspace navigation"
+            aria-controls="ai-workspace-navigation"
+            aria-expanded={leftPanelOpen}
+            className="md:hidden"
+            onClick={() => {
+              restoreLeftNavigationFocusRef.current = true
+              setLeftPanelOpen(true)
+            }}
+            ref={leftNavigationTriggerRef}
+            size="icon"
+            type="button"
+            variant="ghost"
+          >
+            <PanelLeft className="size-4" />
+          </Button>
           <div className="flex size-7 items-center justify-center rounded-md bg-primary text-sm font-semibold text-primary-foreground">
             T
           </div>
-          <span className="text-sm font-semibold">Temps</span>
-          <span className="rounded-full border border-border px-2 py-0.5 font-mono text-[10px] tracking-wide text-muted-foreground">
+          <span className="hidden text-sm font-semibold sm:inline">Temps</span>
+          <span className="hidden rounded-full border border-border px-2 py-0.5 font-mono text-[10px] tracking-wide text-muted-foreground lg:inline">
             AI workspace
           </span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-0.5 sm:gap-2">
           <WorkspaceStatusIndicator
             loading={activeWorkspaceStatusLoading}
             onClick={
@@ -1402,9 +1531,10 @@ export function AiFirstWorkspace() {
             waking={activeWorkspaceWaking}
             workspace={activeWorkspaceStatus}
           />
-          <Button asChild variant="ghost" size="sm">
-            <Link to="/agent-sandbox/providers">
-              <Terminal className="mr-1.5 size-4" /> Harnesses
+          <Button asChild variant="ghost" size="sm" aria-label="Harnesses">
+            <Link to="/agent-sandbox/providers" title="Harnesses">
+              <Terminal className="size-4 sm:mr-1.5" />
+              <span className="hidden sm:inline">Harnesses</span>
               <span
                 aria-label={
                   harnessesLoading
@@ -1429,16 +1559,40 @@ export function AiFirstWorkspace() {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
+            aria-label="Classic console"
           >
-            <a href="/projects">
-              <X className="mr-1.5 size-4" /> Classic console
+            <a href="/projects" title="Classic console">
+              <X className="size-4 sm:mr-1.5" />
+              <span className="hidden sm:inline">Classic console</span>
             </a>
           </Button>
         </div>
       </header>
 
       <div className="grid h-[calc(100dvh-3.5rem)] grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)] xl:grid-cols-[240px_minmax(0,1fr)_420px]">
-        <aside className="hidden min-h-0 border-r border-border bg-card md:block">
+        {leftPanelOpen && (
+          <button
+            aria-label="Close workspace navigation"
+            className="fixed inset-0 top-14 z-40 bg-black/30 md:hidden"
+            onClick={() => setLeftPanelOpen(false)}
+            type="button"
+          />
+        )}
+        <aside
+          aria-label="Workspace navigation"
+          aria-modal={leftPanelOpen || undefined}
+          id="ai-workspace-navigation"
+          ref={leftNavigationRef}
+          role={leftPanelOpen ? 'dialog' : undefined}
+          tabIndex={-1}
+          className={cn(
+            'min-h-0 overflow-y-auto border-r border-border bg-card',
+            leftPanelOpen
+              ? 'fixed bottom-0 left-0 top-14 z-50 block w-[min(22rem,calc(100vw-3rem))] shadow-xl'
+              : 'hidden',
+            'md:static md:block md:w-auto md:shadow-none'
+          )}
+        >
           <div className="flex items-center justify-between border-b border-border px-3 py-3">
             <span className="font-mono text-[10px] font-semibold tracking-wide text-muted-foreground">
               {applicationListMode === 'archived'
@@ -1446,6 +1600,15 @@ export function AiFirstWorkspace() {
                 : 'Workspaces'}
             </span>
             <span className="flex items-center gap-1">
+              <button
+                aria-label="Close workspace navigation"
+                className="rounded p-1 text-muted-foreground hover:bg-accent md:hidden"
+                onClick={() => setLeftPanelOpen(false)}
+                ref={leftNavigationCloseRef}
+                type="button"
+              >
+                <X className="size-4" />
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -1570,6 +1733,31 @@ export function AiFirstWorkspace() {
                   No archived workspaces.
                 </p>
               )}
+            {(applicationListMode === 'archived'
+              ? archivedApplicationsCanLoadMore
+              : activeApplicationsCanLoadMore) && (
+              <button
+                className="flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-2 text-[10px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-wait disabled:opacity-60"
+                disabled={
+                  applicationListMode === 'archived'
+                    ? archivedApplicationPageLoading
+                    : activeApplicationPageLoading
+                }
+                onClick={() =>
+                  void (applicationListMode === 'archived'
+                    ? fetchNextArchivedApplications()
+                    : fetchNextApplications())
+                }
+                type="button"
+              >
+                {(applicationListMode === 'archived'
+                  ? archivedApplicationPageLoading
+                  : activeApplicationPageLoading) && (
+                  <Loader2 className="size-3 animate-spin" />
+                )}
+                Load more workspaces
+              </button>
+            )}
           </div>
           <>
             <div className="mx-3 my-2 border-t border-border" />

@@ -790,7 +790,9 @@ fn store_project_files_fd_relative(
             &parent,
             file_name,
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_bits_truncate((mode.unwrap_or(0o644) & 0o777) as u16),
+            // rustix uses the platform's native mode_t width (u16 on Darwin,
+            // u32 on Linux), so let the Mode constructor select that width.
+            Mode::from_bits_truncate((mode.unwrap_or(0o644) & 0o777) as _),
         )
         .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
         let mut file = File::from(file);

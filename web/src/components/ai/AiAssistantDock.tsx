@@ -789,8 +789,9 @@ export function DockBody({
         <div className="min-h-0 flex-1">
           {inConversation ? (
             <DebugChatPanel
-              key={`${active!.contextType}:${active!.contextId}:${resetKey}`}
+              key={`${active!.contextType}:${active!.contextId}:${activePublicId ?? 'new'}:${resetKey}`}
               projectId={active!.projectId}
+              conversationPublicId={activePublicId ?? undefined}
               contextType={active!.contextType}
               contextId={active!.contextId}
               startPrompt={
