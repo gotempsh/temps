@@ -25,6 +25,26 @@
 //! degrades safely: traffic from an unrecognised Bunny edge records the edge
 //! IP (today's behaviour for unrecognised peers) rather than anything
 //! spoofable.
+//!
+//! Bootstrap trigger: `ensure_refresh_started` (called from
+//! `resolve_session_client_ip` in `proxy.rs`) is deliberately triggered on
+//! EVERY request, unconditionally — not only once a peer is already
+//! recognised as Bunny. This is a necessary divergence from the Cloudflare
+//! module, which only starts refreshing once `is_cloudflare(peer)` is
+//! already true: Cloudflare's builtin CIDR ranges are complete and stable
+//! enough that the very first real CF-fronted request reliably self-boots
+//! trust, but `BUILTIN_IPS` here is deliberately sparse and will almost
+//! never match a real Bunny edge on a fresh deployment. Gating the refresh
+//! trigger on a prior `is_bunny` match would therefore be a permanent
+//! chicken-and-egg deadlock: the sparse seed never matches, so the live
+//! list is never fetched, so the seed never grows. Trade-off accepted: any
+//! live Temps proxy process will, within one refresh cycle (~6h) of
+//! handling its first request at all (not just Bunny-fronted traffic), make
+//! one background call to Bunny's public edge-list API even on instances
+//! that never see Bunny-fronted traffic. This is acceptable because it
+//! fetches only Bunny's public CDN metadata (no tenant/request data
+//! whatsoever) and is guarded by `refresher_started`, an `AtomicBool`, to
+//! fire at most once per process lifetime.
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -139,18 +159,33 @@ impl BunnyIpTrust {
         if !self.is_bunny(peer) {
             return peer;
         }
-        // First confirmed Bunny-fronted connection: start keeping the list
-        // fresh. Keyed on the peer, never on the header.
-        self.ensure_refresher();
         match x_real_ip.and_then(|v| v.trim().parse::<IpAddr>().ok()) {
             Some(client) => client,
             None => peer,
         }
     }
 
-    /// Start the periodic background refresh exactly once. No-op outside a
-    /// tokio runtime (unit tests, tooling) — the builtin list still applies.
-    fn ensure_refresher(&self) {
+    /// Start the periodic background refresh exactly once, safe to call
+    /// unconditionally and idempotently (guarded by `refresher_started`, an
+    /// `AtomicBool`, so repeated calls after the first are a single atomic
+    /// compare-exchange — no lock, no I/O, no allocation).
+    ///
+    /// Deliberately decoupled from `is_bunny`/`resolve_client_ip`: unlike
+    /// Cloudflare's builtin CIDR ranges (broad and stable enough that the
+    /// first real CF-fronted request reliably self-bootstraps trust via
+    /// `is_cloudflare`), Bunny's `BUILTIN_IPS` seed is deliberately sparse —
+    /// it is very unlikely to match a real Bunny edge on a fresh deployment.
+    /// If this were only reachable through a confirmed `is_bunny(peer)` hit
+    /// (as it used to be, called from inside `resolve_client_ip`), the
+    /// refresher would never start for real-world Bunny-fronted traffic:
+    /// the sparse seed never matches, so the live list is never fetched, so
+    /// the seed never grows — a permanent chicken-and-egg deadlock. Callers
+    /// must therefore trigger this unconditionally per request, independent
+    /// of whether the peer matched any known CDN, so any live Temps process
+    /// self-bootstraps the Bunny list within one refresh cycle of handling
+    /// its first request at all — see the call site in
+    /// `resolve_session_client_ip` in `proxy.rs` for the full trade-off.
+    pub fn ensure_refresh_started(&self) {
         if self
             .refresher_started
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -202,6 +237,26 @@ async fn refresh_loop(ips: Arc<ArcSwap<HashSet<IpAddr>>>) {
     }
 }
 
+/// Decide whether a freshly-fetched pair of (IPv4, IPv6) edge lists is
+/// complete enough to replace the current trust set.
+///
+/// A genuinely empty family from Bunny is implausible — both endpoints are
+/// expected to always return a non-empty list of edge addresses. Rejects the
+/// refresh if EITHER family comes back empty, not only when BOTH do:
+/// accepting a lone empty family would silently drop every edge in that
+/// family from the trust set (e.g. a valid-but-empty IPv6 response would
+/// erase all IPv6 edges even though the IPv4 fetch succeeded), which is
+/// worse than keeping the last known-good merged set until the next
+/// successful refresh. Same semantics as `parse_cloudflare_ips_response` in
+/// `cloudflare_ips.rs`. Extracted as a pure function so it is unit-testable
+/// without a real HTTP round trip.
+fn check_families_complete(v4: &[IpAddr], v6: &[IpAddr]) -> Result<(), String> {
+    if v4.is_empty() || v6.is_empty() {
+        return Err("IPv4 or IPv6 list returned empty — refusing to replace trust set".into());
+    }
+    Ok(())
+}
+
 async fn refresh_once(
     client: &reqwest::Client,
     ips: &ArcSwap<HashSet<IpAddr>>,
@@ -209,11 +264,7 @@ async fn refresh_once(
     let v4 = fetch_ip_list(client, BUNNY_IPV4_URL).await?;
     let v6 = fetch_ip_list(client, BUNNY_IPV6_URL).await?;
 
-    if v4.is_empty() && v6.is_empty() {
-        return Err(
-            "both IPv4 and IPv6 lists returned empty — refusing to replace trust set".into(),
-        );
-    }
+    check_families_complete(&v4, &v6)?;
 
     let merged: HashSet<IpAddr> = v4.into_iter().chain(v6).collect();
     let count = merged.len();
@@ -420,6 +471,72 @@ mod tests {
             t.resolve_client_ip(ip("185.152.66.1"), None),
             ip("185.152.66.1")
         );
+    }
+
+    /// Finding 1 (bootstrap deadlock): the refresher must be able to start
+    /// even for a peer that is NOT in the trust set — that is exactly the
+    /// bootstrap scenario (a real Bunny edge absent from the sparse
+    /// `BUILTIN_IPS` seed) that would otherwise never trigger a refresh,
+    /// since `resolve_client_ip` returns early for unrecognised peers and
+    /// never reaches any refresher trigger placed inside it. Proves
+    /// `ensure_refresh_started` is reachable independent of `is_bunny`.
+    #[tokio::test]
+    async fn ensure_refresh_started_starts_for_untrusted_peer() {
+        let t = trust_with(&["185.152.66.1"]);
+        let untrusted = ip("203.0.113.42");
+        assert!(!t.is_bunny(untrusted), "peer must not be in the trust set");
+        assert!(!t.refresher_started.load(Ordering::SeqCst));
+
+        t.ensure_refresh_started();
+
+        assert!(
+            t.refresher_started.load(Ordering::SeqCst),
+            "refresher must start even though the peer never matched the trust set"
+        );
+    }
+
+    /// The trigger is idempotent: calling it repeatedly (as would happen on
+    /// every request) must not panic or spawn more than once. The
+    /// `AtomicBool` guard makes the second call a no-op.
+    #[tokio::test]
+    async fn ensure_refresh_started_is_idempotent() {
+        let t = BunnyIpTrust::new();
+        t.ensure_refresh_started();
+        t.ensure_refresh_started();
+        assert!(t.refresher_started.load(Ordering::SeqCst));
+    }
+
+    // --- Finding 2: refresh completeness check ---
+
+    /// Both families populated → refresh accepted.
+    #[test]
+    fn check_families_complete_accepts_both_populated() {
+        let v4 = vec![ip("1.2.3.4")];
+        let v6 = vec![ip("2001:db8::1")];
+        assert!(check_families_complete(&v4, &v6).is_ok());
+    }
+
+    /// One family empty, the other populated → must be REJECTED, not
+    /// accepted. Before the fix this used `&&` (only rejecting when BOTH
+    /// were empty), which would silently replace the trust set with a
+    /// partial one and erase every edge from the empty family.
+    #[test]
+    fn check_families_complete_rejects_single_empty_family() {
+        let v4: Vec<IpAddr> = vec![];
+        let v6 = vec![ip("2001:db8::1")];
+        assert!(check_families_complete(&v4, &v6).is_err());
+
+        let v4 = vec![ip("1.2.3.4")];
+        let v6: Vec<IpAddr> = vec![];
+        assert!(check_families_complete(&v4, &v6).is_err());
+    }
+
+    /// Both families empty → also rejected (unchanged behaviour).
+    #[test]
+    fn check_families_complete_rejects_both_empty() {
+        let v4: Vec<IpAddr> = vec![];
+        let v6: Vec<IpAddr> = vec![];
+        assert!(check_families_complete(&v4, &v6).is_err());
     }
 
     // --- Parser unit tests ---

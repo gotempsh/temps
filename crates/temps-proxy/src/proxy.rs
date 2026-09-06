@@ -2716,9 +2716,24 @@ fn response_body_filter_inner(
 /// fallback. Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers
 /// intact — `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled
 /// prefix.
+///
+/// Bunny's refresher bootstrap is intentionally triggered here
+/// unconditionally, on every call, regardless of whether this peer matched
+/// Cloudflare, Bunny, or neither — see the long rationale in the
+/// `bunny_ips` module doc comment. In short: Cloudflare's CIDR seed is
+/// complete enough that gating its refresher on a prior `is_cloudflare`
+/// match still self-bootstraps correctly (left unchanged here), but Bunny's
+/// individual-IP seed is deliberately sparse and will almost never match a
+/// real edge on a fresh deployment, so gating its trigger the same way
+/// would deadlock forever. `ensure_refresh_started` is a cheap idempotent
+/// no-op (one atomic load/compare-exchange) after the first successful
+/// call in the process, so calling it unconditionally here is within the
+/// hot-path budget.
 fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
     let peer = session.client_addr()?.as_inet()?.ip();
     let headers = &session.req_header().headers;
+
+    crate::bunny_ips::BUNNY_TRUST.ensure_refresh_started();
 
     // --- Cloudflare: check peer first, then header ---
     if crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(peer) {
