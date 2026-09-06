@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { cn } from './lib/cn'
+import { EMPTY, fmtNum } from './fmt'
 import { GLYPH, GLYPH_CLASS, type State } from './status'
 
 /**
@@ -10,11 +11,11 @@ import { GLYPH, GLYPH_CLASS, type State } from './status'
  */
 export function Num({ value, unit, className }: { value: number | string | null | undefined; unit?: string; className?: string }) {
   if (value === null || value === undefined || value === '') {
-    return <span className={cn('font-mono tabular-nums text-muted-foreground', className)}>–</span>
+    return <span className={cn('font-mono tabular-nums text-muted-foreground', className)}>{EMPTY}</span>
   }
   return (
     <span className={cn('font-mono tabular-nums', className)}>
-      {typeof value === 'number' ? value.toLocaleString() : value}
+      {typeof value === 'number' ? fmtNum(value) : value}
       {unit && <span className="text-muted-foreground">{unit}</span>}
     </span>
   )

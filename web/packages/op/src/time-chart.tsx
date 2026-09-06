@@ -13,6 +13,7 @@ import {
   YAxis,
 } from 'recharts'
 import { cn } from './lib/cn'
+import { fmtAbsolute, fmtNum } from './fmt'
 
 /**
  * Every Temps time axis carries three things:
@@ -37,14 +38,72 @@ import { cn } from './lib/cn'
  * page can narrow whatever sits under the chart (a ledger, a metric grid, the
  * status) to that window, and `null` when cleared (the strip's "clear" or
  * Escape). Pass `selection` to control it. A click without a drag clears.
+ *
+ * Series are told apart by pattern, never by hue: `stroke` ('solid' | 'dashed'
+ * | 'dotted') and `weight` ('thin' | 'regular'), defaulted by position. The
+ * legend is generated from `series` — the swatch is a sample of the real line
+ * and carries the value at the cursor — so a hand-written key in the footer is
+ * always wrong. Only a series that *is* a state (`series.state`) takes a tone.
+ *
+ * Every chart is readable without the picture: the plot is `role="img"` with a
+ * sentence built from `title`, `range` and `verdict`, and the footer's "table"
+ * toggle swaps the plot for the same buckets as rows, deploy markers included.
  */
 export type TimeRange = { from: string; to: string }
 export type TimePoint = { t: string } & Record<string, number | string>
 export type Marker = { id: string; x: string; at?: string; note?: string }
 const LABEL_PX = 72
-export type Series = { key: string; name: string; stroke?: string; width?: number }
+/** How a line is drawn. Series are told apart by pattern, never by hue. */
+export type SeriesStroke = 'solid' | 'dashed' | 'dotted'
+export type SeriesWeight = 'thin' | 'regular'
+export type Series = {
+  key: string
+  name: string
+  /** Dash pattern. Defaults by position: solid, dashed, dotted, solid. */
+  stroke?: SeriesStroke
+  /** Line weight. Defaults: the first series `regular`, the rest `thin`. */
+  weight?: SeriesWeight
+  /** Exact pixel width. Overrides `weight`; kept for callers that tuned a line by hand. */
+  width?: number
+  /**
+   * Only for a series that *is* a state — an error rate read against its
+   * threshold. It takes that tone; every other series is ink. A series is
+   * never coloured to tell it from a neighbour: that is what `stroke` is for.
+   */
+  state?: 'ok' | 'warn' | 'error'
+}
 
 const TICK = { fontSize: 10, fill: 'var(--muted-foreground)', fontFamily: 'Geist Mono' }
+const TONE = { ok: 'var(--success)', warn: 'var(--warning)', error: 'var(--destructive)' } as const
+const DASH: Record<SeriesStroke, string | undefined> = { solid: undefined, dashed: '4 3', dotted: '1 3' }
+const AUTO: SeriesStroke[] = ['solid', 'dashed', 'dotted', 'solid']
+const strokeOf = (s: Series, i: number): SeriesStroke => s.stroke ?? AUTO[i % AUTO.length]
+const widthOf = (s: Series, i: number) => s.width ?? (s.weight ? (s.weight === 'thin' ? 1 : 1.5) : i === 0 ? 1.5 : 1)
+const colorOf = (s: Series) => (s.state ? TONE[s.state] : 'var(--foreground)')
+
+/**
+ * The legend is generated from `series`, never typed by hand: same order, same
+ * name, and a swatch that is a sample of the line itself (same dash, same
+ * weight, same ink), so a label can be matched to a line without a hue. The
+ * value at the cursor rides the label, so the legend is a readout too.
+ */
+function Legend({ series, point, unit }: { series: Series[]; point: TimePoint | null; unit: string }) {
+  return (
+    <ul className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-muted-foreground">
+      {series.map((s, i) => (
+        <li key={s.key} className="flex items-center gap-1.5">
+          <svg aria-hidden width={18} height={6} viewBox="0 0 18 6" className="shrink-0 overflow-visible">
+            <line x1={0} y1={3} x2={18} y2={3} stroke={colorOf(s)} strokeWidth={widthOf(s, i)} strokeDasharray={DASH[strokeOf(s, i)]} />
+          </svg>
+          <span>{s.name}</span>
+          {point && point[s.key] !== undefined && (
+            <span className="tabular-nums text-foreground">{fmtNum(Number(point[s.key]))}{unit ? ` ${unit}` : ''}</span>
+          )}
+        </li>
+      ))}
+    </ul>
+  )
+}
 
 function InkTooltip({ active, payload, label }: { active?: boolean; payload?: { name: string; value: number }[]; label?: string }) {
   if (!active || !payload?.length) return null
@@ -56,7 +115,7 @@ function InkTooltip({ active, payload, label }: { active?: boolean; payload?: { 
   )
 }
 
-export function TimeChart({ data, series, markers = [], thresholds = [], hot, onHot, onOpen, sampled, unit = '', yTicks, height = 176, xInterval, className, readoutFormat, selection: selectionProp, onSelect }: {
+export function TimeChart({ data, series, markers = [], thresholds = [], hot, onHot, onOpen, sampled, unit = '', yTicks, height = 176, xInterval, className, readoutFormat, selection: selectionProp, onSelect, legend, table = true, title, range, verdict }: {
   data: TimePoint[]
   series: Series[]
   markers?: Marker[]
@@ -79,8 +138,19 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
   selection?: TimeRange | null
   /** Called with the selected window, or null when cleared. Enables drag-to-select. */
   onSelect?: (r: TimeRange | null) => void
+  /** Generated legend under the plot. Defaults to on whenever there is more than one series. */
+  legend?: boolean
+  /** The "table" toggle that swaps the plot for the same numbers as rows. On by default. */
+  table?: boolean
+  /** What the chart is of ("p95 latency"). Goes into the chart's `aria-label`. */
+  title?: string
+  /** The window shown ("last 24h"). Goes into the chart's `aria-label`. */
+  range?: string
+  /** The one-sentence verdict a sighted reader takes from the shape. Goes into the `aria-label`. */
+  verdict?: string
 }) {
   const [readout, setReadout] = useState<TimePoint | null>(null)
+  const [asTable, setAsTable] = useState(false)
   const [selState, setSelState] = useState<TimeRange | null>(null)
   const selection = selectionProp === undefined ? selState : selectionProp
   const setSelection = (r: TimeRange | null) => { setSelState(r); onSelect?.(r) }
@@ -106,7 +176,8 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
     const ro = new ResizeObserver(([e]) => setWidth(e.contentRect.width))
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+    // re-observe when the plot comes back from the table view: it is a new node.
+  }, [asTable])
   // Group markers whose labels would overlap at this width. Plot width ≈ container minus the y axis.
   const clusters = useMemo(() => {
     const pxPerIdx = Math.max(1, (width - 42) / Math.max(1, data.length - 1))
@@ -120,11 +191,18 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
     }
     return out
   }, [markers, data, width])
+  // The table view carries the deploy markers too, so it says everything the axis says.
+  const markerAt = useMemo(() => new Map(markers.map((m) => [m.x, m.id])), [markers])
   const open = clusters.find((c) => c.key === openCluster && c.members.length > 1)
   const last = data[data.length - 1]
   const r = readout ?? last
   const primary = series[0]
-  const fmt = readoutFormat ?? ((p: TimePoint) => `${p.t} · ${Number(p[primary.key]).toLocaleString()}${unit ? ` ${unit}` : ''}`)
+  const fmt = readoutFormat ?? ((p: TimePoint) => `${p.t} · ${fmtNum(Number(p[primary.key]))}${unit ? ` ${unit}` : ''}`)
+  const showLegend = legend ?? series.length > 1
+  const axis = data.length ? `${data[0].t} to ${data[data.length - 1].t}` : 'no points'
+  // Every chart is an image with a sentence: what it is, over what window, and the verdict.
+  const ariaLabel = `${title ?? series.map((s) => s.name).join(' and ')}${unit ? ` in ${unit}` : ''}, ${range ?? axis}${verdict ? `. ${verdict.replace(/\.\s*$/, '')}` : ''}. ${data.length} points; switch to the table view to read every value.`
+  if (import.meta.env.DEV && series.length > 4) console.warn(`[chart] TimeChart has ${series.length} series; more than four lines cannot be told apart by pattern alone. Use small multiples or a table (handoff §8, data-viz.md).`)
   return (
     <div className={cn('space-y-1', className)}>
       {r && (
@@ -133,7 +211,35 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
           <span className="text-muted-foreground">{readout ? 'hover' : 'latest'}</span>
         </div>
       )}
-      <div ref={wrap} style={{ height }} className={cn('w-full', selectable && 'select-none', drag && 'cursor-col-resize')} onMouseLeave={() => { setReadout(null); if (drag) { const r = ordered(drag.from, drag.to); setDrag(null); if (r.from !== r.to) setSelection(r) } }}>
+      {asTable && (
+        <div style={{ height }} className="overflow-auto border">
+          <table className="w-full font-mono text-[11px]">
+            <caption className="sr-only">{ariaLabel}</caption>
+            <thead>
+              <tr>
+                <th scope="col" className="op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-left text-[9px]">bucket</th>
+                {series.map((s) => (
+                  <th key={s.key} scope="col" className="op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-right text-[9px]">{s.name}{unit ? ` (${unit})` : ''}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="op-rows">
+              {data.map((p) => (
+                <tr key={p.t}>
+                  <th scope="row" className="whitespace-nowrap px-2 py-1 text-left font-normal text-muted-foreground">
+                    {p.t}{markerAt.get(p.t) ? <span className="ml-1.5 text-foreground">┆ {markerAt.get(p.t)}</span> : null}
+                  </th>
+                  {series.map((s) => (
+                    <td key={s.key} className="px-2 py-1 text-right tabular-nums">{p[s.key] === undefined || p[s.key] === null ? '—' : fmtNum(Number(p[s.key]))}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {!asTable && (
+      <div ref={wrap} role="img" aria-label={ariaLabel} style={{ height }} className={cn('w-full', selectable && 'select-none', drag && 'cursor-col-resize')} onMouseLeave={() => { setReadout(null); if (drag) { const r = ordered(drag.from, drag.to); setDrag(null); if (r.from !== r.to) setSelection(r) } }}>
         <ResponsiveContainer>
           <ComposedChart data={data} margin={{ top: 16, right: 8, bottom: 0, left: 0 }}
             onMouseDown={(s) => { const x = (s as { activeLabel?: unknown })?.activeLabel; if (selectable && typeof x === 'string') setDrag({ from: x, to: x }) }}
@@ -164,12 +270,24 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
               <ReferenceLine key={t.label} y={t.y} stroke={t.state === 'error' ? 'var(--destructive)' : t.state === 'warn' ? 'var(--warning)' : 'var(--success)'} strokeDasharray="2 3" label={{ value: t.label, position: 'insideRight', fontSize: 10, fill: t.state === 'error' ? 'var(--destructive)' : t.state === 'warn' ? 'var(--warning)' : 'var(--success)', fontFamily: 'Geist Mono' }} />
             ))}
             <RechartsTooltip content={<InkTooltip />} cursor={{ stroke: 'var(--op-rule-soft)' }} isAnimationActive={false} />
-            {[...series].reverse().map((s, i) => (
-              <Line key={s.key} type="linear" dataKey={s.key} name={s.name} stroke={s.stroke ?? (i === series.length - 1 ? 'var(--chart-1)' : 'var(--chart-2)')} strokeWidth={s.width ?? (i === series.length - 1 ? 1.5 : 1)} strokeLinecap="square" strokeLinejoin="miter" dot={false} isAnimationActive={false} />
+            {/* Drawn back to front so series[0] sits on top; ink for every line, tone only when the series is itself a state. */}
+            {series.map((s, i) => ({ s, i })).reverse().map(({ s, i }) => (
+              <Line key={s.key} type="linear" dataKey={s.key} name={s.name} stroke={colorOf(s)} strokeWidth={widthOf(s, i)} strokeDasharray={DASH[strokeOf(s, i)]} strokeLinecap="square" strokeLinejoin="miter" dot={false} isAnimationActive={false} />
             ))}
           </ComposedChart>
         </ResponsiveContainer>
       </div>
+      )}
+      {(showLegend || table) && (
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+          {showLegend ? <Legend series={series} point={r ?? null} unit={unit} /> : <span />}
+          {table && (
+            <button type="button" aria-pressed={asTable} onClick={() => setAsTable((v) => !v)} className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground underline underline-offset-4 hover:text-foreground">
+              {asTable ? 'chart' : 'table'}
+            </button>
+          )}
+        </div>
+      )}
       {selection && !drag && (
         <div className="flex flex-wrap items-center gap-x-3 border px-2 py-1 font-mono text-[11px]">
           <span className="op-label text-[9px]">selected</span>
@@ -179,7 +297,7 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
           <button type="button" className="underline underline-offset-4 hover:text-foreground" onClick={() => setSelection(null)}>clear <kbd className="ml-0.5 border px-1 text-[9px]">esc</kbd></button>
         </div>
       )}
-      {!selection && !drag && selectable && !open && <p className="font-mono text-[10px] text-muted-foreground [@media(pointer:coarse)]:hidden">drag across the plot to select a window</p>}
+      {!selection && !drag && !asTable && selectable && !open && <p className="font-mono text-[10px] text-muted-foreground [@media(pointer:coarse)]:hidden">drag across the plot to select a window</p>}
       {open && (
         <div className="op-rows border font-mono text-[11px]">
           <div className="flex items-center gap-2 px-2 py-1 text-muted-foreground">
@@ -213,7 +331,7 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
  * which plan keeps that range.
  */
 export type Range = { label: string; days: number }
-const fmtStamp = (iso: string) => { const d = new Date(iso); return isNaN(d.getTime()) ? iso : d.toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }) }
+const fmtStamp = (iso: string) => fmtAbsolute(iso)
 /**
  * Quick ranges as one strip; with `custom`, a last button opens two
  * datetime fields under the strip. Once applied the button reads the window

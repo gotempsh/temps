@@ -9,6 +9,7 @@
 export { Kbd, MOD, IS_MAC } from './kbd'
 export { Status, StatusLine, AttentionHost, Phrase, worst, GLYPH, GLYPH_CLASS, STATE_RANK, type State, type StatusItem } from './status'
 export { Num, Metric, MetricGrid } from './num'
+export { fmtNum, fmtPct, fmtBytes, fmtDuration, fmtRelative, fmtAbsolute, fmtCount, EMPTY, type Locale } from './fmt'
 export { PageState, type PageStateProps } from './page-state'
 export { EchoDialog } from './echo-dialog'
 export { Ledger, Detail, Settings, Field, Segmented, PageTitle, Pager, ActionBar, SectionTitle, Section,
@@ -16,7 +17,9 @@ export { Ledger, Detail, Settings, Field, Segmented, PageTitle, Pager, ActionBar
 export { Picker, type PickerOption } from './picker'
 export { SecretValue } from './secret-value'
 export { Callout } from './callout'
-export { TimeChart, RangePicker, ChartFooter, type TimePoint, type TimeRange, type Marker, type Series, type Range } from './time-chart'
+export { FormErrors, type FieldError } from './form'
+export { type FieldControl } from './templates'
+export { TimeChart, RangePicker, ChartFooter, type TimePoint, type TimeRange, type Marker, type Series, type SeriesStroke, type SeriesWeight, type Range } from './time-chart'
 export { GitProviderLogo, type GitProviderType } from './git-provider-logo'
 export { Drop } from './drop'
 export { ShellSlotsProvider, useShellSlots, type ShellSlots } from './shell-slots'

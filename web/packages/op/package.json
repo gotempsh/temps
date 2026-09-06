@@ -6,13 +6,20 @@
   "exports": {
     ".": "./src/index.ts",
     "./op.css": "./src/op.css",
+    "./tokens.json": "./tokens.json",
     "./package.json": "./package.json"
+  },
+  "scripts": {
+    "tokens:check": "node scripts/tokens.mjs check",
+    "tokens:build": "node scripts/tokens.mjs build"
   },
   "sideEffects": [
     "*.css"
   ],
   "files": [
     "src",
+    "scripts",
+    "tokens.json",
     "README.md",
     "CHANGELOG.md"
   ],

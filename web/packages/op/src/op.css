@@ -402,9 +402,17 @@
   --op-inset: oklch(0.99 0.003 95);
   --op-inset-foreground: oklch(0.13 0 0);
   --op-rule-soft: color-mix(in oklch, var(--foreground) 16%, transparent);
+  --op-raise-shadow: 3px 3px 0 0 var(--foreground);
   --radius: 0.25rem;
   --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  /* Motion: three tiers and one curve. 100ms is the frozen default (handoff §4);
+     80ms is a hover acknowledgement; 200ms is the ceiling, and only for something
+     arriving on top of the page. Mirrored in tokens.json. See docs/motion.md. */
+  --op-duration-fast: 80ms;
+  --op-duration: 100ms;
+  --op-duration-slow: 200ms;
+  --op-ease: cubic-bezier(0.2, 0, 0, 1);
   font-family: var(--font-sans);
   font-feature-settings: 'tnum' 1;
 }
@@ -455,13 +463,46 @@
 .operator.ink .op-kv > * + *, .operator.ink .op-timeline > * + * { border-top: 1px solid var(--op-rule-soft); }
 .operator.ink tbody tr, .operator.ink tfoot { border-color: var(--op-rule-soft); }
 /* The one raised element per screen. */
-.operator.ink .op-raise { box-shadow: 3px 3px 0 0 var(--foreground); border: 1px solid var(--foreground); border-radius: var(--radius); }
+.operator.ink .op-raise { box-shadow: var(--op-raise-shadow); border: 1px solid var(--foreground); border-radius: var(--radius); }
 .operator.ink button.op-primary { box-shadow: 2px 2px 0 0 var(--foreground); border: 1px solid var(--foreground); }
 .operator.ink button.op-primary:active { transform: translate(1px, 1px); box-shadow: 1px 1px 0 0 var(--foreground); }
 .operator.ink .bg-primary kbd, .operator.ink .bg-foreground kbd { background: var(--background); color: var(--foreground); border-color: var(--background); }
+/* ── motion ──────────────────────────────────────────────────────────────
+   One blanket rule, so nothing in the skin can invent its own timing: every
+   transition is --op-duration on --op-ease, and only the four properties a
+   control changes about itself. Layout, opacity and size are absent on
+   purpose — a row must not slide, a panel must not grow. docs/motion.md. */
 .operator.ink, .operator.ink *:not(.animate-pulse):not(.animate-spin), .operator.ink *::before, .operator.ink *::after {
-  transition-duration: 100ms !important;
+  transition-duration: var(--op-duration) !important;
+  transition-timing-function: var(--op-ease);
   transition-property: transform, box-shadow, background-color, color;
+}
+/* Opt a single element into a different tier, or into a property the blanket
+   rule leaves out (an inline action icon fading up from muted on hover).
+   The `:not(.animate-spin)` is not a filter — it is what lifts these three to
+   the blanket rule's specificity, so that being written after it is enough to
+   win. Without it the blanket rule (which carries `!important`) swallows them
+   and the classes do nothing. */
+.operator.ink .op-motion:not(.animate-spin) { transition-property: transform, box-shadow, background-color, border-color, color, opacity; transition-timing-function: var(--op-ease); }
+.operator.ink .op-motion-fast:not(.animate-spin) { transition-duration: var(--op-duration-fast) !important; }
+.operator.ink .op-motion-slow:not(.animate-spin) { transition-duration: var(--op-duration-slow) !important; }
+/* Reduced motion: durations go to zero, everything still arrives at the same
+   end state. The two animations that survive elsewhere (skeleton pulse, retry
+   spinner) say "still working", which a zero-duration change cannot — but they
+   stop here too, because a reader who asked for no motion asked for no motion;
+   the skeleton is still a skeleton and the retry button still says "retrying…". */
+@media (prefers-reduced-motion: reduce) {
+  .operator.ink {
+    --op-duration-fast: 0s;
+    --op-duration: 0s;
+    --op-duration-slow: 0s;
+  }
+  .operator.ink, .operator.ink *, .operator.ink *::before, .operator.ink *::after {
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
 }
 /* Status line: the sentence. Each phrase is a link. */
 .operator.ink .op-status a { text-decoration: underline; text-decoration-color: var(--op-rule-soft); text-underline-offset: 3px; }
@@ -532,11 +573,11 @@
    muted thumb, on is an ink fill with a paper thumb. The stock pill filled the
    track with ink in BOTH states (unchecked used --input, which is ink here),
    so off looked on. */
-.operator.ink button[role='switch'] { height: 1.25rem; width: 2.25rem; border-radius: 0; border: 1px solid var(--foreground); background: var(--background); padding: 0 2px; transition: background-color 100ms; }
+.operator.ink button[role='switch'] { height: 1.25rem; width: 2.25rem; border-radius: 0; border: 1px solid var(--foreground); background: var(--background); padding: 0 2px; transition: background-color var(--op-duration) var(--op-ease); }
 .operator.ink button[role='switch'][data-state='checked'] { background: var(--foreground); }
 .operator.ink button[role='switch']:disabled { opacity: 0.4; }
 /* Tailwind's translate-x-* utilities set the `translate` property, not `transform`, so override that one or the two add up and the thumb leaves the track. */
-.operator.ink button[role='switch'] > span { height: 0.75rem; width: 0.75rem; border-radius: 0; box-shadow: none; background: var(--muted-foreground); transform: none; translate: 0 0; transition: translate 100ms; }
+.operator.ink button[role='switch'] > span { height: 0.75rem; width: 0.75rem; border-radius: 0; box-shadow: none; background: var(--muted-foreground); transform: none; translate: 0 0; transition: translate var(--op-duration) var(--op-ease); }
 .operator.ink button[role='switch'][data-state='checked'] > span { background: var(--background); translate: 1rem 0; }
 .operator.ink .op-lead { font-weight: 400; line-height: 1.5; font-size: clamp(1.0625rem, 1.5vw, 1.25rem); color: var(--muted-foreground); text-wrap: pretty; }
 .operator.ink .op-lead strong { color: var(--foreground); font-weight: 500; }

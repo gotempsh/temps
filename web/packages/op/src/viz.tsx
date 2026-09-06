@@ -8,6 +8,7 @@ import { ChevronRight } from 'lucide-react'
 import { cn } from './lib/cn'
 import { GLYPH, GLYPH_CLASS, type State } from './status'
 import { Num } from './num'
+import { fmtNum, fmtPct } from './fmt'
 import { Kbd } from './kbd'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -69,14 +70,14 @@ export function Breakdown({ rows, total, unit = 'visitors', limit = 8, more, per
                   {openable && <ChevronRight aria-hidden className="h-3 w-3 shrink-0 text-muted-foreground" />}
                 </span>
                 <Num value={r.count} unit={percent ? undefined : unit} />
-                <span className="text-right font-mono tabular-nums text-muted-foreground">{percent ? `${share.toFixed(share < 10 ? 1 : 0)}%` : ''}</span>
+                <span className="text-right font-mono tabular-nums text-muted-foreground">{percent ? fmtPct(share, { digits: share < 10 ? 1 : 0 }) : ''}</span>
               </button>
             </li>
           )
         })}
         {rest > 0 && (
           <li className="grid grid-cols-[minmax(0,1fr)_auto_3.5rem] items-center gap-3 px-3 py-1.5 text-muted-foreground">
-            <span>other</span><Num value={rest} /><span className="text-right font-mono tabular-nums">{((rest / denom) * 100).toFixed(0)}%</span>
+            <span>other</span><Num value={rest} /><span className="text-right font-mono tabular-nums">{fmtPct(rest / denom, { basis: 'ratio', digits: 0 })}</span>
           </li>
         )}
       </ol>
@@ -219,13 +220,13 @@ export function Funnel({ steps, dropAlert = 50, className }: { steps: FunnelStep
           <li key={s.name} className="grid grid-cols-[1.5rem_minmax(0,1fr)_auto] items-center gap-3 px-3 py-2">
             <span className="font-mono text-[11px] text-muted-foreground">{i + 1}</span>
             <span className="min-w-0">
-              <span className="flex items-baseline justify-between gap-3"><span className="truncate font-medium">{s.name}</span><span className="font-mono tabular-nums"><Num value={s.count} /> <span className="text-muted-foreground">{((s.count / first) * 100).toFixed(0)}%</span></span></span>
+              <span className="flex items-baseline justify-between gap-3"><span className="truncate font-medium">{s.name}</span><span className="font-mono tabular-nums"><Num value={s.count} /> <span className="text-muted-foreground">{fmtPct(s.count / first, { basis: 'ratio', digits: 0 })}</span></span></span>
               <span className="mt-1 block h-2 bg-foreground/[0.06]"><span className="block h-2 bg-foreground" style={{ width: `${(s.count / first) * 100}%` }} /></span>
             </span>
             <span className="w-28 text-right font-mono text-[11px] tabular-nums">
               {i === 0 ? <span className="text-muted-foreground">entered</span> : <>
-                <span className="text-muted-foreground">{conv.toFixed(0)}% on · </span>
-                <span className={drop >= dropAlert ? 'text-destructive' : 'text-muted-foreground'}>{drop >= dropAlert && <span aria-hidden>× </span>}{drop.toFixed(0)}% off</span>
+                <span className="text-muted-foreground">{fmtPct(conv, { digits: 0 })} on · </span>
+                <span className={drop >= dropAlert ? 'text-destructive' : 'text-muted-foreground'}>{drop >= dropAlert && <span aria-hidden>× </span>}{fmtPct(drop, { digits: 0 })} off</span>
               </>}
               {s.avgSeconds !== undefined && <span className="block text-muted-foreground">{s.avgSeconds < 60 ? `${s.avgSeconds}s` : `${Math.round(s.avgSeconds / 60)}m`} avg</span>}
             </span>
@@ -257,7 +258,7 @@ export function Flow({ rows, className }: { rows: FlowRow[]; className?: string 
             <span aria-hidden className="text-center text-muted-foreground">→</span>
             <span className={cn('truncate', !r.to && 'text-muted-foreground')}>{r.to ?? '(exit)'}</span>
             <Num value={r.count} />
-            <span className="text-right tabular-nums text-muted-foreground">{r.share.toFixed(0)}%</span>
+            <span className="text-right tabular-nums text-muted-foreground">{fmtPct(r.share, { digits: 0 })}</span>
           </span>
         </li>
       ))}
@@ -466,14 +467,14 @@ export function Histogram({ buckets, unit = 'ms', value, onChange, height = 96, 
         <div className="flex border text-[11px]">
           {PCTS.map((p, i) => <button key={p} type="button" aria-pressed={value === p} onClick={() => onChange(p)} className={cn('h-6 px-2 font-mono', i > 0 && 'border-l', value === p ? 'bg-foreground text-background' : 'hover:bg-muted')}>{p}</button>)}
         </div>
-        <span className="font-mono tabular-nums">{value} <span className="font-medium">{stat < 10 ? stat.toFixed(1) : Math.round(stat).toLocaleString()}</span><span className="text-muted-foreground">{unit}</span> <span className="text-muted-foreground">· <Num value={total} /> samples</span></span>
+        <span className="font-mono tabular-nums">{value} <span className="font-medium">{fmtNum(stat, stat < 10 ? { digits: 1 } : { digits: 0 })}</span><span className="text-muted-foreground">{unit}</span> <span className="text-muted-foreground">· <Num value={total} /> samples</span></span>
       </div>
       <div className="relative px-3 pb-5 pt-2">
         <div className="flex items-end gap-px" style={{ height }}>
           {buckets.map((b, i) => <span key={i} title={`≤${b.le}${unit} · ${b.count}`} className={cn('min-w-0 flex-1', b.le <= stat ? 'bg-foreground' : 'bg-foreground/25')} style={{ height: `${(b.count / max) * 100}%` }} />)}
         </div>
         <span aria-hidden className="absolute bottom-5 top-2 w-px bg-destructive" style={{ left: `calc(0.75rem + (100% - 1.5rem) * ${Math.min(1, stat / last)})` }} />
-        <div className="mt-1 flex justify-between font-mono text-[10px] text-muted-foreground"><span>0</span><span>{last.toLocaleString()}{unit}</span></div>
+        <div className="mt-1 flex justify-between font-mono text-[10px] text-muted-foreground"><span>0</span><span>{fmtNum(last)}{unit}</span></div>
       </div>
     </div>
   )

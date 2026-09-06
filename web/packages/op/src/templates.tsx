@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Children, isValidElement, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { Children, isValidElement, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useShellSlots } from './shell-slots'
 import { Search } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { cn } from './lib/cn'
+import { fmtNum } from './fmt'
 import { Kbd } from './kbd'
 import { GLYPH, GLYPH_CLASS, Status, type State } from './status'
 
@@ -283,7 +284,7 @@ export function Pager({ page: p, className }: { page: Page; className?: string }
   const btn = 'inline-flex h-7 items-center gap-0.5 px-1.5 hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent'
   return (
     <span className={cn('inline-flex flex-wrap items-center gap-x-2 font-mono text-[11px] text-muted-foreground', className)}>
-      <span className="tabular-nums"><span className="text-foreground">{from.toLocaleString()}–{to.toLocaleString()}</span> of {p.total.toLocaleString()}</span>
+      <span className="tabular-nums"><span className="text-foreground">{fmtNum(from)}–{fmtNum(to)}</span> of {fmtNum(p.total)}</span>
       <span aria-hidden>·</span>
       <button type="button" className={btn} disabled={p.page <= 1} onClick={() => p.onPage(p.page - 1)} aria-label="previous page"><span aria-hidden>‹</span> prev</button>
       <button type="button" className={btn} disabled={p.page >= pages} onClick={() => p.onPage(p.page + 1)} aria-label="next page">next <span aria-hidden>›</span></button>
@@ -638,15 +639,73 @@ export function Settings({ title, meta, status, sections, onSave, dirty, danger 
   )
 }
 
-/** Label · control · help. One row when the section is wide enough (container query), stacked otherwise. */
-export function Field({ label, children, help }: { label: string; children: ReactNode; help?: string }) {
-  return (
-    <label className="grid gap-1 text-xs @md:grid-cols-[160px_minmax(0,1fr)] @md:items-center @md:gap-4">
-      <span className="op-label">{label}</span>
-      <span className="space-y-1">
-        {children}
-        {help && <span className="block text-[11px] text-muted-foreground">{help}</span>}
-      </span>
-    </label>
+/**
+ * The aria props a `Field` computes for the control it labels. Take them with
+ * the render-prop form and spread them onto the input:
+ * `<Field label="branch" error={e}>{(c) => <Input {...c} />}</Field>`.
+ */
+export type FieldControl = { id: string; 'aria-describedby': string | undefined; 'aria-invalid': true | undefined }
+
+/**
+ * Label · control · hint · error. One row when the section is wide enough
+ * (container query), stacked otherwise.
+ *
+ * The label is always visible: a placeholder is an example, never a name.
+ * `hint` (`help` is the older name for the same slot) is advice and stays put
+ * while the field is invalid; `error` is the fault, and it renders under the
+ * hint as glyph + sentence in the destructive tone — the only colour a field
+ * ever carries. `optional` marks the field optional, because the console's
+ * forms are mostly required and it is the exception worth a word. Row height
+ * is unchanged when neither hint nor error is set.
+ *
+ * Pass `id`, or use the render-prop form, and the control is wired:
+ * `aria-describedby` points at the hint and the error, `aria-invalid` is set
+ * while `error` is, and the label uses `htmlFor` instead of wrapping. With a
+ * plain child and no `id` the label wraps the control as it always did.
+ */
+export function Field({ label, children, help, hint, error, optional, id }: {
+  label: string
+  children: ReactNode | ((control: FieldControl) => ReactNode)
+  /** Older name for `hint`. Both render the same line. */
+  help?: string
+  /** Advice under the control. Never the error; the two can show together. */
+  hint?: ReactNode
+  /** The fault, as a sentence that names it and the fix. Sets `aria-invalid`. */
+  error?: string
+  optional?: boolean
+  id?: string
+}) {
+  const auto = useId()
+  const fid = id ?? auto
+  const hintId = `${fid}-hint`
+  const errId = `${fid}-error`
+  const advice = hint ?? help
+  const describedBy = [advice ? hintId : null, error ? errId : null].filter(Boolean).join(' ') || undefined
+  const control: FieldControl = { id: fid, 'aria-describedby': describedBy, 'aria-invalid': error ? true : undefined }
+  const body = typeof children === 'function' ? children(control) : children
+  // A wired control owns its id, so the label points at it; an unwired one is still wrapped.
+  const wired = id !== undefined || typeof children === 'function'
+  const name = (
+    <>
+      {label}
+      {optional && <span className="ml-1.5 font-normal normal-case tracking-normal text-muted-foreground">optional</span>}
+    </>
   )
+  // The hint and the error are described-by, never part of the control's name,
+  // so a wired field keeps them outside the <label>.
+  const rest = (
+    <span className="space-y-1">
+      {body}
+      {advice && <span id={hintId} className="block text-[11px] text-muted-foreground">{advice}</span>}
+      {error && (
+        <span id={errId} className="flex items-baseline gap-1.5 text-[11px] text-destructive">
+          <span aria-hidden className="w-3 shrink-0 text-center">{GLYPH.error}</span>
+          <span className="min-w-0">{error}</span>
+        </span>
+      )}
+    </span>
+  )
+  const cls = 'grid gap-1 text-xs @md:grid-cols-[160px_minmax(0,1fr)] @md:items-center @md:gap-4'
+  if (wired) return <div className={cls}><label htmlFor={fid} className="op-label">{name}</label>{rest}</div>
+  return <label className={cls}><span className="op-label">{name}</span>{rest}</label>
 }
