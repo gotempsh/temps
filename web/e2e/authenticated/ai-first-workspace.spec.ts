@@ -13,9 +13,14 @@ test.describe('AI workspace', () => {
       await page.goto('/ai-first')
       await expectAppMounted(page)
 
-      await expect(
-        page.locator('header').getByText('AI workspace', { exact: true })
-      ).toBeVisible()
+      const workspaceBadge = page
+        .locator('header')
+        .getByText('AI workspace', { exact: true })
+      if (width >= 1024) {
+        await expect(workspaceBadge).toBeVisible()
+      } else {
+        await expect(workspaceBadge).toBeHidden()
+      }
       await expect(
         page.getByRole('button', { name: 'New workspace' })
       ).toBeVisible()

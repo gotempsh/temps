@@ -328,10 +328,19 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
     ))
     .await?;
     let target = "m20260831_000002_add_managed_status_monitors";
-    let pre_target_count = Migrator::migrations()
+    let correction = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let migrations = Migrator::migrations();
+    let pre_target_count = migrations
         .iter()
         .position(|migration| migration.name() == target)
         .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    let correction_position = migrations
+        .iter()
+        .position(|migration| migration.name() == correction)
+        .unwrap_or_else(|| panic!("migration {correction} not found in Migrator"));
+    let post_target_to_correction_count = correction_position
+        .checked_sub(pre_target_count)
+        .unwrap_or_else(|| panic!("migration {correction} must follow {target}"));
     Migrator::up(&db, Some(pre_target_count as u32)).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
 
@@ -423,7 +432,10 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         "simulate the ownership inferred by the previously shipped migration"
     );
 
-    Migrator::up(&db, None).await?;
+    // Apply through the corrective migration only. Applying every migration
+    // registered after it makes the subsequent one-step rollback target the
+    // newest unrelated migration instead of the correction this test owns.
+    Migrator::up(&db, Some(post_target_to_correction_count as u32)).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
     let corrected = db
         .query_one(sea_orm::Statement::from_string(

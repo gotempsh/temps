@@ -4207,10 +4207,15 @@ mod ai_tool_allowlist_tests {
             ),
             &scope,
         );
-        assert!(
-            matches!(outcome, WritePrepareOutcome::Prepared(_)),
-            "a well-formed static detector must still be proposable"
-        );
+        match outcome {
+            WritePrepareOutcome::Prepared(_) => {}
+            WritePrepareOutcome::Invalid(message) => {
+                panic!("a well-formed static detector must still be proposable: {message}")
+            }
+            WritePrepareOutcome::Help(message) => {
+                panic!("a well-formed static detector unexpectedly returned help: {message}")
+            }
+        }
     }
 
     /// `preview_alert` must be reachable from the read CLI, and its help must
