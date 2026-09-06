@@ -8785,7 +8785,8 @@ export type GatewayStatus = {
    */
   last_exit_code?: number | null;
   /**
-   * Network the container is attached to (should be `temps-sandbox-net`).
+   * Trusted control network the gateway starts on. It is additionally attached
+   * to each per-sandbox isolated network during reconciliation.
    */
   network?: string | null;
   /**
@@ -9887,6 +9888,34 @@ export type ImportCredentials = {
    * API token / bearer token for the source platform
    */
   token?: string | null;
+};
+
+/**
+ * Request body for importing an already-provisioned email domain.
+ *
+ * Use this when the domain identity was created directly in the email
+ * provider's own console or API — Temps will look it up rather than
+ * attempting to re-create it, avoiding duplicate or conflicting identities.
+ *
+ * `provider_identity_id` is required for Scaleway (where the provider keys
+ * lookups off an internal UUID rather than the domain name) and optional for
+ * SES (which uses the domain name for all lookups). If a required field is
+ * missing, the provider will surface a clear error.
+ */
+export type ImportEmailDomainRequest = {
+  /**
+   * Domain name (e.g., "updates.example.com")
+   */
+  domain: string;
+  /**
+   * Provider ID to import the domain into
+   */
+  provider_id: number;
+  /**
+   * Provider-internal identity identifier. Required for Scaleway (the domain
+   * UUID shown in the Scaleway console); ignored/optional for SES.
+   */
+  provider_identity_id?: string | null;
 };
 
 /**
@@ -23807,19 +23836,17 @@ export type ListApplicationsData = {
   path?: never;
   query?: {
     /**
-     * Page number (1-indexed)
+     * Resource lifecycle state (defaults to active).
+     */
+    status?: ConversationListStatus;
+    /**
+     * Page number (1-indexed).
      */
     page?: number;
     /**
-     * Number of items per page (max 100)
+     * Number of applications or conversations per page (clamped to 1..=100).
      */
     page_size?: number;
-    sort_by?: string;
-    sort_order?: string;
-    /**
-     * Application lifecycle state (defaults to active)
-     */
-    status?: ConversationListStatus;
   };
   url: "/ai/applications";
 };
@@ -23886,7 +23913,7 @@ export type GetApplicationData = {
   };
   query?: {
     /**
-     * Application lifecycle state (defaults to active)
+     * Resource lifecycle state (defaults to active).
      */
     status?: ConversationListStatus;
   };
@@ -23913,19 +23940,17 @@ export type ListApplicationConversationsData = {
   };
   query?: {
     /**
-     * Page number (1-indexed)
+     * Resource lifecycle state (defaults to active).
+     */
+    status?: ConversationListStatus;
+    /**
+     * Page number (1-indexed).
      */
     page?: number;
     /**
-     * Number of items per page (max 100)
+     * Number of applications or conversations per page (clamped to 1..=100).
      */
     page_size?: number;
-    sort_by?: string;
-    sort_order?: string;
-    /**
-     * Conversation lifecycle state (defaults to active)
-     */
-    status?: ConversationListStatus;
   };
   url: "/ai/applications/{application_public_id}/conversations";
 };
@@ -24365,23 +24390,21 @@ export type ListAllConversationsData = {
   path?: never;
   query?: {
     /**
-     * Page number (1-indexed)
-     */
-    page?: number;
-    /**
-     * Number of items per page (max 100)
-     */
-    page_size?: number;
-    sort_by?: string;
-    sort_order?: string;
-    /**
-     * Conversation lifecycle state (defaults to active)
+     * Conversation lifecycle state (defaults to active).
      */
     status?: ConversationListStatus;
     /**
-     * Limit results to the global AI workspace, or return all readable contexts
+     * Limit results to the global workspace, or return every readable context.
      */
     scope?: ConversationListScope;
+    /**
+     * Page number (1-indexed).
+     */
+    page?: number;
+    /**
+     * Number of conversations per page (clamped to 1..=100).
+     */
+    page_size?: number;
   };
   url: "/ai/conversations";
 };
@@ -31628,6 +31651,50 @@ export type GetDomainByNameResponses = {
 export type GetDomainByNameResponse =
   GetDomainByNameResponses[keyof GetDomainByNameResponses];
 
+export type ImportEmailDomainData = {
+  body: ImportEmailDomainRequest;
+  path?: never;
+  query?: never;
+  url: "/email-domains/import";
+};
+
+export type ImportEmailDomainErrors = {
+  /**
+   * Invalid request or provider lookup failed
+   */
+  400: unknown;
+  /**
+   * Unauthorized
+   */
+  401: unknown;
+  /**
+   * Insufficient permissions
+   */
+  403: unknown;
+  /**
+   * Provider not found
+   */
+  404: unknown;
+  /**
+   * Domain already registered for this provider
+   */
+  409: unknown;
+  /**
+   * Internal server error
+   */
+  500: unknown;
+};
+
+export type ImportEmailDomainResponses = {
+  /**
+   * Domain imported successfully
+   */
+  201: EmailDomainWithDnsResponse;
+};
+
+export type ImportEmailDomainResponse =
+  ImportEmailDomainResponses[keyof ImportEmailDomainResponses];
+
 export type DeleteEmailDomainData = {
   body?: never;
   path: {
@@ -32007,7 +32074,7 @@ export type CreateEmailProviderData = {
 
 export type CreateEmailProviderErrors = {
   /**
-   * Invalid request
+   * Invalid request or validation error
    */
   400: unknown;
   /**
@@ -32019,9 +32086,17 @@ export type CreateEmailProviderErrors = {
    */
   403: unknown;
   /**
+   * Provider credentials are invalid — the provider API definitively rejected them
+   */
+  422: unknown;
+  /**
    * Internal server error
    */
   500: unknown;
+  /**
+   * Could not reach the provider API to verify credentials — the credentials may still be valid
+   */
+  502: unknown;
 };
 
 export type CreateEmailProviderResponses = {
@@ -32150,9 +32225,17 @@ export type UpdateEmailProviderErrors = {
    */
   409: unknown;
   /**
+   * New credentials are invalid — the provider API definitively rejected them
+   */
+  422: unknown;
+  /**
    * Internal server error
    */
   500: unknown;
+  /**
+   * Could not reach the provider API to verify new credentials
+   */
+  502: unknown;
 };
 
 export type UpdateEmailProviderResponses = {

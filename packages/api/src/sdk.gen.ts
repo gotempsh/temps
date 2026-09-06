@@ -1548,6 +1548,9 @@ import type {
   ImportApplicationWorkspaceGitData,
   ImportApplicationWorkspaceGitErrors,
   ImportApplicationWorkspaceGitResponses,
+  ImportEmailDomainData,
+  ImportEmailDomainErrors,
+  ImportEmailDomainResponses,
   ImportExternalServiceData,
   ImportExternalServiceErrors,
   ImportExternalServiceResponses,
@@ -7418,6 +7421,35 @@ export const getDomainByName = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/email-domains/by-domain/{domain}",
     ...options,
+  });
+
+/**
+ * Import an already-provisioned email domain from the provider
+ *
+ * Use this endpoint when the domain identity was created directly in the email
+ * provider's console or API. Temps will fetch its current verification state
+ * rather than registering a new identity, preventing duplicate or conflicting
+ * provider-side entries.
+ */
+export const importEmailDomain = <ThrowOnError extends boolean = false>(
+  options: Options<ImportEmailDomainData, ThrowOnError>,
+): RequestResult<
+  ImportEmailDomainResponses,
+  ImportEmailDomainErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ImportEmailDomainResponses,
+    ImportEmailDomainErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-domains/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**

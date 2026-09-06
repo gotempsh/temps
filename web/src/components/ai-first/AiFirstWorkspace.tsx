@@ -1082,6 +1082,7 @@ export function AiFirstWorkspace() {
     )
     const nextConversationOptions = listApplicationConversationsOptions({
       path: { application_public_id: application.public_id },
+      query: { page: 1, page_size: THREADS_PAGE_SIZE, status: 'active' },
     })
     queryClient.setQueryData<ConversationResponse[]>(
       nextConversationOptions.queryKey,

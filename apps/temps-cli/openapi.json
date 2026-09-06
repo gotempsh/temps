@@ -18713,7 +18713,7 @@
             ]
           },
           "network": {
-            "description": "Network the container is attached to (should be `temps-sandbox-net`).",
+            "description": "Trusted control network the gateway starts on. It is additionally attached\nto each per-sandbox isolated network during reconciliation.",
             "type": [
               "string",
               "null"
@@ -51009,52 +51009,37 @@
         "operationId": "list_applications",
         "parameters": [
           {
-            "description": "Page number (1-indexed)",
+            "description": "Resource lifecycle state (defaults to active).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          },
+          {
+            "description": "Page number (1-indexed).",
             "example": 1,
             "in": "query",
             "name": "page",
             "required": false,
             "schema": {
               "format": "int64",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
           {
-            "description": "Number of items per page (max 100)",
+            "description": "Number of applications or conversations per page (clamped to 1..=100).",
             "example": 20,
             "in": "query",
             "name": "page_size",
             "required": false,
             "schema": {
               "format": "int64",
-              "minimum": 0,
+              "maximum": 100,
+              "minimum": 1,
               "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "sort_by",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "sort_order",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Application lifecycle state (defaults to active)",
-            "in": "query",
-            "name": "status",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/ConversationListStatus"
             }
           }
         ],
@@ -51187,7 +51172,7 @@
             }
           },
           {
-            "description": "Application lifecycle state (defaults to active)",
+            "description": "Resource lifecycle state (defaults to active).",
             "in": "query",
             "name": "status",
             "required": false,
@@ -51241,52 +51226,37 @@
             }
           },
           {
-            "description": "Page number (1-indexed)",
+            "description": "Resource lifecycle state (defaults to active).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          },
+          {
+            "description": "Page number (1-indexed).",
             "example": 1,
             "in": "query",
             "name": "page",
             "required": false,
             "schema": {
               "format": "int64",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
           {
-            "description": "Number of items per page (max 100)",
+            "description": "Number of applications or conversations per page (clamped to 1..=100).",
             "example": 20,
             "in": "query",
             "name": "page_size",
             "required": false,
             "schema": {
               "format": "int64",
-              "minimum": 0,
+              "maximum": 100,
+              "minimum": 1,
               "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "sort_by",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "sort_order",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Conversation lifecycle state (defaults to active)",
-            "in": "query",
-            "name": "status",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/ConversationListStatus"
             }
           }
         ],
@@ -52368,47 +52338,7 @@
         "operationId": "list_all_conversations",
         "parameters": [
           {
-            "description": "Page number (1-indexed)",
-            "example": 1,
-            "in": "query",
-            "name": "page",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Number of items per page (max 100)",
-            "example": 20,
-            "in": "query",
-            "name": "page_size",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "sort_by",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "sort_order",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Conversation lifecycle state (defaults to active)",
+            "description": "Conversation lifecycle state (defaults to active).",
             "in": "query",
             "name": "status",
             "required": false,
@@ -52417,12 +52347,37 @@
             }
           },
           {
-            "description": "Limit results to the global AI workspace, or return all readable contexts",
+            "description": "Limit results to the global workspace, or return every readable context.",
             "in": "query",
             "name": "scope",
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/ConversationListScope"
+            }
+          },
+          {
+            "description": "Page number (1-indexed).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of conversations per page (clamped to 1..=100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
             }
           }
         ],
@@ -64864,7 +64819,7 @@
             "description": "Provider created successfully"
           },
           "400": {
-            "description": "Invalid request"
+            "description": "Invalid request or validation error"
           },
           "401": {
             "description": "Unauthorized"
@@ -64872,8 +64827,14 @@
           "403": {
             "description": "Insufficient permissions"
           },
+          "422": {
+            "description": "Provider credentials are invalid — the provider API definitively rejected them"
+          },
           "500": {
             "description": "Internal server error"
+          },
+          "502": {
+            "description": "Could not reach the provider API to verify credentials — the credentials may still be valid"
           }
         },
         "security": [
@@ -65028,8 +64989,14 @@
           "409": {
             "description": "Provider type mismatch"
           },
+          "422": {
+            "description": "New credentials are invalid — the provider API definitively rejected them"
+          },
           "500": {
             "description": "Internal server error"
+          },
+          "502": {
+            "description": "Could not reach the provider API to verify new credentials"
           }
         },
         "security": [

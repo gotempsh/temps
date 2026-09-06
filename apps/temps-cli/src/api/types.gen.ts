@@ -8741,7 +8741,8 @@ export type GatewayStatus = {
      */
     last_exit_code?: number | null;
     /**
-     * Network the container is attached to (should be `temps-sandbox-net`).
+     * Trusted control network the gateway starts on. It is additionally attached
+     * to each per-sandbox isolated network during reconciliation.
      */
     network?: string | null;
     /**
@@ -23565,19 +23566,17 @@ export type ListApplicationsData = {
     path?: never;
     query?: {
         /**
-         * Page number (1-indexed)
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Page number (1-indexed).
          */
         page?: number;
         /**
-         * Number of items per page (max 100)
+         * Number of applications or conversations per page (clamped to 1..=100).
          */
         page_size?: number;
-        sort_by?: string;
-        sort_order?: string;
-        /**
-         * Application lifecycle state (defaults to active)
-         */
-        status?: ConversationListStatus;
     };
     url: '/ai/applications';
 };
@@ -23641,7 +23640,7 @@ export type GetApplicationData = {
     };
     query?: {
         /**
-         * Application lifecycle state (defaults to active)
+         * Resource lifecycle state (defaults to active).
          */
         status?: ConversationListStatus;
     };
@@ -23667,19 +23666,17 @@ export type ListApplicationConversationsData = {
     };
     query?: {
         /**
-         * Page number (1-indexed)
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Page number (1-indexed).
          */
         page?: number;
         /**
-         * Number of items per page (max 100)
+         * Number of applications or conversations per page (clamped to 1..=100).
          */
         page_size?: number;
-        sort_by?: string;
-        sort_order?: string;
-        /**
-         * Conversation lifecycle state (defaults to active)
-         */
-        status?: ConversationListStatus;
     };
     url: '/ai/applications/{application_public_id}/conversations';
 };
@@ -24101,23 +24098,21 @@ export type ListAllConversationsData = {
     path?: never;
     query?: {
         /**
-         * Page number (1-indexed)
-         */
-        page?: number;
-        /**
-         * Number of items per page (max 100)
-         */
-        page_size?: number;
-        sort_by?: string;
-        sort_order?: string;
-        /**
-         * Conversation lifecycle state (defaults to active)
+         * Conversation lifecycle state (defaults to active).
          */
         status?: ConversationListStatus;
         /**
-         * Limit results to the global AI workspace, or return all readable contexts
+         * Limit results to the global workspace, or return every readable context.
          */
         scope?: ConversationListScope;
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Number of conversations per page (clamped to 1..=100).
+         */
+        page_size?: number;
     };
     url: '/ai/conversations';
 };
@@ -31556,7 +31551,7 @@ export type CreateEmailProviderData = {
 
 export type CreateEmailProviderErrors = {
     /**
-     * Invalid request
+     * Invalid request or validation error
      */
     400: unknown;
     /**
@@ -31568,9 +31563,17 @@ export type CreateEmailProviderErrors = {
      */
     403: unknown;
     /**
+     * Provider credentials are invalid — the provider API definitively rejected them
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Could not reach the provider API to verify credentials — the credentials may still be valid
+     */
+    502: unknown;
 };
 
 export type CreateEmailProviderResponses = {
@@ -31696,9 +31699,17 @@ export type UpdateEmailProviderErrors = {
      */
     409: unknown;
     /**
+     * New credentials are invalid — the provider API definitively rejected them
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Could not reach the provider API to verify new credentials
+     */
+    502: unknown;
 };
 
 export type UpdateEmailProviderResponses = {

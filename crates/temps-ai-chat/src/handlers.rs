@@ -32,7 +32,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use temps_auth::permissions::Permission;
 use temps_auth::{
@@ -639,7 +639,7 @@ pub struct ConversationMessagesQuery {
     pub limit: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationListStatus {
     #[default]
@@ -664,22 +664,50 @@ pub enum ConversationListScope {
     Global,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ConversationListQuery {
+    /// Conversation lifecycle state (defaults to active).
     #[serde(default)]
     pub status: ConversationListStatus,
+    /// Limit results to the global workspace, or return every readable context.
     #[serde(default)]
     pub scope: ConversationListScope,
-    #[serde(flatten)]
-    pub pagination: temps_core::PaginationParams,
+    /// Page number (1-indexed).
+    #[param(example = 1, minimum = 1)]
+    pub page: Option<u64>,
+    /// Number of conversations per page (clamped to 1..=100).
+    #[param(example = 20, minimum = 1, maximum = 100)]
+    pub page_size: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct ApplicationListQuery {
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LifecycleListQuery {
+    /// Resource lifecycle state (defaults to active).
     #[serde(default)]
     pub status: ConversationListStatus,
-    #[serde(flatten)]
-    pub pagination: temps_core::PaginationParams,
+    /// Page number (1-indexed).
+    #[param(example = 1, minimum = 1)]
+    pub page: Option<u64>,
+    /// Number of applications or conversations per page (clamped to 1..=100).
+    #[param(example = 20, minimum = 1, maximum = 100)]
+    pub page_size: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LifecycleStatusQuery {
+    /// Resource lifecycle state (defaults to active).
+    #[serde(default)]
+    pub status: ConversationListStatus,
+}
+
+fn normalize_list_pagination(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
+    (
+        page.unwrap_or(1).max(1),
+        page_size.unwrap_or(20).clamp(1, 100),
+    )
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1577,21 +1605,18 @@ async fn application_conversation_is_visible(
 
 #[utoipa::path(
     get, tag = "AI Applications", path = "/ai/applications",
-    params(
-        temps_core::PaginationParams,
-        ("status" = Option<ConversationListStatus>, Query, description = "Application lifecycle state (defaults to active)"),
-    ),
+    params(LifecycleListQuery),
     responses((status = 200, body = Vec<ApplicationResponse>), (status = 401), (status = 403)),
     security(("bearer_auth" = []))
 )]
 pub async fn list_applications(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ApplicationListQuery>,
+    Query(query): Query<LifecycleListQuery>,
 ) -> Result<Json<Vec<ApplicationResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
-    let (page, page_size) = query.pagination.normalize();
+    let (page, page_size) = normalize_list_pagination(query.page, query.page_size);
     let applications = state
         .applications
         .list_with_status(auth.user_id(), page, page_size, query.status.as_str())
@@ -2704,7 +2729,7 @@ pub async fn set_application_primary_project(
     get, tag = "AI Applications", path = "/ai/applications/{application_public_id}",
     params(
         ("application_public_id" = String, Path,),
-        ("status" = Option<ConversationListStatus>, Query, description = "Application lifecycle state (defaults to active)"),
+        LifecycleStatusQuery,
     ),
     responses((status = 200, body = ApplicationResponse), (status = 401), (status = 403), (status = 404)),
     security(("bearer_auth" = []))
@@ -2713,7 +2738,7 @@ pub async fn get_application(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(application_public_id): Path<String>,
-    Query(query): Query<ApplicationListQuery>,
+    Query(query): Query<LifecycleStatusQuery>,
 ) -> Result<Json<ApplicationResponse>, Problem> {
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
@@ -2873,8 +2898,7 @@ pub async fn restore_application(
     get, tag = "AI Applications", path = "/ai/applications/{application_public_id}/conversations",
     params(
         ("application_public_id" = String, Path,),
-        temps_core::PaginationParams,
-        ("status" = Option<ConversationListStatus>, Query, description = "Conversation lifecycle state (defaults to active)"),
+        LifecycleListQuery,
     ),
     responses((status = 200, body = Vec<ConversationResponse>), (status = 401), (status = 403), (status = 404)),
     security(("bearer_auth" = []))
@@ -2883,12 +2907,12 @@ pub async fn list_application_conversations(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(application_public_id): Path<String>,
-    Query(query): Query<ApplicationListQuery>,
+    Query(query): Query<LifecycleListQuery>,
 ) -> Result<Json<Vec<ConversationResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let application = authorized_application(&state, &auth, &application_public_id).await?;
-    let (page, page_size) = query.pagination.normalize();
+    let (page, page_size) = normalize_list_pagination(query.page, query.page_size);
     let conversations = state
         .applications
         .conversations_with_status(
@@ -4029,11 +4053,7 @@ pub async fn find_conversation(
 #[utoipa::path(
     get, tag = "AI Chat",
     path = "/ai/conversations",
-    params(
-        temps_core::PaginationParams,
-        ("status" = Option<ConversationListStatus>, Query, description = "Conversation lifecycle state (defaults to active)"),
-        ("scope" = Option<ConversationListScope>, Query, description = "Limit results to the global AI workspace, or return all readable contexts"),
-    ),
+    params(ConversationListQuery),
     responses((status = 200, body = Vec<GlobalConversationResponse>), (status = 401), (status = 403)),
     security(("bearer_auth" = []))
 )]
@@ -4047,7 +4067,7 @@ pub async fn list_all_conversations(
     // project-scoped deployment/project token must not reach another tenant's
     // chats through it. Restrict to human/admin (user/API-key) principals.
     deny_deployment_token!(auth);
-    let (page, page_size) = query.pagination.normalize();
+    let (page, page_size) = normalize_list_pagination(query.page, query.page_size);
     let hidden_project_ids =
         hidden_conversation_project_ids(&auth, &state.project_access_checker).await?;
     let items = state
@@ -7688,7 +7708,49 @@ pub struct AiChatApiDoc;
 mod tests {
     use super::*;
     use crate::PendingPermissionEntry;
-    use axum::http::StatusCode;
+    use axum::http::{StatusCode, Uri};
+
+    #[test]
+    fn application_list_query_deserializes_numeric_pagination() {
+        let uri: Uri = "/api/ai/applications?page=1&page_size=100&status=active"
+            .parse()
+            .expect("valid application list URI");
+        let Query(query) = Query::<LifecycleListQuery>::try_from_uri(&uri)
+            .expect("numeric application pagination must deserialize");
+
+        assert_eq!(query.status, ConversationListStatus::Active);
+        assert_eq!(
+            normalize_list_pagination(query.page, query.page_size),
+            (1, 100)
+        );
+    }
+
+    #[test]
+    fn global_conversation_list_query_deserializes_numeric_pagination() {
+        let uri: Uri = "/api/ai/conversations?page=1&page_size=50&scope=global&status=active"
+            .parse()
+            .expect("valid global conversation list URI");
+        let Query(query) = Query::<ConversationListQuery>::try_from_uri(&uri)
+            .expect("numeric conversation pagination must deserialize");
+
+        assert_eq!(query.status, ConversationListStatus::Active);
+        assert_eq!(query.scope, ConversationListScope::Global);
+        assert_eq!(
+            normalize_list_pagination(query.page, query.page_size),
+            (1, 50)
+        );
+    }
+
+    #[test]
+    fn application_status_query_deserializes_status_without_pagination() {
+        let uri: Uri = "/api/ai/applications/app_123?status=archived"
+            .parse()
+            .expect("valid application URI");
+        let Query(query) = Query::<LifecycleStatusQuery>::try_from_uri(&uri)
+            .expect("application lifecycle status must deserialize");
+
+        assert_eq!(query.status, ConversationListStatus::Archived);
+    }
 
     #[test]
     fn application_project_defaults_to_autopack() {
