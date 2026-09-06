@@ -8,7 +8,6 @@
 //! line in a log file is enough to reproduce the failure.
 
 use ipnet::Ipv4Net;
-use std::net::IpAddr;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -25,18 +24,6 @@ pub enum NetworkError {
         "network data-plane operations are only supported on Linux (current target: {target})"
     )]
     UnsupportedPlatform { target: &'static str },
-
-    /// `/proc/sys/net/ipv4/ip_forward` could not be enabled.
-    #[error("failed to enable ipv4 forwarding: {reason}")]
-    IpForwardFailed { reason: String },
-
-    /// Required kernel module is missing (e.g. `vxlan` not loaded and
-    /// auto-load is disabled).
-    #[error("required kernel module '{module}' is unavailable: {reason}")]
-    MissingKernelModule {
-        module: &'static str,
-        reason: String,
-    },
 
     // ----- link / bridge -----
     /// `rtnetlink` failed while creating, modifying, or deleting a link.
@@ -144,14 +131,6 @@ pub enum NetworkError {
     /// an invalid underlay address.
     #[error("invalid peer entry for node {node_id}: {reason}")]
     InvalidPeer { node_id: Uuid, reason: String },
-
-    /// Underlay address resolution failed.
-    #[error("could not resolve underlay address {addr} for node {node_id}: {reason}")]
-    UnderlayUnreachable {
-        node_id: Uuid,
-        addr: IpAddr,
-        reason: String,
-    },
 
     // ----- generic IO escape hatch -----
     /// Filesystem operation failed (e.g. writing to `/proc/sys/...`).

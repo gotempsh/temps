@@ -71,9 +71,6 @@ impl OverlayForwardRule {
                 input.clone(),
             ]);
         }
-        if let Some(output) = &self.output {
-            args.extend(["-o".to_string(), output.clone()]);
-        }
         args.extend([
             "-s".to_string(),
             self.source.clone(),

@@ -288,9 +288,3 @@ pub async fn setup(
         compute_pool: cluster_network.compute_pool_cidr,
     })
 }
-
-pub async fn current_peers(
-    db: Arc<DatabaseConnection>,
-) -> Result<Vec<Peer>, ControlPlaneSetupError> {
-    Ok(PostgresAllocator::new(db).control_plane_peer_list().await?)
-}

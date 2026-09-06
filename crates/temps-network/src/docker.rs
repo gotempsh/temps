@@ -24,15 +24,8 @@ const NETWORK_OWNER_VALUE: &str = "multi-node-overlay";
 /// Refuse a setup before any kernel state is changed when Docker already owns
 /// an overlapping address range. Docker rejects these late with a generic
 /// `invalid pool request`; this turns it into an actionable, named conflict.
-pub async fn preflight_network(
-    docker: &Docker,
-    config: &NetworkConfig,
-    alloc: &NodeAlloc,
-) -> crate::Result<()> {
-    preflight_network_for_pool(docker, config, alloc, alloc.compute_cidr).await
-}
-
-/// Preflight the complete cluster pool, not only this node's allocation.
+///
+/// Preflights the complete cluster pool, not only this node's allocation.
 /// Every node installs routes for peer subnets, so a local Docker network
 /// overlapping any part of the pool can black-hole a future peer.
 pub async fn preflight_network_for_pool(
