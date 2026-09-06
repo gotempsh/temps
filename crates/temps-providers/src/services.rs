@@ -3,7 +3,7 @@
 
 use crate::externalsvc::{
     legacy_managed_instance_names, managed_instance_name,
-    mariadb::{validate_immutable_mariadb_image, MariaDbService, MariaDbSizeProfile},
+    mariadb::{validate_mariadb_image, MariaDbService, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     mongodb::MongodbService,
     postgres::PostgresService,
     postgres_cluster::PostgresClusterService,
@@ -1545,12 +1545,8 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
-                        service_id: 0,
-                        reason: "MariaDB requires an immutable docker_image in repository@sha256:<64-hex-digest> format"
-                            .to_string(),
-                    })?;
-                validate_immutable_mariadb_image(&image).map_err(|reason| {
+                    .unwrap_or_else(|| MARIADB_DEFAULT_IMAGE.to_string());
+                validate_mariadb_image(&image).map_err(|reason| {
                     ExternalServiceError::ParameterValidationFailed {
                         service_id: 0,
                         reason,

@@ -27,6 +27,17 @@ const MARIADB_INTERNAL_PORT: &str = "3306";
 const MARIADB_IMAGE_REFERENCE_EXAMPLE: &str =
     "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// Default image for a MariaDB service that doesn't request a specific one.
+/// A plain, mutable upstream tag rather than the digest-pinned WAL-G image:
+/// `mariadb_dump` (logical backups) works against any MariaDB, so a service
+/// created without WAL-G is still fully backup-capable -- it just can't run
+/// `mariadb_physical`/continuous archiving until its `docker_image` is
+/// updated to a real `repository@sha256:...` reference (`docker_image` is
+/// declared updateable for exactly this reason). Pinning a MariaDB WAL-G
+/// image is only required once one is actually named -- see
+/// `validate_immutable_mariadb_image` -- not for creation in general.
+pub(crate) const MARIADB_DEFAULT_IMAGE: &str = "mariadb:lts";
+
 /// Repositories a restore-time `docker_image` override may name, in addition
 /// to whatever repository the source service already runs. See
 /// [`crate::externalsvc::restore_image`] for why the override is constrained.
@@ -535,6 +546,18 @@ pub(crate) fn validate_immutable_mariadb_image(image: &str) -> std::result::Resu
     Ok(())
 }
 
+/// Enforces the immutable-digest requirement for any `docker_image` other
+/// than [`MARIADB_DEFAULT_IMAGE`]. The default is our own vetted logical-backup
+/// image and is exempt so a service with no `docker_image` supplied (the
+/// common case) doesn't get rejected by the pinning rule meant for opt-in
+/// WAL-G images.
+pub(crate) fn validate_mariadb_image(image: &str) -> std::result::Result<(), String> {
+    if image == MARIADB_DEFAULT_IMAGE {
+        return Ok(());
+    }
+    validate_immutable_mariadb_image(image)
+}
+
 fn example_host() -> &'static str {
     "localhost"
 }
@@ -835,7 +858,7 @@ impl MariaDbService {
         Self::validate_identifier("username", &config.username)?;
         Self::validate_password("password", &config.password)?;
         Self::validate_password("root_password", &config.root_password)?;
-        validate_immutable_mariadb_image(&config.docker_image).map_err(|reason| {
+        validate_mariadb_image(&config.docker_image).map_err(|reason| {
             anyhow::anyhow!(
                 "Invalid MariaDB docker_image '{}': {}",
                 config.docker_image,
@@ -852,7 +875,7 @@ impl MariaDbService {
         config: &MariaDbConfig,
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
-        validate_immutable_mariadb_image(&config.docker_image).map_err(|reason| {
+        validate_mariadb_image(&config.docker_image).map_err(|reason| {
             anyhow::anyhow!(
                 "Refusing to execute MariaDB image '{}': {}",
                 config.docker_image,
