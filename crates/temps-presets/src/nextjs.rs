@@ -795,8 +795,9 @@ mod tests {
 
     /// Parses a raw `curl -w "%{http_code}"` output and reports whether it
     /// represents a successful (2xx) response. A container that answers with
-    /// 201/204/206, or a redirect while still booting, is not "down" -- only
-    /// an exact-match on `"200"` would wrongly keep polling in those cases.
+    /// 201/204/206 is not "down" -- only an exact-match on `"200"` would
+    /// wrongly keep polling in those cases. Redirects (3xx) and error codes
+    /// still count as not-ready, so the poll keeps waiting for them.
     fn curl_status_indicates_success(raw_status: &str) -> bool {
         raw_status
             .trim()
