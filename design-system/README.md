@@ -32,7 +32,8 @@ bun run dev      # http://localhost:5183
 | `/op-components` | Every operator component in `@temps-sdk/op`, every state, with props |
 | `/patterns` | The three page templates live (Ledger, Detail, Settings), PageState, promote/roll back, per-environment variables with bulk association, time and retention, keyboard model, responsive folds |
 | `/kitchen-sink` | Stress test: the whole v1 console at 390/768/1024/1280, pathological data, every state of every component, dark, dense, charts and forms at the limit, and the banned gallery (the old look, greyed, each item naming its replacement) |
-| `/v1` | Operator console v1 (three templates, PageState, sampled status, plan switcher) |
+| `/v1` | Operator console v1 (three templates, PageState, sampled status; the plan is a fixture, Cloud Starter) |
+| `/v1?fresh=1` | The same console as a fresh install: nothing configured, nothing recorded. Combines with `?p=…`, e.g. `/v1?p=email&fresh=1` |
 | `/v1-landing` | Landing page in the same system, with pricing, limits table, mobile menu, frozen accent |
 | `/status-page` | The public status page for a project, inside the sandbox chrome |
 | `/agent` | Agentic conversation on v1: AI Elements vocabulary (tools in six states, approvals, subagent, plan, tasks, question, queue, checkpoint, prompt bar with model/thinking/mode/workspace/context) |

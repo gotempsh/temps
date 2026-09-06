@@ -463,7 +463,7 @@ export function ComponentsPage() {
           </div>
         </Demo>
 
-        <Demo label="native select · the header plan switcher, styled by the skin">
+        <Demo label="native select · a short, fixed list of known values, styled by the skin">
           <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
             plan
             <select

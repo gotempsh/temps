@@ -241,7 +241,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
   const [compare, setCompare] = useState(false)
   const [sel, setSel] = useState<TimeRange | null>(null)
   const [q, setQ] = useState('')
-  const [fresh] = useFresh()
+  const fresh = useFresh()
   const [pagesView, setPagesView] = useState<'list' | 'flow'>('list')
   const [device, setDevice] = useState<'desktop' | 'mobile'>('desktop')
   const [vital, setVital] = useState<VitalKey>('LCP')

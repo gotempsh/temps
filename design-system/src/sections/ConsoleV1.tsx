@@ -35,7 +35,6 @@ import {
   Plus,
   Rocket,
   RotateCcw,
-  Rows3,
   ScrollText,
   Maximize2,
   Minimize2,
@@ -74,7 +73,6 @@ import { DatabaseScreen } from './ConsoleV1Database'
 import { ErrorsScreen, IssueScreen } from './ConsoleV1Errors'
 import { ProxyScreen } from './ConsoleV1Proxy'
 import { SettingsHub, SettingsPage } from './ConsoleV1Settings'
-import { useFresh } from './console-fresh'
 import { PROJECT_ICONS as ICONS } from './console-projects'
 import { AnalyticsScreen, EventScreen, MonitorScreen, UptimeScreen } from './ConsoleV1Analytics'
 import { BackupsScreen, GitProvidersScreen, GitProviderScreen, SecurityScreen, ScanScreen } from './ConsoleV1Admin'
@@ -96,10 +94,10 @@ import { cn } from '@/lib/utils'
    · Retention horizon on every time axis. The horizon differs per plan
      (30d / 90d / 13mo / as configured), so the axis says what it is.
    · Metric tiles that must name their baseline. No bare deltas.
-   · Decisions frozen: no accent axis, radius 0.25rem, ink borders, density
-     comfortable by default and remembered.
-   · A plan switcher in the header so you can see how the same screens
-     behave on self-hosted, Starter, Team and Business.
+   · Decisions frozen: no accent axis, radius 0.25rem, ink borders, rows at
+     the comfortable density.
+   · The plan is a fixture, not a control: the header carries console
+     features only, and the plan-dependent rules read from PLAN below.
    ──────────────────────────────────────────────────────────────────────── */
 
 const SKIN = 'operator ink v1'
@@ -125,12 +123,19 @@ const PLANS: Record<PlanId, { label: string; retention: string; retentionDays: n
   business: { label: 'Cloud Business', retention: '13 months', retentionDays: 395, ingest: '1 TB/mo', ingestGb: 1000, pitr: '90d' },
 }
 const INGEST_USED_GB = 11.4 // this month, all projects
-const PlanContext = createContext<{ plan: PlanId; setPlan: (p: PlanId) => void }>({ plan: 'selfhost', setPlan: () => {} })
+/* The plan the mockup is fixed to. Handoff §10 makes the plan a design input,
+   not a knob: it decides the retention horizon on every axis, which ranges are
+   gated, whether telemetry reads "sampled", and the PITR column. Starter is
+   the one value that keeps all four visible at once — 30d retention, so 90d
+   and 13mo render struck through; a 10 GB allowance the demo data has already
+   passed (INGEST_USED_GB), so the charts and status lines say sampled; and a
+   7d PITR horizon in the databases ledger. Change this constant to see the
+   same screens on another plan. */
+const PLAN: PlanId = 'starter'
 function usePlan() {
-  const { plan } = useContext(PlanContext)
-  const p = PLANS[plan]
+  const p = PLANS[PLAN]
   const sampled = p.ingestGb !== null && INGEST_USED_GB > p.ingestGb
-  return { id: plan, ...p, sampled }
+  return { id: PLAN, ...p, sampled }
 }
 
 // ── Data ────────────────────────────────────────────────────────────────
@@ -157,6 +162,12 @@ const PROJECTS = [
   { name: 'acme-web', kind: 'app', repo: 'acme-web', domain: '—', replicas: '—', branch: 'main', env: 'staging', state: 'idle' as State, deployed: 'never', dep: '—', commit: '—', msg: '', by: '—', dur: '—', prev: null, err: 0, visitors: 0, cert: '—', note: 'not deployed' },
 ].map((p) => ({ ...p, icon: ICONS[p.name], spark: Array.from({ length: 24 }, (_, i) => Math.max(1, diurnal(i * 2, p.visitors / 40 + 4, 6))) }))
 type Project = (typeof PROJECTS)[number]
+/* The ledger's meta line says a second true thing about the list, and it has to
+   be a different fact from the one the header's attention badge and the status
+   line below already carry (which is "how many need attention"). How many
+   environments those projects span is that second fact, counted from the rows
+   rather than typed in, so it cannot drift from the data. */
+const ENVIRONMENTS = new Set(PROJECTS.map((p) => p.env)).size
 
 /* Brand §6 "an icon wherever it adds context": these lists mix kinds, so the kind
    leads the row in a fixed 16px slot of muted ink. One vocabulary per axis, shared
@@ -291,7 +302,7 @@ function ProjectsScreen({ go, dense }: { go: (v: string) => void; dense: boolean
   }))
   return (
     <Ledger
-      title="Projects" meta={`${PROJECTS.length} projects · ${plan.label}`}
+      title="Projects" meta={`${PROJECTS.length} projects · ${ENVIRONMENTS} environments`}
       status={
         <StatusLine state={attention.length ? 'error' : plan.sampled ? 'sampled' : 'ok'} more={attention.length > 1 ? { label: `+${attention.length - 1 + (plan.sampled ? 1 : 0)} more`, items: [
             { state: 'warn', children: <><Phrase onClick={() => go('api-gateway')}>api-gateway</Phrase> error rate 0.61% since dep_91a.</> },
@@ -593,7 +604,7 @@ function Palette({ open, onOpenChange, go }: { open: boolean; onOpenChange: (o: 
           )))}
         </CommandGroup>
         <CommandGroup heading="commands" className={heading}>
-          {([['deploy api-gateway', `${MOD} ⏎`, Rocket], ['open build logs', '', ScrollText], ['create backup now', '', HardDrive], ['toggle density', 'd', Rows3]] as const).map(([l, k, Icon]) => (
+          {([['deploy api-gateway', `${MOD} ⏎`, Rocket], ['open build logs', '', ScrollText], ['create backup now', '', HardDrive]] as const).map(([l, k, Icon]) => (
             <CommandItem key={l} onSelect={() => { onOpenChange(false); notify('ok', l) }} className={item}>
               <Icon className="h-3.5 w-3.5 opacity-70" /><span>{l}</span>{k && <CommandShortcut className="text-inherit opacity-60">{k}</CommandShortcut>}
             </CommandItem>
@@ -674,17 +685,15 @@ function ObserveRoutes({ view, go, dense }: { view: string; go: (v: string) => v
   return null
 }
 
-const DENSITY_KEY = 'temps.ds.v1.density'
-
 export function ConsoleV1({ view, go, fullHref, full }: { view: string; go: (v: string) => void; /** Where the ⤢ button goes: the chrome-free route (or back to the sandbox page when already full). */ fullHref?: string; full?: boolean }) {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const [notesOpen, setNotesOpen] = useState(false)
-  const [plan, setPlan] = useState<PlanId>('selfhost')
-  const [fresh, setFresh] = useFresh()
-  // Density: comfortable by default, remembered. Operators turn it on once.
-  const [dense, setDenseState] = useState(() => typeof localStorage !== 'undefined' && localStorage.getItem(DENSITY_KEY) === 'dense')
-  const setDense = useCallback((f: (d: boolean) => boolean) => setDenseState((d) => { const n = f(d); localStorage.setItem(DENSITY_KEY, n ? 'dense' : 'comfortable'); return n }), [])
+  /* Density is a design rule (row heights, the `dense` prop on the op
+     primitives), not something the console lets you flip: the shell renders
+     the comfortable density and screens that were drawn dense say so
+     themselves. There is no header control, so there is no `d` key either. */
+  const dense = false
   const [notes, setNotes] = useState<Note[]>([])
   const push = useCallback((n: Omit<Note, 'id' | 'ts'>) => {
     const note: Note = { ...n, id: Date.now() + Math.random(), ts: new Date().toISOString().slice(11, 19) }
@@ -697,12 +706,11 @@ export function ConsoleV1({ view, go, fullHref, full }: { view: string; go: (v: 
       const tag = (e.target as HTMLElement)?.tagName
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen((o) => !o); return }
       if (tag === 'INPUT' || tag === 'TEXTAREA' || e.metaKey || e.ctrlKey) return
-      if (e.key === 'd') setDense((d) => !d)
       if (e.key === 'Escape') { setNotesOpen(false); setNavOpen(false) }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [setDense])
+  }, [])
 
   const unread = notes.filter((n) => n.level !== 'ok').length
   const page = pageOf(view)
@@ -714,83 +722,72 @@ export function ConsoleV1({ view, go, fullHref, full }: { view: string; go: (v: 
 
   return (
     <NotesContext.Provider value={{ notes, push }}>
-      <PlanContext.Provider value={{ plan, setPlan }}>
-        <div data-density={dense ? 'dense' : 'comfortable'} className={cn(SKIN, 'relative flex flex-1')}>
-          <Palette open={paletteOpen} onOpenChange={setPaletteOpen} go={go} />
-          {navOpen && <button aria-label="Close menu" className="fixed inset-0 z-30 bg-foreground/20 lg:hidden" onClick={() => setNavOpen(false)} />}
-          <aside className={cn('relative w-52 shrink-0 border-r bg-background', navOpen ? 'fixed inset-y-0 left-0 z-40 block' : 'hidden lg:block')}>
-            <div className="flex h-11 items-center gap-2 border-b px-3">
-              <LogoMark size={18} /><span className="text-sm font-semibold">temps</span>
-              <span className="ml-auto font-mono text-[10px] text-muted-foreground">v0.1.0</span>
-              <button className="lg:hidden" onClick={() => setNavOpen(false)} aria-label="Close"><X className="h-4 w-4" /></button>
-            </div>
-            <nav className="py-2 text-xs">
-              {NAV.map((g) => (
-                <div key={g.group} className="mb-2">
-                  <p className="op-label px-3 py-1">{g.group}</p>
-                  {g.items.map(([label, Icon, target]) => (
-                    <button key={label} type="button" onClick={() => { if (target) go(target); setNavOpen(false) }} className={cn('flex h-7 w-full items-center gap-2 px-3 text-left hover:bg-muted focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring', target && active(target) && 'border-l-2 border-foreground bg-muted pl-[10px] font-medium', !target && 'text-muted-foreground')}>
-                      <Icon className="h-3.5 w-3.5" /> {label}
-                    </button>
-                  ))}
-                </div>
-              ))}
-            </nav>
-            <div className="absolute inset-x-0 bottom-0 hidden border-t p-3 text-[11px] text-muted-foreground lg:block">
-              <Kbd keys="d" className="mr-1" /> density · <Kbd keys={['⌘', 'K']} className="mx-1" /> find
-            </div>
-          </aside>
-
-          <div className="flex min-w-0 flex-1 flex-col">
-            <header className="flex h-11 items-center gap-2 border-b px-3 text-xs sm:px-4">
-              <button type="button" className="flex h-7 w-7 items-center justify-center border lg:hidden" onClick={() => setNavOpen(true)} aria-label="Menu"><Menu className="h-4 w-4" /></button>
-              <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 truncate text-muted-foreground">
-                <span className="hidden sm:inline">{navGroup(page)}</span>
-                <span aria-hidden className="hidden text-[var(--op-rule-soft)] sm:inline">/</span>
-                {PAGES.includes(view)
-                  ? null
-                  : <><a href="#" onClick={(e) => { e.preventDefault(); go(page) }} className="truncate hover:text-foreground">{navLabel(page)}</a></>}
-                <span ref={setCrumbSlot} className={cn('flex min-w-0 items-center gap-1.5 truncate', PAGES.includes(view) && '[&>span:first-child]:hidden')} />
-              </nav>
-              <div className="ml-auto flex shrink-0 items-center gap-2">
-                <AttentionHost onSlot={setAttentionSlot} />
-                {/* Sandbox-only knobs: below xl the sidebar plus the real controls fill the header, so these go before anything a user would need. */}
-                <label className="hidden items-center gap-1 text-[11px] text-muted-foreground xl:flex" title="Render every screen as a console that was installed minutes ago: nothing configured, nothing recorded.">
-                  <input type="checkbox" checked={fresh} onChange={(e) => setFresh(e.target.checked)} className="accent-foreground" aria-label="Fresh install (demo)" /> fresh
-                </label>
-                <label className="hidden items-center gap-1 text-[11px] text-muted-foreground xl:flex">
-                  plan
-                  <select value={plan} onChange={(e) => setPlan(e.target.value as PlanId)} className="h-7 border bg-background px-1 font-mono text-[11px] text-foreground" aria-label="Plan (demo)">
-                    {(Object.keys(PLANS) as PlanId[]).map((k) => <option key={k} value={k}>{PLANS[k].label}</option>)}
-                  </select>
-                </label>
-                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setPaletteOpen(true)}><Search /> <span className="hidden sm:inline">find</span> <Kbd keys={['⌘', 'K']} className="ml-1" /></Button>
-                <Button variant="outline" size="icon" className={cn('h-7 w-7', dense && 'bg-foreground text-background')} aria-pressed={dense} aria-label="Toggle density" onClick={() => setDense((d) => !d)}><Rows3 /></Button>
-                {fullHref && <Button variant="outline" size="icon" className="h-7 w-7" asChild><Link to={fullHref} aria-label={full ? 'Exit full screen' : 'Full screen'} title={full ? 'back to the sandbox page' : 'the console alone, no sandbox chrome'}>{full ? <Minimize2 /> : <Maximize2 />}</Link></Button>}
-                <div className="relative" ref={bellWrap}>
-                  <Button variant="outline" size="icon" className="h-7 w-7" aria-label="Notifications" aria-expanded={notesOpen} onClick={() => setNotesOpen((o) => !o)}><Bell /></Button>
-                  {unread > 0 && <span className="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center bg-foreground px-0.5 font-mono text-[9px] text-background">{unread}</span>}
-                  <Drop anchor={bellWrap} open={notesOpen} width={360}>
-                      <div className="flex items-center justify-between border-b px-3 py-2"><span className="op-label">notifications</span><span className="text-[11px] text-muted-foreground">{notes.length} · newest first</span></div>
-                      <div className="op-rows max-h-72 overflow-auto">
-                        {notes.length === 0 ? <p className="px-3 py-4 text-[11px] text-muted-foreground">Nothing yet. Deploys, rollbacks and alerts land here and as toasts.</p> : notes.map((n) => <div key={n.id} className="px-3 py-2"><NoteRow n={n} /></div>)}
-                      </div>
-                  </Drop>
-                </div>
-                <span className="hidden items-center gap-2 border-l pl-3 sm:flex"><span className="flex h-5 w-5 items-center justify-center border text-[10px]">M</span><span className="text-muted-foreground">maya</span></span>
-              </div>
-            </header>
-            <main className="flex-1 px-4 pb-4 sm:px-6 sm:pb-6">
-             <ShellSlotsProvider value={{ crumb: crumbSlot, attention: attentionSlot }}>
-              {view === 'projects' && <ProjectsScreen go={go} dense={dense} />}
-              {view === 'databases' && <DatabasesScreen dense={dense} go={go} />}
-              {(page === 'sandboxes' || page === 'traces' || page === 'metrics' || page === 'backups' || page === 'git' || page === 'security' || page === 'email' || page === 'analytics' || page === 'uptime' || page === 'proxy' || page === 'settings' || page === 'errors' || view.startsWith('db:') || view.startsWith('deploy:')) && <ObserveRoutes view={view} go={go} dense={dense} />}
-              {page === 'projects' && view !== 'projects' && !view.startsWith('deploy:') && <ProjectScreen name={view} dense={dense} go={go} />}
-            </ShellSlotsProvider>
-            </main>
+      <div data-density="comfortable" className={cn(SKIN, 'relative flex flex-1')}>
+        <Palette open={paletteOpen} onOpenChange={setPaletteOpen} go={go} />
+        {navOpen && <button aria-label="Close menu" className="fixed inset-0 z-30 bg-foreground/20 lg:hidden" onClick={() => setNavOpen(false)} />}
+        <aside className={cn('relative w-52 shrink-0 border-r bg-background', navOpen ? 'fixed inset-y-0 left-0 z-40 block' : 'hidden lg:block')}>
+          <div className="flex h-11 items-center gap-2 border-b px-3">
+            <LogoMark size={18} /><span className="text-sm font-semibold">temps</span>
+            <span className="ml-auto font-mono text-[10px] text-muted-foreground">v0.1.0</span>
+            <button className="lg:hidden" onClick={() => setNavOpen(false)} aria-label="Close"><X className="h-4 w-4" /></button>
           </div>
+          <nav className="py-2 text-xs">
+            {NAV.map((g) => (
+              <div key={g.group} className="mb-2">
+                <p className="op-label px-3 py-1">{g.group}</p>
+                {g.items.map(([label, Icon, target]) => (
+                  <button key={label} type="button" onClick={() => { if (target) go(target); setNavOpen(false) }} className={cn('flex h-7 w-full items-center gap-2 px-3 text-left hover:bg-muted focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring', target && active(target) && 'border-l-2 border-foreground bg-muted pl-[10px] font-medium', !target && 'text-muted-foreground')}>
+                    <Icon className="h-3.5 w-3.5" /> {label}
+                  </button>
+                ))}
+              </div>
+            ))}
+          </nav>
+          <div className="absolute inset-x-0 bottom-0 hidden border-t p-3 text-[11px] text-muted-foreground lg:block">
+            <Kbd keys={['⌘', 'K']} className="mr-1" /> find · <Kbd keys="/" className="mx-1" /> filter
+          </div>
+        </aside>
+
+        <div className="flex min-w-0 flex-1 flex-col">
+          <header className="flex h-11 items-center gap-2 border-b px-3 text-xs sm:px-4">
+            <button type="button" className="flex h-7 w-7 items-center justify-center border lg:hidden" onClick={() => setNavOpen(true)} aria-label="Menu"><Menu className="h-4 w-4" /></button>
+            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 truncate text-muted-foreground">
+              <span className="hidden sm:inline">{navGroup(page)}</span>
+              <span aria-hidden className="hidden text-[var(--op-rule-soft)] sm:inline">/</span>
+              {PAGES.includes(view)
+                ? null
+                : <><a href="#" onClick={(e) => { e.preventDefault(); go(page) }} className="truncate hover:text-foreground">{navLabel(page)}</a></>}
+              <span ref={setCrumbSlot} className={cn('flex min-w-0 items-center gap-1.5 truncate', PAGES.includes(view) && '[&>span:first-child]:hidden')} />
+            </nav>
+            <div className="ml-auto flex shrink-0 items-center gap-2">
+              <AttentionHost onSlot={setAttentionSlot} />
+              {/* Console features only: no sandbox knobs live here. The plan is a
+                  fixture (PLAN), and the fresh-install demo is the route `?fresh=1`. */}
+              <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setPaletteOpen(true)}><Search /> <span className="hidden sm:inline">find</span> <Kbd keys={['⌘', 'K']} className="ml-1" /></Button>
+              {fullHref && <Button variant="outline" size="icon" className="h-7 w-7" asChild><Link to={fullHref} aria-label={full ? 'Exit full screen' : 'Full screen'} title={full ? 'back to the sandbox page' : 'the console alone, no sandbox chrome'}>{full ? <Minimize2 /> : <Maximize2 />}</Link></Button>}
+              <div className="relative" ref={bellWrap}>
+                <Button variant="outline" size="icon" className="h-7 w-7" aria-label="Notifications" aria-expanded={notesOpen} onClick={() => setNotesOpen((o) => !o)}><Bell /></Button>
+                {unread > 0 && <span className="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center bg-foreground px-0.5 font-mono text-[9px] text-background">{unread}</span>}
+                <Drop anchor={bellWrap} open={notesOpen} width={360}>
+                    <div className="flex items-center justify-between border-b px-3 py-2"><span className="op-label">notifications</span><span className="text-[11px] text-muted-foreground">{notes.length} · newest first</span></div>
+                    <div className="op-rows max-h-72 overflow-auto">
+                      {notes.length === 0 ? <p className="px-3 py-4 text-[11px] text-muted-foreground">Nothing yet. Deploys, rollbacks and alerts land here and as toasts.</p> : notes.map((n) => <div key={n.id} className="px-3 py-2"><NoteRow n={n} /></div>)}
+                    </div>
+                </Drop>
+              </div>
+              <span className="hidden items-center gap-2 border-l pl-3 sm:flex"><span className="flex h-5 w-5 items-center justify-center border text-[10px]">M</span><span className="text-muted-foreground">maya</span></span>
+            </div>
+          </header>
+          <main className="flex-1 px-4 pb-4 sm:px-6 sm:pb-6">
+           <ShellSlotsProvider value={{ crumb: crumbSlot, attention: attentionSlot }}>
+            {view === 'projects' && <ProjectsScreen go={go} dense={dense} />}
+            {view === 'databases' && <DatabasesScreen dense={dense} go={go} />}
+            {(page === 'sandboxes' || page === 'traces' || page === 'metrics' || page === 'backups' || page === 'git' || page === 'security' || page === 'email' || page === 'analytics' || page === 'uptime' || page === 'proxy' || page === 'settings' || page === 'errors' || view.startsWith('db:') || view.startsWith('deploy:')) && <ObserveRoutes view={view} go={go} dense={dense} />}
+            {page === 'projects' && view !== 'projects' && !view.startsWith('deploy:') && <ProjectScreen name={view} dense={dense} go={go} />}
+          </ShellSlotsProvider>
+          </main>
         </div>
-      </PlanContext.Provider>
+      </div>
     </NotesContext.Provider>
   )
 }
@@ -811,7 +808,7 @@ export function ConsoleV1Page({ full = false }: { /** Render without the sandbox
       {!full && <div className="border-b px-4 py-3 text-xs sm:px-6">
         <p className="op-label">operator console · v1 · the twelve answers as code</p>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">
-          Every screen is one of three templates: ledger (<a href="?p=projects" className="underline underline-offset-4">projects</a>, <a href="?p=databases" className="underline underline-offset-4">databases</a>, <a href="?p=errors" className="underline underline-offset-4">errors</a>), detail (<a href="?p=api-gateway" className="underline underline-offset-4">api-gateway</a>, with deploys + promote, environments, and per-environment variables as tabs 2–4), settings (tab 6 there, <Kbd keys={['⌘', 'S']} /> saves). One <span className="font-mono">PageState</span> with four states: loading, empty, unconfigured (<a href="?p=analytics" className="underline underline-offset-4">analytics</a>, <a href="?p=acme-web" className="underline underline-offset-4">acme-web</a>), error (<a href="?p=errors" className="underline underline-offset-4">errors</a>, with retry). A fifth status, <span className="font-mono">◌ sampled</span>, from the pricing promise. Retention horizon on every axis. Metric tiles must name their baseline. Sandboxes (<a href="?p=sandboxes" className="underline underline-offset-4">list</a>, <a href="?p=sandbox:sbx_7f21" className="underline underline-offset-4">detail</a>, <a href="?p=sandbox:sbx_e77b" className="underline underline-offset-4">failed</a>), <a href="?p=traces" className="underline underline-offset-4">traces</a> with operations, a <a href="?p=trace:3f9c1e7a8b2d4f60" className="underline underline-offset-4">trace waterfall</a>, and the <a href="?p=metrics" className="underline underline-offset-4">metrics explorer</a>. Backups (<a href="?p=backups" className="underline underline-offset-4">schedules, jobs, sources</a>), <a href="?p=git" className="underline underline-offset-4">git providers</a> with an expired installation, and <a href="?p=security" className="underline underline-offset-4">security</a> (scans, headers, access). Switch the plan in the header to see the same screens on self-hosted, Starter, Team and Business. No accent, radius frozen, density remembered.
+          Every screen is one of three templates: ledger (<a href="?p=projects" className="underline underline-offset-4">projects</a>, <a href="?p=databases" className="underline underline-offset-4">databases</a>, <a href="?p=errors" className="underline underline-offset-4">errors</a>), detail (<a href="?p=api-gateway" className="underline underline-offset-4">api-gateway</a>, with deploys + promote, environments, and per-environment variables as tabs 2–4), settings (tab 6 there, <Kbd keys={['⌘', 'S']} /> saves). One <span className="font-mono">PageState</span> with four states: loading, empty, unconfigured (<a href="?p=analytics" className="underline underline-offset-4">analytics</a>, <a href="?p=acme-web" className="underline underline-offset-4">acme-web</a>), error (<a href="?p=errors" className="underline underline-offset-4">errors</a>, with retry). A fifth status, <span className="font-mono">◌ sampled</span>, from the pricing promise. Retention horizon on every axis. Metric tiles must name their baseline. Sandboxes (<a href="?p=sandboxes" className="underline underline-offset-4">list</a>, <a href="?p=sandbox:sbx_7f21" className="underline underline-offset-4">detail</a>, <a href="?p=sandbox:sbx_e77b" className="underline underline-offset-4">failed</a>), <a href="?p=traces" className="underline underline-offset-4">traces</a> with operations, a <a href="?p=trace:3f9c1e7a8b2d4f60" className="underline underline-offset-4">trace waterfall</a>, and the <a href="?p=metrics" className="underline underline-offset-4">metrics explorer</a>. Backups (<a href="?p=backups" className="underline underline-offset-4">schedules, jobs, sources</a>), <a href="?p=git" className="underline underline-offset-4">git providers</a> with an expired installation, and <a href="?p=security" className="underline underline-offset-4">security</a> (scans, headers, access). The plan is a fixture (Cloud Starter), so the gated ranges, the sampled charts and the retention footers are all on screen; <a href="?fresh=1" className="underline underline-offset-4">?fresh=1</a> renders every screen as a console installed minutes ago. No accent, radius frozen, rows comfortable.
         </p>
       </div>}
       <ConsoleV1 view={view} go={go} fullHref={fullHref} full={full} />

@@ -41,7 +41,8 @@ Routes that matter:
 | `/v1?p=api-gateway`| Project detail: chart, metrics, incident thread, settings tab.         |
 | `/v1?p=settings:nodes` | Fleet: the nodes ledger with a status column (`hetzner-3` offline, `hetzner-1` under memory pressure); `node:<name>` the record; `settings:cluster` the join token, cluster DNS and CA. |
 | `/v1?p=deploy:dep_91a` | Deployment record: `dep_91a` live with an error-rate regression, `dep_92e` failed build with the compiler's words, `dep_92b` building live, `dep_90e` superseded (roll back), `dep_88c` cancelled. |
-| `/v1?p=errors`     | Issues ledger; `issue:<id>` the record. `&fail=1` shows the error-store outage with retry; **fresh** shows the no-DSN onboarding. |
+| `/v1?p=errors`     | Issues ledger; `issue:<id>` the record. `&fail=1` shows the error-store outage with retry; `&fresh=1` shows the no-DSN onboarding. |
+| `/v1?fresh=1`      | Fresh install: every screen as the console looks minutes after `temps serve` first started — nothing configured, nothing recorded. Combines with `p`, e.g. `/v1?p=email&fresh=1`. |
 | `/console?p=…`     | The console alone, no sandbox layout or intro; same `p` views. The ⤢ button in the header toggles it. |
 | `/landing`         | The landing alone, no sandbox layout. The ⤢ button fixed bottom-right toggles it (sandbox control, not part of the page). |
 | `/v1?p=settings`   | Settings hub; `settings:<slug>` pages (domain, updates, builds, timeouts, users, teams, signin, keys, headers, traffic, routes, store, retention, alerts, nodes, plugins). |
@@ -1030,7 +1031,7 @@ record and the metrics facet are the same strip at two sizes.
 
 `src/sections/ConsoleV1Analytics.tsx`.
 
-First run (the **fresh** checkbox in the shell header, `?fresh=1`): the
+First run (`/v1?p=analytics&fresh=1`): the
 verdict is ○ "No visits recorded yet", the meta says "no data yet", the tabs
 stay, and every tab renders the same unconfigured PageState: what the page
 will show (a fake verdict line, a bar strip, a breakdown line), the one
@@ -1092,7 +1093,7 @@ EmailDomainResponse + DnsRecordResponse, EmailResponse, EmailStatsResponse and
 EmailTrackingSetupResponse. The live page (`web/src/pages/Email.tsx`) is five
 equal tabs of cards with the SDK docs inside the console. On v1:
 
-- First run (the **fresh** checkbox in the shell header, `?fresh=1`): every tab onboards instead of going
+- First run (`/v1?p=email&fresh=1`): every tab onboards instead of going
   blank. Mail: "Nothing has been sent yet" with the curl to send one and
   links to the provider and domain tabs. Domains: "No sending domain" with
   what the DNS check does. Providers: "No email provider" with what sending
@@ -1337,10 +1338,14 @@ Temps sells observability. These are the core of the system.
 | `1` `2` `3` | detail              | switch tab                                |
 | ⌘⏎          | detail              | primary action (deploy)                   |
 | ⌘S          | settings            | click the save button                     |
-| `d`         | everywhere          | toggle density                            |
 | `esc`       | everywhere          | close drawer, menu, dialog                |
 
-Keys are ignored while an input has focus. Every key has a visible badge.
+Keys are ignored while an input has focus. Every key has a visible badge —
+that is the rule, not a nicety: a keyboard shortcut is an accelerator for a
+control the reader can see, never the only way to reach a behaviour. Density
+used to have a `d` key and a header button; both are gone, because density is
+a design rule (row heights, the `dense` prop) rather than something the
+console asks the operator to decide.
 
 **The cursor is the focus.** In a ledger, `j`, `k` and the arrows move DOM
 focus to the row they mark, and the row's own key handler opens it on `⏎`.
@@ -1352,10 +1357,16 @@ rule: never move a highlight without moving focus with it.
 
 ## 10. Plans as design input
 
-`ConsoleV1.tsx` has a `PlanContext` with self-hosted, Starter, Team, Business
-and a switcher in the header. It exists so the same screens can be seen under
-each plan's retention and ingest allowance. In the real console this comes
-from the license or Cloud subscription. What changes per plan:
+The plan is a design input, not a control. `ConsoleV1.tsx` fixes it in one
+constant, `const PLAN: PlanId = 'starter'`, read through `usePlan()`; the
+header carries no plan switcher, because a plan is not something an operator
+flips from a toolbar. Starter is the value chosen because it keeps every
+plan-dependent behaviour on screen at once: 30d retention (so the 90d and
+13mo ranges render struck through), a 10 GB allowance the demo data has
+already passed (so charts, status lines and footers say `sampled`), and a 7d
+PITR horizon in the databases ledger. Change the constant to see the same
+screens on another plan. In the real console the value comes from the license
+or Cloud subscription. What changes per plan:
 
 | Plan        | Retention          | Ingest    | PITR         | Shows when exceeded                       |
 |-------------|--------------------|-----------|--------------|-------------------------------------------|

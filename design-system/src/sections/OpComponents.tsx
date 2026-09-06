@@ -262,7 +262,7 @@ export function OpComponentsPage() {
             <Demo label="in context">
               <div className="flex flex-wrap items-center gap-3 text-xs">
                 <Button size="sm" className="op-primary h-8 text-xs"><Rocket /> deploy <Kbd keys={['⌘', '⏎']} className="ml-1 opacity-70" /></Button>
-                <span className="text-muted-foreground"><Kbd keys="j" className="mx-1" /><Kbd keys="k" className="mr-1" /> move · <Kbd keys="⏎" className="mx-1" /> open · <Kbd keys="/" className="mx-1" /> filter · <Kbd keys="d" className="mx-1" /> density</span>
+                <span className="text-muted-foreground"><Kbd keys="j" className="mx-1" /><Kbd keys="k" className="mr-1" /> move · <Kbd keys="⏎" className="mx-1" /> open · <Kbd keys="/" className="mx-1" /> filter</span>
               </div>
             </Demo>
           </Block>

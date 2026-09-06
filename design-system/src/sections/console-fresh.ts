@@ -4,15 +4,14 @@
 import { useSearchParams } from 'react-router'
 
 /**
- * "Fresh install" for the sandbox: `?fresh=1` renders every screen as the
+ * "Fresh install" for the sandbox: `/v1?fresh=1` renders every screen as the
  * console looks minutes after `temps serve` first started, with nothing
- * configured and nothing recorded. It is a demo control, toggled from the
- * shell header, so every first-run state stays one click away instead of a
- * URL trick. Screens that have no first-run state yet simply ignore it.
+ * configured and nothing recorded. It is a route, not a header control — the
+ * console header carries console features only, and a demo state that lives
+ * in the URL is linkable, bookmarkable and screenshot-stable. Screens that
+ * have no first-run state yet simply ignore it.
  */
-export function useFresh(): [boolean, (on: boolean) => void] {
-  const [params, setParams] = useSearchParams()
-  const fresh = params.get('fresh') === '1'
-  const set = (on: boolean) => { const p = new URLSearchParams(params); if (on) p.set('fresh', '1'); else p.delete('fresh'); setParams(p) }
-  return [fresh, set]
+export function useFresh(): boolean {
+  const [params] = useSearchParams()
+  return params.get('fresh') === '1'
 }

@@ -339,18 +339,17 @@ export function KitchenSinkPage() {
         title="The console at every width"
         rule={
           <>
-            <p>The whole v1 shell, embedded exactly as the landing page embeds it. Pick a width and drive it: navigate, open the palette with <Kbd keys={['⌘', 'K']} />, toggle density with <Kbd keys="d" />.</p>
+            <p>The whole v1 shell, embedded exactly as the landing page embeds it. Pick a width and drive it: navigate, open the palette with <Kbd keys={['⌘', 'K']} />, filter a ledger with <Kbd keys="/" />.</p>
             <p>The frame scrolls horizontally, so a 1280 preset on a phone is a scrollable strip rather than a page that overflows.</p>
           </>
         }
         api={`<ConsoleV1 view={view} go={setView} />
-// density is remembered in localStorage:
-//   temps.ds.v1.density = 'dense' | 'comfortable'`}
+// the shell renders one density; there is no toggle and no stored preference`}
       >
         <Demo label="resizable frame · 640px tall, scrolls in both axes" className="px-0 sm:px-0">
           <ConsoleFrame />
         </Demo>
-        <Rule state="ok">The console remembers density in <span className="font-mono">localStorage</span> under <span className="font-mono">temps.ds.v1.density</span>. Toggling it here changes it for <span className="font-mono">/v1</span> too, and it survives a reload.</Rule>
+        <Rule state="ok">The console header carries console features only — menu, crumb, attention, <Kbd keys={['⌘', 'K']} />, notifications. Density is a design rule, not a control: the shell renders <span className="font-mono">data-density="comfortable"</span> and the <span className="font-mono">dense</span> prop stays on the primitives for screens that need it.</Rule>
         <Rule state="error">
           The width presets change the console's available width, not the viewport. v1's responsive rules are media queries
           (<span className="font-mono">lg:</span> sidebar, <span className="font-mono">md:</span> ledger columns), so the 390 preset still renders the desktop layout
@@ -358,8 +357,7 @@ export function KitchenSinkPage() {
         </Rule>
         <Rule state="error">
           Keyboard handlers in <span className="font-mono">Ledger</span>, <span className="font-mono">Detail</span> and the console shell are bound to <span className="font-mono">window</span>, not to the
-          component. With the console embedded on this page, <Kbd keys="d" /> toggles its density from anywhere on the page, and <Kbd keys="j" />/<Kbd keys="k" /> move the cursor in
-          every ledger below at once.
+          component. With the console embedded on this page, <Kbd keys="j" />/<Kbd keys="k" /> move the cursor in every ledger below at once.
         </Rule>
       </Block>
 

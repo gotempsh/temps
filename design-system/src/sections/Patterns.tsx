@@ -701,7 +701,6 @@ const KEYS: { keys: string | string[]; where: string; does: string; control: str
   { keys: ['1', '6'], where: 'detail', does: 'switch to tab 1…6', control: 'the tab strip' },
   { keys: ['⌘', '⏎'], where: 'detail', does: 'the primary action (deploy)', control: 'the primary button' },
   { keys: ['⌘', 'S'], where: 'settings', does: 'click the save button', control: 'the sticky save bar' },
-  { keys: 'd', where: 'everywhere', does: 'toggle density', control: 'the density control in the header' },
   { keys: 'esc', where: 'everywhere', does: 'close dialog, menu, selection', control: 'cancel in every dialog' },
 ]
 

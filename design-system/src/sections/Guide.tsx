@@ -326,7 +326,6 @@ const KEYS: readonly (readonly [string[], string, string])[] = [
   [['1'], 'detail', 'switch tab'],
   [['⌘', '⏎'], 'detail', 'primary action'],
   [['⌘', 'S'], 'settings', 'click the save button'],
-  [['d'], 'everywhere', 'toggle density'],
   [['esc'], 'everywhere', 'close drawer, menu, dialog'],
 ]
 

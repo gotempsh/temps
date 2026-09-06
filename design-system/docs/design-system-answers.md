@@ -189,7 +189,7 @@ reference screens match `/v1` in the screenshot diff.
 `/v1` in the design-system app (`src/sections/ConsoleV1.tsx`) is these answers
 as code: `Ledger`, `Detail` and `Settings` templates, one `PageState` with four
 states, the `sampled` status, retention horizon on the chart, `Metric` tiles
-that require a baseline, density remembered, no accent axis. `/v1-landing` is
+that require a baseline, one density, no accent axis. `/v1-landing` is
 the v3 landing plus pricing from `pricing.md`, the limits table, a mobile menu
 and the accent frozen to `signal` on the primary CTA.
 

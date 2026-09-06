@@ -111,10 +111,10 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Keyboard
 
-- `⌘K` palette · `/` filter · `j` `k` `⏎` ledger · `1` `2` `3` tabs · `⌘⏎` primary · `⌘S` save · `d` density · `esc` close.
+- `⌘K` palette · `/` filter · `j` `k` `⏎` ledger · `1` `2` `3` tabs · `⌘⏎` primary · `⌘S` save · `esc` close.
 - Ignore every key while an input has focus.
 - Move DOM focus with the cursor. Never paint a highlight without moving focus.
-- Give every key a visible badge, and every badge a handler.
+- Give every key a visible badge, and every badge a handler. A shortcut is an accelerator for a control you can see; if the control goes, the key goes with it.
 
 ## Responsive (390 and 1440 are both required)
 

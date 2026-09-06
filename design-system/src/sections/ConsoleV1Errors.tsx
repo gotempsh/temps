@@ -60,7 +60,7 @@ const inFilter = (i: Issue, f: Filter) => f === 'all' ? true : f === 'review' ? 
 
 const RANGES: readonly Range[] = [{ label: '1h', days: 0.05 }, { label: '24h', days: 1 }, { label: '7d', days: 7 }, { label: '30d', days: 30 }, { label: '90d', days: 90 }]
 export function ErrorsScreen({ dense, plan, notify, go }: { dense: boolean; plan: Plan; notify: Notify; go: (v: string) => void }) {
-  const [fresh] = useFresh()
+  const fresh = useFresh()
   const [q, setQ] = useState('')
   const [filter, setFilter] = useState<Filter>('review')
   const [range, setRange] = useState('24h')
