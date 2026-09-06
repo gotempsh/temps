@@ -1437,6 +1437,26 @@ async fn repoint_continuous_archive_source(
     permission_guard!(auth, ExternalServicesWrite);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
+    // `assert_service_owned_by_caller` only proves the caller may manage
+    // `id` -- it says nothing about whether they may use
+    // `request.new_s3_source_id`. Unlike `external_services`, `s3_sources`
+    // carries no project scoping at all (see its entity definition), so
+    // every other endpoint that touches one (`list_s3_sources`,
+    // `create_s3_source`, `get_s3_source`, `update_s3_source` in
+    // `temps-backup`) gates on "instance admin, or no team-access checker is
+    // registered at all" instead. Without the same gate here, a Teams
+    // project admin with only `ExternalServicesWrite` on their own project
+    // could name the ID of an S3 source they were never granted and redirect
+    // this service's WAL straight into it.
+    if !auth.is_instance_admin()
+        && !(auth.project_id().is_none() && app_state.project_access_checker.is_none())
+    {
+        return Err(forbidden()
+            .title("Insufficient Permissions")
+            .detail("Only an administrator may repoint a continuous archive source")
+            .build());
+    }
+
     let previous_s3_source_id = match app_state.external_service_manager.get_service(id).await {
         Ok(service) => service.continuous_archive_s3_source_id,
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
@@ -1492,6 +1512,17 @@ async fn repoint_continuous_archive_source(
         }
         Err(e @ crate::services::ExternalServiceError::ParameterValidationFailed { .. }) => {
             Err(bad_request().detail(e.to_string()).build())
+        }
+        // Distinct from a plain 500: the physical repoint already
+        // succeeded, so retrying this same request (same body) is the
+        // correct recovery action, not just "something went wrong,
+        // investigate the logs" -- a client that only sees a generic 500
+        // has no way to tell those two situations apart.
+        Err(e @ crate::services::ExternalServiceError::ArchiveSourceDesynced { .. }) => {
+            Err(ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                .title("Archive Source Pin Desynchronized")
+                .detail(e.to_string())
+                .build())
         }
         Err(e) => Err(internal_server_error()
             .detail(format!(

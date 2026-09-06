@@ -202,6 +202,28 @@ pub enum ExternalServiceError {
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
 
+    /// `repoint_continuous_archive_source` physically repoints the
+    /// container's `archive_command` before persisting the new pin -- if the
+    /// persist step then fails (after retrying), the live WAL destination
+    /// and the recorded pin disagree, and every later mirror/restore
+    /// decision keyed on the pin (`temps-cloud`'s `backup_mirror.rs`) is
+    /// wrong until this is reconciled. Kept distinct from `DatabaseError` so
+    /// this specific, actionable state is never mistaken for an ordinary
+    /// transient failure that left nothing inconsistent behind.
+    #[error(
+        "Service {service_id} archiving now writes to S3 source {new_s3_source_id}, but the \
+         database still records the previous source because persisting the pin failed after \
+         {attempts} attempt(s): {reason}. The live WAL destination and the recorded pin are now \
+         out of sync -- repoint to the same source again to reconcile, or fix the underlying \
+         database issue first."
+    )]
+    ArchiveSourceDesynced {
+        service_id: i32,
+        new_s3_source_id: i32,
+        attempts: u32,
+        reason: String,
+    },
+
     #[error("Parameter validation failed for service {service_id}: {reason}")]
     ParameterValidationFailed { service_id: i32, reason: String },
 
@@ -3012,6 +3034,19 @@ impl ExternalServiceManager {
                 reason: format!("S3 source {} does not exist", new_s3_source_id),
             })?;
 
+        // Captured *before* the physical repoint below, not after it
+        // succeeds. `backup_mirror.rs` uses this timestamp as the cutoff for
+        // "this backup's WAL predates the switch, so it can never appear
+        // under the new prefix" -- if it were captured after the physical
+        // change instead, any backup whose base snapshot started in the gap
+        // between "container actually repointed" and "DB write observed"
+        // would be a false positive: its WAL is correctly landing in the new
+        // source already, but it would still get permanently marked
+        // unsupported because its `started_at` predates that later
+        // timestamp. Capturing it first makes it a safe lower bound on the
+        // real switch instant instead.
+        let pin_started_at = chrono::Utc::now();
+
         // Postgres/Timescale needs `archive_command` physically rewritten —
         // WAL-G bakes its destination into the container's environment, so
         // updating the pin alone would be a lie about where archiving
@@ -3112,21 +3147,37 @@ impl ExternalServiceManager {
                 })?;
         }
 
-        let now = chrono::Utc::now();
-        external_services::ActiveModel {
-            id: Set(service.id),
-            continuous_archive_s3_source_id: Set(Some(new_s3_source_id)),
-            continuous_archive_pinned_at: Set(Some(now)),
-            ..Default::default()
+        // The container (when Postgres/Timescale) has already been
+        // physically repointed above -- WAL is now landing in
+        // `new_s3_source_id` regardless of whether this persists. A single
+        // transient DB hiccup right here must not leave that live change
+        // unrecorded, so retry before surfacing the desync as a distinct,
+        // actionable error instead of an ordinary `DatabaseError`.
+        let retry = temps_core::retry::RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::from_millis(200))
+            .with_max_delay(std::time::Duration::from_secs(2));
+        let persisted = retry
+            .retry(|| async {
+                external_services::ActiveModel {
+                    id: Set(service.id),
+                    continuous_archive_s3_source_id: Set(Some(new_s3_source_id)),
+                    continuous_archive_pinned_at: Set(Some(pin_started_at)),
+                    ..Default::default()
+                }
+                .update(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await;
+
+        if let Err(reason) = persisted {
+            return Err(ExternalServiceError::ArchiveSourceDesynced {
+                service_id,
+                new_s3_source_id,
+                attempts: retry.max_attempts,
+                reason,
+            });
         }
-        .update(self.db.as_ref())
-        .await
-        .map_err(|e| ExternalServiceError::DatabaseError {
-            reason: format!(
-                "pinning service {} to continuous archive source {}: {}",
-                service_id, new_s3_source_id, e
-            ),
-        })?;
 
         self.get_service(service_id).await
     }
