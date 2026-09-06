@@ -15,6 +15,7 @@ import {
 import { problemDetail } from './problem-detail'
 import {
   workspaceHarnessOptions,
+  workspaceStatusClickTarget,
   workspaceStatusPresentation,
 } from './workspace-readiness'
 
@@ -142,6 +143,12 @@ describe('WorkspaceStatusIndicator', () => {
     expect(html).toContain('sbx_123')
     expect(html).toContain('running and accessible')
   })
+
+  test('opens the managed workspace panel without crossing into standalone sandbox routes', () => {
+    expect(workspaceStatusClickTarget(true, workspace)).toBe('workspace')
+    expect(workspaceStatusClickTarget(false, workspace)).toBe('workspace')
+    expect(workspaceStatusClickTarget(false, null)).toBeNull()
+  })
 })
 
 describe('ApplicationStartScreen', () => {
@@ -212,14 +219,33 @@ describe('WorkspaceViewTabs', () => {
       />
     )
 
-    expect(html).toContain('grid-cols-3')
+    expect(html).toContain('grid-cols-4')
     expect(html).not.toContain('overflow-x-auto')
     expect(html).toContain('Output')
     expect(html).toContain('Preview')
     expect(html).toContain('Files')
+    expect(html).toContain('Workspace')
     expect(html).not.toContain('Projects')
     expect(html).not.toContain('Settings')
     expect(html).toContain('99+')
+    expect(html).toContain('aria-selected="true"')
+  })
+
+  test('keeps managed workspace status discoverable in the global view', () => {
+    const html = renderToStaticMarkup(
+      <WorkspaceViewTabs
+        activeView="workspace"
+        changedFileCount={0}
+        hasApplication={false}
+        onChange={() => {}}
+      />
+    )
+
+    expect(html).toContain('grid-cols-2')
+    expect(html).toContain('Output')
+    expect(html).toContain('Workspace')
+    expect(html).not.toContain('Preview')
+    expect(html).not.toContain('Files')
     expect(html).toContain('aria-selected="true"')
   })
 })

@@ -32,6 +32,13 @@ export type WorkspaceStatusPresentation = {
   dot: string
 }
 
+export function workspaceStatusClickTarget(
+  hasApplication: boolean,
+  workspace: ApplicationWorkspaceResponse | null
+): 'workspace' | null {
+  return hasApplication || workspace ? 'workspace' : null
+}
+
 export function workspaceStatusPresentation(
   workspace: ApplicationWorkspaceResponse | null,
   loading: boolean,

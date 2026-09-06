@@ -16,6 +16,7 @@ import {
   MonitorPlay,
   Plus,
   RefreshCw,
+  Server,
   ShieldCheck,
   Sparkles,
   Terminal,
@@ -89,6 +90,7 @@ import { ArtifactRenderer } from './ArtifactRenderer'
 import { ApplicationPreviewPanel } from './ApplicationPreviewPanel'
 import { ApplicationProjectsPanel } from './ApplicationProjectsPanel'
 import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSettingsPanel'
+import { GlobalWorkspaceStatusPanel } from './GlobalWorkspaceStatusPanel'
 import { WorkspaceDiffViewer } from './WorkspaceDiffViewer'
 import { shouldRefreshArtifactsForLiveEvent } from './artifact-refresh'
 import { problemDetail } from './problem-detail'
@@ -109,6 +111,7 @@ import {
 
 import {
   workspaceHarnessOptions,
+  workspaceStatusClickTarget,
   workspaceStatusPresentation,
   type WorkspaceHarnessOption as HarnessOption,
 } from './workspace-readiness'
@@ -354,6 +357,10 @@ export function AiFirstWorkspace() {
 
   const activeApplication = applications.find(
     (application) => application.public_id === activeApplicationId
+  )
+  const workspaceStatusTarget = workspaceStatusClickTarget(
+    Boolean(activeApplication),
+    activeWorkspaceStatus
   )
 
   const handleApplicationChange = useCallback(
@@ -1383,7 +1390,7 @@ export function AiFirstWorkspace() {
           <WorkspaceStatusIndicator
             loading={activeWorkspaceStatusLoading}
             onClick={
-              activeApplication
+              workspaceStatusTarget
                 ? () => {
                     setRightView('workspace')
                     if (window.innerWidth < 1280) {
@@ -1878,6 +1885,12 @@ export function AiFirstWorkspace() {
                 onWorkspaceChange={handleWorkspaceStatusChange}
                 waking={activeWorkspaceWaking}
               />
+            ) : rightView === 'workspace' ? (
+              <GlobalWorkspaceStatusPanel
+                loading={activeWorkspaceStatusLoading}
+                waking={activeWorkspaceWaking}
+                workspace={activeWorkspaceStatus}
+              />
             ) : (
               <div className="space-y-3">
                 <div className="mb-4 flex items-center gap-2">
@@ -1965,6 +1978,12 @@ export function AiFirstWorkspace() {
                 key={activeApplication.public_id}
                 onWorkspaceChange={handleWorkspaceStatusChange}
                 waking={activeWorkspaceWaking}
+              />
+            ) : rightView === 'workspace' ? (
+              <GlobalWorkspaceStatusPanel
+                loading={activeWorkspaceStatusLoading}
+                waking={activeWorkspaceWaking}
+                workspace={activeWorkspaceStatus}
               />
             ) : (
               <div className="space-y-3">
@@ -2141,6 +2160,7 @@ export function WorkspaceViewTabs({
           },
         ]
       : []),
+    { view: 'workspace', label: 'Workspace', icon: Server },
   ]
 
   return (
@@ -2148,7 +2168,7 @@ export function WorkspaceViewTabs({
       aria-label="Application workspace views"
       className={cn(
         'grid h-14 shrink-0 border-b border-border bg-card px-1',
-        hasApplication ? 'grid-cols-3' : 'grid-cols-1'
+        hasApplication ? 'grid-cols-4' : 'grid-cols-2'
       )}
       role="tablist"
     >
