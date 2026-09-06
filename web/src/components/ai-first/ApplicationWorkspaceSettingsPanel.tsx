@@ -5,8 +5,10 @@ import {
   Activity,
   Archive,
   ArchiveRestore,
+  Bot,
   Cpu,
   Database,
+  ExternalLink,
   HardDrive,
   Loader2,
   MemoryStick,
@@ -16,6 +18,7 @@ import {
   RotateCw,
   Save,
   Server,
+  Terminal,
 } from 'lucide-react'
 import {
   useCallback,
@@ -25,6 +28,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from 'react'
+import { Link } from 'react-router'
 import {
   controlApplicationWorkspace,
   getApplicationWorkspace,
@@ -32,8 +36,14 @@ import {
   type ApplicationWorkspaceResponse,
 } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
+import {
+  harnessUpgradeCommands,
+  sandboxShellCommand,
+} from './harness-upgrade-commands'
 
 type Props = {
   applicationPublicId: string
@@ -331,6 +341,103 @@ export function ApplicationWorkspaceSettingsPanel({
               </Button>
             </div>
           </section>
+
+          {workspace.sandbox_public_id && (
+            <section className="space-y-3 rounded-xl border border-border p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="flex items-center gap-1.5 text-xs font-medium">
+                    <Bot className="size-3.5" /> Harness maintenance
+                  </p>
+                  <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
+                    Finish active turns, then run an upgrade in this persistent
+                    sandbox. Credentials, sessions, and project files remain in
+                    place.
+                  </p>
+                </div>
+                <Button asChild size="sm" variant="outline">
+                  <Link
+                    rel="noopener noreferrer"
+                    target="_blank"
+                    to={`/sandboxes/${encodeURIComponent(workspace.sandbox_public_id)}`}
+                  >
+                    <ExternalLink className="mr-1 size-3.5" /> Web console
+                  </Link>
+                </Button>
+              </div>
+
+              <div className="rounded-lg border border-border bg-muted/30 p-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="flex items-center gap-2 text-xs font-medium">
+                    <Terminal className="size-4" /> Interactive shell
+                  </span>
+                  <CopyButton
+                    className="size-7 rounded-md"
+                    label="Copy sandbox shell command"
+                    minimal
+                    value={sandboxShellCommand(workspace.sandbox_public_id)}
+                  />
+                </div>
+                <code className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
+                  {sandboxShellCommand(workspace.sandbox_public_id)}
+                </code>
+                <p className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
+                  Run from an authenticated Temps CLI. Detach with Ctrl-P,
+                  Ctrl-Q and reattach with the same command.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                {harnessUpgradeCommands(workspace.sandbox_public_id).map(
+                  (upgrade) => (
+                    <div
+                      className="rounded-lg border border-border bg-muted/30 p-2.5"
+                      key={upgrade.providerId}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex items-center gap-2 text-xs font-medium">
+                          <AiHarnessLogo
+                            providerId={upgrade.providerId}
+                            size={18}
+                          />
+                          {upgrade.name}
+                        </span>
+                        <CopyButton
+                          className="size-7 rounded-md"
+                          label={`Copy ${upgrade.name} upgrade command`}
+                          minimal
+                          value={upgrade.command}
+                        />
+                      </div>
+                      <code className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
+                        {upgrade.command}
+                      </code>
+                      <details className="mt-2 text-[10px] text-muted-foreground">
+                        <summary className="cursor-pointer select-none">
+                          Run as a one-shot CLI command
+                        </summary>
+                        <div className="mt-1.5 flex items-start gap-1.5 rounded bg-background p-2">
+                          <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
+                            {upgrade.cliCommand}
+                          </code>
+                          <CopyButton
+                            className="size-6 shrink-0 rounded"
+                            label={`Copy ${upgrade.name} Temps CLI command`}
+                            minimal
+                            value={upgrade.cliCommand}
+                          />
+                        </div>
+                      </details>
+                    </div>
+                  )
+                )}
+              </div>
+              <p className="text-[10px] leading-4 text-muted-foreground">
+                The updated binary is used by the next harness process. Restart
+                any separately attached interactive harness after upgrading.
+              </p>
+            </section>
+          )}
 
           <section className="space-y-3 rounded-xl border border-border p-3">
             <p className="text-xs font-medium">Desired resources</p>
