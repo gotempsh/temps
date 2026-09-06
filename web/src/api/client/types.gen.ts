@@ -4405,7 +4405,10 @@ export type CreateProjectAccessRequest = {
 /**
  * Request to create a project from a template
  *
- * Supports two deploy modes:
+ * Supports three deploy modes:
+ * * **Native image service mode** — curated service templates deploy a
+ * digest-pinned container image and retain their template release identity,
+ * runtime configuration, and managed-service bindings.
  * * **Fork mode** — when `git_provider_connection_id` is set, the template
  * repo is cloned into a new repository under the user's Git account and the
  * project tracks that fork (git-push deploys, automatic deploy on push).
@@ -4498,11 +4501,13 @@ export type CreateProjectFromTemplateRequest = {
  */
 export type CreateProjectFromTemplateResponse = {
     /**
-     * Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.
+     * Actionable retry guidance when project creation succeeded but deployment
+     * dispatch did not. Internal queue errors are never exposed.
      */
     deployment_error?: string | null;
     /**
-     * Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.
+     * Whether the initial deployment was successfully queued. This is set for
+     * native image service templates; Git-backed modes use their pipeline flow.
      */
     deployment_queued?: boolean | null;
     /**
@@ -4545,7 +4550,8 @@ export type CreateProjectRequest = {
      */
     environment_variables?: Array<ProjectEnvVarInput> | null;
     /**
-     * Exact slug returned by service-template preflight. Normal project creation omits it.
+     * Optimistically reserved slug used by template creation to ensure the
+     * persisted project receives the URL shown during configuration.
      */
     expected_slug?: string | null;
     /**

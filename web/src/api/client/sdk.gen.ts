@@ -4915,9 +4915,9 @@ export const getVisibleCustomDomainByHostname = <ThrowOnError extends boolean = 
 /**
  * Create a new project from a template
  *
- * Creates a new repository from a template and sets up the project with the
- * specified configuration. The template is cloned to a new repository under
- * the authenticated user's account or specified organization.
+ * Image-backed service templates are created directly from their pinned image.
+ * Source-backed starter templates can either use their public repository or
+ * create a repository under the selected Git provider account.
  */
 export const createProjectFromTemplate = <ThrowOnError extends boolean = false>(options: Options<CreateProjectFromTemplateData, ThrowOnError>): RequestResult<CreateProjectFromTemplateResponses, CreateProjectFromTemplateErrors, ThrowOnError> => (options.client ?? client).post<CreateProjectFromTemplateResponses, CreateProjectFromTemplateErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
@@ -7080,9 +7080,8 @@ export const updateServiceTemplateRuntime = <ThrowOnError extends boolean = fals
 });
 
 /**
- * Atomically replace a service-template project's image runtime and resource
- * profile. This endpoint is deliberately separate from generic project
- * settings because these fields form one deployable configuration.
+ * Return the immutable service-template release applied to a project together
+ * with catalog drift, missing requirements, and an available upgrade preview.
  */
 export const getProjectServiceTemplate = <ThrowOnError extends boolean = false>(options: Options<GetProjectServiceTemplateData, ThrowOnError>): RequestResult<GetProjectServiceTemplateResponses, GetProjectServiceTemplateErrors, ThrowOnError> => (options.client ?? client).get<GetProjectServiceTemplateResponses, GetProjectServiceTemplateErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
