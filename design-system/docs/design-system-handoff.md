@@ -21,8 +21,8 @@ bun run dev --port 5183 --host      # http://localhost:5183
 bunx tsc --noEmit -p .              # must be clean before any hand-back
 ```
 
-The reading entry point is `/guide`: one chrome-free page that renders these
-markdown files — this one, `brand-guidelines.md` and `ux-audit-2026-09-06.md` —
+The reading entry point is `/guide`: one page, in the same chrome as every
+reference page, that renders these markdown files — this one, `brand-guidelines.md` and `ux-audit-2026-09-06.md` —
 in the order someone building a screen needs them, with live token swatches,
 the type scale in its real classes, the five status glyphs and an example
 primitive beside the rule it illustrates. The markdown files stay the single
@@ -159,7 +159,8 @@ change is wrong, not the rule.
 
 ## 4. Tokens
 
-All in `src/globals.css`. Blocks, in cascade order:
+All in `op.css`, shipped with the components in `@temps-sdk/op`; the sandbox's
+`src/globals.css` imports it. Blocks, in cascade order:
 
 | Block                        | What it sets                                                   |
 |------------------------------|----------------------------------------------------------------|
@@ -249,7 +250,8 @@ lists by attention. `worst(states)` picks the status line glyph.
 
 ## 6. Components
 
-All in `src/components/op/`, re-exported from `index.ts`. Reference page with
+All in the `@temps-sdk/op` package (`web/packages/op`), imported through the
+one-line re-export at `src/components/op/index.ts`. Reference page with
 every state: `/op-components`. These are what a new screen reaches for first;
 shadcn primitives are for what these do not cover.
 

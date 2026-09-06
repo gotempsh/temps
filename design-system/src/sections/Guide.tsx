@@ -4,14 +4,13 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { useTheme } from 'next-themes'
-import { Moon, Sun } from 'lucide-react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
   Callout, Kbd, KeyValue, Lede, Num, ProjectMark, Section as OpSection, SectionTitle, Status, StatusLine,
   type State,
 } from '@/components/op'
-import { LogoMark } from '@/components/Logo'
+import { useDocToc, useShell } from '@/components/shell-context'
 import { writeToClipboard } from '@/lib/clipboard'
 import { bullets, headings, markedItems, plain, slice, slug, unique } from '@/lib/md'
 import { cn } from '@/lib/utils'
@@ -22,9 +21,12 @@ import auditMd from '../../docs/ux-audit-2026-09-06.md?raw'
 import rulesMd from '../../docs/RULES.md?raw'
 
 /* ────────────────────────────────────────────────────────────────────────
-   /guide — the consolidated design-system guide. One chrome-free page that
-   reads the four markdown documents in `docs/` and puts them in the order a
-   designer or engineer actually needs them.
+   /guide — the consolidated design-system guide. One page that reads the four
+   markdown documents in `docs/` and puts them in the order a designer or
+   engineer actually needs them. It renders inside the app's one shell
+   (`src/components/Layout.tsx`): the shell draws the top bar, the section rail
+   and the "on this page" rail, this file supplies the sections, the search
+   index and the body.
 
    The documents stay the single source of truth. This page never copies
    their prose: it imports them with Vite's `?raw` and slices them at heading
@@ -1562,32 +1564,29 @@ function search(q: string): Entry[] {
 
 // ── page ───────────────────────────────────────────────────────────────
 
-function sectionFromHash(): string {
-  if (typeof window === 'undefined') return SECTIONS[0].id
-  const raw = decodeURIComponent(window.location.hash.replace(/^#/, ''))
+/**
+ * The guide's section list, id and label only: what the shell's left rail
+ * draws. Exported from here so there is one list, and the numbering in the
+ * rail is the numbering of the sections below.
+ */
+export const GUIDE_NAV: readonly { id: string; label: string }[] = SECTIONS.map(({ id, label }) => ({ id, label }))
+
+/**
+ * Which section a hash names. Takes the hash rather than reading it so the
+ * shell, which tracks `hashchange` itself, can ask the same question.
+ */
+export function sectionFromHash(hash?: string): string {
+  const source = hash ?? (typeof window === 'undefined' ? '' : window.location.hash)
+  const raw = decodeURIComponent(source.replace(/^#/, ''))
   const id = raw.split('--')[0]
   return SECTIONS.some((s) => s.id === id) ? id : SECTIONS[0].id
 }
 
-function ThemeToggle() {
-  const { resolvedTheme, setTheme } = useTheme()
-  const isDark = resolvedTheme === 'dark'
-  return (
-    <button
-      type="button"
-      onClick={() => setTheme(isDark ? 'light' : 'dark')}
-      className="flex h-7 w-7 shrink-0 items-center justify-center border hover:bg-muted"
-    >
-      {isDark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-      <span className="sr-only">Switch to {isDark ? 'light' : 'dark'} mode</span>
-    </button>
-  )
-}
-
 export function GuidePage() {
   const [current, setCurrent] = useState<string>(() => sectionFromHash())
-  const [q, setQ] = useState('')
-  const searchRef = useRef<HTMLInputElement>(null)
+  // One filter box for the whole app: the shell owns it and `/` focuses it,
+  // the guide reads the same string to search headings and taste rules.
+  const { query: q, setQuery: setQ } = useShell()
 
   // The hash is the only source of truth for "which section": every rail
   // link, prev/next and heading anchor is a real href, so back and forward
@@ -1608,20 +1607,6 @@ export function GuidePage() {
     return () => window.removeEventListener('hashchange', apply)
   }, [])
 
-  // `/` focuses the filter, the same key the ledgers use. Ignored in inputs.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
-      const t = e.target as HTMLElement | null
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
-      e.preventDefault()
-      searchRef.current?.focus()
-      searchRef.current?.select()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [])
-
   const index = SECTIONS.findIndex((s) => s.id === current)
   const section = SECTIONS[index] ?? SECTIONS[0]
   const prev = SECTIONS[index - 1]
@@ -1632,166 +1617,74 @@ export function GuidePage() {
     [section.id],
   )
 
+  // The right rail is the shell's; the guide tells it what this section holds.
+  useDocToc(onThisPage)
+
   return (
-    <div className="operator ink v1 min-h-screen bg-background text-foreground">
-      <header className="op-sticky sticky top-0 z-30 flex h-12 items-center gap-3 border-b bg-background px-3 sm:px-4">
-        <LogoMark size={18} />
-        <h1 className="shrink-0 text-sm font-semibold tracking-tight">Design system guide</h1>
-        <span className="hidden text-xs text-muted-foreground lg:block">
-          one page over four documents
-        </span>
-        <div className="ml-auto flex items-center gap-2">
-          <label className="flex h-7 items-center gap-2 border px-2 focus-within:outline-2 focus-within:-outline-offset-2 focus-within:outline-ring">
-            <span className="sr-only">Filter the guide</span>
-            <input
-              ref={searchRef}
-              type="search"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') {
-                  setQ('')
-                  e.currentTarget.blur()
-                }
-              }}
-              placeholder="filter headings and taste rules"
-              className="w-28 bg-transparent font-mono text-xs outline-none placeholder:text-muted-foreground sm:w-56"
-            />
-            <Kbd keys="/" className="hidden sm:flex" />
-          </label>
-          <ThemeToggle />
-          <Link to="/brand" className="op-status hidden text-xs sm:block">
-            sandbox
-          </Link>
-        </div>
-      </header>
-
-      {/* Below lg the rail becomes one scrolling row, so a phone loses width, never function. */}
-      <nav aria-label="Guide sections, compact" className="op-scroll-x flex gap-4 border-b px-3 py-2 text-xs lg:hidden">
-        {SECTIONS.map((s) => (
-          <a
-            key={s.id}
-            href={`#${s.id}`}
-            aria-current={s.id === section.id ? 'true' : undefined}
-            className={cn(
-              'shrink-0 whitespace-nowrap',
-              s.id === section.id ? 'font-medium underline underline-offset-4' : 'text-muted-foreground',
-            )}
-          >
-            {s.label}
-          </a>
-        ))}
-      </nav>
-
-      <div className="flex items-start">
-        <nav
-          aria-label="Guide sections"
-          className="sticky top-12 hidden w-56 shrink-0 self-start border-r p-3 text-xs lg:block"
-        >
-          <p className="op-label mb-2 text-muted-foreground">sections</p>
-          <ol className="space-y-0.5">
-            {SECTIONS.map((s, i) => (
-              <li key={s.id}>
-                <a
-                  href={`#${s.id}`}
-                  aria-current={s.id === section.id ? 'true' : undefined}
-                  className={cn(
-                    'flex items-baseline gap-2 px-2 py-1',
-                    s.id === section.id
-                      ? 'bg-muted font-medium'
-                      : 'text-muted-foreground hover:text-foreground',
-                  )}
-                >
-                  <span className="w-4 shrink-0 font-mono text-[11px] tabular-nums">{i + 1}</span>
-                  <span className="min-w-0">{s.label}</span>
-                </a>
-              </li>
-            ))}
-          </ol>
-        </nav>
-
-        <main className="min-w-0 flex-1 px-4 py-6 sm:px-6">
-          {q.trim() ? (
-            <div className="min-w-0">
-              <h2 className="op-h2 text-[1.25rem]">
-                {results.length} {results.length === 1 ? 'match' : 'matches'} for “{q.trim()}”
-              </h2>
-              <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
-                Headings and taste rules. Press <Kbd keys="esc" /> in the box to clear it.
-              </p>
-              {results.length === 0 ? (
-                <p className="mt-4 text-sm text-muted-foreground">
-                  Nothing matches. The guide indexes headings and the 23 taste rules, not every sentence.
-                </p>
-              ) : (
-                <ul className="op-rows mt-4 border">
-                  {results.map((r) => (
-                    <li key={`${r.section}-${r.id}`}>
-                      <a
-                        href={`#${r.id}`}
-                        onClick={() => setQ('')}
-                        className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-3 py-2 text-sm hover:bg-muted"
-                      >
-                        <span className="min-w-0">{r.text}</span>
-                        <span className="op-label ml-auto shrink-0 text-muted-foreground">
-                          {r.kind === 'taste' ? 'taste rule' : r.sectionLabel}
-                        </span>
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+    <>
+      {q.trim() ? (
+        <div className="min-w-0">
+          <h2 className="op-h2 text-[1.25rem]">
+            {results.length} {results.length === 1 ? 'match' : 'matches'} for “{q.trim()}”
+          </h2>
+          <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
+            Headings and taste rules. Press <Kbd keys="esc" /> in the box to clear it.
+          </p>
+          {results.length === 0 ? (
+            <p className="mt-4 text-sm text-muted-foreground">
+              Nothing matches. The guide indexes headings and the 23 taste rules, not every sentence.
+            </p>
           ) : (
-            <article className="min-w-0">
-              <p className="op-label text-muted-foreground">
-                {index + 1} of {SECTIONS.length}
-              </p>
-              <h2 className="op-h2 mt-1 text-[1.5rem]">{section.label}</h2>
-              <p className="op-prose mt-1 max-w-[72ch] font-mono text-xs text-muted-foreground">
-                source · {section.source}
-              </p>
-              <div className="mt-6 min-w-0">{section.body}</div>
-
-              <nav
-                aria-label="Previous and next section"
-                className="mt-12 flex flex-wrap items-baseline justify-between gap-4 border-t pt-4 text-sm"
-              >
-                {prev ? (
-                  <a href={`#${prev.id}`} className="op-status">
-                    ← {prev.label}
+            <ul className="op-rows mt-4 border">
+              {results.map((r) => (
+                <li key={`${r.section}-${r.id}`}>
+                  <a
+                    href={`#${r.id}`}
+                    onClick={() => setQ('')}
+                    className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-3 py-2 text-sm hover:bg-muted"
+                  >
+                    <span className="min-w-0">{r.text}</span>
+                    <span className="op-label ml-auto shrink-0 text-muted-foreground">
+                      {r.kind === 'taste' ? 'taste rule' : r.sectionLabel}
+                    </span>
                   </a>
-                ) : (
-                  <span />
-                )}
-                {next ? (
-                  <a href={`#${next.id}`} className="op-status ml-auto">
-                    {next.label} →
-                  </a>
-                ) : (
-                  <span />
-                )}
-              </nav>
-            </article>
+                </li>
+              ))}
+            </ul>
           )}
-        </main>
+        </div>
+      ) : (
+        <article className="min-w-0">
+          <p className="op-label text-muted-foreground">
+            {index + 1} of {SECTIONS.length}
+          </p>
+          <h2 className="op-h2 mt-1 text-[1.5rem]">{section.label}</h2>
+          <p className="op-prose mt-1 max-w-[72ch] font-mono text-xs text-muted-foreground">
+            source · {section.source}
+          </p>
+          <div className="mt-6 min-w-0">{section.body}</div>
 
-        <nav
-          aria-label="On this page"
-          className="sticky top-12 hidden w-52 shrink-0 self-start p-4 text-xs xl:block"
-        >
-          <p className="op-label mb-2 text-muted-foreground">on this page</p>
-          <ul className="space-y-1">
-            {onThisPage.map((e) => (
-              <li key={e.id}>
-                <a href={`#${e.id}`} className="block truncate text-muted-foreground hover:text-foreground">
-                  {e.text}
-                </a>
-              </li>
-            ))}
-          </ul>
-        </nav>
-      </div>
-    </div>
+          <nav
+            aria-label="Previous and next section"
+            className="mt-12 flex flex-wrap items-baseline justify-between gap-4 border-t pt-4 text-sm"
+          >
+            {prev ? (
+              <a href={`#${prev.id}`} className="op-status">
+                ← {prev.label}
+              </a>
+            ) : (
+              <span />
+            )}
+            {next ? (
+              <a href={`#${next.id}`} className="op-status ml-auto">
+                {next.label} →
+              </a>
+            ) : (
+              <span />
+            )}
+          </nav>
+        </article>
+      )}
+    </>
   )
 }

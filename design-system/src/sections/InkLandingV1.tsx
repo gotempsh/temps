@@ -21,6 +21,7 @@ import { LogoMark } from '@/components/Logo'
 import { ConsoleV1 } from '@/sections/ConsoleV1'
 import { PlatformLogo } from '@/components/platform-logos'
 import { SystemMapSection } from '@/components/system-map-section'
+import { PAGE_BLEED } from '@/components/shell-context'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -249,7 +250,7 @@ export function InkLandingV1Page({ full = false }: { /** Render without the sand
   const SAVINGS: Record<string, string> = { 'Just me': '$3.1k', '2–5': '$9.8k', '6–15': '$31k', '16+': '$74k' }
 
   return (
-    <div className={full ? 'operator ink v1 min-h-screen' : 'operator ink v1 -m-4 sm:-m-6 lg:-m-8'} data-accent="signal">
+    <div className={full ? 'operator ink v1 min-h-screen' : `operator ink v1 ${PAGE_BLEED}`} data-accent="signal">
       {/* Frozen: one accent (signal), on the primary CTA only. No switcher. */}
       {/* Sandbox control, not part of the landing: toggles the chrome-free route. */}
       <Link to={full ? '/v1-landing' : '/landing'} aria-label={full ? 'Exit full screen' : 'Full screen'} title={full ? 'back to the sandbox page' : 'the landing alone, no sandbox chrome'} className="fixed bottom-4 right-4 z-40 inline-flex h-8 w-8 items-center justify-center border bg-background text-foreground shadow-sm hover:bg-muted [&_svg]:h-3.5 [&_svg]:w-3.5">{full ? <Minimize2 /> : <Maximize2 />}</Link>

@@ -6,6 +6,7 @@ import { Link } from 'react-router'
 import { ArrowUp, Bot, Brain, Check, ChevronDown, ShieldOff, Zap, ChevronRight, Copy, Pencil, X, FilePen, FileText, GitBranch, Globe, HelpCircle, ListChecks, ListOrdered, Paperclip, RotateCcw, Search, Square, Terminal, ThumbsDown, ThumbsUp, type LucideIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Drop, EchoDialog, Kbd, MOD, Phrase, Picker, Section, Status, StatusLine, GLYPH, GLYPH_CLASS, type State } from '@/components/op'
+import { PAGE_BLEED } from '@/components/shell-context'
 import { cn } from '@/lib/utils'
 import { writeToClipboard } from '@/lib/clipboard'
 
@@ -17,7 +18,7 @@ import { writeToClipboard } from '@/lib/clipboard'
    Checkpoint, Sources, Actions, Suggestion, Context, PromptInput) re-drawn
    with the five rules: paper and ink, every border ink, one raised element,
    colour only through the five state glyphs, dense. Every block below is a
-   small component so it can move into src/components/op when the console
+   small component so it can move into @temps-sdk/op when the console
    grows an agent surface.
 
    Rules specific to this surface:
@@ -679,7 +680,7 @@ export function AgentChatPage() {
 
   return (
     // Fills the viewport under the docs header (h-14): the transcript column scrolls, the rail stays put.
-    <div className="operator ink v1 -m-4 flex h-[calc(100dvh-3.5rem)] flex-col sm:-m-6 lg:-m-8">
+    <div className={cn('operator ink v1 flex h-[calc(100dvh-3rem)] flex-col', PAGE_BLEED)}>
       <div className="shrink-0 border-b px-4 py-3 text-xs sm:px-6">
         <p className="op-label">agent · an agentic conversation on v1</p>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">

@@ -664,7 +664,7 @@ grid="minmax(0,1.6fr) 180px 120px minmax(0,2fr)"`}
         rule={
           <>
             <p>The old look, once, small and greyed. Each item names what replaces it. These are the only imports from <span className="font-mono">@/components/ui</span> on this page that v1 forbids in new work.</p>
-            <p>If you find yourself reaching for one of these, the replacement is in <span className="font-mono">src/components/op</span>.</p>
+            <p>If you find yourself reaching for one of these, the replacement is in <span className="font-mono">@temps-sdk/op</span>.</p>
           </>
         }
         api={`// §13 Banned: cards as layout, badges, pill tabs,

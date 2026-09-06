@@ -73,6 +73,7 @@ import { useFresh } from './console-fresh'
 import { PROJECT_ICONS as ICONS } from './console-projects'
 import { AnalyticsScreen, EventScreen, MonitorScreen, UptimeScreen } from './ConsoleV1Analytics'
 import { BackupsScreen, GitProvidersScreen, GitProviderScreen, SecurityScreen, ScanScreen } from './ConsoleV1Admin'
+import { PAGE_BLEED } from '@/components/shell-context'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -786,7 +787,7 @@ export function ConsoleV1Page({ full = false }: { /** Render without the sandbox
   const search = params.toString() ? `?${params.toString()}` : ''
   const fullHref = (full ? '/v1' : '/console') + search
   return (
-    <div className={cn('operator ink v1 flex flex-col', full ? 'min-h-screen' : '-m-4 min-h-[calc(100vh-4.5rem)] sm:-m-6 lg:-m-8')}>
+    <div className={cn('operator ink v1 flex flex-col', full ? 'min-h-screen' : `min-h-[calc(100vh-3rem)] ${PAGE_BLEED}`)}>
       {!full && <div className="border-b px-4 py-3 text-xs sm:px-6">
         <p className="op-label">operator console · v1 · the twelve answers as code</p>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">

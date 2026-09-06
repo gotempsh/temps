@@ -45,7 +45,7 @@ import { cn } from '@/lib/utils'
    cross-cutting patterns that every screen has to get right (promote and
    roll back, per-environment variables, time and retention, keyboard).
 
-   Every example here is live and built from src/components/op. Nothing is
+   Every example here is live and built from @temps-sdk/op. Nothing is
    a screenshot and nothing is a placeholder box: if an example cannot be
    made to work, the pattern is not ready to be documented.
 

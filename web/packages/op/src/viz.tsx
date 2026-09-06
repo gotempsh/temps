@@ -331,7 +331,10 @@ export function StackTrace({ frames, className }: { frames: Frame[]; className?:
               <span className="tabular-nums text-muted-foreground">:{f.line}{f.col !== undefined && `:${f.col}`}{f.original && <span className="ml-2 border px-1 text-[10px]">map · {f.original}</span>}</span>
             </button>
             {isOpen && f.context && (
-              <pre className="op-inset overflow-x-auto border-t border-[var(--op-rule-soft)] py-1 text-[11px] leading-5">
+              /* A source excerpt scrolls sideways on a narrow column, so it is
+                 focusable: a scrollable region a keyboard cannot reach is
+                 content a keyboard user cannot read. */
+              <pre tabIndex={0} className="op-inset overflow-x-auto border-t border-[var(--op-rule-soft)] py-1 text-[11px] leading-5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
                 {f.context.map((c) => (
                   <div key={c.line} className={cn('grid grid-cols-[3rem_minmax(0,1fr)] gap-3 px-3', c.line === f.line && 'bg-destructive/10')}>
                     <span className={cn('select-none text-right tabular-nums', c.line === f.line ? 'text-destructive' : 'text-muted-foreground')}>{c.line === f.line && <span aria-hidden>× </span>}{c.line}</span>

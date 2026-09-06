@@ -25,7 +25,7 @@ bun run dev      # http://localhost:5183
 
 | Route | Covers |
 |---|---|
-| `/guide` | The reading entry point: `docs/*.md` rendered as one chrome-free page, with live blocks in place of prose where a rule is better shown than described |
+| `/guide` | The reading entry point: `docs/*.md` rendered as one page, with live blocks in place of prose where a rule is better shown than described |
 | `/brand` | The decided brand: positioning, plan ladder as design input, paper + ink, type role, signature moves, voice |
 | `/foundations` | Type hierarchy by weight, paper/ink tokens (light + dark), colour = status (five states), density and rhythm, radius 0.25rem, motion, responsive rules |
 | `/components` | The primitives under ink: button, input, picker vs select, checkbox/switch, tabs vs segmented, rows, palette, popover/menu, dialog, toast, skeleton, breadcrumb + page title, plus the banned list with replacements |
@@ -41,9 +41,12 @@ Three routes render the same surfaces chrome-free, as a real user would see
 them: `/console`, `/landing` and `/status?project=…`. The ⤢ button in the
 sandbox header toggles between each pair.
 
-`/` redirects to `/brand`. Every route renders under the v1 skin using the
-shared scaffolding in `src/components/op-doc.tsx`; toggle light/dark in the
-header — every surface should look correct in both.
+`/` redirects to `/guide`. Every route above renders inside one shell,
+`src/components/Layout.tsx`: top bar (mark, filter, light/dark), a left rail
+listing the guide's 15 sections and then the reference pages, the page itself
+starting at the column's left edge, and one "on this page" rail on the right
+that the guide and `src/components/op-doc.tsx` both feed. Toggle light/dark in
+the header — every surface should look correct in both.
 
 ## The package
 

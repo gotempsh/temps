@@ -4,7 +4,7 @@
 import { useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { Bot, Link as LinkIcon, Monitor, Rocket, RotateCcw, Search, Share2, Smartphone, Tablet, Trash2 } from 'lucide-react'
-import { Rule } from '@/components/op-doc'
+import { DocPage, Rule } from '@/components/op-doc'
 import {
   Breakdown, Sparkline, StatusStrip, ScoreRing, CalendarHeatmap, Funnel, Flow, Waterfall, StackTrace, LogLines, Stages, Histogram, Live, ProjectMark,
   type Span, type Frame, type LogLine as OpLogLine, type Pct, type StatusBucket, GeoMap, Callout } from '@/components/op'
@@ -86,7 +86,7 @@ const TOC = [
 
 function Block({ id, title, rule, api, children }: { id: string; title: string; rule: ReactNode; api: string; children: ReactNode }) {
   return (
-    <section id={id} className="border-t pt-8">
+    <section id={id} className="scroll-mt-16 border-t pt-8">
       <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
         <div className="min-w-0">
           <h2 className="op-h2">{title}</h2>
@@ -180,16 +180,13 @@ export function OpComponentsPage() {
   ] as LedgerRow[]).filter((r) => r.id.includes(q))
 
   return (
-    <div className="operator ink v1 -m-4 sm:-m-6 lg:-m-8">
-      <div className="border-b px-4 py-3 text-xs sm:px-6">
-        <p className="op-label">operator components · src/components/op</p>
-        <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">
-          The components the three page templates are built from. Each block: the rule, the props that matter, every state. <Link to="/v1" className="underline underline-offset-4">/v1</Link> is these assembled into a console; the handoff document is <span className="font-mono">docs/design-system-handoff.md</span>.
-        </p>
-      </div>
-
-      <div className="mx-auto flex max-w-6xl gap-10 px-4 py-8 sm:px-6">
-        <div className="min-w-0 flex-1 space-y-12">
+    <DocPage
+      eyebrow="operator components · @temps-sdk/op"
+      intro={<>
+        The components the three page templates are built from. Each block: the rule, the props that matter, every state. <Link to="/v1" className="underline underline-offset-4">/v1</Link> is these assembled into a console; the handoff document is <span className="font-mono">docs/design-system-handoff.md</span>.
+      </>}
+      toc={TOC}
+    >
           <Block id="status" title="Status · StatusLine · Phrase" api={`<Status state="warn" label="error rate above 0.5%" />
 <StatusLine state={worst(states)} more={{ label: '+1 warning', items: [
   { state: 'warn', children: <><Phrase onClick={open}>api-gateway</Phrase> error rate 0.61% since dep_91a.</> },
@@ -218,7 +215,7 @@ export function OpComponentsPage() {
               <p className="op-status border-b pb-3 text-sm leading-6 opacity-60"><span className="text-warning">◐</span> <a href="#">6 projects</a> · <span className="text-destructive">×</span> <a href="#">billing-worker failing health checks</a> · <span className="text-warning">◐</span> <a href="#">api-gateway error rate 0.61%</a> · <a href="#">4 deploys today</a> · <a href="#">cert expires in 6d</a></p>
             </Demo>
             <Demo label="still wrong · two clauses, two links, a tail that truncates">
-              <p className="op-status flex items-baseline gap-2 border-b pb-3 text-sm leading-6 opacity-60"><span className="text-destructive">×</span><span className="min-w-0 truncate"><a href="#">billing-worker</a> is failing health checks. <a href="#">api-gateway</a> error rate 0.61% since dep_91a. <span className="text-muted-foreground">4 healthy · cert for cdn.acme.sh expires in 6d</span></span></p>
+              <p className="op-status flex items-baseline gap-2 border-b pb-3 text-sm leading-6 opacity-60"><span className="text-destructive">×</span><span className="min-w-0 truncate"><a href="#">billing-worker</a> is failing health checks. <a href="#">api-gateway</a> error rate 0.61% since dep_91a. <span>4 healthy · cert for cdn.acme.sh expires in 6d</span></span></p>
             </Demo>
           </Block>
 
@@ -492,14 +489,7 @@ served from /api/projects/{id}/icon · fetched after a deploy · monogram until 
             <Demo label="LogLines · toggle debug off"><LogLines lines={VZ_LOG} live height={180} /></Demo>
             <Demo label="Stages · build is running"><Stages stages={VZ_STAGES} /></Demo>
             <Demo label="Histogram · http.server.request.duration"><Histogram buckets={VZ_HIST} unit="ms" value={pct} onChange={setPct} /></Demo>
-          </Block>
-        </div>
-
-        <nav className="sticky top-6 hidden h-fit w-44 shrink-0 text-xs xl:block">
-          <p className="op-label mb-2">on this page</p>
-          {TOC.map(([id, l]) => <a key={id} href={`#${id}`} className="block py-1 text-muted-foreground hover:text-foreground">{l}</a>)}
-        </nav>
-      </div>
-    </div>
+      </Block>
+    </DocPage>
   )
 }

@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import { GLYPH, GLYPH_CLASS, StatusStrip, type State, type StatusBucket } from '@/components/op'
 import { ProjectMark } from '@/components/op'
 import { PROJECT_ICONS } from './console-projects'
+import { PAGE_BLEED } from '@/components/shell-context'
 
 /**
  * The public status page, one per project, published at status.<domain>.
@@ -70,7 +71,7 @@ export function StatusPage({ full = false }: { full?: boolean }) {
   const legend = useMemo(() => (['ok', 'warn', 'error', 'idle', 'sampled'] as State[]).filter((st) => COMPONENTS.some((c) => c.state === st || c.buckets.some((b) => b.state === st))), [])
   const verdict = worst === 'ok' ? 'All systems operational.' : worst === 'warn' ? `${affected.map((c) => c.name).join(' and ')} ${affected.length > 1 ? 'are' : 'is'} degraded.` : `${affected.filter((c) => c.state === 'error').map((c) => c.name).join(' and ')} ${affected.filter((c) => c.state === 'error').length > 1 ? 'are' : 'is'} down${affected.some((c) => c.state === 'warn') ? `; ${affected.filter((c) => c.state === 'warn').map((c) => c.name).join(', ')} degraded` : ''}.`
   return (
-    <div className={full ? 'operator ink v1 min-h-screen' : 'operator ink v1 -m-4 min-h-[calc(100vh-4.5rem)] sm:-m-6 lg:-m-8'}>
+    <div className={full ? 'operator ink v1 min-h-screen' : `operator ink v1 min-h-[calc(100vh-3rem)] ${PAGE_BLEED}`}>
       <Link to={full ? '/status-page' : '/status'} aria-label={full ? 'Exit full screen' : 'Full screen'} className="fixed bottom-4 right-4 z-40 inline-flex h-8 w-8 items-center justify-center border bg-background text-foreground hover:bg-muted [&_svg]:h-3.5 [&_svg]:w-3.5">{full ? <Minimize2 /> : <Maximize2 />}</Link>
       <header className="border-b px-4 sm:px-8">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-4 py-4">
