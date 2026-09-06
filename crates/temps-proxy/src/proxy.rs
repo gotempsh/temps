@@ -2699,25 +2699,51 @@ fn response_body_filter_inner(
     Ok(None)
 }
 
-/// Resolve the client IP for a session from the TCP peer, honoring
-/// `CF-Connecting-IP` only when the peer is a verified Cloudflare egress
-/// address (see `cloudflare_ips`). Returns `None` for non-inet peers (unix
-/// sockets) so callers keep their own fallback.
+/// Resolve the client IP for a session from the TCP peer, honoring CDN
+/// client-IP headers only when the peer is a verified edge address.
 ///
-/// Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers intact —
-/// `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled prefix.
+/// Security invariant: the *peer address* (not any header) determines which
+/// CDN, if any, is trusted. Headers are only consulted for verified peers and
+/// must parse as a bare `IpAddr`; anything else falls back to the peer. This
+/// makes header spoofing from untrusted origins impossible.
+///
+/// Chain:
+/// 1. Cloudflare peer → honor `CF-Connecting-IP` (see `cloudflare_ips`).
+/// 2. Bunny CDN peer → honor `X-Real-IP` (see `bunny_ips`).
+/// 3. All other peers → use peer address directly.
+///
+/// Returns `None` for non-inet peers (unix sockets) so callers keep their own
+/// fallback. Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers
+/// intact — `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled
+/// prefix.
 fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
     let peer = session.client_addr()?.as_inet()?.ip();
-    let cf_connecting_ip = session
-        .req_header()
-        .headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok());
-    Some(
-        crate::cloudflare_ips::CLOUDFLARE_TRUST
-            .resolve_client_ip(peer, cf_connecting_ip)
-            .to_string(),
-    )
+    let headers = &session.req_header().headers;
+
+    // --- Cloudflare: check peer first, then header ---
+    if crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(peer) {
+        let cf_connecting_ip = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok());
+        return Some(
+            crate::cloudflare_ips::CLOUDFLARE_TRUST
+                .resolve_client_ip(peer, cf_connecting_ip)
+                .to_string(),
+        );
+    }
+
+    // --- Bunny CDN: check peer first, then header ---
+    if crate::bunny_ips::BUNNY_TRUST.is_bunny(peer) {
+        let x_real_ip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
+        return Some(
+            crate::bunny_ips::BUNNY_TRUST
+                .resolve_client_ip(peer, x_real_ip)
+                .to_string(),
+        );
+    }
+
+    // --- Direct connection: use peer address ---
+    Some(peer.to_string())
 }
 
 /// Selects the upstream read/write/idle timeout for a proxied request.
@@ -7662,6 +7688,90 @@ mod forwarded_authority_tests {
         assert_eq!(
             request.headers.get("x-unrelated"),
             Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+}
+
+/// Tests for the CDN client-IP resolution chain in `resolve_session_client_ip`.
+///
+/// `PingoraSession` cannot be constructed in isolation in unit tests (it
+/// requires a live I/O object). We therefore test the resolution logic through
+/// the underlying trust-store methods directly — `BunnyIpTrust::resolve_client_ip`
+/// and `CloudflareIpTrust::resolve_client_ip` — which is where the anti-spoofing
+/// invariant and header parsing actually live. This follows the same pattern as
+/// the unit tests in `cloudflare_ips.rs` and `bunny_ips.rs`.
+#[cfg(test)]
+mod cdn_client_ip_tests {
+    use crate::bunny_ips::BunnyIpTrust;
+    use std::collections::HashSet;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn bunny_trust_with(ips: &[&str]) -> BunnyIpTrust {
+        let set: HashSet<IpAddr> = ips.iter().map(|s| ip(s)).collect();
+        BunnyIpTrust::with_ips(set)
+    }
+
+    /// Simulates a request arriving from a Bunny edge IP with a valid
+    /// `X-Real-IP` header. The resolved client IP must be the header value.
+    #[test]
+    fn bunny_edge_peer_with_valid_x_real_ip_uses_header() {
+        let bunny_edge = "185.152.66.10";
+        let real_client = "203.0.113.42";
+        let t = bunny_trust_with(&[bunny_edge]);
+        assert_eq!(
+            t.resolve_client_ip(ip(bunny_edge), Some(real_client)),
+            ip(real_client),
+            "verified Bunny peer must use the X-Real-IP header value"
+        );
+    }
+
+    /// Simulates a direct connection (no CDN): an arbitrary peer with a
+    /// spoofed `X-Real-IP` must NOT be trusted — the peer address is returned.
+    #[test]
+    fn non_bunny_peer_with_spoofed_x_real_ip_uses_peer() {
+        let attacker = "203.0.113.99";
+        let spoofed_client = "10.0.0.1";
+        // Trust set does NOT include the attacker's IP.
+        let t = bunny_trust_with(&["185.152.66.10"]);
+        assert_eq!(
+            t.resolve_client_ip(ip(attacker), Some(spoofed_client)),
+            ip(attacker),
+            "untrusted peer must ignore X-Real-IP even when the header value is valid"
+        );
+    }
+
+    /// A Bunny edge peer with a malformed or missing header falls back to peer.
+    #[test]
+    fn bunny_edge_peer_with_bad_header_falls_back_to_peer() {
+        let bunny_edge = "185.152.66.10";
+        let t = bunny_trust_with(&[bunny_edge]);
+        let peer = ip(bunny_edge);
+        for bad in ["not-an-ip", "1.2.3.4, 5.6.7.8", "1.2.3.4:8080", ""] {
+            assert_eq!(
+                t.resolve_client_ip(peer, Some(bad)),
+                peer,
+                "malformed X-Real-IP {bad:?} must fall back to peer"
+            );
+        }
+        assert_eq!(t.resolve_client_ip(peer, None), peer);
+    }
+
+    /// Verify the Cloudflare trust chain still works correctly alongside Bunny
+    /// (regression guard: adding Bunny must not break the existing CF path).
+    #[test]
+    fn cloudflare_peer_still_uses_cf_connecting_ip() {
+        use crate::cloudflare_ips::CloudflareIpTrust;
+        let t = CloudflareIpTrust::new();
+        // 104.16.1.1 is inside the builtin Cloudflare ranges.
+        let cf_edge = ip("104.16.1.1");
+        let real_client = ip("198.51.100.7");
+        assert_eq!(
+            t.resolve_client_ip(cf_edge, Some("198.51.100.7")),
+            real_client
         );
     }
 }
