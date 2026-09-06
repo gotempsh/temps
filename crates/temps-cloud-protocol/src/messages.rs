@@ -680,6 +680,45 @@ pub struct ManagedNotificationAccepted {
 }
 
 // ---------------------------------------------------------------------------
+// Backup lifecycle — OSS pushes started/completed/failed as they happen, so
+// Cloud can show a live "processing" state instead of waiting to notice the
+// result on its next mirror-sweep poll.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupLifecycleStage {
+    Started,
+    Completed,
+    Failed,
+}
+
+/// A backup lifecycle transition reported by an instance. `instance_id`
+/// binds it to the reporting instance's bearer token the same way every
+/// other backup-scoped call does; `backup_id` is that instance's local
+/// `backups.id`, not globally unique, so Cloud keys its own state on
+/// `(instance_id, backup_id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLifecycleEventRequest {
+    pub instance_id: Uuid,
+    pub backup_id: i32,
+    pub engine: String,
+    pub stage: BackupLifecycleStage,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLifecycleEventAccepted {
+    pub event_id: Uuid,
+}
+
+// ---------------------------------------------------------------------------
 // Liveness
 // ---------------------------------------------------------------------------
 
