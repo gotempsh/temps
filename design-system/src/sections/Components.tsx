@@ -3,7 +3,7 @@
 
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { ArrowUpFromLine, Box, Cpu, Database, ExternalLink, FileText, HardDrive, Loader2, MoreHorizontal, RotateCcw, Rocket, Rows3, Trash2, Waypoints } from 'lucide-react'
+import { ArrowUpFromLine, Box, Cpu, Database, ExternalLink, FileText, HardDrive, Loader2, MoreHorizontal, RotateCcw, Rocket, Trash2, Waypoints } from 'lucide-react'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -844,9 +844,8 @@ export function ComponentsPage() {
                   <CommandShortcut className="text-inherit opacity-60">{MOD} ⏎</CommandShortcut>
                 </CommandItem>
                 <CommandItem className={CMDK_ITEM} onSelect={() => setPaletteOpen(false)}>
-                  <Rows3 aria-hidden className={KIND} />
-                  <span>toggle density</span>
-                  <CommandShortcut className="text-inherit opacity-60">d</CommandShortcut>
+                  <RotateCcw aria-hidden className={KIND} />
+                  <span>roll back api-gateway</span>
                 </CommandItem>
               </CommandGroup>
             </CommandList>
