@@ -302,6 +302,16 @@ reports `configured: false` with a reason and a setup URL over a 404
 that leaves the client unable to distinguish "not built" from
 "not set up".
 
+## Use the design system for redesigned UI
+
+UI built on the operator design system (`@temps-sdk/op` in
+`web/packages/op`, mockups and docs in `design-system/`) follows
+`design-system/docs/RULES.md`. The `temps-design-system` skill
+(`.agents/skills/temps-design-system/SKILL.md`) gives the procedure, the
+verification (`bun run lint`, `bun run e2e` in `design-system/`) and the
+boundary with the legacy `web/src` console, which stays on its current look
+until a screen is migrated whole.
+
 ## Responsive pagination is a shared UI contract
 
 Use `web/src/components/ui/responsive-pagination.tsx` for paginated web lists

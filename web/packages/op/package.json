@@ -1,0 +1,51 @@
+{
+  "name": "@temps-sdk/op",
+  "version": "0.1.2",
+  "type": "module",
+  "description": "The Temps operator design system — the op primitives (records, ledgers, status, viz, page templates) plus the skin they render in, as one self-contained package.",
+  "exports": {
+    ".": "./src/index.ts",
+    "./op.css": "./src/op.css",
+    "./tokens.json": "./tokens.json",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "tokens:check": "node scripts/tokens.mjs check",
+    "tokens:build": "node scripts/tokens.mjs build"
+  },
+  "sideEffects": [
+    "*.css"
+  ],
+  "files": [
+    "src",
+    "scripts",
+    "tokens.json",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "dependencies": {
+    "@radix-ui/react-alert-dialog": "^1.1.23",
+    "@radix-ui/react-dialog": "^1.1.23",
+    "@radix-ui/react-popover": "^1.1.23",
+    "@radix-ui/react-slot": "^1.3.3",
+    "@radix-ui/react-tooltip": "^1.2.16",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "^1.30.0",
+    "react-simple-maps": "^3.0.0",
+    "recharts": "3.10.1",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.6.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.2.4",
+    "@types/react-simple-maps": "^3.0.6",
+    "typescript": "^5.9.2"
+  }
+}
