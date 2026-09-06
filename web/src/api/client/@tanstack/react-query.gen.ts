@@ -9818,9 +9818,9 @@ export const getVisibleCustomDomainByHostnameOptions = (options: Options<GetVisi
 /**
  * Create a new project from a template
  *
- * Creates a new repository from a template and sets up the project with the
- * specified configuration. The template is cloned to a new repository under
- * the authenticated user's account or specified organization.
+ * Image-backed service templates are created directly from their pinned image.
+ * Source-backed starter templates can either use their public repository or
+ * create a repository under the selected Git provider account.
  */
 export const createProjectFromTemplateMutation = (options?: Partial<Options<CreateProjectFromTemplateData>>): UseMutationOptions<CreateProjectFromTemplateResponse2, DefaultError, Options<CreateProjectFromTemplateData>> => {
     const mutationOptions: UseMutationOptions<CreateProjectFromTemplateResponse2, DefaultError, Options<CreateProjectFromTemplateData>> = {
@@ -14200,9 +14200,8 @@ export const updateServiceTemplateRuntimeMutation = (options?: Partial<Options<U
 export const getProjectServiceTemplateQueryKey = (options: Options<GetProjectServiceTemplateData>) => createQueryKey('getProjectServiceTemplate', options);
 
 /**
- * Atomically replace a service-template project's image runtime and resource
- * profile. This endpoint is deliberately separate from generic project
- * settings because these fields form one deployable configuration.
+ * Return the immutable service-template release applied to a project together
+ * with catalog drift, missing requirements, and an available upgrade preview.
  */
 export const getProjectServiceTemplateOptions = (options: Options<GetProjectServiceTemplateData>) => queryOptions<GetProjectServiceTemplateResponse, DefaultError, GetProjectServiceTemplateResponse, ReturnType<typeof getProjectServiceTemplateQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
