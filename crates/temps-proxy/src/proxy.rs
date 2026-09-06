@@ -2855,8 +2855,26 @@ fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
     })
 }
 
-fn strip_untrusted_forwarded_header(request: &mut RequestHeader) {
+/// Strip every client-controlled IP/forwarding header from the request that
+/// is about to be forwarded upstream to the deployed tenant app.
+///
+/// Callers must invoke this only *after* `resolve_session_client_ip` has
+/// already read whatever CDN header it needed from the original inbound
+/// request — the resolved value is then re-emitted as the sole trusted
+/// `X-Forwarded-For` (see the call site's comment). At this trust boundary
+/// `Forwarded`, `X-Real-IP`, and `CF-Connecting-IP` are all client-supplied:
+/// any direct client (bypassing Bunny/Cloudflare entirely) can set them to
+/// an arbitrary value. If left in place, a tenant app that itself reads one
+/// of these headers (very common, e.g. nginx-era `X-Real-IP` convention)
+/// would see the attacker's forged value verbatim instead of the platform's
+/// resolved IP, letting an external client forge how its own request
+/// appears to the tenant's own IP-based logic (rate limiting, geofencing,
+/// abuse detection). Extend this function, not a second call site, if a
+/// future CDN adds another raw client-IP header to the trust chain.
+fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
     request.remove_header("forwarded");
+    request.remove_header("x-real-ip");
+    request.remove_header("cf-connecting-ip");
 }
 
 /// Whether a `Content-Type` value's media type — its "essence", the part
@@ -4999,10 +5017,13 @@ impl ProxyHttp for LoadBalancer {
             return Ok(true); // Skip proxying
         }
 
-        // RFC 7239 Forwarded is client-controlled at this trust boundary. We
-        // emit a complete trusted X-Forwarded-* set below, so do not let an
-        // application prioritize a conflicting client-supplied value.
-        strip_untrusted_forwarded_header(session.req_header_mut());
+        // RFC 7239 Forwarded, X-Real-IP, and CF-Connecting-IP are all
+        // client-controlled at this trust boundary (any direct client can
+        // set them, bypassing Bunny/Cloudflare entirely). We emit a
+        // complete trusted X-Forwarded-* set below from the already-
+        // resolved `ctx.ip_address`, so do not let a tenant app read a raw,
+        // possibly-spoofed client-supplied header instead.
+        strip_untrusted_client_ip_headers(session.req_header_mut());
 
         // Capture request headers
         let request_headers: HashMap<String, String> = session
@@ -7610,7 +7631,7 @@ mod traffic_classification_tests {
 
 #[cfg(test)]
 mod forwarded_authority_tests {
-    use super::{parse_public_authority, strip_untrusted_forwarded_header, PublicAuthority};
+    use super::{parse_public_authority, strip_untrusted_client_ip_headers, PublicAuthority};
     use axum::http::HeaderValue;
     use pingora_http::RequestHeader;
 
@@ -7682,9 +7703,37 @@ mod forwarded_authority_tests {
             .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
             .expect("unrelated test header must be valid");
 
-        strip_untrusted_forwarded_header(&mut request);
+        strip_untrusted_client_ip_headers(&mut request);
 
         assert!(!request.headers.contains_key("forwarded"));
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+
+    /// A direct client that bypasses Bunny/Cloudflare entirely can still set
+    /// `X-Real-IP` / `CF-Connecting-IP` itself. Those raw headers must never
+    /// reach the tenant app upstream — only the platform's own resolved
+    /// `X-Forwarded-For` (set separately by the caller) is trustworthy.
+    #[test]
+    fn removes_client_supplied_cdn_ip_headers() {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        request
+            .insert_header("x-real-ip", HeaderValue::from_static("203.0.113.99"))
+            .expect("X-Real-IP test header must be valid");
+        request
+            .insert_header("cf-connecting-ip", HeaderValue::from_static("203.0.113.99"))
+            .expect("CF-Connecting-IP test header must be valid");
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_client_ip_headers(&mut request);
+
+        assert!(!request.headers.contains_key("x-real-ip"));
+        assert!(!request.headers.contains_key("cf-connecting-ip"));
         assert_eq!(
             request.headers.get("x-unrelated"),
             Some(&HeaderValue::from_static("preserved"))
