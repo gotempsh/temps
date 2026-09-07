@@ -677,13 +677,8 @@ async fn mirror_native_backup(
     let version = service_engine_version(resources.encryption, service);
 
     let (root, selected, engine, format, compression, identity) = match service_type.as_str() {
-        "mongodb" | "mongo" | "redis" => {
+        "mongodb" | "mongo" | "redis" if location_key.trim_end_matches('/').ends_with("/walg") => {
             let root = location_key.trim_end_matches('/').to_string();
-            if !root.ends_with("/walg") {
-                return Err(StageError::Unsupported(format!(
-                    "{service_type} Cloud backups require the WAL-G stream path; got {location}"
-                )));
-            }
             let all = resources
                 .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
                 .await?;
@@ -738,6 +733,56 @@ async fn mirror_native_backup(
                     },
                 )
             }
+        }
+        // No WAL-G in the container at backup time: temps-backup's
+        // RedisEngine/MongodbEngine fall back to a one-shot `redis-cli
+        // --rdb`/`mongodump --archive` dump, gzip it, and upload exactly one
+        // dump object plus a `metadata.json` sidecar -- the same shape
+        // postgres_pgdump uses below. That backup is fully valid and
+        // restorable in OSS; only the WAL-G-specific immutable-identity proof
+        // is unavailable, so it mirrors to Cloud as a plain object set
+        // instead of being permanently excluded. Previously this whole
+        // branch required a `/walg` path and returned `Unsupported` forever
+        // for any non-WAL-G Redis/MongoDB backup, even though nothing about
+        // the dump itself makes it structurally unmirrorable.
+        "mongodb" | "mongo" | "redis" => {
+            let root = location_key
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .ok_or_else(|| {
+                    StageError::Unsupported(format!(
+                        "{service_type} dump location {location_key} has no parent directory"
+                    ))
+                })?;
+            let metadata_key = format!("{root}/metadata.json");
+            let all = resources
+                .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+                .await?;
+            let selected = all
+                .iter()
+                .filter(|object| object.key == location_key || object.key == metadata_key)
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.len() < 2 || !selected.iter().any(|object| object.key == metadata_key) {
+                return Err(StageError::Retry(format!(
+                    "{service_type} dump {location_key} is incomplete or lacks {metadata_key}"
+                )));
+            }
+            let (engine, format) = if service_type == "redis" {
+                (BackupEngine::Redis, BackupFormat::RedisRdb)
+            } else {
+                (BackupEngine::MongoDb, BackupFormat::MongoDumpArchive)
+            };
+            (
+                root,
+                selected,
+                engine,
+                format,
+                BackupCompression::Gzip,
+                NativeSnapshotIdentity::ObjectSet {
+                    snapshot_name: backup.backup_id.clone(),
+                },
+            )
         }
         "mariadb" => {
             let root = location_key.trim_end_matches('/').to_string();
@@ -3302,6 +3347,176 @@ mod tests {
                 "pg_dump-tagged backup was rejected instead of routed to native mirroring \
                  (this is the exact bug under test — dispatch fell through to WAL-G's synchronous \
                  \"not a WAL-G repository\" check, which runs before any I/O and can only produce \
+                 Unsupported, never Retry): {reason}"
+            ),
+        }
+    }
+
+    /// Redis/MongoDB fall back to a one-shot logical dump (`redis-cli
+    /// --rdb`/`mongodump --archive`) whenever the container has no wal-g in
+    /// it, uploading a single object under a location that does NOT end in
+    /// `/walg`. Before this fix, `mirror_native_backup`'s combined
+    /// `"redis"|"mongodb"` arm required a `/walg` root unconditionally and
+    /// returned `Unsupported` — a *permanent* rejection — for every such
+    /// backup, with no I/O at all. The fallback arm added by this fix
+    /// reaches its own repository-listing S3 call instead, which fails with
+    /// `Retry` against the closed loopback endpoint below. As in the
+    /// pg_dump test above, that distinction (`Retry` vs. synchronous
+    /// `Unsupported`) is proof of taking the right path without a working
+    /// S3 backend.
+    #[tokio::test]
+    async fn redis_logical_fallback_backups_route_to_native_mirror_not_walg() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+            schema.create_table_from_entity(temps_entities::external_service_backups::Entity),
+            schema.create_table_from_entity(temps_entities::external_services::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite fixture table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated foreign keys");
+
+        let encryption = temps_core::EncryptionService::new_from_password("redis-fallback-test");
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("Temps Cloud managed backups".to_owned()),
+            bucket_name: Set("managed-bucket".to_owned()),
+            region: Set("test-1".to_owned()),
+            backing_service_id: Set(None),
+            // A closed loopback port: any S3 call this test reaches fails
+            // fast with connection-refused instead of hanging or reaching
+            // real AWS, per the convention documented on `linked_link_fixture`.
+            endpoint: Set(Some("http://127.0.0.1:1".to_owned())),
+            bucket_path: Set(String::new()),
+            access_key_id: Set(encryption
+                .encrypt_string("test-access-key")
+                .expect("encrypt fixture access key")),
+            secret_key: Set(encryption
+                .encrypt_string("test-secret-key")
+                .expect("encrypt fixture secret key")),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("S3 source inserts");
+        temps_entities::external_services::Model {
+            id: 1,
+            name: "redis".to_owned(),
+            service_type: "redis".to_owned(),
+            version: Some("7".to_owned()),
+            status: "running".to_owned(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_owned(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service inserts");
+        let backup_uuid = Uuid::new_v4().to_string();
+        let s3_location = format!(
+            "s3://managed-bucket/external_services/redis/redis/2026/09/04/{backup_uuid}/dump.rdb.gz"
+        );
+        temps_entities::external_service_backups::Model {
+            id: 1,
+            service_id: 1,
+            backup_id: 1,
+            backup_type: "full".to_owned(),
+            state: "completed".to_owned(),
+            started_at: now,
+            finished_at: Some(now),
+            size_bytes: Some(1),
+            s3_location: s3_location.clone(),
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "gzip".to_owned(),
+            created_by: 1,
+            expires_at: None,
+            service_name_snapshot: None,
+            service_type_snapshot: None,
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .expect("external service backup inserts");
+        let backup = temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("redis-fallback-backup".to_owned()),
+            backup_id: Set(backup_uuid),
+            schedule_id: Set(None),
+            backup_type: Set("full".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1)),
+            file_count: Set(Some(1)),
+            s3_source_id: Set(1),
+            s3_location: Set(s3_location),
+            error_message: Set(None),
+            metadata: Set(serde_json::json!({"engine": "redis"}).to_string()),
+            checksum: Set(None),
+            compression_type: Set("gzip".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("redis-fallback backup inserts");
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        let instance_id = link.instance_id().expect("linked instance id");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("closed loopback source can never actually mirror in this test");
+        match error {
+            StageError::Retry(_) => {}
+            StageError::Unsupported(reason) => panic!(
+                "redis logical-fallback backup (no /walg root) was permanently rejected instead \
+                 of routed to native mirroring (this is the exact bug under test — dispatch fell \
+                 through to the /walg-only guard, which runs before any I/O and can only produce \
                  Unsupported, never Retry): {reason}"
             ),
         }
