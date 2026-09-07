@@ -430,7 +430,16 @@ async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> a
     // convention), so blanket-demoting is_managed = TRUE here would also
     // demote real ownership and cause reconciliation to create a duplicate
     // managed monitor on the next boot. See that migration's file comment.
-    Migrator::up(&db, None).await?;
+    //
+    // Apply up through m20260904_000001 specifically, not `None` (every
+    // registered migration) — later migrations added after it would
+    // otherwise become the target of the `Some(1)` down()/up() calls below.
+    let reset_target = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let reset_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == reset_target)
+        .unwrap_or_else(|| panic!("migration {reset_target} not found in Migrator"));
+    Migrator::up(&db, Some(reset_target_count as u32 + 1)).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
     let preserved = db
         .query_one(sea_orm::Statement::from_string(
@@ -508,9 +517,16 @@ async fn test_managed_monitor_migration_down_restores_state_from_previous_up_imp
     ))
     .await?;
 
-    // Run every migration, including the current no-op up() for
-    // m20260904_000001, so it's recorded as applied.
-    Migrator::up(&db, None).await?;
+    // Apply up through m20260904_000001 specifically (its current no-op
+    // up()), not `None` (every registered migration) — otherwise a later
+    // migration becomes the target of the `down(&db, Some(1))` call below
+    // instead of the one this test means to roll back.
+    let target = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(target_count as u32 + 1)).await?;
 
     db.execute_unprepared(
         "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
