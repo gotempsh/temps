@@ -1912,9 +1912,33 @@ impl ApplicationService {
         page_size: u64,
         status: &str,
     ) -> Result<Vec<ApplicationWithProjects>, ApplicationError> {
-        let applications = ai_applications::Entity::find()
+        self.list_with_status_and_visibility(user_id, page, page_size, status, None)
+            .await
+    }
+
+    /// List one lifecycle state after applying the caller's application
+    /// visibility allowlist in SQL. Authorization must precede pagination: if
+    /// an inaccessible application is removed after `LIMIT`, a short response
+    /// can incorrectly tell clients that no later visible page exists.
+    pub(crate) async fn list_with_status_and_visibility(
+        &self,
+        user_id: i32,
+        page: u64,
+        page_size: u64,
+        status: &str,
+        visible_application_ids: Option<&[i64]>,
+    ) -> Result<Vec<ApplicationWithProjects>, ApplicationError> {
+        if visible_application_ids.is_some_and(<[i64]>::is_empty) {
+            return Ok(Vec::new());
+        }
+        let mut query = ai_applications::Entity::find()
             .filter(ai_applications::Column::CreatedBy.eq(user_id))
-            .filter(ai_applications::Column::Status.eq(status))
+            .filter(ai_applications::Column::Status.eq(status));
+        if let Some(visible_application_ids) = visible_application_ids {
+            query = query
+                .filter(ai_applications::Column::Id.is_in(visible_application_ids.iter().copied()));
+        }
+        let applications = query
             .order_by_desc(ai_applications::Column::UpdatedAt)
             .offset(page.saturating_sub(1).saturating_mul(page_size))
             .limit(page_size)
@@ -1990,6 +2014,55 @@ impl ApplicationService {
                 }
             })
             .collect())
+    }
+
+    /// Load every candidate application topology, optionally in one lifecycle
+    /// state, for a user's authorization preflight. Active applications are
+    /// quota-bounded, while archived applications may accumulate without that
+    /// bound. Page-number pagination therefore has to consider the full
+    /// candidate set before applying an authorization-aware offset.
+    pub(crate) async fn project_scopes_for_listing(
+        &self,
+        user_id: i32,
+        status: Option<&str>,
+    ) -> Result<HashMap<i64, ApplicationProjectScope>, ApplicationError> {
+        let mut query =
+            ai_applications::Entity::find().filter(ai_applications::Column::CreatedBy.eq(user_id));
+        if let Some(status) = status {
+            query = query.filter(ai_applications::Column::Status.eq(status));
+        }
+        let applications = query.all(self.db.as_ref()).await?;
+        let application_ids = applications
+            .iter()
+            .map(|application| application.id)
+            .collect::<Vec<_>>();
+        let links = if application_ids.is_empty() {
+            Vec::new()
+        } else {
+            ai_application_projects::Entity::find()
+                .filter(ai_application_projects::Column::ApplicationId.is_in(application_ids))
+                .order_by_asc(ai_application_projects::Column::Id)
+                .all(self.db.as_ref())
+                .await?
+        };
+        let mut scopes = applications
+            .into_iter()
+            .map(|application| {
+                (
+                    application.id,
+                    ApplicationProjectScope {
+                        public_id: application.public_id,
+                        project_ids: Vec::new(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for link in links {
+            if let Some(scope) = scopes.get_mut(&link.application_id) {
+                scope.project_ids.push(link.project_id);
+            }
+        }
+        Ok(scopes)
     }
 
     /// Compensating action used only while application creation is still in
@@ -2955,6 +3028,110 @@ mod tests {
         assert!(statements[0].contains("LIMIT") && statements[0].contains("OFFSET"));
         assert!(statements[1].contains("status"));
         assert!(statements[1].contains("LIMIT") && statements[1].contains("OFFSET"));
+    }
+
+    #[tokio::test]
+    async fn application_visibility_is_applied_in_sql_before_pagination() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+
+        assert!(service
+            .list_with_status_and_visibility(7, 2, 5, "active", Some(&[11, 13]))
+            .await
+            .expect("visible application page")
+            .is_empty());
+
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"ai_applications\".\"id\" IN"));
+        assert!(sql.contains("LIMIT") && sql.contains("OFFSET"));
+    }
+
+    #[tokio::test]
+    async fn empty_application_visibility_skips_the_paginated_query() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = ApplicationService::new(db.clone());
+
+        assert!(service
+            .list_with_status_and_visibility(7, 1, 5, "active", Some(&[]))
+            .await
+            .expect("empty visible application page")
+            .is_empty());
+
+        drop(service);
+        assert!(Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn archived_visibility_preflight_is_not_truncated_to_the_active_workspace_quota() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+
+        assert!(service
+            .project_scopes_for_listing(7, Some("archived"))
+            .await
+            .expect("archived application visibility candidates")
+            .is_empty());
+
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"status\" ="));
+        assert!(!sql.contains("LIMIT"));
+        assert!(!sql.contains("OFFSET"));
+    }
+
+    #[tokio::test]
+    async fn conversation_visibility_preflight_includes_every_application_lifecycle() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+
+        assert!(service
+            .project_scopes_for_listing(7, None)
+            .await
+            .expect("all application visibility candidates")
+            .is_empty());
+
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"created_by\""));
+        assert!(!sql.contains("\"status\" ="));
+        assert!(!sql.contains("LIMIT"));
     }
 
     #[tokio::test]

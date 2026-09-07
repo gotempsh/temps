@@ -16,8 +16,9 @@ use chrono::Utc;
 use futures::{future::BoxFuture, Stream};
 use futures_util::StreamExt;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    sea_query::{Expr, Query},
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 
 use temps_ai::{
@@ -473,7 +474,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 use temps_auth::context::AuthContext;
-use temps_entities::{ai_conversations, ai_messages};
+use temps_entities::{ai_conversations, ai_messages, projects};
 
 use temps_ai_api_tools::{
     ApiCallScope, ProjectSelectorScope, WriteApiToolsHandle, WritePrepareOutcome,
@@ -1831,12 +1832,48 @@ impl ConversationService {
         page: u64,
         page_size: u64,
     ) -> Result<Vec<ConversationWithProject>, ChatError> {
+        self.list_all_conversations_with_visibility(
+            user_id,
+            hidden_project_ids,
+            status,
+            global_only,
+            page,
+            page_size,
+            None,
+            &[],
+        )
+        .await
+    }
+
+    /// Paginate only rows the caller may see. Application visibility comes
+    /// from the request-time project authorization preflight and context
+    /// visibility from the caller's current role; both filters must be part
+    /// of the SQL query before `OFFSET/LIMIT`, otherwise a filtered short page
+    /// can strand visible conversations behind it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_all_conversations_with_visibility(
+        &self,
+        user_id: i32,
+        hidden_project_ids: &[i32],
+        status: &str,
+        global_only: bool,
+        page: u64,
+        page_size: u64,
+        visible_application_ids: Option<&[i64]>,
+        hidden_context_types: &[&str],
+    ) -> Result<Vec<ConversationWithProject>, ChatError> {
+        let existing_project_ids = Query::select()
+            .column(projects::Column::Id)
+            .from(projects::Entity)
+            .to_owned();
         let mut query = ai_conversations::Entity::find()
             .filter(ai_conversations::Column::CreatedBy.eq(user_id))
             .filter(ai_conversations::Column::Status.eq(status))
-            .order_by_desc(ai_conversations::Column::LastActivityAt)
-            .offset(page.saturating_sub(1).saturating_mul(page_size))
-            .limit(page_size.min(Self::LIST_ALL_LIMIT));
+            .filter(
+                Condition::any()
+                    .add(ai_conversations::Column::ProjectId.is_null())
+                    .add(ai_conversations::Column::ProjectId.in_subquery(existing_project_ids)),
+            );
         if global_only {
             query = query
                 .filter(ai_conversations::Column::ProjectId.is_null())
@@ -1853,7 +1890,29 @@ impl ConversationService {
                     ),
             );
         }
-        let convs = query.all(self.db.as_ref()).await?;
+        if let Some(visible_application_ids) = visible_application_ids {
+            let mut application_visibility =
+                Condition::any().add(ai_conversations::Column::ContextType.ne("application"));
+            if !visible_application_ids.is_empty() {
+                application_visibility = application_visibility.add(
+                    ai_conversations::Column::ApplicationId
+                        .is_in(visible_application_ids.iter().copied()),
+                );
+            }
+            query = query.filter(application_visibility);
+        }
+        if !hidden_context_types.is_empty() {
+            query = query.filter(
+                ai_conversations::Column::ContextType
+                    .is_not_in(hidden_context_types.iter().copied()),
+            );
+        }
+        let convs = query
+            .order_by_desc(ai_conversations::Column::LastActivityAt)
+            .offset(page.saturating_sub(1).saturating_mul(page_size))
+            .limit(page_size.min(Self::LIST_ALL_LIMIT))
+            .all(self.db.as_ref())
+            .await?;
 
         let mut ids: Vec<i32> = convs.iter().filter_map(|c| c.project_id).collect();
         ids.sort_unstable();
@@ -1861,8 +1920,8 @@ impl ConversationService {
         let projects = if ids.is_empty() {
             Vec::new()
         } else {
-            temps_entities::projects::Entity::find()
-                .filter(temps_entities::projects::Column::Id.is_in(ids))
+            projects::Entity::find()
+                .filter(projects::Column::Id.is_in(ids))
                 .all(self.db.as_ref())
                 .await?
         };
@@ -1873,18 +1932,13 @@ impl ConversationService {
 
         Ok(convs
             .into_iter()
-            .filter(|conversation| {
-                conversation
-                    .project_id
-                    .is_none_or(|project_id| !hidden_project_ids.contains(&project_id))
-            })
             .filter_map(|c| {
                 let info = c
                     .project_id
                     .and_then(|project_id| by_id.get(&project_id).cloned());
-                // Exclude only conversations whose project is missing. Project
-                // membership filtering is supplied by the caller; the legacy
-                // per-project chat toggle is deliberately ignored.
+                // Missing projects are excluded in SQL before pagination. Keep
+                // this defensive check for the narrow race where a project is
+                // deleted between the page query and metadata enrichment.
                 match info {
                     Some((name, slug)) => Some(ConversationWithProject {
                         project_name: Some(name),
@@ -8810,6 +8864,76 @@ mod tests {
         assert!(sql.contains("project_id") && sql.contains("IS NULL"));
         assert!(sql.contains("application_id") && sql.contains("IS NULL"));
         assert!(sql.contains("context_type"));
+        assert!(sql.contains("LIMIT") && sql.contains("OFFSET"));
+    }
+
+    #[tokio::test]
+    async fn conversation_visibility_is_applied_in_sql_before_pagination() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_conversations::Model>::new()])
+                .into_connection(),
+        );
+        let service = db_service_from_arc(db.clone());
+
+        assert!(service
+            .list_all_conversations_with_visibility(
+                5,
+                &[7],
+                "active",
+                false,
+                2,
+                25,
+                Some(&[11, 13]),
+                &["deployment"],
+            )
+            .await
+            .expect("visibility-filtered conversation page")
+            .is_empty());
+
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"project_id\" NOT IN"));
+        assert!(sql.contains("\"project_id\" IN (SELECT \"id\" FROM \"projects\")"));
+        assert!(sql.contains("\"context_type\" <>"));
+        assert!(sql.contains("\"application_id\" IN"));
+        assert!(sql.contains("\"context_type\" NOT IN"));
+        assert!(sql.contains("LIMIT") && sql.contains("OFFSET"));
+    }
+
+    #[tokio::test]
+    async fn empty_application_visibility_excludes_application_conversations_before_pagination() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_conversations::Model>::new()])
+                .into_connection(),
+        );
+        let service = db_service_from_arc(db.clone());
+
+        assert!(service
+            .list_all_conversations_with_visibility(5, &[], "active", false, 1, 25, Some(&[]), &[],)
+            .await
+            .expect("non-application conversation page")
+            .is_empty());
+
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"context_type\" <>"));
+        assert!(!sql.contains("\"application_id\" IN"));
         assert!(sql.contains("LIMIT") && sql.contains("OFFSET"));
     }
 

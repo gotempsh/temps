@@ -1645,6 +1645,55 @@ async fn application_list_access(
     Ok((scopes, access))
 }
 
+/// Resolve every application visible in the requested candidate set before a
+/// list is paginated. This prevents inaccessible rows from consuming a page.
+/// Active applications are quota-bounded; archived applications require the
+/// full candidate set because page-number offsets are defined over visible
+/// rows.
+async fn visible_application_ids_for_listing(
+    state: &AppState,
+    auth: &AuthContext,
+    status: Option<&str>,
+) -> Result<Vec<i64>, Problem> {
+    let scopes = state
+        .applications
+        .project_scopes_for_listing(auth.user_id(), status)
+        .await?;
+    let project_ids = scopes
+        .values()
+        .flat_map(|scope| scope.project_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let access =
+        application_project_access_map(auth, &state.project_access_checker, &project_ids).await?;
+    let mut visible = Vec::with_capacity(scopes.len());
+    for (application_id, scope) in scopes {
+        let application_visible = access.as_ref().is_none_or(|access| {
+            scope
+                .project_ids
+                .iter()
+                .all(|project_id| access.get(project_id).copied().unwrap_or(false))
+        });
+        if application_visible {
+            visible.push(application_id);
+        } else {
+            quarantine_application_workspace(state, auth.user_id(), &scope.public_id).await;
+        }
+    }
+    visible.sort_unstable();
+    Ok(visible)
+}
+
+fn hidden_conversation_context_types(auth: &AuthContext) -> Vec<&'static str> {
+    let mut hidden = Vec::with_capacity(3);
+    if !auth.has_permission(&Permission::OtelRead) {
+        hidden.extend(["alert", "alert_suggest"]);
+    }
+    if !auth.has_permission(&Permission::DeploymentsRead) {
+        hidden.push("deployment");
+    }
+    hidden
+}
+
 /// Resolve visibility from a topology/access snapshot loaded once per list.
 async fn application_conversation_is_visible(
     state: &AppState,
@@ -1688,36 +1737,24 @@ pub async fn list_applications(
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let (page, page_size) = normalize_list_pagination(query.page, query.page_size);
+    let visible_application_ids =
+        visible_application_ids_for_listing(&state, &auth, Some(query.status.as_str())).await?;
     let applications = state
         .applications
-        .list_with_status(auth.user_id(), page, page_size, query.status.as_str())
+        .list_with_status_and_visibility(
+            auth.user_id(),
+            page,
+            page_size,
+            query.status.as_str(),
+            Some(&visible_application_ids),
+        )
         .await?;
-    let project_ids = applications
-        .iter()
-        .flat_map(|application| application.projects.iter().map(|project| project.id))
-        .collect::<Vec<_>>();
-    let access =
-        application_project_access_map(&auth, &state.project_access_checker, &project_ids).await?;
-    let mut visible = Vec::with_capacity(applications.len());
-    for application in applications {
-        let application_visible = access.as_ref().is_none_or(|access| {
-            application
-                .projects
-                .iter()
-                .all(|project| access.get(&project.id).copied().unwrap_or(false))
-        });
-        if application_visible {
-            visible.push(ApplicationResponse::from(application));
-        } else {
-            quarantine_application_workspace(
-                &state,
-                auth.user_id(),
-                &application.application.public_id,
-            )
-            .await;
-        }
-    }
-    Ok(Json(visible))
+    Ok(Json(
+        applications
+            .into_iter()
+            .map(ApplicationResponse::from)
+            .collect(),
+    ))
 }
 
 #[utoipa::path(
@@ -4893,42 +4930,31 @@ pub async fn list_all_conversations(
     let (page, page_size) = normalize_list_pagination(query.page, query.page_size);
     let hidden_project_ids =
         hidden_conversation_project_ids(&auth, &state.project_access_checker).await?;
+    let visible_application_ids = if query.scope == ConversationListScope::All {
+        // Conversation lifecycle is independent from application lifecycle:
+        // archived threads may belong to archived applications, while an
+        // active thread can outlive an application archive race. Authorize
+        // against every application owned by the caller.
+        Some(visible_application_ids_for_listing(&state, &auth, None).await?)
+    } else {
+        None
+    };
+    let hidden_context_types = hidden_conversation_context_types(&auth);
     let items = state
         .service
-        .list_all_conversations_filtered(
+        .list_all_conversations_with_visibility(
             auth.user_id(),
             &hidden_project_ids,
             query.status.as_str(),
             query.scope == ConversationListScope::Global,
             page,
             page_size,
+            visible_application_ids.as_deref(),
+            &hidden_context_types,
         )
         .await?;
-    let application_ids = items
-        .iter()
-        .filter_map(|item| item.conversation.application_id)
-        .collect::<Vec<_>>();
-    let (application_scopes, application_access) =
-        application_list_access(&state, &auth, &application_ids).await?;
     let mut conversations = Vec::with_capacity(items.len());
     for item in items {
-        if !can_read_context(&auth, &item.conversation.context_type) {
-            continue;
-        }
-        if !application_conversation_is_visible(
-            &state,
-            &auth,
-            &item.conversation,
-            &application_scopes,
-            &application_access,
-        )
-        .await?
-        {
-            // Global lists should remain useful when a collaborator loses
-            // access to one member project; omit the now-inaccessible thread
-            // rather than leaking its name, title, or activity.
-            continue;
-        }
         conversations.push(GlobalConversationResponse {
             public_id: item.conversation.public_id,
             project_id: item.conversation.project_id,
