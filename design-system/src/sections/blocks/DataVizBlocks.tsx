@@ -3,6 +3,7 @@
 
 import type { ReactNode } from 'react'
 import { ChartFooter, TimeChart, type Series, type TimePoint } from '@/components/op'
+import { useBlockFilter } from '@/components/op-doc'
 
 /**
  * The data-visualisation rules, drawn. Companion to `docs/data-viz.md`:
@@ -13,6 +14,10 @@ import { ChartFooter, TimeChart, type Series, type TimePoint } from '@/component
 
 /** Same shape as `OpComponents.tsx`'s Block; local so the two files stay independent. */
 function Block({ id, title, rule, api, children }: { id: string; title: string; rule: ReactNode; api: string; children: ReactNode }) {
+  // `/guide` renders one of these beside its own prose; see `OneDemo` in op-doc.
+  const show = useBlockFilter(id)
+  if (show === 'hide') return null
+  if (show === 'demos') return <div className="min-w-0 space-y-4">{children}</div>
   return (
     <section id={id} className="scroll-mt-16 border-t pt-8">
       <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">

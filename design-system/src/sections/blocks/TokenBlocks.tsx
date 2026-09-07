@@ -389,12 +389,15 @@ export function MotionBlock() {
               shimmering, anything decorative.
             </p>
             <p>
-              Two exceptions exist today and are written down in{' '}
+              Three exceptions exist today and are written down in{' '}
               <span className="font-mono">docs/motion.md</span>: the permanent hard 3px{' '}
-              <span className="font-mono">.op-raise</span> offset, which never lifts, and the two
-              animations the blanket rule excludes by selector —{' '}
-              <span className="font-mono">animate-pulse</span> (skeletons) and{' '}
-              <span className="font-mono">animate-spin</span> (the retry button).
+              <span className="font-mono">.op-raise</span> offset, which never lifts;{' '}
+              <span className="font-mono">.op-pulse</span>, the slow opacity-only breath on a{' '}
+              <span className="font-mono">running</span> glyph, which is the only motion in the system
+              that says something (work is happening now, and it stops when the work stops); and{' '}
+              <span className="font-mono">animate-pulse</span> on skeletons. All three are lifted out of
+              the blanket rule by selector. <span className="font-mono">animate-spin</span> is no longer
+              an exception: a spinner is legitimate inline on a submitting button and nowhere else.
             </p>
           </>
         }

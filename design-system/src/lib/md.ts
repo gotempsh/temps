@@ -77,6 +77,40 @@ export function headings(md: string): Heading[] {
   return out
 }
 
+export type Subsection = { title: string; body: string }
+
+/**
+ * Split a document body into one entry per heading at `depth`, with anything
+ * before the first one returned as a leading entry with an empty title.
+ *
+ * The guide needs this cut for the sections that describe components: each
+ * subsection is a component, and it has to be laid out beside *its own* live
+ * demo rather than under a run of all of them. `slice()` cuts one named
+ * region; this cuts every region at a level, in order, without naming them.
+ */
+export function subsections(md: string, depth: number): Subsection[] {
+  const lines = md.split('\n')
+  const fenced = withoutFences(lines)
+  const head = new RegExp(`^#{${depth}}\\s+(.*)$`)
+  const out: Subsection[] = [{ title: '', body: '' }]
+  const buf: string[][] = [[]]
+  lines.forEach((line, i) => {
+    // `^#{2}\s` cannot match `### x` (the third hash is not whitespace), so a
+    // deeper heading stays inside the subsection it belongs to. Only this
+    // level cuts, and a heading inside a fence never cuts at all.
+    const m = fenced[i] ? null : head.exec(line)
+    if (m) {
+      out.push({ title: plain(m[1]), body: '' })
+      buf.push([])
+      return
+    }
+    buf[buf.length - 1].push(line)
+  })
+  return out
+    .map((s, i) => ({ ...s, body: buf[i].join('\n').trim() }))
+    .filter((s) => s.title !== '' || s.body !== '')
+}
+
 export type Bullet = { title: string; body: string }
 
 /**

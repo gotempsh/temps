@@ -23,6 +23,7 @@ Libraries actually in use: `recharts` 3.10 (only charting lib, wrapped by
 | Projects, deployments, env vars | list, detail, stages + build logs, runtime logs, env, domains | list, detail, env matrix, deployment record (`deploy:<tag>`) with phased pipeline + per-step logs, build/runtime log facets, checks | virtualised ANSI log viewer, domains/ACME |
 | Analytics | overview tiles + hourly chart + 10 breakdown cards with drill-down, dimension list with bars, pages with sparklines, page detail, journey, funnels, replays + player, live globe, visitors/segments/events, AI agents, speed insights + choropleth | metric grid + one chart | breakdown list with bars and drill-down, sparkline in row, funnel, journey transitions, replay player + event timeline, geo (map or globe), score ring, visitor journey |
 | Errors | list + stats, occurrences chart, group detail, event detail (stack trace with source context, breadcrumbs, spans, tags, raw JSON), source maps, autofix | issues ledger with status filter, issue record (chart, stack trace, breadcrumbs, latest event, tags, similar), events and tags facets | spans on an event, raw JSON view, source-map upload state, autofix |
+| Logs | per-deployment runtime log viewer, historical log viewer, container log viewer (`components/runtime-logs/*`, `components/containers/ContainerLogsViewer.tsx`): one container at a time, ANSI via `ansi-to-html`, level filter, live tail | cross-project Logs explorer (`?p=logs`): query bar with typed `key:value` tokens in the URL, volume-by-level chart with drag-to-select, facets as Breakdowns with error share, list / patterns / by-service views, chosen trailing columns, live tail with hold-and-count, export, saved queries; log record (`log:<id>`) with structured fields and ±20 lines of context | virtualisation for a real 41k-line page, server-side pattern clustering, an inline row expansion (`LedgerRow.expanded`, handoff §15), archive/rehydrate for lines past retention |
 | Traces | list, waterfall span tree, span attributes + events, correlated logs, cross-project, operations stats | list, detail with spans (ledger) | collapsible waterfall, correlated log panel |
 | Metrics | dashboards grid, explorer with percentiles + histogram, alerts, anomaly band chart, correlations | metrics ledger + chart | percentile selector, histogram panel, band chart, dashboard tile grid, alert rule form |
 | Uptime | monitors, bucketed status strip, response-time tiles | nothing (nav only) | status-bar strip with per-bucket popover |
@@ -54,8 +55,14 @@ Ranked by how many pages need them.
    per span, correlated logs beneath.
 5. **Stack trace**: frame list, in-app vs vendor, expandable source context
    with gutter, symbolication marker.
-6. **Log viewer**: virtualised, ANSI colour, level filter, container
-   multi-select, live tail; and the **build-stage stepper** that streams one.
+6. ~~**Log viewer**: virtualised, ANSI colour, level filter, container
+   multi-select, live tail; and the **build-stage stepper** that streams one.~~
+   Done: the level filter, the container multi-select and the live tail exist
+   as a screen rather than only as a pane — the cross-project Logs explorer
+   (`?p=logs`, handoff §7b), where the container multi-select is a facet that
+   writes a token and the tail holds and counts while the reader reads
+   something older. `Stages` streams the build-stage one. Still open:
+   virtualisation for a page of 41,000 lines.
 7. **Funnel**: tapering step bars with completions, conversion and drop-off
    per step; horizontal variant; optional value per step.
 8. **Geo**: choropleth (`SpeedWorldMap`) and 3D globe with marker overlays

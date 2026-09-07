@@ -450,9 +450,11 @@ body {
      stay as they are — but nothing in this file may animate for a reader who
      asked it not to. `op.css` zeroes motion inside `.operator.ink`; this is
      the same rule for the utilities that render outside the skin (portals,
-     the landing). `animate-pulse` and `animate-spin` are the two exceptions
-     motion.md keeps, and they are left iterating at zero duration rather than
-     removed, so a skeleton still reads as a skeleton. */
+     the landing). `animate-pulse` (skeletons) and `.op-pulse` (a `running`
+     glyph) are the animations motion.md keeps, and they are left iterating at
+     zero duration rather than removed, so a skeleton still reads as a
+     skeleton. `animate-spin` is no longer an exception: it is legitimate
+     inline on a submitting button and nowhere else. */
   @media (prefers-reduced-motion: reduce) {
     .animate-ping,
     .animate-bounce,

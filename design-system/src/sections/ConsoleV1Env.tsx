@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ArrowRight, Check, Eye, EyeOff, Minus, Plus, Search, Trash2, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { CalendarHeatmap, Columns, EchoDialog, Kbd, Ledger, PageState, Phrase, Picker, Section, SecretValue, Stages, Status, StatusLine, type LedgerRow, type Stage, type State } from '@/components/op'
+import { CalendarHeatmap, Columns, EchoDialog, Kbd, KbdPair, Ledger, PageState, Phrase, Picker, Section, SecretValue, Stages, Status, StatusLine, type LedgerRow, type Stage, type State } from '@/components/op'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -52,7 +52,9 @@ export const DEPS: Dep[] = [
   { id: 89, tag: 'dep_89f', status: 'success', environment_id: 2, commit_hash: '4f21a8d', commit_message: 'perf(router): cache edge lookups', commit_author: 'maya', branch: 'develop', created_at: '11h ago', duration: '43s', is_current: false },
   { id: 88, tag: 'dep_88c', status: 'cancelled', environment_id: 1, commit_hash: 'c0ffee1', commit_message: 'chore: bump deps', commit_author: 'jules', branch: 'main', created_at: 'yesterday', duration: '—', is_current: false },
 ]
-const DEP_STATE: Record<Dep['status'], State> = { success: 'ok', building: 'warn', failed: 'error', cancelled: 'idle' }
+// A build in flight is `running`, not `warn`: nothing is wrong with it, it is
+// simply not finished. The glyph pulses in the row until it stops.
+const DEP_STATE: Record<Dep['status'], State> = { success: 'ok', building: 'running', failed: 'error', cancelled: 'idle' }
 
 type Var = { id: number; key: string; value: string; is_secret: boolean; include_in_preview: boolean; environments: number[]; updated_at: string }
 const VARS0: Var[] = [
@@ -176,7 +178,7 @@ export function EnvironmentsTab({ notify, dense }: { notify: Notify; dense: bool
           columns={['environment', 'branch', 'current deploy', 'url', 'protection', 'activity', 'state']}
           grid="minmax(7rem,max-content) minmax(5rem,max-content) minmax(0,1.6fr) minmax(0,1fr) minmax(5rem,max-content) minmax(4.5rem,max-content) minmax(6rem,max-content)"
           rows={rows} total={ENVS.length} filter={q} onFilter={setQ} placeholder="filter environments" dense={dense}
-          footer={<>{rows.length} of {ENVS.length} · <Kbd keys="j" className="mx-1" /> down · <Kbd keys="k" className="mx-1" /> up · <Kbd keys="/" className="mx-1" /> filter</>}
+          footer={<>{rows.length} of {ENVS.length} · <KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="/" className="mx-1" /> filter</>}
         />
       </Section>
     </div>
@@ -194,7 +196,17 @@ const BUILD_STAGES: Stage[] = [
   { name: 'image', state: 'idle' },
   { name: 'deploy', state: 'idle' },
 ]
-const ACTIVITY = Array.from({ length: 12 * 7 }, (_, i) => ({ date: `2026-0${6 + Math.floor(i / 30)}-${String(1 + (i % 30)).padStart(2, '0')}`, count: (i % 7 === 5 || i % 7 === 6) ? (i % 4 === 0 ? 1 : 0) : Math.floor(Math.abs(Math.sin(i / 2.7)) * 7) }))
+/* A day carries the tags of what shipped, not only how many: the readout says
+   "3 deploys · dep_91a, dep_91b, dep_90e", which is the answer to the question
+   a reader points at a dark cell to ask. */
+const ACTIVITY = Array.from({ length: 12 * 7 }, (_, i) => {
+  const count = (i % 7 === 5 || i % 7 === 6) ? (i % 4 === 0 ? 1 : 0) : Math.floor(Math.abs(Math.sin(i / 2.7)) * 7)
+  return {
+    date: `2026-0${6 + Math.floor(i / 30)}-${String(1 + (i % 30)).padStart(2, '0')}`,
+    count,
+    ids: Array.from({ length: count }, (_, k) => `dep_${(80 + i).toString(36)}${'abcdefg'[k]}`),
+  }
+})
 
 export function DeploysTab({ notify, dense, go }: { notify: Notify; dense: boolean; go: (v: string) => void }) {
   const [q, setQ] = useState('')
@@ -226,7 +238,7 @@ export function DeploysTab({ notify, dense, go }: { notify: Notify; dense: boole
     <div className="space-y-6">
     <Columns>
       <div><Section title="Building now" meta="dep_92b · staging · b7c9d21 · started 20:29" action={<a href="#" onClick={(e) => { e.preventDefault(); go('deploy:dep_92b') }} className="text-xs">open</a>}><Stages stages={BUILD_STAGES} /></Section></div>
-      <div><Section title="Activity" meta="12 weeks · deploys per day"><div className="border bg-background p-3"><CalendarHeatmap days={ACTIVITY} /></div></Section></div>
+      <div><Section title="Activity" meta="12 weeks · deploys per day"><div className="border bg-background p-3"><CalendarHeatmap days={ACTIVITY} unit="deploys" onOpen={(d) => go(`deploy:${d.ids?.[0] ?? 'dep_91a'}`)} /></div></Section></div>
     </Columns>
     <Ledger
       status={
@@ -394,7 +406,7 @@ export function VariablesTab({ notify, dense }: { notify: Notify; dense: boolean
             </div>
           ))}
           <div className="op-row flex flex-wrap items-center gap-x-1 gap-y-1 text-[11px] text-muted-foreground">
-            {list.length} of {vars.length} · <Kbd keys="j" className="mx-1" /> down · <Kbd keys="k" className="mx-1" /> up · <Kbd keys="x" className="mx-1" /> or <Kbd keys="⏎" className="mx-1" /> select · <Kbd keys={['⇧', 'A']} className="mx-1" /> all · <Kbd keys="/" className="mx-1" /> search
+            {list.length} of {vars.length} · <KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="x" className="mx-1" /> or <Kbd keys="⏎" className="mx-1" /> select · <Kbd keys={['⇧', 'A']} className="mx-1" /> all · <Kbd keys="/" className="mx-1" /> search
           </div>
         </div>
       )}

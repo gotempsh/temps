@@ -6,8 +6,8 @@ import { Cpu, RefreshCw, Server } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
-  Callout, ChartFooter, Columns, Detail, EchoDialog, Field, KeyValue, Ledger, Lede, LogLines, Phrase, Section, Segmented, SecretValue, Settings, Status, StatusLine, TimeChart,
-  type KV, type LedgerRow, type LogLine, type State,
+  Callout, ChartFooter, Columns, Detail, EchoDialog, Field, Gauge, KeyValue, Ledger, Lede, LogLines, Phrase, Section, Segmented, SecretValue, Settings, Status, StatusLine, TimeChart, Topology,
+  type KV, type LedgerRow, type LogLine, type State, type TopoLink, type TopoNode,
 } from '@/components/op'
 import { Toggle } from './ConsoleV1Admin'
 import { EffectLegend, eff } from './ConsoleV1Settings'
@@ -122,10 +122,12 @@ export function NodeScreen({ name, dense, notify, go }: { name: string; dense: b
   const [range, setRange] = useState<'1h' | '6h' | '24h' | '7d'>('6h')
   const [q, setQ] = useState('')
   const off = n.status === 'offline'
-  const DIMS: { key: Dim; label: string; value: string; sub: string; state?: State; series: number[] }[] = [
-    { key: 'cpu', label: 'cpu', value: pct(n.cpu, off), sub: `${n.vcpu} vCPU · load ${n.load}`, series: series(n.cpu - 4, 9, 1) },
-    { key: 'mem', label: 'memory', value: pct(n.memPct, off), sub: `of ${n.mem}`, state: !off && n.memPct >= 90 ? 'warn' : undefined, series: series(n.memPct - 6, 8, 3) },
-    { key: 'disk', label: 'disk', value: pct(n.diskPct, off), sub: `of ${n.disk}`, state: !off && n.diskPct >= 90 ? 'warn' : undefined, series: series(n.diskPct - 1, 1.5, 5) },
+  // Each dimension carries the numbers a Gauge needs: the reading, what the
+  // scale is of, the peak in the window, and the two lines that make it a state.
+  const DIMS: { key: Dim; label: string; value: number; sub: string; series: number[]; thresholds: { at: number; state: 'warn' | 'error'; label: string }[] }[] = [
+    { key: 'cpu', label: 'cpu', value: n.cpu, sub: `of ${n.vcpu} vCPU · load ${n.load}`, series: series(n.cpu - 4, 9, 1), thresholds: [{ at: 80, state: 'warn', label: 'warn' }, { at: 95, state: 'error', label: 'saturated' }] },
+    { key: 'mem', label: 'memory', value: n.memPct, sub: `of ${n.mem}`, series: series(n.memPct - 6, 8, 3), thresholds: [{ at: 80, state: 'warn', label: 'warn' }, { at: 95, state: 'error', label: 'oom risk' }] },
+    { key: 'disk', label: 'disk', value: n.diskPct, sub: `of ${n.disk}`, series: series(n.diskPct - 1, 1.5, 5), thresholds: [{ at: 80, state: 'warn', label: 'warn' }, { at: 90, state: 'error', label: 'writes stop' }] },
   ]
   const d = DIMS.find((x) => x.key === dim) ?? DIMS[0]
 
@@ -171,17 +173,23 @@ export function NodeScreen({ name, dense, notify, go }: { name: string; dense: b
             )}
             <Section title="Pressure" meta={off ? 'last known values · 4m old' : `sampled every 15s · ${range}`}>
               <div className="space-y-4">
+                {/* One tile per dimension: the figure, an ink bar from zero, the
+                    two threshold lines with their own words, and the peak — so a
+                    flat-looking average cannot hide a spike. An offline node keeps
+                    its tiles and says why they are empty. */}
                 <div className="op-tiles" style={{ '--tiles': 3 } as CSSProperties}>
                   {DIMS.map((x) => { const on = x.key === dim; return (
-                    <button key={x.key} type="button" aria-pressed={on} onClick={() => setDim(x.key)} className={`min-w-0 p-3 text-left transition-colors hover:bg-muted/40 ${on ? 'bg-muted/60' : ''}`}>
-                      <p className="op-label truncate">{x.label}</p>
-                      <p className={`mt-1 flex items-baseline gap-2 font-mono text-lg leading-6 ${off ? 'text-muted-foreground' : ''}`}>{x.value}{x.state && <span className="text-xs"><Status state={x.state} label="over 90%" /></span>}</p>
-                      <p className="truncate font-mono text-[11px] text-muted-foreground">{x.sub}</p>
+                    <button key={x.key} type="button" aria-pressed={on} onClick={() => setDim(x.key)} className={`min-w-0 text-left transition-colors hover:bg-muted/40 ${on ? 'bg-muted/60' : ''}`}>
+                      <Gauge label={x.label} value={x.value} of={x.sub}
+                        peak={off ? undefined : Math.max(...x.series)} peakLabel={`in ${range}`}
+                        thresholds={x.thresholds}
+                        idle={off ? 'no samples since 20:37' : undefined} />
                     </button>
                   ) })}
                 </div>
                 <div className="border bg-background p-3">
-                  <TimeChart data={d.series.map((v, i) => ({ t: `${String(14 + Math.floor(i / 8)).padStart(2, '0')}:${String((i % 8) * 7.5).padStart(2, '0').slice(0, 2)}`, v: off ? 0 : v }))} series={[{ key: 'v', name: d.label }]} unit="%" height={160} xInterval={7} readoutFormat={(p) => `${p.t} · ${d.label} ${p.v}%`} />
+                  <TimeChart data={d.series.map((v, i) => ({ t: `${String(14 + Math.floor(i / 8)).padStart(2, '0')}:${String((i % 8) * 7.5).padStart(2, '0').slice(0, 2)}`, v: off ? 0 : v }))} series={[{ key: 'v', name: d.label }]} unit="%" height={160} xInterval={7} readoutFormat={(p) => `${p.t} · ${d.label} ${p.v}%`}
+                    title={`${d.label} on ${n.name}`} range={range} verdict={off ? 'No samples since 20:37; the line is flat because nothing is arriving.' : `Between ${Math.min(...d.series)}% and ${Math.max(...d.series)}% over the window.`} />
                 </div>
                 <div className="flex flex-wrap items-center justify-between gap-2"><ChartFooter><span>{d.label} · {range}{off && ' · flat since 20:37, no samples'}</span></ChartFooter><Segmented options={[['1h', '1h'], ['6h', '6h'], ['24h', '24h'], ['7d', '7d']] as const} value={range} onChange={setRange} className="h-6 [&>button]:h-6" /></div>
               </div>
@@ -237,7 +245,20 @@ export function NodeScreen({ name, dense, notify, go }: { name: string; dense: b
 }
 
 // ── Cluster settings (settings:cluster) ───────────────────────────────
-export function ClusterPage({ meta, notify }: { meta: React.ReactNode; notify: Notify }) {
+
+/* The fleet as a graph, from the same NODES the ledger draws. Layer 0 is the
+   control plane, layer 1 the workers; the layout is deterministic, so the
+   picture the operator saw yesterday is the picture they see today. */
+const TOPO_NODES: TopoNode[] = NODES.map((n) => ({
+  id: n.name, label: n.name, kind: n.role, state: NODE_STATE[n.status], layer: n.role === 'control plane' ? 0 : 1,
+  facts: n.status === 'offline' ? `${n.address} · no heartbeat for ${n.heartbeat.replace(' ago', '')}` : `${n.address} · ${n.vcpu} vCPU · ${n.containers.length} containers`,
+}))
+const TOPO_LINKS: TopoLink[] = NODES.filter((n) => n.role !== 'control plane').map((n) => ({
+  from: NODES[0].name, to: n.name, kind: n.reach === 'relay' ? 'relay' : 'direct',
+  state: n.status === 'offline' ? ('error' as State) : undefined,
+}))
+
+export function ClusterPage({ meta, notify, go }: { meta: React.ReactNode; notify: Notify; go?: (v: string) => void }) {
   const [dirty, setDirty] = useState(false)
   const [dns, setDns] = useState(true)
   const [reveal, setReveal] = useState(false)
@@ -268,6 +289,17 @@ export function ClusterPage({ meta, notify }: { meta: React.ReactNode; notify: N
         </> },
       ]}
       danger={<div className="flex flex-wrap items-center justify-between gap-3 text-xs"><div><p className="font-medium">Rotate the cluster CA</p><p className="text-[11px] text-muted-foreground">Emergency only. Every worker stops trusting the control plane at once and has to be re-joined by hand; outstanding join tokens die with it.</p></div><EchoDialog trigger={<Button size="sm" variant="outline" className="h-8 text-xs text-destructive">rotate ca</Button>} destructive title="Rotate the cluster CA" description="2 workers lose trust immediately and their containers keep running unreachable until each is re-joined. Type rotate to confirm." confirmWord="rotate" steps={['issue new ca', 'revoke old ca', 'invalidate join tokens']} onDone={() => notify('warn', 'cluster ca rotated', '2 workers need to re-join')} /></div>} />
+    {/* What is joined to what, and how each worker is reached. The list under
+        the graph carries the keyboard and the state words; the graph is the
+        second view of the same rows. */}
+    <Section title="Fleet" meta={`${TOPO_NODES.length} nodes · ${TOPO_LINKS.length} tunnels`}>
+      <Topology nodes={TOPO_NODES} links={TOPO_LINKS} label="cluster" height={220}
+        onOpen={go ? (n) => go(`node:${n.id}`) : undefined}
+        verdict={TOPO_NODES.some((n) => n.state === 'error')
+          ? `${TOPO_NODES.find((n) => n.state === 'error')?.label} has not sent a heartbeat for 4 minutes; its relay connection timed out.`
+          : 'Every worker is reachable from the control plane.'}
+        meta={`heartbeat every 15s · offline after 3 missed · direct needs UDP 51820 both ways, relay needs outbound 443 only`} />
+    </Section>
     <EffectLegend />
     </div>
   )

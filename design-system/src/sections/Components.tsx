@@ -53,7 +53,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import {
   EchoDialog,
   Field,
-  Kbd,
+  Kbd, KbdPair,
   MOD,
   Num,
   PageState,
@@ -693,7 +693,7 @@ export function ComponentsPage() {
             <p>
               Header labels are <code>.op-label</code>. No zebra striping, no hover shadow, no border-radius on rows.
               Hover is <code>bg-muted</code> and a 2px ink bar on the left of the cursor row, which is the same
-              affordance <Kbd keys="j" /> <Kbd keys="k" /> use.
+              affordance <KbdPair keys={['j', 'k']} does={['down', 'up']} /> use.
             </p>
           </>
         }
@@ -745,8 +745,7 @@ export function ComponentsPage() {
               </div>
             ))}
             <div className="op-row flex flex-wrap items-center gap-y-1 text-[11px] text-muted-foreground">
-              4 of 6 · <Kbd keys="j" className="mx-1" />
-              <Kbd keys="k" className="mr-1" /> move · <Kbd keys="⏎" className="mx-1" /> open ·{' '}
+              4 of 6 · <KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="⏎" className="mx-1" /> open ·{' '}
               <Kbd keys="/" className="mx-1" /> filter
             </div>
           </div>
@@ -1292,8 +1291,7 @@ import { MOD } from '@/components/op'   // '⌘' | 'Ctrl'`}
               <Kbd keys="/" /> filter
             </span>
             <span className="flex items-center gap-2">
-              <Kbd keys="j" />
-              <Kbd keys="k" /> move
+              <KbdPair keys={['j', 'k']} does={['down', 'up']} />
             </span>
             <span className="flex items-center gap-2">
               <Kbd keys="esc" /> close

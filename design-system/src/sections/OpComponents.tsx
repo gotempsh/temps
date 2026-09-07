@@ -1,18 +1,24 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, type ReactNode } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { Bot, Box, Container, Cpu, FileText, GitBranch, Link as LinkIcon, Monitor, Rocket, RotateCcw, Search, Share2, Smartphone, Tablet, Trash2 } from 'lucide-react'
+import { Bot, Box, Container, Cpu, FileText, GitBranch, Link as LinkIcon, Loader2, Monitor, RefreshCw, Rocket, RotateCcw, Search, Share2, Smartphone, Tablet, Trash2 } from 'lucide-react'
 import { DocPage, Rule } from '@/components/op-doc'
 import {
   Breakdown, Sparkline, StatusStrip, ScoreRing, CalendarHeatmap, Funnel, Flow, Waterfall, StackTrace, LogLines, Stages, Histogram, Live, ProjectMark,
   type Span, type Frame, type LogLine as OpLogLine, type Pct, type StatusBucket, GeoMap, Callout } from '@/components/op'
 import { Button } from '@/components/ui/button'
 import {
-  ChartFooter, Detail, EchoDialog, Field, Kbd, Ledger, Metric, MetricGrid, Num, PageState, Phrase, RangePicker,
-  PageTitle, Picker, Segmented, Settings, ShellSlotsProvider, Status, StatusLine, TimeChart, worst, type LedgerRow, type State,
+  ChartFooter, Detail, EchoDialog, Field, Kbd, KbdPair, Ledger, Metric, MetricGrid, Num, PageState, Phrase, RangePicker,
+  PageTitle, Picker, Section, Segmented, Settings, ShellSlotsProvider, Status, StatusLine, TimeChart, worst,
+  type LedgerRow, type State,
 } from '@/components/op'
+// `Inspector` is not re-exported from the package barrel yet (that one line in
+// `web/packages/op/src/index.ts` belongs to whoever owns the package this pass),
+// so it is reached by path. Swap this for `@/components/op` the moment the
+// barrel carries it — nothing else about the block changes.
+import { Inspector, type InspectorAnchor } from '../../../web/packages/op/src/inspector'
 import { BRANCHES } from './ConsoleV1'
 // The five blocks files are the live half of docs/{forms,notifications,content,
 // data-viz,motion,icons}.md. The guide mounts the same components section by
@@ -20,7 +26,12 @@ import { BRANCHES } from './ConsoleV1'
 // one of the two places.
 import { ContentBlocks } from './blocks/ContentBlocks'
 import { DataVizBlocks } from './blocks/DataVizBlocks'
+// The second wave of charts and the generative-UI blocks. Their `*_TOC`
+// exports are the source of truth for the ids and the labels: the rail below
+// spreads them rather than restating them, so the rail and the DOM cannot drift.
+import { DATAVIZ2_TOC, DataVizBlocks2 } from './blocks/DataVizBlocks2'
 import { FormBlocks } from './blocks/FormBlocks'
+import { GENUI_TOC, GenUiBlocks } from './blocks/GenUiBlocks'
 import { NotificationBlocks } from './blocks/NotificationBlocks'
 import { TokenBlocks } from './blocks/TokenBlocks'
 
@@ -36,7 +47,19 @@ const VZ_LOCATIONS = [
   { label: 'United Kingdom', icon: flag('gb'), count: 1404 }, { label: 'Spain', icon: flag('es'), count: 980 }, { label: 'France', icon: flag('fr'), count: 812 }, { label: 'Portugal', icon: flag('pt'), count: 611 },
 ]
 const VZ_STRIP: StatusBucket[] = Array.from({ length: 48 }, (_, i) => ({ start: `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`, state: i === 41 ? 'error' : i === 40 || i === 42 ? 'warn' : 'ok', checks: 60, down: i === 41 ? 60 : 0, p50_ms: i === 41 ? undefined : 90 + ((i * 7) % 40), p95_ms: i === 41 ? undefined : 300 + ((i * 11) % 90) }))
-const VZ_DAYS = Array.from({ length: 12 * 7 }, (_, i) => ({ date: `2026-0${1 + Math.floor(i / 31)}-${String(1 + (i % 31)).padStart(2, '0')}`, count: (i % 7 === 5 || i % 7 === 6) ? (i % 3 === 0 ? 1 : 0) : Math.floor(Math.abs(Math.sin(i / 2.3)) * 9) }))
+/**
+ * 12 weeks of deploys, each day naming what shipped. `ids` is what makes the
+ * readout worth reading — "3 deploys" is a number, "dep_2ha · dep_2hb · dep_2hc"
+ * is something you can open. Moved here with the readout demo it feeds.
+ */
+const VZ_DAYS = Array.from({ length: 12 * 7 }, (_, i) => {
+  const count = i % 7 === 5 || i % 7 === 6 ? (i % 4 === 0 ? 1 : 0) : Math.floor(Math.abs(Math.sin(i / 2.7)) * 9)
+  return {
+    date: `2026-0${6 + Math.floor(i / 30)}-${String(1 + (i % 30)).padStart(2, '0')}`,
+    count,
+    ids: Array.from({ length: count }, (_, k) => `dep_${(80 + i).toString(36)}${'abcdefghi'[k]}`),
+  }
+})
 const VZ_SPANS: Span[] = [
   { id: 'r', name: 'POST /checkout', service: 'api-gateway', start_ms: 0, duration_ms: 812, state: 'error', children: [
     { id: 'a', name: 'auth.verify', service: 'api-gateway', start_ms: 2, duration_ms: 14 },
@@ -78,10 +101,12 @@ const TOC = [
   ['status', 'Status · StatusLine'],
   ['num', 'Num · Metric'],
   ['page-state', 'PageState'],
+  ['button-busy', 'Button · busy'],
   ['kbd', 'Kbd'],
   ['echo', 'EchoDialog'],
   ['chart', 'TimeChart · RangePicker'],
   ['ledger', 'Ledger'],
+  ['inspector', 'Inspector'],
   ['detail', 'Detail · PageTitle'],
   ['picker', 'Picker'],
   ['settings', 'Settings'],
@@ -103,6 +128,9 @@ const TOC = [
   ['viz-series', 'TimeChart · legend and table view'],
   ['viz-legend', 'Series without a second hue'],
   ['viz-a11y', 'Charts read without the picture'],
+  // Spread, never retyped: DataVizBlocks2 and GenUiBlocks own their ids.
+  ...DATAVIZ2_TOC,
+  ...GENUI_TOC,
   ['content-error', 'Error messages'],
   ['content-time', 'Time and the id beside it'],
   ['content-fmt', 'fmt · the formatters'],
@@ -135,7 +163,14 @@ function Demo({ label, children }: { label: string; children: ReactNode }) {
   )
 }
 
-const STATES: State[] = ['ok', 'warn', 'error', 'idle', 'sampled']
+/**
+ * The six states, in the order the legend reads them. `running` sits beside
+ * `warn` because that is where `STATE_RANK` puts it (error 0, warn 1,
+ * running 2, sampled 3, ok 4, idle 5): work in progress outranks anything
+ * healthy in a "needs attention first" list, but it is not a verdict.
+ */
+// STATE_RANK order: worst first, the way a sorted ledger reads.
+const STATES: State[] = ['error', 'warn', 'running', 'sampled', 'ok', 'idle']
 const SERIES = Array.from({ length: 24 }, (_, i) => ({ t: `${String(i).padStart(2, '0')}:00`, req: Math.round(400 + 600 * Math.max(0, Math.sin(((i - 6) / 24) * Math.PI * 2)) + (i > 15 ? 250 : 0)) }))
 
 /** A stand-in shell header: breadcrumb slot on the left, attention slot on the right, a StatusLine inside. */
@@ -182,8 +217,107 @@ function PagedLedgerDemo() {
   )
 }
 
+/**
+ * `Inspector` inspects a ledger row beside the list instead of navigating away
+ * from it. Drawn here against the documented shape while the primitive lands in
+ * `@temps-sdk/op`: ~520px pushing the main column on `xl`, an overlay sheet
+ * with a scrim below `xl`, full-screen below `md`; an ink rule on its left
+ * edge; a header of glyph + word, mono title, meta and three actions; stacked
+ * `Section`s under a small in-panel toc row.
+ *
+ * The point of the primitive is that the list keeps the cursor: `j`/`k` keep
+ * moving the ledger's cursor and the panel follows, so a reader walks a list
+ * reading each row without ever losing their place.
+ */
+const INSPECT: { id: string; state: State; word: string; title: string; meta: string }[] = [
+  { id: 'log_03x9w6', state: 'error', word: 'error', title: 'health check GET /healthz timed out after 30s', meta: 'billing-worker · production · 31m ago' },
+  { id: 'log_03x951', state: 'warn', word: 'warn', title: 'container restarted after 3 health check failures', meta: 'billing-worker · production · 44m ago' },
+  { id: 'log_03x8dw', state: 'running', word: 'building', title: 'next build · 31 of 48 routes', meta: 'acme-storefront · staging · now' },
+]
+
+function InspectorDemo() {
+  // Open on a desktop, closed on a phone — deliberately, and this is the
+  // component's own rule rather than a demo trick: from `xl` the panel is
+  // `sticky` and therefore in flow (the ledger is pushed, never covered), so
+  // it can be shown standing open. Below `xl` it is a sheet over a scrim and
+  // below `md` it is the whole screen, and a gallery page that opened a
+  // full-screen sheet over itself on load would bury the seventeen blocks
+  // under it. On a narrow screen the reader opens a row to see it.
+  const [open, setOpen] = useState<string | null>(() =>
+    typeof window !== 'undefined' && window.matchMedia('(min-width: 1280px)').matches ? INSPECT[0].id : null)
+  const rowRefs = useRef<Record<string, HTMLElement | null>>({})
+  const row = INSPECT.find((r) => r.id === open) ?? INSPECT[0]
+  const [log, setLog] = useState<string | null>(null)
+  const rows: LedgerRow[] = INSPECT.map((r) => ({
+    id: r.id,
+    state: r.state,
+    cells: [
+      <span key="m" className="min-w-0 truncate">{r.title}</span>,
+      <span key="i" className="font-mono text-[11px] text-muted-foreground">{r.id}</span>,
+    ],
+    mobile: <span className="min-w-0"><span className="block truncate">{r.title}</span><span className="block truncate font-mono text-[11px] text-muted-foreground">{r.id}</span></span>,
+    onOpen: () => setOpen(r.id),
+  }))
+  const ANCHORS: InspectorAnchor[] = [
+    { id: 'insp-fields', label: 'fields' },
+    { id: 'insp-trace', label: 'trace' },
+    { id: 'insp-request', label: 'request' },
+    { id: 'insp-context', label: 'context' },
+  ]
+  return (
+    <div ref={(el) => { if (el) for (const r of INSPECT) rowRefs.current[r.id] = el.querySelector<HTMLElement>(`[data-row="${r.id}"]`) }}
+      className="flex min-w-0 items-start gap-4">
+      <div className="min-w-0 flex-1">
+        <Ledger status={null} dense columns={['line', 'id']} grid="minmax(0,1fr) minmax(96px,max-content)" rows={rows} total={INSPECT.length} hint="needs attention first" />
+        <p className="mt-2 font-mono text-[11px] text-muted-foreground">
+          {log ?? 'open a row · j k keep moving this list and the panel follows · esc closes and comes back here'}
+        </p>
+      </div>
+      <Inspector
+        open={open !== null}
+        label="log line inspector"
+        state={row.state}
+        word={row.word}
+        title={row.id}
+        meta={row.meta}
+        anchors={ANCHORS}
+        onOpen={() => setLog(`open ${row.id} · the full record page`)}
+        onCopyLink={() => setLog(`link to ${row.id} copied`)}
+        onClose={() => setOpen(null)}
+        returnFocus={() => rowRefs.current[row.id]}
+      >
+        <div id="insp-fields">
+          <Section title="Fields" meta="4 fields">
+            <dl className="grid grid-cols-[minmax(72px,max-content)_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px]">
+              {[['method', 'GET'], ['route', '/healthz'], ['status', '504'], ['duration', '30,000 ms']].map(([k, v]) => (
+                <div key={k} className="contents"><dt className="text-muted-foreground">{k}</dt><dd className="min-w-0 truncate font-mono">{v}</dd></div>
+              ))}
+            </dl>
+          </Section>
+        </div>
+        <div id="insp-trace">
+          <Section title="Trace" meta="d4e5f6a7 · 6 spans">
+            <p className="text-[11px] text-muted-foreground">The trace this line belongs to, read here rather than in a page the reader has to come back from.</p>
+          </Section>
+        </div>
+        <div id="insp-request">
+          <Section title="Request" meta="req_77c210">
+            <p className="text-[11px] text-muted-foreground">Every line the same request wrote, in order.</p>
+          </Section>
+        </div>
+        <div id="insp-context">
+          <Section title="Context" meta="±20 lines">
+            <p className="text-[11px] text-muted-foreground">The lines either side, from the same container: what a log record is actually read for.</p>
+          </Section>
+        </div>
+      </Inspector>
+    </div>
+  )
+}
+
 export function OpComponentsPage() {
   const [retrying, setRetrying] = useState(false)
+  const [busy, setBusy] = useState(false)
   const [hot, setHot] = useState<string | null>(null)
   const [range, setRange] = useState('24h')
   const [gate, setGate] = useState<string | null>(null)
@@ -223,9 +357,16 @@ export function OpComponentsPage() {
 ] }}>
   <Phrase onClick={open}>billing-worker</Phrase> is failing health checks.
 </StatusLine>`}
-            rule={<><p>Five states. Colour only ever appears through them, and always with a glyph and a word. <code>sampled</code> exists because pricing promises the console says when telemetry is head-sampled.</p><p>The status line is the page's verdict: one glyph (the worst state on the page), one sentence under 60 characters, at most one link. Inside the console shell it takes no line of the page: it renders into the header as a glyph and a count, and the sentences open on demand. Outside a shell it renders inline, with further problems behind <code>more</code> on the right. Facts and counts never appear in a verdict.</p></>}>
-            <Demo label="the five states">
+            rule={<><p>Six states. Colour only ever appears through them, and always with a glyph and a word. <code>sampled</code> exists because pricing promises the console says when telemetry is head-sampled. <code>running</code> is the odd one out: it takes <em>no</em> hue — plain ink, <code>◉</code>, and a slow opacity-only pulse (<code>.op-pulse</code>) that is the only motion in the system — because work in progress is not a verdict. Its word comes from the operation, never from the state: <em>building</em>, <em>restoring</em>, <em>scanning</em>.</p><p>The status line is the page's verdict: one glyph (the worst state on the page), one sentence under 60 characters, at most one link. Inside the console shell it takes no line of the page: it renders into the header as a glyph and a count, and the sentences open on demand. Outside a shell it renders inline, with further problems behind <code>more</code> on the right. Facts and counts never appear in a verdict.</p></>}>
+            <Demo label="the six states">
               <div className="flex flex-wrap gap-6 text-sm">{STATES.map((s) => <Status key={s} state={s} label={s} />)}</div>
+            </Demo>
+            <Demo label="running · the word is the operation, not the state">
+              <div className="flex flex-wrap gap-6 text-sm">
+                <Status state="running" label="building" />
+                <Status state="running" label="restoring" />
+                <Status state="running" label="scanning" />
+              </div>
             </Demo>
             <Demo label="inside the shell · header attention indicator, click it">
               <HeaderSlotDemo />
@@ -283,13 +424,42 @@ export function OpComponentsPage() {
             <Demo label="error"><PageState state="error" title="Error store unreachable" message="connection refused: clickhouse://127.0.0.1:9000 (timeout 3s)" resource="clickhouse · events-ch" retrying={retrying} onRetry={() => { setRetrying(true); window.setTimeout(() => setRetrying(false), 900) }} /></Demo>
           </Block>
 
+          <Block id="button-busy" title="Button · busy" api={`<Button busy={saving} busyLabel={<><Loader2 /> saving…</>}>
+  save
+</Button>
+
+// busy is NOT disabled: the colour, the focus and the
+// width all stay. A minimum 400ms holds off the flicker.`}
+            rule={<>
+              <p>
+                A button whose work is still running spins <em>its own icon</em> and changes <em>its own label</em>.
+                This is the one sanctioned spinner in the system — a reload spins because the thing it stands for
+                goes round. A state glyph pulses instead (<code>running</code> ◉), because a state is not an action.
+              </p>
+              <Rule state="ok">Busy, never <code>disabled</code>. Disabling greys the control out and drops focus, so a keyboard reader who just pressed ⌘S is thrown to the top of the document at the moment they are waiting to hear what happened.</Rule>
+              <Rule state="ok">The width is locked to the idle width, so “save” becoming “saving…” does not move the row it sits in.</Rule>
+              <Rule state="ok">A minimum busy time of 400ms: under that, a fast answer is a flicker the eye cannot read.</Rule>
+              <Rule state="ok">Under <code>prefers-reduced-motion</code> the icon holds still and the label alone says it — which is why <code>busyLabel</code> is not really optional.</Rule>
+              <Rule state="error">A spinner anywhere else: as page state (that is <code>PageState</code>), beside a row, or in a header.</Rule>
+            </>}>
+            <Demo label="idle · busy · the width does not move">
+              <div className="flex flex-wrap items-center gap-3">
+                <Button size="sm" className="op-primary h-8 text-xs" busy={busy} busyLabel={<><Loader2 aria-hidden /> saving…</>}
+                  onClick={() => { setBusy(true); window.setTimeout(() => setBusy(false), 1600) }}>save <Kbd keys={['⌘', 'S']} className="ml-1 opacity-70" /></Button>
+                <Button size="sm" variant="outline" className="h-8 text-xs" busy={busy} busyLabel={<><RefreshCw aria-hidden /> reloading…</>}
+                  onClick={() => { setBusy(true); window.setTimeout(() => setBusy(false), 1600) }}><RefreshCw /> reload</Button>
+                <span className="font-mono text-[11px] text-muted-foreground">{busy ? 'aria-busy · clicks ignored · focus kept' : 'press one'}</span>
+              </div>
+            </Demo>
+          </Block>
+
           <Block id="kbd" title="Kbd" api={`<Kbd keys={['⌘', '⏎']} />   ⌘⏎ on macOS, Ctrl⏎ elsewhere
 <Kbd keys="j" />`}
             rule={<><p>Key badge, platform-aware. Lives inside primary buttons, in ledger footers, next to inputs. Always an accelerator, never the only entry point.</p></>}>
             <Demo label="in context">
               <div className="flex flex-wrap items-center gap-3 text-xs">
                 <Button size="sm" className="op-primary h-8 text-xs"><Rocket /> deploy <Kbd keys={['⌘', '⏎']} className="ml-1 opacity-70" /></Button>
-                <span className="text-muted-foreground"><Kbd keys="j" className="mx-1" /><Kbd keys="k" className="mr-1" /> move · <Kbd keys="⏎" className="mx-1" /> open · <Kbd keys="/" className="mx-1" /> filter</span>
+                <span className="text-muted-foreground"><KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="⏎" className="mx-1" /> open · <Kbd keys="/" className="mx-1" /> filter</span>
               </div>
             </Demo>
           </Block>
@@ -344,6 +514,29 @@ rows={[{ id, state, icon: <Box />, cells, mobile, onOpen }]}   // icon = the row
             </Demo>
             <Demo label="paginated · the footer is the pager · try [ ] and the page size">
               <PagedLedgerDemo />
+            </Demo>
+          </Block>
+
+          <Block id="inspector" title="Inspector" api={`<Inspector open={row} onClose={() => setOpen(null)}
+  state="error" word="error" title="health check GET /healthz timed out"
+  meta="billing-worker · production · 31m ago"
+  actions={{ onOpen, onCopyLink }}
+  panes={[{ id: 'fields', title: 'Fields' }, { id: 'trace' }, { id: 'request' }, { id: 'context' }]}>
+  <Section title="Fields">…</Section>
+</Inspector>
+
+// xl: ~520px, pushes the main column · below xl: an overlay sheet with a scrim
+// below md: full screen · role="complementary"`}
+            rule={<>
+              <p>A right-hand panel that inspects a ledger row <em>beside</em> the list. A <b>Detail</b> is a page you navigate to and come back from; an <b>Inspector</b> is the row read without leaving the list, which is what a reader walking a log or an error list actually wants. About 520px, pushing the main column on <code>xl</code>; an overlay sheet over a scrim below <code>xl</code>; full screen below <code>md</code>. An ink rule on the left edge is the whole separation — no card, no shadow.</p>
+              <p>The header is the row's identity in one line: the state glyph and its word, the title in mono, the meta under it, and three actions — <em>open</em> (go to the full record), <em>copy link</em>, and <code>×</code>. Under it a small in-panel toc row (<code>fields · trace · request · context</code>, numbered <code>1</code>–<code>4</code>) so the panel's own sections are reachable without scrolling it. The body is stacked <code>Section</code>s, the same ones a record page uses.</p>
+              <p>The keyboard contract is the reason it exists: <Kbd keys={['⏎']} /> opens the cursor row, <KbdPair keys={['j', 'k']} does={['down', 'up']} /> keep moving the <em>ledger's</em> cursor with the panel following, <Kbd keys={['esc']} /> closes it and returns focus to the row it came from, and <Kbd keys={['/']} /> still reaches the query bar. Focus enters the panel only with <Kbd keys={['Tab']} />: it is not a dialog and never traps.</p>
+              <Rule state="ok"><code>role="complementary"</code>, labelled by the row it is inspecting.</Rule>
+              <Rule state="error">A modal dialog. A modal takes the list away, which is the one thing the reader is keeping.</Rule>
+              <Rule state="error">Stealing focus on open, or letting <code>j</code>/<code>k</code> scroll the panel instead of moving the cursor.</Rule>
+            </>}>
+            <Demo label="live · open a row, then close it with ×">
+              <InspectorDemo />
             </Demo>
           </Block>
 
@@ -492,17 +685,25 @@ served from /api/projects/{id}/icon · fetched after a deploy · monogram until 
           </Block>
           <Block id="strip" title="StatusStrip · ScoreRing · CalendarHeatmap · Live" api={`<StatusStrip buckets={[{ start, state, checks, down, p50_ms, p95_ms }]} height />
 <ScoreRing value={0–100} label />
-<CalendarHeatmap days={[{ date, count }]} />
+<CalendarHeatmap days={[{ date, count, ids? }]} unit="deploys" onOpen />
 <Live every="30s" paused onToggle />`}
             rule={<>
-              <p>A <b>StatusStrip</b> is uptime as shape: one segment per bucket coloured by state, the legend is the five glyphs, hover reads the bucket. It fills its cell so monitors compare by shape. A <b>ScoreRing</b> is a 0–100 score as an arc with the number in the middle; the arc colour is the state at the Web Vitals thresholds (≥90 ok, ≥50 warn). A <b>CalendarHeatmap</b> is activity per day in five ink intensities: ink, because the colour means how much, not how well.</p>
+              <p>A <b>StatusStrip</b> is uptime as shape: one segment per bucket coloured by state, the legend is the five glyphs, hover reads the bucket. It fills its cell so monitors compare by shape. A <b>ScoreRing</b> is a 0–100 score as an arc with the number in the middle; the arc colour is the state at the Web Vitals thresholds (≥90 ok, ≥50 warn). A <b>CalendarHeatmap</b> is activity per day in five ink intensities: ink, because the colour means how much, not how well. Its readout is the point: a cell used to carry a <code>title</code> attribute, which a pointer gets, a touch never does and a keyboard cannot reach. Now the grid is one tab stop, arrows walk it, <code>⏎</code> opens the day through <code>onOpen</code>, and the readout — the date, the count with its <code>unit</code>, and the <code>ids</code> of what actually shipped — renders as a live region beside the cursor on a pointer and as a fixed row under the grid on a phone.</p>
               <p><b>Live</b> says a surface updates by itself, with the interval, and can be paused. It sits in a ledger's footer or a section's meta; a page never polls silently.</p>
-              <Rule state="ok">States only through the five colours; quantity only through ink intensity or length.</Rule>
+              <Rule state="ok">States only through the state colours; quantity only through ink intensity or length.</Rule>
+              <Rule state="error">A readout that only a hover can reach. <code>title</code> is not a readout.</Rule>
               <Rule state="error">A green heatmap, a gradient ring, a status strip with a number inside every segment.</Rule>
             </>}>
             <Demo label="StatusStrip · hover 20:30"><div className="space-y-3 border bg-background p-3 text-xs">{([['acme.sh', VZ_STRIP.map((b) => ({ ...b, state: 'ok' as const, down: 0 })), 100], ['api-gateway', VZ_STRIP, 97.9]] as [string, StatusBucket[], number][]).map(([n, b, up]) => <div key={n} className="grid grid-cols-[8rem_minmax(0,1fr)_4rem] items-center gap-3"><span className="font-medium">{n}</span><StatusStrip buckets={b} height={16} /><Num value={up} unit="%" className="text-right" /></div>)}</div></Demo>
             <Demo label="ScoreRing · web vitals"><div className="flex flex-wrap gap-6 border bg-background p-3">{[['LCP', 92], ['INP', 96], ['CLS', 88], ['TTFB', 71], ['FCP', 44]].map(([k, v]) => <ScoreRing key={String(k)} value={Number(v)} label={String(k)} />)}</div></Demo>
-            <Demo label="CalendarHeatmap · 12 weeks of deploys"><div className="border bg-background p-3"><CalendarHeatmap days={VZ_DAYS} /></div></Demo>
+            <Demo label="CalendarHeatmap · 12 weeks of deploys, and the readout every input can reach">
+              <div className="border bg-background p-3">
+                <CalendarHeatmap days={VZ_DAYS} unit="deploys" onOpen={(d) => setLog((l) => [`open ${d.date} · ${d.ids?.length ? d.ids.join(' · ') : `${d.count} deploys`}`, ...l])} />
+              </div>
+              <p className="mt-2 font-mono text-[10px] text-muted-foreground">
+                hover or focus a day to read it · ← → move a week, ↑ ↓ move a day, ⏎ opens · on a phone the readout is the row under the grid
+              </p>
+            </Demo>
             <Demo label="Live"><div className="border bg-background px-3 py-2"><Live every="30s" paused={livePaused} onToggle={() => setLivePaused((p) => !p)} /></div></Demo>
           </Block>
 
@@ -535,6 +736,9 @@ served from /api/projects/{id}/icon · fetched after a deploy · monogram until 
           <FormBlocks />
           <NotificationBlocks />
           <DataVizBlocks />
+          {/* The second wave of the same subject, straight after the first. */}
+          <DataVizBlocks2 />
+          <GenUiBlocks />
           <ContentBlocks />
           <TokenBlocks />
     </DocPage>

@@ -132,7 +132,8 @@ Two ways to get this wrong, both common:
 ## Long submits
 
 - Keep the reader on the form. A submit never becomes a spinner page.
-- Show progress on the button ("saving…", then the step) and lock the fields while it runs.
+- Show progress on the button itself: `Button` takes `busy` and `busyLabel`, so it spins its own icon, says the verb in progress ("saving…"), keeps its idle width and keeps its focus. Lock the fields while it runs.
+- `busy` is never `disabled`. A disabled button greys out and drops focus, so the reader who just pressed ⌘S is thrown to the top of the document at the moment they are waiting to hear what happened.
 - Name the steps when there are steps, as `EchoDialog` does: stop containers, remove routes, revoke certificate.
 - Say what happened when it fails, in a Callout above the form, with the fields still holding what was typed. Nothing typed is ever thrown away by a failure.
 - Never leave a submitted form in a permanent loading state. A submit that cannot finish says so and offers retry.

@@ -3,7 +3,7 @@
 
 import { useState, type CSSProperties } from 'react'
 import {
-  Breakdown, ChartFooter, Detail, Ledger, LogLines, Num, PageState, Phrase, Picker, RangePicker, Section, Status, StatusLine, TimeChart,
+  Breakdown, ChartFooter, Detail, Ledger, LogLines, Num, PageState, Phrase, Picker, RangePicker, Section, StackedInk, Status, StatusLine, TimeChart,
   type LedgerRow, type LogLine, type Range, type State,
 } from '@/components/op'
 import type { Notify, Plan } from './ConsoleV1Observe'
@@ -118,8 +118,17 @@ export function ProxyScreen({ dense, plan, notify, go }: { dense: boolean; plan:
             {/* The legend is the chart's own, drawn from `series`. The footer says what the plot cannot: window, resolution, marker. */}
             <ChartFooter><span>{t.label} / minute · {range}</span><span>· ┆ deploy</span></ChartFooter>
           </div>
-          <div className="op-grid grid gap-6 md:grid-cols-2 xl:grid-cols-4">
-            <Section title="Status" meta="share of requests"><Breakdown rows={[{ label: '2xx', count: SUM - E5 - 7 }, { label: '3xx', count: 0 }, { label: '4xx', count: 7 }, { label: '5xx', count: E5, state: 'error' }]} total={SUM} unit="requests" /></Section>
+          {/* The status split over time rather than as a share of the window: a
+              ranked list would say "0.4% 5xx" and hide that all of it landed in
+              two minutes. 5xx is the one layer that is itself a state. */}
+          <Section title="Status classes" meta="composition over time · 5xx is a state">
+            <StackedInk data={T} layers={[{ key: 'ok', name: '2xx' }, { key: 'e4', name: '4xx' }, { key: 'e5', name: '5xx', state: 'error' }]}
+              unit="requests" height={150} xInterval={9}
+              title="requests by status class" range={range}
+              verdict={`api:8080 reset ${E5} connections at 10:44; 16% of requests answered 502 for two minutes and nothing since.`}
+              footer={<><span>requests / minute · {range}</span><span>· retention {plan.retention}</span><span>· ┆ dep_91a at 10:41</span></>} />
+          </Section>
+          <div className="op-grid grid gap-6 md:grid-cols-2 xl:grid-cols-3">
             <Section title="Destination" meta="who answered"><Breakdown rows={[{ label: 'console', count: Math.round(SUM * 0.76) }, { label: 'project routes', count: Math.round(SUM * 0.24) }, { label: 'proxy itself', count: 0, children: [{ label: 'ACME challenges', count: 0 }, { label: 'redirects', count: 0 }] }]} total={SUM} unit="requests" /></Section>
             <Section title="Slowest routes" meta="p95 · worst first"><Breakdown rows={[...ROUTES].sort((a, b) => b.p95 - a.p95).slice(0, 4).map((r) => ({ label: <span className="font-mono">{r.host}{r.path}</span>, key: r.host + r.path, count: r.p95, state: r.p95 > 1000 ? 'warn' : undefined, onOpen: () => setTab('routes') }))} total={Math.max(...ROUTES.map((r) => r.p95))} unit="ms" percent={false} more={{ label: 'all routes', onClick: () => setTab('routes') }} /></Section>
             <Section title="Upstreams" meta="5xx per upstream"><Breakdown rows={[{ label: 'api:8080', count: 91, state: 'error' }, { label: 'web:3000', count: 0 }, { label: 'crm:3000', count: 0 }, { label: 'console:8081', count: 0 }]} total={91} unit="5xx" percent={false} /></Section>

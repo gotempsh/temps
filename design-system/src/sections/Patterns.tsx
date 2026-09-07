@@ -13,7 +13,7 @@ import {
   Detail,
   EchoDialog,
   Field,
-  Kbd,
+  Kbd, KbdPair,
   Ledger,
   Metric,
   MetricGrid,
@@ -152,8 +152,7 @@ function LedgerExample() {
       }
       footer={
         <>
-          {shown.length} of {DATABASES.length} · {attention} needs attention · <Kbd keys="j" className="mx-1" />
-          <Kbd keys="k" className="mr-1" /> move · <Kbd keys="⏎" className="mx-1" /> open{opened && <> · opened <span className="font-mono">{opened}</span></>}
+          {shown.length} of {DATABASES.length} · {attention} needs attention · <KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="⏎" className="mx-1" /> open{opened && <> · opened <span className="font-mono">{opened}</span></>}
         </>
       }
     />
@@ -1040,7 +1039,7 @@ $ temps env detach production STRIPE_TEST_KEY`}
             <p>Ten keys, the same everywhere. They are accelerators for people who live in the console; they are never the only way to reach anything.</p>
             <Rule state="ok">Every shortcut has a visible control that does the same thing, and a <code>Kbd</code> badge on that control.</Rule>
             <Rule state="error">A feature reachable only by a chord. A keyboard-only feature does not exist for the person who has not read the docs.</Rule>
-            <p>This page is itself a demonstration: <Kbd keys="j" /> <Kbd keys="k" /> move the ledger above, <Kbd keys="1" />–<Kbd keys="3" /> switch the detail's tabs, <Kbd keys={['⌘', 'S']} /> saves the settings form.</p>
+            <p>This page is itself a demonstration: <KbdPair keys={['j', 'k']} does={['down', 'up']} /> move the ledger above, <Kbd keys="1" />–<Kbd keys="3" /> switch the detail's tabs, <Kbd keys={['⌘', 'S']} /> saves the settings form.</p>
           </>
         }
       >

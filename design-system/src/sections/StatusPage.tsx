@@ -54,7 +54,7 @@ const INCIDENTS: Incident[] = [
     { t: '14:15', state: 'identified', text: 'The webhook worker stopped after a certificate expired. Deliveries are queued, not dropped.' },
   ] },
 ]
-const WORD: Record<State, string> = { ok: 'operational', warn: 'degraded', error: 'outage', idle: 'maintenance', sampled: 'unknown' }
+const WORD: Record<State, string> = { ok: 'operational', warn: 'degraded', error: 'outage', idle: 'maintenance', sampled: 'unknown', running: 'in progress' }
 const UPDATE_STATE: Record<Update['state'], State> = { investigating: 'error', identified: 'warn', monitoring: 'warn', resolved: 'ok' }
 
 export function StatusPage({ full = false }: { full?: boolean }) {

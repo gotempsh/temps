@@ -12,7 +12,7 @@ import { Input } from '@/components/ui/input'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Block, Demo, DocPage, Rule } from '@/components/op-doc'
 import {
-  ChartFooter, EchoDialog, Field, Kbd, Ledger, Metric, MetricGrid, Num, PageState, Phrase, Picker,
+  ChartFooter, EchoDialog, Field, Kbd, KbdPair, Ledger, Metric, MetricGrid, Num, PageState, Phrase, Picker,
   Segmented, Settings, Status, StatusLine, TimeChart,
   type LedgerRow, type PickerOption, type State, type TimePoint,
 } from '@/components/op'
@@ -357,7 +357,7 @@ export function KitchenSinkPage() {
         </Rule>
         <Rule state="error">
           Keyboard handlers in <span className="font-mono">Ledger</span>, <span className="font-mono">Detail</span> and the console shell are bound to <span className="font-mono">window</span>, not to the
-          component. With the console embedded on this page, <Kbd keys="j" />/<Kbd keys="k" /> move the cursor in every ledger below at once.
+          component. With the console embedded on this page, <KbdPair keys={['j', 'k']} does={['down', 'up']} /> moves the cursor in every ledger below at once.
         </Rule>
       </Block>
 

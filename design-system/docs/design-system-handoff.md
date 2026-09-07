@@ -8,6 +8,9 @@ conversation that produced it. Everything it describes exists in
 Companion documents, in reading order after this one:
 
 - `brand-guidelines.md`: the direction, the type scale, colour, signature moves.
+- `generative-ui.md`: what an AI may render. An agent answers with the console's
+  own blocks, carries the call that drew each one, and proposes every write.
+  The reference surface is `/agent` (§7b).
 - `design-system-answers.md`: the twelve questions a design system must answer,
   answered for Temps from the pricing page, the console source and the product.
 - `operator-console-brief.md`: the original brief. Historical. Do not edit.
@@ -23,10 +26,10 @@ bunx tsc --noEmit -p .              # must be clean before any hand-back
 
 The reading entry point is `/guide`: one page, in the same chrome as every
 reference page, that renders these markdown files — this one, `brand-guidelines.md`,
-`ux-audit-2026-09-06.md`, and the seven documents that own a rule each
+`ux-audit-2026-09-06.md`, and the eight documents that own a rule each
 (`forms.md`, `notifications.md`, `content.md`, `localisation.md`, `data-viz.md`,
-`motion.md`, `icons.md`) — in the order someone building a screen needs them, with live token swatches,
-the type scale in its real classes, the five status glyphs and an example
+`generative-ui.md`, `motion.md`, `icons.md`) — in the order someone building a screen needs them, with live token swatches,
+the type scale in its real classes, the six status glyphs and an example
 primitive beside the rule it illustrates. The markdown files stay the single
 source of truth; the guide never copies their text, it imports them with Vite's
 `?raw`. Edit the document, not the page. `docs/RULES.md` is the compact,
@@ -50,10 +53,12 @@ Routes that matter:
 | `/v1?p=settings`   | Settings hub; `settings:<slug>` pages (domain, updates, builds, timeouts, users, teams, signin, keys, headers, traffic, routes, store, retention, alerts, nodes, plugins). |
 | `/status?project=` | The public status page for a project, chrome-free; `/status-page` inside the sandbox. `/v1?p=monitor:mon_2` is a monitor record. |
 | `/v1?p=sandboxes`, `?p=sandbox:sbx_7f21`, `?p=traces`, `?p=trace:3f9c1e7a8b2d4f60`, `?p=metrics` | Observe and sandbox surfaces (§7b). |
+| `/v1?p=logs`, `?p=log:<id>` | The Logs tool screen: query bar, volume chart, facets, three renderings of one list, and one line as a record (§7b). |
+| `/agent` | The agent conversation, in two scenarios: a coding agent in a worktree, and the console assistant answering with generated blocks (§7b, `docs/generative-ui.md`). |
 | `/v1-landing`      | Landing page in the same system, with pricing.                         |
 | `/op-components`   | Every operator component, every state, with props.                     |
 | `/brand#hierarchy` | The type scale rendered live.                                          |
-| Docs | `docs/forms.md` · `notifications.md` · `content.md` · `localisation.md` · `data-viz.md` · `motion.md` · `icons.md`. One document per rule set, each a `/guide` section (`#forms`, `#notifications`, `#content`, `#locale`, `#dataviz`, `#motion`, `#icons`) with its live blocks from `src/sections/blocks/` mounted under the prose. `/op-components` mounts the same blocks. |
+| Docs | `docs/forms.md` · `notifications.md` · `content.md` · `localisation.md` · `data-viz.md` · `generative-ui.md` · `motion.md` · `icons.md`. One document per rule set, each a `/guide` section (`#forms`, `#notifications`, `#content`, `#locale`, `#dataviz`, `#generative-ui`, `#motion`, `#icons`) with its live blocks from `src/sections/blocks/` mounted under the prose. `/op-components` mounts the same blocks. |
 
 Gotchas that cost time:
 
@@ -150,7 +155,10 @@ change is wrong, not the rule.
 
 1. **Paper and ink only.** Background is warm off-white, text is near-black.
    Dark mode inverts the same pair. No greys for structure.
-2. **Every border is ink.** 1px `--border` equals `--foreground`. The only
+2. **Every border is ink.** 1px `--border` equals `--foreground` on paper.
+   On night `--border` (and the raise, which falls in `--border`) is 62% ink:
+   a light stroke on a dark ground carries more weight than an ink stroke on
+   paper, so an equal-contrast frame reads as a glowing box. The only other
    exception is row dividers inside a ledger, which use `--op-rule-soft`
    (16% ink).
 3. **No cards.** One raised element per screen (`.op-raise`, a 3px hard
@@ -165,6 +173,15 @@ change is wrong, not the rule.
 
 All in `op.css`, shipped with the components in `@temps-sdk/op`; the sandbox's
 `src/globals.css` imports it. Blocks, in cascade order:
+
+**Hover and selection lift the whole row.** A hovered, selected or focused
+`.op-row` (and an option, and a tab) overrides `--muted-foreground` to 80% ink;
+an ink-filled selection — the palette's current item, a filled tab, anything on
+`.bg-foreground` — takes it the other way, to 78% paper. Every utility reads
+that one variable, so the row's muted text, its state glyphs and its lucide
+icons all step up together. Without it the right-hand side of a row stays at
+resting muted while the fill moves under it, and the half of the row the reader
+is pointing at is the dimmest thing on the screen.
 
 `web/packages/op/tokens.json` is the same layer as data (W3C DTCG, exported as
 `@temps-sdk/op/tokens.json`): `base` is the raw material — the paper/ink pair,
@@ -261,21 +278,42 @@ Frozen decisions. Do not reopen without a written reason:
 
 ## 5. Status vocabulary
 
-`src/components/op/status.tsx`. Five states, one glyph each, one colour each.
+`src/components/op/status.tsx`. Six states, one glyph each, one colour each.
 
 | State     | Glyph | Colour  | Meaning                                              |
 |-----------|-------|---------|------------------------------------------------------|
 | `ok`      | ●     | success | healthy, passing, deployed                           |
 | `warn`    | ◐     | warning | degraded, above threshold, expiring                  |
 | `error`   | ×     | destructive | failing, unreachable                             |
+| `running` | ◉     | ink     | work in flight: building, restoring, scanning        |
 | `idle`    | ○     | muted   | not deployed, not configured, nothing yet            |
 | `sampled` | ◌     | muted   | telemetry head-sampled past the plan allowance       |
 
 `sampled` exists because the pricing page promises that past the allowance
 "telemetry is head-sampled and the console says so; it is never silently
 dropped". That promise is a UI contract. It shows in the status line, as a band
-on the chart, in the chart footer and in project settings. `STATE_RANK` orders
-lists by attention. `worst(states)` picks the status line glyph.
+on the chart, in the chart footer and in project settings.
+
+`running` is the sixth state and the only one that is **ink and never a hue**.
+The other five are verdicts — this is well, this is not, this is nothing yet —
+and a verdict is what a colour is for. Work in flight is not a verdict: a build
+that is running is neither good nor bad, and tinting it amber says a thing has
+gone wrong that has not. Its word comes from the operation, never from the
+state: `building`, `restoring`, `scanning`, `importing`, not "in progress".
+The glyph carries `.op-pulse`, a slow opacity-only pulse (~1.6s) zeroed under
+`prefers-reduced-motion`, because motion here means work is happening now, and
+it stops when the work stops (`docs/motion.md`).
+
+**Pending, queued and waiting-for-you are `warn`, not `running`, and warn does
+not pulse.** A deploy waiting on an approval, a schedule that has not fired, a
+proposal nobody has answered: nothing is happening, somebody has to act, and a
+pulse would say the opposite. `running` is reserved for a machine that is
+actually doing the work right now.
+
+`STATE_RANK` orders lists by attention and places `running` between `warn` and
+`sampled`: something in flight outranks a healthy row, because it is about to
+change, and is outranked by anything that has already gone wrong.
+`worst(states)` picks the status line glyph.
 
 ## 6. Components
 
@@ -330,6 +368,23 @@ One component, four states: `loading` (skeleton rows, never a spinner),
 of what the surface will show, a link to the settings page), `error` (message,
 resource, retry). Nothing renders blank. Replaces the console's three empty
 state components and spinner-as-page-state.
+
+### Button
+
+The shadcn button in the ink skin, plus one addition the system needs:
+`busy` and `busyLabel`. While busy it spins its own icon (`.op-busy`,
+`0.9s linear` — the one spin in the system), swaps its label for the verb in
+progress ("saving…", "reloading…", "deploying…"), locks its min-width to the
+width it had idle so the row does not move, sets `aria-busy` and swallows
+clicks. It is **not** `disabled`: disabling greys the control out and drops
+focus, so a keyboard reader who just pressed ⌘S is thrown to the top of the
+document at exactly the moment they are waiting to hear what happened. A
+minimum busy time of 400ms stops a fast answer reading as a flicker, and under
+`prefers-reduced-motion` the icon holds still and the label carries it alone.
+
+A reload spins because the thing it stands for goes round; a `running` glyph
+pulses (§5) because a state is not an action. `Settings` takes `saving` and
+passes it to the sticky save bar. See `docs/motion.md` exception 4.
 
 ### Kbd
 
@@ -438,6 +493,22 @@ whole rule set; `/guide#dataviz` draws it.
 `thresholds={[{ y, label, state }]}` draws dashed horizontal reference lines
 labelled at the right edge in the state tone (a vital's good / poor line).
 
+`band={{ lower, upper, label }}` draws an expected range behind the line as two
+keys of the same points, hatched in ink — never a filled area and never a
+second hue — with its own generated legend entry. `anomalies={[{ x, note,
+state }]}` puts a × on the first series at each called-out point; the caller
+lists the same points under the plot, because a glyph on a plot is not
+reachable by a keyboard on its own. `outside(point, band, key)` and
+`vsExpected(point, band, key)` are the helpers that derive both from the data
+("+141% above", "inside"), so the plot, the list and the table cannot drift.
+`compare={{ label, data }}` merges the period before this one onto the same
+points under one reserved key and draws it as a dotted thin ghost, with the
+delta and its baseline in the legend ("+9% vs prior 7d"); compare equal-length
+windows or say nothing. `Series` gained `top` (an out-of-band segment belongs
+last in the legend and on top of the line it marks) and `inTable` (off for a
+series that is a derived copy of another; a column of en dashes is not a fact).
+`BandChart` wraps all of this for the metrics explorer.
+
 `RangePicker` takes `custom={{ from, to, onChange }}` to add a last button
 that opens two datetime fields under the strip (from, to, a retention note,
 cancel, apply; "to" must be after "from" and the form says so). Once applied
@@ -543,11 +614,187 @@ In `src/components/ui/`. Sparkline for ledger cells. LogViewer has a gutter,
 level colour, `/` search, n/N, follow toggle. EmptyPlaceholder is the older
 onboarding component; PageState `unconfigured` supersedes it for new work.
 
+### The ink vocabulary (`viz-ink.tsx`)
+
+What every figure in the second wave is built from, so fourteen primitives look
+like one system. `Figure({ label, table, footer, legend, height, children })`
+is the frame: the `role="img"` plot with its `aria-label`, the generated
+legend, the footer, and the table toggle that swaps the drawing for the same
+numbers. `DataTable({ caption, head, rows, numeric })` renders that table view
+as a real `<table>` with the numeric columns right-aligned and tabular, so
+"ship a table view with every chart" is one call, not a per-figure decision.
+`InkPatterns()` mounts the SVG defs once per page; `INK_LAYER_ORDER`
+(`solid` · `hatch` · `dot` · `cross`), `INK_FILL`, `INK_FILL_OPACITY` and
+`INK_FILL_WORD` are the four layer fills a composition may use and the words
+the table calls them, which is why a fifth layer has nowhere to go.
+`INK_STEPS` is the five-step density ramp, `inkStep(value, max)` picks the
+step and `inkCell(value, max)` returns the cell style; zero is the empty step,
+never a light something. `INK_TONE` is the only place a figure reaches a
+state colour. `StateWord({ state, children })` prints glyph + word together so
+neither travels alone. `useReadout(count)` is the shared pointer / touch /
+keyboard readout state (`←` `→` move it) and `ReadoutLive({ text })` is its
+`aria-live` line, which is how `CalendarHeatmap`'s cells stopped being a
+`title` and nothing else.
+
+### BandChart, StackedInk, LatencyHeatmap, StateTimeline, WindowTimeline, SessionTimeline
+
+The time-shaped figures (`viz-time.tsx`). All take `title`, `range` (where
+they have one), `verdict` and an optional `footer`, and all ship a table view.
+
+`BandChart({ data, actual, actualName, band, worse, errorAt, bandNote,
+markers, unit, title, range, verdict, height, xInterval, footer, onOpen })`
+answers "is 980ms unusual for 10:00?": the expected range hatched behind the
+line, the out-of-band stretch toned because it *is* a state, a × at each peak,
+and the excursions derived from the data as `Excursion` rows (`x`, `value`,
+`bound`, `pct`, `side`, `state`, `points`, `deploy`) listed under the plot and
+summarised in the footer with the deploy beside. `worse` says which side is
+bad (`up` · `down` · `both`); `errorAt` is the percentage past the bound that
+turns a warn excursion into an error.
+
+`StackedInk({ data, layers, unit, title, range, verdict, height, xInterval,
+partial, footer })` is composition over time as stacked **bars from zero** —
+never a stacked area. An `InkLayer` is `{ key, name, fill, state }`; four
+layers at most, told apart by pattern, and `state` only on the layer that is
+itself a state. `partial` hatches the bucket still filling.
+
+`LatencyHeatmap({ columns, rows, counts, unit, title, range, verdict,
+overlays, cell, footer })` is time × latency bucket with ink density by count,
+`rows` as `{ le, label }` upper bounds and `overlays` for p50/p95 lines drawn
+over it; it answers whether the p95 is one slow route or all of them.
+
+`StateTimeline({ segments, title, range, verdict, height, footer, onOpen })`
+draws `StateSegment`s (`state`, `word`, `from`, `seconds`, `note`) as wide as
+they were long, with the durations printed. **`StatusStrip` versus
+`StateTimeline`**: `StatusStrip` belongs in a ledger, where every row gets
+equal buckets and rows are compared by shape; `StateTimeline` belongs on a
+record, where the transitions are real and the question is how long it was
+down. Never both for the same window on one screen — two pictures of one hour
+that disagree about the width of a minute.
+
+`WindowTimeline({ from, to, covered, marks, cursor, title, verdict, zone,
+height, footer })` puts what a restore can reach on the same axis as the
+restore cursor, backups as `WindowMark`s, the covered span as a band, and the
+zone printed; it goes directly above the point-in-time field.
+
+`SessionTimeline({ duration_ms, events, position_ms, onSeek, title, verdict,
+footer })` is one session: the axis, and beside it the `SessionEvent` list
+(`at_ms`, `kind`, `label`, `state`, `note`) that carries the keyboard. The
+scrubber is a native range input.
+
+### PercentileLadder, CohortGrid, DeltaTable
+
+The grid-shaped figures (`viz-grid.tsx`), which are tables first.
+
+`PercentileLadder({ rungs, unit, label, meta })` puts a distribution in a tile:
+`Rung`s of `{ name, value, delta, baseline, state }`, each delta on its own row
+beside the baseline it is a delta from. `CohortGrid({ cohorts, periodLabel,
+label, verdict, meta })` is retention as a real `<table>` — `Cohort`s of
+`{ label, size, values }`, the percentage in the cell, the cohort size in its
+own column, and an en dash for a period not yet reached. `DeltaTable({ rows,
+before, after, label, meta })` is the release comparison: `DeltaRow`s of
+`{ metric, before, after, unit, better, threshold, note }`, toned only where a
+`threshold` makes the value a state, never because a number went up.
+
+### PathTree, Topology
+
+The graph-shaped figures (`viz-graph.tsx`). `PathTree({ root, label, verdict,
+dropAlert, onOpen, meta })` draws journeys as an indented, collapsible tree of
+`PathNode`s (`label`, `count`, `exits`, `children`, `note`) with drop-off per
+branch and `dropAlert` (50 by default) the share that takes a tone. Never a
+Sankey. `Topology({ nodes, links, label, verdict, onOpen, height, meta })`
+lays `TopoNode`s out in deterministic layers (`layer` is given, never solved
+for, so the picture does not move between reloads) and puts the same nodes in
+a list beneath it; the list carries the keyboard, and the graph is one
+`role="img"` with no focusable children. `TopoLink` takes `kind`
+(`direct` · `relay` · `call`), which is the pattern it is drawn with.
+
+### UsageBar, Gauge
+
+Measures against a limit (`viz-usage.tsx`). `UsageBar({ label, used,
+allowance, unit, plan, format, sampledFrom, sampledLabel, resets, warnAt,
+action })` states the usage as a sentence before the bar, hatches the overage
+rather than pinning the bar at 100%, marks where sampling began, and always
+names the plan and its allowance. `Gauge({ label, value, max, unit, of, peak,
+peakLabel, thresholds, idle })` is a machine's pressure drawn horizontally
+from zero, with threshold ticks that carry their own words and the peak with
+its window; `idle` is what an unsampled node says instead of disappearing —
+it keeps its tile and states why there is no number.
+
+### ToolRow, Proposal, Provenance, StreamBlock, AgentQuestion, AgentSources, RunAside
+
+The agent surface (`web/packages/op/src/agent.tsx`); the whole rule set is
+`docs/generative-ui.md`, drawn on `/agent` and `/op-components#genui-ledger`.
+
+`ToolRow({ name, arg, kind, state, ms, input, output, diff, error, meta,
+defaultOpen, approval, approved })` is one typed call as one row: kind icon ·
+name and argument in mono · state word · duration, opening to its input, its
+output, its diff or its error. `state` is a `ToolState` and the word comes from
+`TOOL_STATE`, never from a call site: `preparing` · `running` · `done` ·
+`failed` · `needs approval` · `approved` · `denied`. `kind` is a `ToolKind`
+with one icon each (`toolKind`/`toolIcon` derive it from the name). Edits and
+commands open by default because the diff and the output are the content;
+reads, searches and queries collapse. `approval` is a `ToolApproval`
+(`reason`, `destructive`, `onRespond`) answered inline with `Y` / `N`; only
+irreversible loss takes the red left rule.
+
+`Provenance({ tool, when, range, note, query, queryLabel, children })` wraps
+**every** generated block and prints `from <tool> · <when> · <range>` under it,
+with `show query` revealing what was actually sent. `tool` and `when` are
+required, so the component cannot be used to launder a picture the model
+invented.
+
+`Proposal({ action, target, consequence, reversal, irreversible, autonomy,
+kind, confirmWord, confirmLabel, declineLabel, steps, decided, onConfirm,
+onDecline })` is how a write is shown and not performed: the four facts as a
+`KeyValue` (action · target · consequence · reversible), the autonomy level in
+words, and nothing running until a human confirms. Reversible confirms in ink;
+`irreversible` routes through `EchoDialog` with the name typed out and the
+`steps` ticked.
+
+`StreamBlock({ kind, label })` holds the shape of the block that is coming
+(`text` · `chart` · `ledger` · `detail` · `keyvalue` · `tool`) at the height it
+will land at, static — a skeleton that shimmers and a chart that draws itself
+are both banned. `AgentQuestion({ q, options, answer, onAnswer, hint })` asks
+with two to four typed options, each with the consequence of picking it,
+answered in two steps: pick (`1`–`4`), then confirm (`⏎`). `AgentSources({
+items })` ends an answer with what was read, as links into the console's own
+records. `RunAside({ model, workspace, mode, modeState, context, checkpoints,
+rows })` is the run as reference facts — model · workspace · permission mode ·
+context with its percent · checkpoints, plus whatever else this run needs
+stated (tools, proposals, cost).
+
+### Inspector
+
+The panel that reads one row **beside** the list. ~520px at `xl`, where it
+**pushes** the main column rather than covering it; below `xl` it is an
+overlay sheet with a scrim; below md it is full screen. An ink border on its
+left edge, no card and no shadow — it is a region of the page, not a thing
+floating over it. The header is state glyph + word · the title as a mono id ·
+the meta (the time, with the deploy id beside it) · `open` (go to the full
+record page), `copy link`, and `×`. The body is stacked `Section`s and **no
+tabs**, with a small in-panel toc row above them — `fields · trace · request ·
+context` — whose entries are anchors reachable with `1`–`4`.
+`role="complementary"` with an `aria-label`, and the title is
+`aria-live="polite"` so a panel following the cursor is announced rather than
+silently swapping under the reader.
+
+The keyboard contract is the whole point of it: `⏎` on a ledger row opens the
+panel; while it is open `j`/`k` keep moving the **ledger's** cursor and the
+panel follows; `esc` closes it and returns focus to the row it came from; `/`
+still goes to the page's query bar and never into the panel; and focus enters
+the panel only with Tab, so opening it does not take the list away from the
+reader.
+
 ## 7. The three page templates
 
 `src/components/op/templates.tsx`. Every console screen is one of these. A
 screen that does not fit is a reason to extend a template, not to start from a
 blank div.
+
+Changing a tab or a facet never moves the document; only the content below the
+strip changes. The strip reveals its own active tab sideways (`revealInRow`),
+because a `scrollIntoView` on a tab also scrolls the page vertically, and a
+reader who pressed `2` did not ask to be moved.
 
 All three take `title` and `meta` and render a `PageTitle` first. It carries
 its own top padding (`pt-5`) so the first thing under the shell header has
@@ -714,6 +961,19 @@ need the events, the content and the headers together to see what. Hiding
 two of the three behind clicks makes them look for it. The email page was
 three tabs and is now one page: events and headers on the left, the rendered
 message on the right, the text version under a `<details>`.
+
+**A tool screen inspects in a panel; a record is a page.** On a screen whose
+whole job is narrowing one list (logs, traces, the proxy access log, the audit
+log), reading a row must not cost the reader their place in it: `⏎` opens an
+`Inspector` beside the list, the panel follows the ledger's cursor as `j` and
+`k` move it, and `esc` puts focus back on the row. The panel never takes `/`,
+`j` or `k` — those belong to the query bar and the list, and a panel that
+stole them would make the screen's own keyboard stop working the moment it
+opened. The division of labour: the **panel** is for staying in the list while
+reading one row, the **record page** is the deep link you send to somebody, and
+the panel's `open` action goes to it. Both render the same content from one
+shared component, so the thing you read in the list and the thing you paste
+into a ticket cannot drift apart.
 
 **One axis per control.** A page gets one row of tabs, ever, and it answers
 one question: which facet of this resource (overview, deploys, variables,
@@ -951,6 +1211,159 @@ and the record are built from those and nothing else.
 - **States.** Fresh: unconfigured PageState with the two-line SDK init and
   the DSN link. `?fail=1`: the error store itself is down; the page names
   the resource and retries.
+
+### Logs (`/v1?p=logs`, `log:<id>`)
+
+`src/sections/ConsoleV1Logs.tsx`. Every line every application on this
+instance wrote, in one list, with a query bar in front of it. This is the
+first screen in the console that is a **tool** rather than a resource: the
+reader does not arrive for a facet of something (a project's deploys, an
+issue's events), they arrive with a question — "what did billing-worker say
+after dep_31c" — and narrow one list until it answers. So there are no tabs,
+there is no record the page is about, and the whole screen is a query bar,
+one chart, one Ledger and a column of facets.
+
+- **The scope is a sentence.** The meta reads
+  `all projects · production · runtime · 24h · 422 lines`, assembled from the
+  scope Pickers (projects, environment, source) exactly as §7 says a scope
+  should read. Two projects makes it `in api-gateway, billing-worker`, and the
+  projects Picker then carries that phrase as its selected option with
+  "from the facets" as its meta — a control that cannot say the truth is
+  worse than no control.
+- **The query bar owns `/`.** It is the only thing on the page bound to it,
+  which is why the `Ledger` is given no `filter`/`onFilter`: a second search
+  box fighting for the same key is how a reader learns not to trust a
+  shortcut. Free words search the message; `key:value` becomes a removable
+  chip. Typing opens a `Drop` of typed suggestions — keys first with what each
+  one means, then values with their line counts — and `⏎` adds the highlighted
+  one, `backspace` on an empty input removes the last chip, `esc` closes.
+- **Tokens are the truth, and the truth is in the URL.** Every facet row,
+  every scope Picker, every saved query, every pattern row and every `Phrase`
+  in the verdict writes a token. The query and the chosen columns live in
+  `?q=` and `?cols=` beside `?p=`, so a log search is a link that still
+  finds the same lines tomorrow. Tokens of one key are an "or" (two project
+  chips mean both projects); different keys are an "and".
+- **Facets are Breakdowns that add tokens.** The aside is level, project,
+  environment, source, service, node, deployment and "fields seen" (the
+  structured attributes: status, method, route, duration, each drilling into
+  its top values). Every row carries its count, its share bar, and — where it
+  has any — a second thin ink bar for the **error share** inside that group,
+  so "which container is the one that is angry" is answerable without
+  clicking. A small "filter facets" input sits at the top; a facet with no
+  matching row does not render an empty frame. The facets count the window,
+  not the query, so the reader can always widen. Below xl the whole aside
+  becomes a `Drop` behind a "facets" button, so it is never both places at
+  once and a phone never scrolls sideways to reach it.
+- **The chart is the time filter.** Volume by level in 30 minute buckets,
+  four series told apart by pattern and never by hue: error solid regular and
+  the only one with a tone (it is a state), warn thin dashed, info thin solid,
+  debug thin dotted. Buckets are aligned to the half hour, not to "now", so
+  the deploy markers land on the rise they caused. Drag selects a window and
+  the list follows it, saying so in the hint. The chart answers the query
+  (a facet click narrows the plot and the list together) but deliberately
+  ignores its own selection, because a plot that redrew itself from its
+  selection leaves no way back.
+- **Views are renderings of one list, not tabs.** A `Segmented` of
+  `list · patterns · by service`, all three driving the same `Ledger` — same
+  keyboard, same footer, different columns. **patterns** groups the query by
+  message template (`health check GET ‹path› timed out after ‹n›s`) with
+  count, share, first seen, last seen, a 24h `Sparkline` and the worst level
+  in the group as its glyph; `⏎` adds a `pattern:` token and drops back to
+  the list. **by service** is the same ranked-list idea for containers, with
+  the error count beside the line count. A thousand lines that are one thing
+  should read as one thing that happened a thousand times.
+- **The row.** Time relative under a day with the absolute stamp as its
+  `title`; level as glyph + word (× error, ◐ warn, ○ info, and `debug` as a
+  muted word with no glyph to spend); the project's mark with its container;
+  the message in mono, ANSI already stripped, truncated with the full text on
+  hover. Trailing cells are the reader's choice — a `columns` Drop offers
+  deployment, trace, node, request, duration and status, and the choice rides
+  in the link like the query. A row with a trace shows the link glyph, and
+  `t` on a row opens its trace directly. Below md the cells go and the
+  phone row carries level · service · time on one line and the message on the
+  next.
+- **`⏎` opens the line in the `Inspector` beside the list**, which follows
+  the cursor as `j` and `k` move it, so reading twenty lines does not cost
+  twenty navigations; `log:<id>` stays the deep link, and it is what the
+  panel's `open` action goes to. **`e` expands the line under the cursor**
+  into the raw line (or the JSON re-indented) and its structured fields
+  without opening anything. `space` toggles live. All three have a visible
+  badge with a handler behind it.
+- **Live tail.** `Live` beside the range picker, off by default. The list is
+  newest first, so a pinned cursor means the reader is standing where the new
+  lines land: while they are at the top, lines append there; scroll away to
+  read something older and the tail holds and counts —
+  "paused · 12 new lines · resume" in the ledger's hint — rather than moving
+  the ground under them.
+- **Actions do.** `copy query` (the same string the URL carries),
+  `save view` (a name field in a `Drop`; the saved query joins the saved-query
+  Picker beside the scope) and `export` (`csv`/`json`, the current query, with
+  the count spelled out on the button and the 100,000-line cap stated
+  underneath). Each is one click and a toast, because each is reversible;
+  nothing here needs an `EchoDialog`.
+- **Correlation is inline and both ways**: a line shows its trace (the
+  waterfall, with the emitting span marked `▸ this line`) and its request (the
+  proxy access entry), and a trace record shows the lines it produced; a line
+  with no trace id says so and links the setting that turns tracing on. The
+  query bar accepts `trace:` and `request:`, so a trace id pasted into it
+  lands on the lines of that trace. A deployment's runtime log facet has
+  "open in Logs", which goes to `logs:deploy:<tag>` with the token already
+  set.
+- **States.** `?fresh=1` is unconfigured: no container is running and no
+  domain is on the proxy, with three example lines and the link to the log
+  store. A query that matches nothing is `empty` and says how many lines are
+  in the window, what it was matched against, and that lines past retention
+  were deleted rather than hidden. Ranges past the plan's retention are struck
+  through in the `RangePicker` and say which plan keeps them; the footer
+  states the horizon and the zone (`times are UTC`) beside every window.
+
+**Two departures from the brief, taken deliberately.** Saved views are a
+`Picker` and not part of the `Segmented`, because the `Segmented` holds the
+three renderings of the list and saved queries grow without limit — every
+"save view" adds one — so they read as a scope, and a scope is a `Picker` read
+as a sentence; a `Segmented` would break its own 2–4 rule on the fifth save.
+And "by service" is the `Ledger`'s third rendering rather than a `Breakdown`,
+because it looks like a Breakdown but it is the list's own rows, so `j`/`k`/`⏎`
+still work and the footer still counts; a `Breakdown` dropped into the list's
+place would have taken the keyboard away from the screen's main list.
+
+**Log record (`log:<id>`).** One line is a record, because an operator quotes
+one line to somebody. Meta is `log_… · project · environment`; the verdict
+says what to do about it ("billing-worker has said this since dep_31c
+shipped — read the lines around the deploy, then roll it back or fix the
+check"), and an ordinary info line gets "Nothing to do: an ordinary runtime
+line, kept so the twenty around it can be read". The Lede carries level,
+service, deployment, node, trace and when it was written. Main column: the
+line itself (raw as the container wrote it, or the JSON re-indented), the
+structured fields as `KeyValue`, and **±20 lines from the same container** as
+`LogLines` with `▸ this line` in the source column — which is exactly what
+`log_chunks.line_offsets` exists for in the backend. Aside: where to go
+(the trace, the deployment, the issue error tracking grouped it under, every
+line this container wrote, the rest of this request) and "33 lines in the
+hour before this one say exactly this. One alert covers all of them."
+Actions: copy line, open in trace, create alert from this query.
+
+**Real shapes behind it** (read from `temps/`, never edited): `log_events`
+(time, project_id, service, env, level, message, `fields` JSONB, chunk_id,
+line_offset, deploy_id), `log_chunks` (container_id, node_name,
+external_service_id, started_at, line_count, line_offsets) and
+`deployment_container_logs` (container_name, service_name, node_id). That is
+why a line carries a service, a node, a deployment and a chunk offset, and
+why "the twenty lines around this one" is a real query rather than a nicety.
+Real console pages this replaces: `components/runtime-logs/log-viewer.tsx`,
+`history-log-viewer.tsx`, `components/containers/ContainerLogsViewer.tsx` —
+none of which is cross-project, and all of which are one container at a time.
+
+**Fixtures.** ~420 lines, seeded and clock-fixed at 2026-09-06 21:29 UTC, so
+a visual baseline is a fact about the design and not about the hour it ran
+in. Four applications — api-gateway (runtime and proxy-shaped access lines),
+billing-worker, acme-storefront (build lines, ANSI coloured and stripped) and
+docs (proxy access) — plus system and agent lines. The story is the one the
+rest of the console tells: `dep_31c` ships to billing-worker at 19:30 and its
+health check never passes again, so 41 errors in the last hour, 38 of them
+from billing-worker, and the other three are the 502 on docs, the TypeError
+in AddressForm and the failed staging build. A handful of JSON lines and a
+handful of ANSI ones are in the set on purpose, because both have to render.
 
 ### Settings (`/v1?p=settings`, `settings:<slug>`)
 
@@ -1317,8 +1730,38 @@ last run, and an onboarding state when unconfigured.
 The Vercel AI Elements vocabulary (Message, Reasoning / ChainOfThought, Plan,
 Tool with its six states, Confirmation, Task, Queue, Checkpoint, Sources,
 Actions, Suggestion, Context, PromptInput) drawn with the v1 rules, in
-`src/sections/AgentChat.tsx`. Every block is a small component ready to move
-into `src/components/op` when the console grows an agent surface.
+`src/sections/AgentChat.tsx`. Every block is now a primitive in
+`@temps-sdk/op` (`agent.tsx`, §6), and the whole rule set is
+`docs/generative-ui.md`.
+
+**Two scenarios, one ledger**, chosen with a `Segmented` in the page header,
+because the claim the surface has to survive is that an agent writing code and
+an agent answering an operator are the same kind of record:
+
+- **Coding agent** (`fix: address form null id` · `api-gateway · worktree
+  feat/checkout-address`). A `TypeError` in `AddressForm` since `dep_91a`: find
+  the cause, fix it with a test, run the suite, open a PR, and do not touch the
+  Stripe retry code. It is the surface for everything a run *does* — reasoning
+  that collapses to "thought for 6s · 3/3 steps", reads and greps that collapse,
+  an edit that opens with its unified diff, a command open with its output, one
+  failing command shown as `× failed` with the error verbatim, a subagent
+  holding its own transcript, tasks, a checkpoint, a plan, and the push waiting
+  on an inline approval. Its aside carries tasks, files changed and permissions;
+  its permission mode is "accept file edits", flagged `warn` because it is wider
+  than the default.
+- **Console assistant** (`why did checkout errors jump?` · `checkout-web ·
+  production`). The same ledger answering an operator with the console's own
+  blocks: `get_error_time_series` produces a `TimeChart` and
+  `list_error_groups` produces a `Ledger`, each wrapped in `Provenance` with
+  `show query`, so the reader can always get from a picture back to the call
+  that drew it. The verdict comes first in words ("Roll back checkout-web
+  production to dep_90c"), and the one write is a `Proposal` — action, target,
+  consequence, reversibility, autonomy — that does nothing until it is
+  confirmed; declining it says what did not change ("Nothing ran. Production
+  stays on dep_91a at 9.1 errors per minute"). Its aside is the run plus the
+  autonomy list per capability, ending in `delete anything · not on the
+  allowlist`, because what is *not* allowed is a fact the reader needs before
+  they ask. It is read-only: writes propose.
 
 - The transcript is a ledger of turns (who · when · model in a left column).
   Inside a turn there are no boxes. A tool call is one line: a kind icon that
@@ -1404,6 +1847,15 @@ into `src/components/op` when the console grows an agent surface.
 
 Verified at 390 and 1440 wide on every v1 screen with a scrollWidth check.
 
+- The shell is sticky and the main column is the only thing that scrolls. The
+  sidebar rail and the header pin (`sticky`, `self-start`, `top-0` full-screen
+  and `top-12` under the sandbox chrome, each with its own `overflow-y-auto`),
+  and the `Inspector` pins the same way, with its own scroll and its `top`
+  aligned to the bottom of the header. A shell that scrolls away takes the
+  navigation *and the attention badge* with it, so on a long screen — Logs is
+  the one that exposed it — the reader has to scroll back to the top to find
+  out that anything is wrong. Below lg the sidebar is a fixed drawer and none
+  of this applies.
 - Actions go through `ActionBar` (Detail `actions`, Ledger `action`, or
   directly). From sm up it is the right-aligned wrapping row you expect.
   Below sm it is the same row at natural widths, scrolling sideways with an
@@ -1590,6 +2042,7 @@ design-system/
     content.md                    the words: capitalisation, terms, errors, buttons, numbers
     localisation.md               expansion, no concatenation, logical properties, RTL readiness
     data-viz.md                   which chart answers which question; series without a hue
+    generative-ui.md              what an agent may render: the console's blocks, provenance, proposals (/guide#generative-ui)
     motion.md                     the three duration tokens, what may move, the two exceptions
     icons.md                      lucide only, two sizes, the concept → icon vocabulary
     design-system-answers.md      the twelve questions, answered
@@ -1603,6 +2056,14 @@ design-system/
       form.tsx  FormErrors, the multi-field submit summary
       datetime.tsx  date, time, range, duration and schedule fields, and the
                     Strip that RangePicker shares with them (forms.md)
+    ../web/packages/op/src/       the package itself; the files above re-export it
+      agent.tsx     ToolRow, Proposal, Provenance, StreamBlock, AgentQuestion, AgentSources, RunAside (generative-ui.md)
+      inspector.tsx the panel that reads one ledger row beside the list, following its cursor (§6, §7)
+      viz-ink.tsx   the shared ink vocabulary every figure is built from: Figure, DataTable, InkPatterns, StateWord, the readout, the five density steps
+      viz-time.tsx  BandChart, StackedInk, LatencyHeatmap, StateTimeline, WindowTimeline, SessionTimeline
+      viz-grid.tsx  PercentileLadder, CohortGrid, DeltaTable — the figures that are tables first
+      viz-graph.tsx PathTree and Topology, each with the same nodes as a list beneath it
+      viz-usage.tsx UsageBar and Gauge: a measure against an allowance, and a machine's pressure
     ../web/packages/op/tokens.json    the token layer as data (§4)
     ../web/packages/op/scripts/tokens.mjs  check / build, wired into bun run lint
     components/ui/                shadcn primitives + sparkline, log-viewer, empty-placeholder
@@ -1611,12 +2072,15 @@ design-system/
     sections/ConsoleV1.tsx        reference console (uses components/op)
     sections/ConsoleV1Env.tsx     deploys + promote, environments, variables tabs (§7b)
     sections/ConsoleV1Observe.tsx sandboxes, sandbox detail, traces, trace waterfall, metrics (§7b)
+    sections/ConsoleV1Logs.tsx    the Logs tool screen and the log record (§7b)
     sections/InkLandingV1.tsx     reference landing
     sections/Guide.tsx            /guide — renders docs/*.md into one consolidated page
     lib/md.ts                     the slicing helpers the guide cuts documents with
     sections/OpComponents.tsx     component reference page
-    sections/blocks/              the live half of the seven documents above:
+    sections/blocks/              the live half of the documents above:
       FormBlocks NotificationBlocks ContentBlocks DataVizBlocks TokenBlocks
+      DataVizBlocks2  the second wave of figures, viz-band … viz-topology (data-viz.md §§9–23)
+      GenUiBlocks     tool rows, provenance, proposals, streaming, questions (generative-ui.md)
       (mounted by both /guide and /op-components — one implementation)
     sections/Brand.tsx            brand page incl. hierarchy block
 ```
@@ -1643,6 +2107,35 @@ design-system/
 8. Accessibility pass: the ledger uses `role="listbox"` with
    `aria-activedescendant`; verify with a screen reader, and confirm the
    sampled band has a text equivalent beyond the footer.
+9. Four primitives the Logs screen (§7b) wanted and had to hand-build, in the
+   order they cost the most:
+   - **`LedgerRow.expanded?: ReactNode`**, rendered as a full-width subgrid
+     row. `.op-row` is a fixed `--row-h` on desktop by design, so a row cannot
+     grow to hold its own detail and `e` opens the expansion in a `Section`
+     under the list instead of in place. The same slot would serve the proxy
+     access log and the deploy checks.
+   - **`QueryBar({ keys, values, tokens, onTokens })` in the package**, with
+     the shared `key:value` grammar (`writeQuery` / `readQuery`) so every tool
+     screen serialises the same way. The Logs query bar is about 90 hand-built
+     lines — chips, the typed suggestion `Drop`, the arrow-key cursor, the
+     `backspace`-removes-last rule — that traces, proxy logs, the audit log
+     and analytics events will each need identically.
+   - **`BreakdownRow.of?: { count: number; label: string }`**, a second
+     measure on a facet row. "Count, and how much of it is errors" is the
+     facet question, and the second bar currently has to be drawn inside the
+     row `label`.
+   - **`Picker` multi-select**, which is why two projects arrive through the
+     facets and are described back to the Picker as a synthetic option
+     ("in api-gateway, billing-worker · from the facets").
+   Minor, with it: `Drop` anchors right by default, so a suggestion panel
+   needs a `start-0 end-auto` override.
+10. The `op.css` blanket transition rule carries `!important`, so every class
+    that must actually animate has to be lifted out of it with a `:not(…)`
+    arm — now `.animate-spin`, `.animate-pulse` and `.op-pulse`. That is
+    fragile (opting one class in means editing a selector three hundred lines
+    away from the class itself) and it collides with the dialog's own
+    `--op-duration-slow`. Replace the blanket `!important` with a scoped rule
+    so opting in stops requiring a remote edit.
 
 Found by the kitchen-sink stress page (`/kitchen-sink`), not yet fixed:
 

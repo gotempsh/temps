@@ -2,7 +2,7 @@
 
 Machine-readable digest of `brand-guidelines.md`, `design-system-handoff.md`,
 `content.md`, `localisation.md`, `forms.md`, `notifications.md`, `data-viz.md`,
-`motion.md` and `icons.md`.
+`generative-ui.md`, `motion.md` and `icons.md`.
 Imperative only. When this file and those documents disagree, they win — fix this file.
 Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
@@ -17,7 +17,8 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 ## Non-negotiable
 
 - Use paper and ink only. Background warm off-white, text near-black. Dark inverts the same pair.
-- Make every border ink (`--border` equals `--foreground`). Use `--op-rule-soft` only for row dividers.
+- Make every border ink on paper (`--border` equals `--foreground`). On night, borders and the raise are 62% ink: a light stroke on a dark ground weighs more than an ink stroke on paper. Use `--op-rule-soft` only for row dividers.
+- On night, keep subdued regions darker than the ground and state hues at chroma 0.11–0.14. Never invert the light pair and stop there.
 - Ship no cards. Use one `.op-raise` per screen, on the thing the reader must act on.
 - Emit colour only through `Status`: glyph, word, tone, in that order. Never a bare tone.
 - Keep whitespace between sections, not inside tables.
@@ -27,6 +28,7 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Tokens
 
+- A hover or a selection lifts the whole row: muted text, state glyphs and icons step up with the fill, never dimmer under the reader. One variable (`--muted-foreground`) does it, so nothing is left behind.
 - Take every value from a token. A hex, an `oklch()` or a `ms` literal in a tsx file is a bug.
 - Name only semantic tokens in a component (`--muted-foreground`), never a base token.
 - Edit `web/packages/op/tokens.json` and `op.css` in one commit. `bun run lint` fails when they disagree.
@@ -39,6 +41,9 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - A literal duration in a tsx file. `duration-150`, `transition-all`.
 - A second hue. `data-accent` is landing-only, one filled element per viewport.
 - Spinners as page state. Use `PageState state="loading"` (skeleton rows).
+- Pulsing an `ok` glyph.
+- Pulsing a live label.
+- A spinner that is not on a busy button. `Loader2` as page state, a spinner beside a row, a spinner in a header.
 - Blank empty states. Every non-happy state is `PageState`.
 - Confirm dialogs that are not `EchoDialog`.
 - `<select>` for branches, images, regions, environments, or >7 options. Use `Picker`.
@@ -70,10 +75,26 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - An empty date that means forever. Free-text durations (`30d` in a text box). `MM/DD/YY`.
 - "Success", "Done" or "Error" as the whole message.
 - A stored secret prefilled into an input. A banner that pushes the page down.
-- Pie charts, donuts, treemaps, stacked areas. A truncated y axis on bars.
+- Pie charts, donuts, treemaps, stacked areas, Sankey and alluvial diagrams, radial gauges and needles, force-directed graphs. A truncated y axis on bars.
 - A colour legend, or two series told apart by `--chart-1` / `--chart-2`.
-- A chart with no table view, or more than four series on one plot.
-- Hover-only readouts (the `GeoMap` desktop pointer readout is the one exception, because the list beside it carries the keyboard).
+- A legend that says "less … more", or any swatch with no number behind it.
+- A colour ramp or a red-to-green scale for a count: density is how much, not how well.
+- A fifth layer on one composition, or hue used to separate layers.
+- A delta with no baseline, or a red delta on a metric with no budget.
+- A red area flood or a shaded rectangle behind a plot.
+- A bar pinned at 100% with the overage invisible.
+- A restore form with no picture of the window it accepts.
+- A graph with no list beneath it, a layout that moves between reloads, or a focusable control inside a `role="img"`.
+- A chart with no table view, more than four series on one plot, or a figure whose data is a series and which ships no table view.
+- Hover-only readouts — an anomaly, a map country or a heatmap cell reachable only by hovering (the `GeoMap` desktop pointer readout is the one exception, because the list beside it carries the keyboard).
+- Chat bubbles, avatars, an "AI" circle, typing dots.
+- A markdown table where a `Ledger`, `KeyValue` or `Breakdown` exists.
+- A chart, list or number an agent rendered with no `Provenance`.
+- An agent confirming its own proposal, or a write that ran without a human.
+- A hidden, collapsed-away or summarised-over tool call — especially a failed one.
+- A free-text "please provide …" where typed options or a `Field` belong.
+- A `StreamBlock` that is a different shape or height from the block that lands.
+- An external link from a tool that was not a web search.
 
 ## Type
 
@@ -93,16 +114,22 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Use `--op-duration` (100ms) by default, `--op-duration-fast` (80ms) for hover, `--op-duration-slow` (200ms) only for something arriving on top of the page.
 - Use one curve, `--op-ease`. Change the tier with `.op-motion-fast` / `.op-motion-slow`, never with a literal.
 - Reduced motion is one media rule in `op.css` that zeroes all three durations. Never gate motion in JavaScript.
-- Leave the two exceptions alone: `.op-raise`'s hard 3px offset never lifts, and `animate-pulse` / `animate-spin` are the only surviving animations.
+- Leave the exceptions alone: `.op-raise`'s hard 3px offset never lifts, and `animate-pulse` (skeletons), `.op-pulse` (a `running` glyph) and `.op-busy` (a button doing the work) are the only surviving animations.
+- Give a `running` glyph a slow opacity-only pulse (`.op-pulse`, ~1.6s), zeroed under `prefers-reduced-motion`. It is the only motion in the system that is not a control answering the reader, because motion means work is happening *now* and it stops when the work stops.
+- Give a button whose work is still running `busy` and `busyLabel`: it spins its own icon at 0.9s, says the verb in progress, keeps its width, its colour and its focus, and is never `disabled`. A reload spins because the thing it stands for goes round; a state pulses, because a state is not an action. Nothing else in the system spins.
 
 ## Status vocabulary
 
+- Six states, and no seventh: `ok` ● · `warn` ◐ · `error` × · `running` ◉ · `idle` ○ · `sampled` ◌.
 - `ok` ● success — healthy, passing, deployed.
 - `warn` ◐ warning — degraded, above threshold, expiring.
 - `error` × destructive — failing, unreachable.
+- `running` ◉ ink, never a hue — work in flight. It is not a verdict, so it takes no tone.
 - `idle` ○ muted — not deployed, not configured, nothing yet.
 - `sampled` ◌ muted — head-sampled past the plan allowance.
-- Order lists with `STATE_RANK`. Pick the page glyph with `worst(states)`.
+- Take a `running` word from the operation: building, restoring, scanning. Never "in progress".
+- Say pending / waiting-for-you as `warn`, not `running`, and warn does not pulse. Nothing is happening; somebody has to act.
+- Order lists with `STATE_RANK` (`running` ranks between warn and sampled). Pick the page glyph with `worst(states)`.
 - Use an icon for what a thing or event *is*; use a glyph for what state it is in.
 
 ## Icons
@@ -129,12 +156,24 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
   - one resource with 2–6 facets → `Detail` with tabs, one row.
   - a configuration → `Settings` with sections and a sticky save bar.
   - nothing yet / not set up / failed → `PageState`.
+- Changing a tab or a facet never moves the document; only the content below the strip changes. The strip reveals its active tab sideways, and the reader's place on the page is theirs.
 - Give a page one row of tabs, ever. A scope is a `Picker` read as a sentence ("in production").
   2–4 views of one list are a `Segmented` in the toolbar. Time is a `RangePicker`.
 - Order a record: title + meta → status (verdict) → `Lede` → `Columns`( main: content then events · aside: reference ).
 - Make every section one `SectionTitle` (600/14 + one mono fact) and exactly one body.
 - Separate sections with an ink rule; frame every group; raise exactly one thing.
 - Let every block share the page's left and right edges. Cap the measure inside the frame (~70ch), never the frame.
+
+### Logs and tools
+
+- A tool screen is one list with a query bar in front of it: no tabs, no record, and the query bar owns `/`.
+- Tokens are the truth. Every facet, scope `Picker`, saved query and verdict `Phrase` writes one; nothing narrows a list by a state the reader cannot see, remove, or copy.
+- Put the query in the URL. A search that cannot be linked is a search that has to be typed again.
+- Facets are `Breakdown`s that add tokens, counted over the window and not over the query, so the reader can always widen.
+- Give a list two to four renderings, never two lists: one `Ledger`, one keyboard, different columns (raw · grouped by pattern · ranked by owner).
+- Live tail pins the newest line while the reader is standing where new lines land; scroll away and it holds and counts ("paused · 12 new · resume"), never moves the ground under them.
+- Correlation is inline and goes both ways: a line shows the trace it belongs to and the request it served; a trace shows its lines. A line with no trace says so as a fact and links the setting that turns tracing on — never a section that quietly disappears.
+- Inspect a row in an `Inspector` beside the list, never by leaving it: `⏎` opens the panel, `j`/`k` keep moving the ledger's cursor and the panel follows, `esc` returns focus to the row, and `/` still belongs to the query bar. The record page is the deep link; the panel is how you stay in the list.
 
 ## Record page checklist (enforced by `scripts/audit-records.mjs`)
 
@@ -191,7 +230,7 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Charts
 
-- Pick the chart from the question: over time → `TimeChart`; share or rank → `Breakdown`; steps → `Funnel`; from→to → `Flow`; distribution → `Histogram`; by bucket → `StatusStrip`; 0–100 → `ScoreRing`; by day → `CalendarHeatmap`; nested timing → `Waterfall`; by country → the ranked list, `GeoMap` second.
+- Pick the chart from the question: over time → `TimeChart`; share or rank → `Breakdown`; steps → `Funnel`; from→to → `Flow`; distribution → `Histogram`; by bucket → `StatusStrip`; 0–100 → `ScoreRing`; by day → `CalendarHeatmap`; nested timing → `Waterfall`; by country → the ranked list, `GeoMap` second; is this normal → `BandChart`; against the period before → `TimeChart` `compare`; composition over time → `StackedInk`; one slow route or all of them → `LatencyHeatmap`; a distribution in a tile → `PercentileLadder`; do they come back → `CohortGrid`; what next → `PathTree`; a session → `SessionTimeline`; against an allowance → `UsageBar`; a machine's pressure → `Gauge`; how long was it down → `StateTimeline`; before and after → `DeltaTable`; what a restore can reach → `WindowTimeline`; what talks to what → `Topology`.
 - Separate series by pattern, never hue: `stroke` solid · dashed · dotted, `weight` thin · regular.
 - Let `TimeChart` draw the legend from `series`. Never type one in a footer.
 - Give a series a tone only when the series is itself a state (`series.state`): an error rate against its threshold band.
@@ -203,6 +242,38 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Say the unit once in the header, never on every tick; numbers stay mono and tabular.
 - State range · retention · sampled · the baseline of every delta in `ChartFooter`.
 - Keep one plot to four series. More is small multiples or a table.
+- Draw an expected range as a hatched ink band behind the line (`TimeChart` `band`), never as a filled area or a background wash; colour the out-of-band **segment** in the state tone (it is a state), put a × at its peak, derive the excursions from the data, and list them under the plot as well as summarising them in the footer with the deploy beside.
+- Draw the prior period as a dotted thin ghost (`compare`), put the delta in the generated legend with its baseline, and compare equal-length windows only.
+- Draw composition over time as stacked **bars** from zero, at most four layers told apart by pattern at ≤3 greys; state tone only on the layer that *is* a state.
+- Give a density grid the five ink steps and a legend that prints the numbers behind the swatches; zero is the empty step, never a light something.
+- Put a delta's baseline on its own row (`PercentileLadder`, `DeltaTable`, `Metric`), and tone it only when a threshold makes the value a state.
+- Draw retention as a real `<table>` with the percentage in the cell and the cohort size in a column; a period not yet reached is an en dash.
+- Draw journeys as an indented, collapsible tree with drop-off per branch.
+- Put a session's events in a list beside the axis; the list carries the keyboard, the scrubber is a native range input.
+- State usage as a sentence before the bar, hatch the overage, mark where sampling began, and always name the plan and its allowance.
+- Draw a resource gauge horizontally from zero with threshold ticks that carry their own words and the peak with its window; an unsampled node keeps its tiles and says why.
+- Use `StatusStrip` in a ledger (equal buckets, rows compared by shape) and `StateTimeline` on a record (real transitions with durations); never both for the same window on one screen.
+- Put the recoverable window on the same axis as the restore cursor, with the zone printed, directly above the point-in-time field.
+- Lay a graph out in deterministic layers and put the same nodes in a list beneath it; the list carries the keyboard, and the graph is one `role="img"` with no focusable children.
+- Give every density and map figure a readout that works on a pointer, on touch and on a keyboard — including `CalendarHeatmap`, whose cells used to carry only a `title`.
+
+## Generative UI
+
+- Answer with the console's blocks: over time is `TimeChart`, a set is `Ledger`, one record is `Detail`, facts are `KeyValue`. An agent has no drawing kit of its own.
+- Render nothing the console does not already have. A missing block is a PR, not an improvisation.
+- Make every step a `ToolRow`: kind icon · state word · title · meta · duration, collapsed, opening to input and output.
+- Use the seven state words and no others: preparing, running, done, failed, needs approval, approved, denied.
+- Show a failed call as `×` and the error verbatim in mono. Never hide it, never summarise it away.
+- Hang `Provenance` under every generated block: `from <tool> · <when> · <range>`, with `show query`.
+- Render reads immediately; propose every write. A `Proposal` states action · target · consequence · reversibility, and nothing runs until a human confirms.
+- Confirm a reversible write in ink; route an irreversible one through `EchoDialog` with the name typed out. Red means loss nobody can get back.
+- Say the autonomy level per capability in words — observe · propose · act with approval · autopilot — on the proposal and in the run aside.
+- Stream in four states only: thinking with seconds, a call running with a live duration, partial text with `.op-caret`, and a `StreamBlock` shaped like the block that is coming.
+- On stop, keep what completed and say what did not: "Stopped after step 4 of 9."
+- Ask with `AgentQuestion` typed options, pick then confirm; ask for missing parameters with `Field`s, never with a sentence.
+- Answer a failure with the fix: name the permission and link the setting, state the retry, state the quota. Never "I don't have access to that".
+- Lay it out as conversation (main) · run (aside: model · workspace · mode · context · checkpoints) · composer (fixed bottom); below md the aside becomes the composer's picker row.
+- Write verdict first, then the blocks; sentence case, one fact once, no "I have successfully…".
 
 ## Content
 

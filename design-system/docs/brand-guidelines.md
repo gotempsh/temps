@@ -47,6 +47,9 @@ inline, never a modal), run (the record of what happened), autonomy level
 (observe / propose / act with approval / autopilot). Use these words and no
 synonyms.
 
+`docs/generative-ui.md` owns the rest: an agent answers with the console's own
+blocks, and proposes every write.
+
 ## 1. The direction: paper and ink
 
 - Paper and ink only. Backgrounds are warm off-white (`oklch(0.975 0.004 95)`),
@@ -189,6 +192,25 @@ The check is automated: the components page is audited with a contrast
 script in both modes before a token or a primitive is changed, and the
 audit must come back empty apart from `--op-rule-soft` separators.
 
+### Night is not paper inverted
+
+Dark mode swaps the pair, then corrects four things the swap gets wrong:
+
+- **Frames.** A light stroke on a dark ground weighs more than an ink stroke
+  on paper (irradiation), so `--border` on night is 62% ink, not equal to the
+  text. Text stays at full contrast; frames stop glowing.
+- **The raise.** The 3px hard shadow falls in `--border`, never in the
+  foreground: a shadow cannot be lighter than the surface it falls from.
+- **Subdued regions.** The sampled band, no-data fills and skeletons sit
+  below the ground on night as they do on paper. A fill lighter than the
+  ground reads as a highlight and inverts the meaning of "less".
+- **State hues.** Chroma is held to 0.11–0.14 on night. Everything else on
+  the screen is grey, so a hue at paper chroma reads as neon.
+
+Muted text is one step lighter on night than the ratio alone would need,
+because light text blooms on a dark ground and 11px mono is where it shows.
+`tokens.json` holds both layers and `bun run lint` fails when they drift.
+
 ## 5. Signature moves
 
 These are what make a Temps screen recognisable at a glance. Every product
@@ -202,6 +224,17 @@ surface should use at least one.
   and "fine" things never appear in a verdict.
   Wrong, as a line across the page: `◐ 6 projects · ✕ billing-worker failing · ◐ api-gateway 0.61% · 4 deploys today · cert 6d`.
   Right: `× 1 ◐ 1` in the header; open: `✕ billing-worker is failing health checks.` then `◐ api-gateway error rate 0.61% since dep_91a.`
+- Six states and no seventh: `ok` ●, `warn` ◐, `error` ×, `running` ◉,
+  `idle` ○, `sampled` ◌. A glyph never travels without its word. Five of the
+  six are verdicts — this is well, this is not, this is nothing yet — and a
+  verdict is what a colour is for. `running` is the one that is not: work in
+  flight is neither good nor bad, so it is **ink, never a hue**, and its word
+  comes from the operation the machine is doing — building, restoring,
+  scanning — never from the state. It is the only glyph that moves: a slow
+  opacity pulse, because motion means work is happening now, and it stops
+  when the work stops. Pending, queued and waiting-for-you are `warn`, and
+  warn does not pulse — nothing is happening there, somebody has to act, and
+  a pulse would say the opposite.
 - Breadcrumbs in the header, never on the page: group / list / current. The
   current crumb is the resource's real name, never its id.
 - The proposal block. Every AI suggestion has the same shape, in this order:
@@ -265,7 +298,7 @@ the same way every time.
   700ms tooltip makes the reader doubt that.
 - **Icons say what, glyphs say how.** The kind of a thing or an event is an
   icon (queued, sent, delivered; terminal, file, agent). Its state is a glyph
-  and a word (● ◐ × ○ ◌). Never a coloured dot to mean an event, never an
+  and a word (● ◐ × ◉ ○ ◌). Never a coloured dot to mean an event, never an
   icon to mean a state. A row of green dots is decoration; a row of inbox,
   send, mail-check is a story.
 - **Say it once.** A fact lives in one place: the title meta, the lede, or a
@@ -297,7 +330,7 @@ the same way every time.
 - **Icons say what kind, glyphs say what state.** A flag, a browser mark, a
   channel or device icon sits in a fixed 16px slot before the label so the
   eye can scan a list by kind without reading. State stays with the glyph
-  (● ◐ × ○ ◌) and never with the icon: a red Chrome logo means nothing.
+  (● ◐ × ◉ ○ ◌) and never with the icon: a red Chrome logo means nothing.
   Icons are monochrome ink at 14px, never brand colours.
 - **An icon wherever it adds context.** The slot is not a decoration to be
   granted; it is owed to any list whose items are of different kinds, or
@@ -392,6 +425,10 @@ the same way every time.
   fault with evidence is a Callout, the result of an action is a toast, what was
   missed is the bell, a blocking decision is an EchoDialog. Two surfaces for one
   event is one of them lying. `docs/notifications.md`.
+
+- **An agent draws with the console's own blocks.** It has no drawing kit of
+  its own, every block it renders carries the call that produced it, and every
+  write is a proposal a human confirms. `docs/generative-ui.md`.
 
 ## 7. Do and don't
 

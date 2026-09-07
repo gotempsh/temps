@@ -133,6 +133,24 @@ export function EffectLegend() {
   return <p className="font-mono text-[11px] text-muted-foreground">takes effect: <Eff e="now" /> <Eff e="next request" /> <Eff e="restart" /></p>
 }
 
+/**
+ * Reloading the plugin set takes about a second on a real box, so the button
+ * says so instead of doing nothing visible and then flashing a toast. Busy,
+ * not disabled: the reader keeps their focus and the button keeps its width.
+ */
+function PluginReload({ notify }: { notify: Notify }) {
+  const [busy, setBusy] = useState(false)
+  return (
+    <Button size="sm" variant="outline" className="h-7 text-xs" busy={busy} busyLabel={<><RefreshCw aria-hidden /> reloading…</>}
+      onClick={() => {
+        setBusy(true)
+        window.setTimeout(() => { setBusy(false); notify('ok', 'plugins reloaded', '6 plugins · 1 update available') }, 900)
+      }}>
+      <RefreshCw /> reload
+    </Button>
+  )
+}
+
 export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const page = ALL.find((p) => p.slug === slug) ?? ALL[0]
   const [dirty, setDirty] = useState(false)
@@ -144,7 +162,15 @@ export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense:
   const [window, setWindow] = useState('04:00')
   const [keep, setKeep] = useState({ raw: 7 * DAY, hourly: 90 * DAY, daily: 730 * DAY, proxy: 14 * DAY, spans: 14 * DAY, app: 14 * DAY })
   const touch = () => setDirty(true)
-  const save = () => { setDirty(false); notify('ok', `${page.title} saved`) }
+  // A save is a round trip, so the bar and the button say so while it is in
+  // flight. The button stays focused throughout — busy, never disabled.
+  const [saving, setSaving] = useState(false)
+  const save = () => {
+    if (saving) return
+    setSaving(true)
+    // `globalThis`, not `window`: this scope has a `window` state (the restart window).
+    globalThis.setTimeout(() => { setSaving(false); setDirty(false); notify('ok', `${page.title} saved`) }, 900)
+  }
   // The trail is the shell's job; the meta places the page (group · what it is about), and is never a link.
   const meta = `${page.group} · ${ABOUT[page.slug] ?? page.title.toLowerCase()}`
   const restartDialog = <EchoDialog trigger={<Button size="sm" className="op-primary h-7 text-xs"><RefreshCw /> restart now</Button>} title="Restart temps" description="The console and proxy are unavailable for a few seconds; running deployments continue. Type restart to confirm." confirmWord="restart" steps={['drain in-flight requests', 'restart process', 'wait for readyz']} onDone={() => notify('ok', 'restarted', 'build concurrency is now 4')} />
@@ -190,11 +216,11 @@ export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense:
     return <Ledger title="Custom routes" meta={meta} dense={dense} status={<StatusLine state="warn"><span className="font-mono">legacy.acme.sh</span> is served over plain http: no certificate was requested because TLS is off for the route.</StatusLine>} columns={['domain', 'target', 'tls', 'state']} grid="minmax(10rem,1fr) minmax(12rem,1.5fr) minmax(4rem,max-content) minmax(12rem,2fr)" rows={rows} total={R.length} filter={q} onFilter={setQ} placeholder="filter routes" action={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'add route', 'domain → target · tls · websocket')}>add route</Button>} footer={<span>routes the proxy serves that are not a project: internal tools, other machines · project domains live on the project</span>} />
   }
   if (slug === 'nodes') return <NodesLedger dense={dense} go={go} meta={meta} />
-  if (slug === 'cluster') return <ClusterPage meta={meta} notify={notify} />
+  if (slug === 'cluster') return <ClusterPage meta={meta} notify={notify} go={go} />
   if (slug === 'plugins') {
     const P = [['agents', 'built-in', 'loaded', 'ok', ''], ['compliance-pack', 'external · /opt/temps/plugins', 'loaded', 'ok', 'license valid to 2026-11-28'], ['hello-world', 'example', 'not installed', 'idle', 'copy the install snippet']]
     const rows: LedgerRow[] = P.map((p) => ({ id: p[0], state: p[3] as State, mobile: <><span className="block font-mono">{p[0]}</span><span className="block text-[11px] text-muted-foreground">{p[1]} · {p[2]}</span></>, cells: [<span className="font-mono">{p[0]}</span>, <span className="text-muted-foreground">{p[1]}</span>, <Status state={p[3] as State} label={p[2]} />, <span className="text-muted-foreground">{p[4]}</span>] }))
-    return <Ledger title="Plugins" meta={meta} dense={dense} status={<StatusLine state="ok">Three plugins loaded, none failed. Reload after installing one; a failed plugin stops the console, not the proxy.</StatusLine>} columns={['plugin', 'source', 'state', '']} grid="minmax(8rem,1fr) minmax(10rem,1.5fr) minmax(8rem,max-content) minmax(10rem,1.5fr)" rows={rows} total={P.length} filter={q} onFilter={setQ} placeholder="filter plugins" action={<Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => notify('ok', 'plugins reloaded', '3 loaded · 0 failed')}><RefreshCw /> reload</Button>} />
+    return <Ledger title="Plugins" meta={meta} dense={dense} status={<StatusLine state="ok">Three plugins loaded, none failed. Reload after installing one; a failed plugin stops the console, not the proxy.</StatusLine>} columns={['plugin', 'source', 'state', '']} grid="minmax(8rem,1fr) minmax(10rem,1.5fr) minmax(8rem,max-content) minmax(10rem,1.5fr)" rows={rows} total={P.length} filter={q} onFilter={setQ} placeholder="filter plugins" action={<PluginReload notify={notify} />} />
   }
 
   // Form pages on the Settings template. Each field's help says when it takes effect.
@@ -341,7 +367,7 @@ export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense:
   return (
     <div className="space-y-4">
       {/* `before` goes inside the template's status slot: a restart Callout above the page title reads as belonging to the shell, not to this page. */}
-      <Settings title={page.title} meta={meta} status={pg.before ? <div className="space-y-4">{pg.status}{pg.before}</div> : pg.status} sections={pg.sections} onSave={save} dirty={dirty} danger={pg.danger} />
+      <Settings title={page.title} meta={meta} status={pg.before ? <div className="space-y-4">{pg.status}{pg.before}</div> : pg.status} sections={pg.sections} onSave={save} dirty={dirty} saving={saving} danger={pg.danger} />
       <EffectLegend />
     </div>
   )

@@ -1,24 +1,29 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { Box, Cpu, Database, FileText, Rocket, Waypoints } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
-  Callout, Kbd, KeyValue, Lede, Num, ProjectMark, Section as OpSection, SectionTitle, Status, StatusLine,
+  Callout, Kbd, KbdPair, KeyValue, Lede, Num, PageState, ProjectMark, Section as OpSection, SectionTitle, Status, StatusLine,
   type State,
 } from '@/components/op'
 import { useDocToc, useShell } from '@/components/shell-context'
 import { writeToClipboard } from '@/lib/clipboard'
-import { bullets, headings, markedItems, plain, slice, slug, unique } from '@/lib/md'
+import { bullets, headings, markedItems, plain, slice, slug, subsections, unique } from '@/lib/md'
 import { cn } from '@/lib/utils'
 
+import { Button } from '@/components/ui/button'
+import { OneDemo } from '@/components/op-doc'
+import { ConsoleV1 } from './ConsoleV1'
 import { ContentBlocks } from './blocks/ContentBlocks'
 import { DataVizBlocks } from './blocks/DataVizBlocks'
+import { DataVizBlocks2, DATAVIZ2_TOC } from './blocks/DataVizBlocks2'
 import { FormBlocks } from './blocks/FormBlocks'
+import { GenUiBlocks, GENUI_TOC } from './blocks/GenUiBlocks'
 import { NotificationBlocks } from './blocks/NotificationBlocks'
 import { IconsBlock, MotionBlock, TokensBlock } from './blocks/TokenBlocks'
 
@@ -31,6 +36,7 @@ import localisationMd from '../../docs/localisation.md?raw'
 import formsMd from '../../docs/forms.md?raw'
 import notificationsMd from '../../docs/notifications.md?raw'
 import dataVizMd from '../../docs/data-viz.md?raw'
+import generativeUiMd from '../../docs/generative-ui.md?raw'
 import motionMd from '../../docs/motion.md?raw'
 import iconsMd from '../../docs/icons.md?raw'
 
@@ -112,6 +118,7 @@ const DOC_LOCALE = withoutTitle(localisationMd)
 const DOC_FORMS = withoutTitle(formsMd)
 const DOC_NOTIFICATIONS = withoutTitle(notificationsMd)
 const DOC_DATAVIZ = withoutTitle(dataVizMd)
+const DOC_GENUI = withoutTitle(generativeUiMd)
 const DOC_MOTION = withoutTitle(motionMd)
 const ICONS_SET = slice(iconsMd, '## The set', '## The vocabulary')
 const ICONS_ADDING = slice(iconsMd, '## Adding a concept')
@@ -138,16 +145,18 @@ function LiveBlocks({ children }: { children: ReactNode }) {
   return <div className="mt-12 min-w-0 space-y-12">{children}</div>
 }
 
-const STATES: readonly State[] = ['ok', 'warn', 'error', 'idle', 'sampled']
+// In STATE_RANK order: worst first, so the list reads the way a sorted ledger does.
+const STATES: readonly State[] = ['error', 'warn', 'running', 'sampled', 'ok', 'idle']
 const STATE_MEANING: Record<State, string> = {
   ok: 'healthy, passing, deployed',
-  warn: 'degraded, above threshold, expiring',
+  warn: 'degraded, above threshold, expiring — and waiting for you',
   error: 'failing, unreachable',
+  running: 'work happening now — building, restoring, scanning',
   idle: 'not deployed, not configured, nothing yet',
   sampled: 'head-sampled past the plan allowance',
 }
 
-/** The five glyphs, rendered by the component that owns them. */
+/** The six glyphs, rendered by the component that owns them — including the pulse. */
 function LiveStatus() {
   return (
     <Live label="rendered with <Status>">
@@ -156,6 +165,13 @@ function LiveStatus() {
           <li key={s} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-3 py-2 text-sm">
             <Status state={s} label={s} />
             <span className="ml-auto text-xs text-muted-foreground">{STATE_MEANING[s]}</span>
+            {s === 'running' && (
+              <span className="w-full text-xs text-muted-foreground">
+                the only motion in the system: a slow opacity pulse while the work is in flight, and no tone,
+                because running is not a verdict. It stops when the work stops. <code className="font-mono">warn</code> is
+                what waits for you, and warn does not pulse.
+              </span>
+            )}
           </li>
         ))}
       </ul>
@@ -362,27 +378,34 @@ function LiveGlyphs() {
 }
 
 /** The keys, with the platform-aware badge that ships them. */
-const KEYS: readonly (readonly [string[], string, string])[] = [
-  [['⌘', 'K'], 'everywhere', 'command palette'],
-  [['/'], 'ledger', 'focus the filter'],
-  [['j'], 'ledger', 'move the cursor down (focus follows)'],
-  [['k'], 'ledger', 'move the cursor up (focus follows)'],
-  [['⏎'], 'ledger', 'open the focused row'],
-  [['1'], 'detail', 'switch tab'],
-  [['⌘', '⏎'], 'detail', 'primary action'],
-  [['⌘', 'S'], 'settings', 'click the save button'],
-  [['esc'], 'everywhere', 'close drawer, menu, dialog'],
+/**
+ * `pair` is `j` and `k` said once. They are one idea — a cursor moving — and a
+ * table that gives them a row each makes the reader learn one thing twice.
+ * The mapping is unchanged.
+ */
+type KeyRow = { keys: string[]; pair?: [string, string]; does: [string, string]; where: string; what?: string }
+const KEYS: readonly KeyRow[] = [
+  { keys: ['⌘', 'K'], where: 'everywhere', does: ['command palette', ''] },
+  { keys: ['/'], where: 'ledger', does: ['focus the filter', ''] },
+  { keys: [], pair: ['j', 'k'], where: 'ledger', does: ['down', 'up'], what: 'move the cursor — focus follows it' },
+  { keys: ['⏎'], where: 'ledger', does: ['open the focused row', ''] },
+  { keys: ['1'], where: 'detail', does: ['switch tab', ''] },
+  { keys: ['⌘', '⏎'], where: 'detail', does: ['primary action', ''] },
+  { keys: ['⌘', 'S'], where: 'settings', does: ['click the save button', ''] },
+  { keys: ['esc'], where: 'everywhere', does: ['close drawer, menu, dialog', ''] },
 ]
 
 function LiveKeys() {
   return (
     <Live label="rendered with <Kbd> — ⌘ becomes Ctrl off macOS">
       <div className="op-rows border">
-        {KEYS.map(([keys, where, does]) => (
-          <div key={keys.join('') + where} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-sm">
-            <Kbd keys={[...keys]} />
-            <span className="op-label text-muted-foreground">{where}</span>
-            <span className="ml-auto text-xs text-muted-foreground">{does}</span>
+        {KEYS.map((row) => (
+          <div key={(row.pair ?? row.keys).join('') + row.where} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-sm">
+            {row.pair
+              ? <KbdPair keys={row.pair} does={row.does} />
+              : <><Kbd keys={[...row.keys]} /><span className="text-xs text-muted-foreground">{row.does[0]}</span></>}
+            <span className="op-label text-muted-foreground">{row.where}</span>
+            {row.what && <span className="ml-auto text-xs text-muted-foreground">{row.what}</span>}
           </div>
         ))}
       </div>
@@ -591,6 +614,7 @@ const DOC_ANCHORS: Record<string, string | null> = {
   'forms.md': '#forms',
   'notifications.md': '#notifications',
   'data-viz.md': '#dataviz',
+  'generative-ui.md': '#generative-ui',
   'motion.md': '#motion',
   'icons.md': '#icons',
   'RULES.md': '#tooling',
@@ -625,28 +649,43 @@ const HEADING_CLASS: Record<number, string> = {
  * Source headings are shifted one level down (`##` renders as `<h3>`) so the
  * page's own h1/h2 stay above them and the outline never skips a level.
  */
+/**
+ * One heading, with its anchor and whatever the LIVE map hangs off it. Both
+ * renderers go through this: the markdown renderer below, and `DocSections`,
+ * which pulls a subsection's heading out of the markdown so the prose and the
+ * demo can sit beside each other underneath it. Two heading implementations
+ * would be two id schemes, and the "on this page" rail would start missing
+ * half the page.
+ */
+function DocHeading({ prefix, depth, text, children }: { prefix: string; depth: number; text: string; children?: ReactNode }) {
+  const id = `${prefix}--${slug(text)}`
+  const rendered = Math.min(depth + 1, 6)
+  const Tag = `h${rendered}` as 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
+  return (
+    <>
+      <Tag id={id} className={cn('group flex scroll-mt-16 items-baseline gap-2', HEADING_CLASS[rendered])}>
+        <span className="min-w-0">{children ?? text}</span>
+        <a
+          href={`#${id}`}
+          aria-label={`Link to “${text}”`}
+          className="shrink-0 font-mono text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+        >
+          #
+        </a>
+      </Tag>
+      {prefix === 'surfaces' ? <SurfaceLinks slugId={slug(text)} /> : null}
+      {LIVE[id] ?? null}
+    </>
+  )
+}
+
 function mdComponents(prefix: string): Components {
   const heading = (depth: number) =>
     function Heading({ children }: { children?: ReactNode }) {
-      const text = plain(textOf(children))
-      const id = `${prefix}--${slug(text)}`
-      const rendered = Math.min(depth + 1, 6)
-      const Tag = `h${rendered}` as 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
       return (
-        <>
-          <Tag id={id} className={cn('group flex scroll-mt-16 items-baseline gap-2', HEADING_CLASS[rendered])}>
-            <span className="min-w-0">{children}</span>
-            <a
-              href={`#${id}`}
-              aria-label={`Link to “${text}”`}
-              className="shrink-0 font-mono text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
-            >
-              #
-            </a>
-          </Tag>
-          {prefix === 'surfaces' ? <SurfaceLinks slugId={slug(text)} /> : null}
-          {LIVE[id] ?? null}
-        </>
+        <DocHeading prefix={prefix} depth={depth} text={plain(textOf(children))}>
+          {children}
+        </DocHeading>
       )
     }
 
@@ -721,6 +760,154 @@ function Md({ prefix, children }: { prefix: string; children: string }) {
     </ReactMarkdown>
   )
 }
+
+// ── sections that describe components ──────────────────────────────────
+
+/**
+ * A section whose subsections are each about one component reads wrong as a
+ * column of prose with a run of demos bolted underneath: by the time you
+ * reach the demo you have forgotten which rule it was for, and the right half
+ * of a wide screen is empty the whole way down.
+ *
+ * So the five component sections (Components, Forms, Notifications, Data viz,
+ * Generative UI) are cut into their subsections and laid out as rows: the
+ * heading full width, then the rule on the left at a readable measure and
+ * *that rule's* demo on the right. Below `lg` the demo stacks under its prose,
+ * which is the same reading order.
+ *
+ * A subsection with no demo keeps the full width — a 60ch column with nothing
+ * beside it is the thing this is here to stop.
+ */
+function DocSections({ prefix, md, depth, demos }: { prefix: string; md: string; depth: number; demos?: Record<string, ReactNode> }) {
+  const parts = useMemo(() => subsections(md, depth), [md, depth])
+  return (
+    <div>
+      {parts.map((part, i) => {
+        // The chunk before the first heading is the document's own preamble.
+        if (!part.title) return <Md key={i} prefix={prefix}>{part.body}</Md>
+        const demo = demos?.[part.title]
+        return (
+          <section key={part.title} className="mt-2">
+            <DocHeading prefix={prefix} depth={depth} text={part.title} />
+            {demo ? (
+              // 2fr / 3fr rather than a fixed prose width: the demo needs about
+              // what `/op-components` gives it (a chart under ~450px stops being
+              // readable), and the guide's column changes width with the rails.
+              // The prose keeps its 60ch cap inside its share.
+              <div className="grid items-start gap-x-8 gap-y-4 xl:grid-cols-[2fr_3fr]">
+                <div className="min-w-0 max-w-[60ch]">
+                  <Md prefix={prefix}>{part.body}</Md>
+                </div>
+                <div className="mt-3 min-w-0 border-t pt-4 xl:mt-3 xl:border-t-0 xl:pt-0">
+                  <p className="op-label mb-3 text-muted-foreground">live</p>
+                  {demo}
+                </div>
+              </div>
+            ) : (
+              <Md prefix={prefix}>{part.body}</Md>
+            )}
+          </section>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * Subsection heading → the demo that belongs beside it. Written out by hand
+ * rather than matched on the words, because the documents and the blocks are
+ * authored separately and a fuzzy match would silently pair the wrong two
+ * things. A heading that is not here renders full width, on purpose.
+ *
+ * The ids on the right are the `Block` ids the blocks components declare, and
+ * they are the same ids `/op-components` anchors — `DATAVIZ2_TOC` and
+ * `GENUI_TOC` are the register for the two new sets.
+ */
+const DEMO_IDS_USED = new Set<string>()
+const use = (id: string) => { DEMO_IDS_USED.add(id); return id }
+const viz1 = (id: string) => <OneDemo id={use(id)}><DataVizBlocks /></OneDemo>
+const viz2 = (id: string) => <OneDemo id={use(id)}><DataVizBlocks2 /></OneDemo>
+const genui = (id: string) => <OneDemo id={use(id)}><GenUiBlocks /></OneDemo>
+const form = (id: string) => <OneDemo id={use(id)}><FormBlocks /></OneDemo>
+const notify = (id: string) => <OneDemo id={use(id)}><NotificationBlocks /></OneDemo>
+const content = (id: string) => <OneDemo id={use(id)}><ContentBlocks /></OneDemo>
+
+const DEMOS_DATAVIZ: Record<string, ReactNode> = {
+  '1. Pick the chart from the question': viz1('viz-choice'),
+  '2. Series without a second hue': viz1('viz-legend'),
+  '6. Accessibility': viz1('viz-a11y'),
+  '8. Footer contract': viz1('viz-series'),
+  '9. BandChart — is this value normal?': viz2('viz-band'),
+  '10. Compare — against the period before': viz2('viz-compare'),
+  '11. StackedInk — composition over time': viz2('viz-stacked'),
+  '12. LatencyHeatmap — time × bucket': viz2('viz-heatmap'),
+  '13. PercentileLadder — p50 · p95 · p99': viz2('viz-ladder'),
+  '14. CohortGrid — retention': viz2('viz-cohort'),
+  '15. PathTree — journeys': viz2('viz-paths'),
+  '16. SessionTimeline — a session': viz2('viz-session'),
+  '17. UsageBar — usage against an allowance': viz2('viz-usage'),
+  '18. Gauge — cpu, memory, disk': viz2('viz-gauge'),
+  '19. StateTimeline — state over time': viz2('viz-state'),
+  '20. DeltaTable — release comparison': viz2('viz-delta'),
+  '21. WindowTimeline — backups and PITR': viz2('viz-window'),
+  '22. Topology — cluster and service map': viz2('viz-topology'),
+}
+
+const DEMOS_GENUI: Record<string, ReactNode> = {
+  '2. The ledger of tool calls': genui('genui-ledger'),
+  '3. Provenance': genui('genui-provenance'),
+  '4. Reading versus writing': genui('genui-proposal'),
+  '5. Streaming': genui('genui-streaming'),
+  '6. Asking': genui('genui-question'),
+  '11. Banned': genui('genui-wrong'),
+}
+
+const DEMOS_FORMS: Record<string, ReactNode> = {
+  'Field anatomy': form('form-field'),
+  'Validation timing': form('form-validation'),
+  'Dates, times and ranges': (
+    <div className="space-y-8">
+      {form('form-datetime')}
+      {form('form-range-schedule')}
+    </div>
+  ),
+  'Disabled and unavailable': form('form-disabled'),
+  'Saving': form('form-validation'),
+}
+
+const DEMOS_NOTIFICATIONS: Record<string, ReactNode> = {
+  'The decision table': notify('notify-table'),
+  'Rules': notify('notify-attention'),
+  // `subsections` runs the heading through `plain()`, so the key is the words,
+  // not the backticks the document writes them in.
+  "The sandbox's notify()": notify('notify-toast'),
+}
+
+/**
+ * Handoff §6 is the component register, one `###` per primitive, so every
+ * entry that has a demo anywhere in the sandbox gets it here. The ones with
+ * no shared demo — `Picker`, `EchoDialog`, the command palette, `Switch`,
+ * `SecretValue`, `Inspector` — are full-width prose with their
+ * `/op-components` block a click away, which is honest: inventing a second
+ * copy of a demo to fill a column is how two demos start disagreeing.
+ */
+const DEMOS_COMPONENTS: Record<string, ReactNode> = {
+  'StatusLine, Phrase, Status': <LiveStatus />,
+  'Callout': <LiveCallout />,
+  'Kbd': <LiveKeys />,
+  'TimeChart, RangePicker, ChartFooter': viz1('viz-series'),
+  'Field, FormErrors': form('form-field'),
+  'DateTimeField, DateField, TimeField, DateTimeRangeField, DurationField, ScheduleField': form('form-datetime'),
+  'fmt (fmt.ts)': content('content-fmt'),
+  'PageState': content('content-error'),
+  'The ink vocabulary (viz-ink.tsx)': viz2('viz-heatmap'),
+  'BandChart, StackedInk, LatencyHeatmap, StateTimeline, WindowTimeline, SessionTimeline': viz2('viz-band'),
+  'PercentileLadder, CohortGrid, DeltaTable': viz2('viz-ladder'),
+  'PathTree, Topology': viz2('viz-paths'),
+  'UsageBar, Gauge': viz2('viz-usage'),
+  'ToolRow, Proposal, Provenance, StreamBlock, AgentQuestion, AgentSources, RunAside': genui('genui-ledger'),
+}
+
 
 // ── the taste entries ──────────────────────────────────────────────────
 
@@ -1122,19 +1309,310 @@ const FACT_PLACES: readonly (readonly [string, string])[] = [
   ['the aside', 'What is left after the meta and the Lede: reference they did not come for. Never a repeat.'],
 ]
 
+// ── the shapes, shown ──────────────────────────────────────────────────
+
+/**
+ * A real console screen, rendered live at 1280×800 and scaled into a box.
+ *
+ * Not a screenshot: a screenshot of a design system goes stale the first time
+ * a token moves, and "here is the shape" is exactly the claim a stale picture
+ * gets wrong. It is the same `ConsoleV1` the routes mount, in `preview` mode
+ * so ten of them on one page do not each start listening for ⌘K, made inert
+ * (`pointer-events-none`, `aria-hidden`) and covered by one link, so the whole
+ * frame is a single tab stop that opens the screen full size.
+ *
+ * Dark is a `.dark` wrapper rather than a second route, because the tokens are
+ * scoped (`.dark .operator.ink`) — which is the point of the pair being here
+ * at all: the same screen, two token sets, no re-skin.
+ */
+const FRAME_W = 1280
+const FRAME_H = 800
+const noGo = () => {}
+
+function ScreenFrame({ view, dark, label, href }: { view: string; dark?: boolean; label: string; href?: string }) {
+  const box = useRef<HTMLDivElement>(null)
+  const [scale, setScale] = useState(FRAME_W ? 0.34 : 1)
+  useEffect(() => {
+    const el = box.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setScale(el.clientWidth / FRAME_W))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  const to = href ?? `/v1?p=${view}`
+  return (
+    <figure className="min-w-0">
+      <div ref={box} className="relative w-full overflow-hidden border bg-background" style={{ height: Math.round(FRAME_H * scale) }}>
+        <div
+          aria-hidden
+          className={cn('pointer-events-none absolute left-0 top-0 origin-top-left select-none', dark && 'dark')}
+          style={{ width: FRAME_W, height: FRAME_H, transform: `scale(${scale})` }}
+        >
+          <div className="operator ink v1 flex h-full flex-col bg-background text-foreground" style={{ '--op-shell-top': '2.75rem' } as CSSProperties}>
+            <ConsoleV1 view={view} go={noGo} full preview />
+          </div>
+        </div>
+        {/* One tab stop for the whole frame. The frame is a picture of a screen;
+            the link is the screen. */}
+        <Link to={to} className="absolute inset-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
+          <span className="sr-only">Open {label} full size</span>
+        </Link>
+      </div>
+      <figcaption className="mt-2 flex items-baseline gap-2 text-xs">
+        <span className="op-label">{dark ? 'dark' : 'light'}</span>
+        <Link to={to} className="op-status ml-auto font-mono text-[11px]">{to}</Link>
+      </figcaption>
+    </figure>
+  )
+}
+
+/** The five shapes, each with the screen that is its reference. */
+const SHAPES: readonly { id: string; shape: string; data: string; view: string; href?: string; rule: string }[] = [
+  {
+    id: 'list', shape: 'Ledger', data: 'Many records of one kind',
+    view: 'projects',
+    rule: 'One row per record, the same columns for every row, sorted by what the reader is worried about. The verdict counts what is wrong; the footer counts the set.',
+  },
+  {
+    id: 'record', shape: 'Detail', data: 'One record, read end to end',
+    view: 'deploy:dep_91a',
+    rule: 'Title and meta place it, the verdict says what to do, the Lede carries the four to six facts, the main column is what they came for, the aside is reference.',
+  },
+  {
+    id: 'facets', shape: 'Detail with facets', data: 'One resource with several faces',
+    view: 'db:acme-pg',
+    rule: 'Tabs are facets of one record, never separate pages. The title, meta and verdict stay; only the main column changes.',
+  },
+  {
+    id: 'config', shape: 'Settings', data: 'A configuration, saved once',
+    view: 'settings',
+    rule: 'Sections of fields, one sticky save bar, the danger zone last and typed. Every field says when it takes effect.',
+  },
+  {
+    id: 'tool', shape: 'Tool', data: 'A question, narrowed until it answers',
+    view: 'logs',
+    rule: 'Not a template: one list with a query bar in front of it. No tabs, no record, the query in the URL, and the query bar owns /.',
+  },
+]
+
+/** The numbered parts of a record, as callouts over the real screen. */
+const ANATOMY: readonly { n: number; part: string; what: string; at: [string, string] }[] = [
+  { n: 1, part: 'title + meta', what: 'the name, then id · project · environment — what places the record', at: ['18.5%', '9%'] },
+  { n: 2, part: 'verdict', what: 'one glyph, one sentence, at most one link: what to do about it', at: ['18.5%', '17.5%'] },
+  { n: 3, part: 'lede', what: 'the four to six facts the reader wants without scrolling', at: ['18.5%', '26%'] },
+  { n: 4, part: 'main', what: 'what they came to read, in sections', at: ['30%', '52%'] },
+  { n: 5, part: 'aside', what: 'reference they did not come for — and never a repeat of 1–3', at: ['82%', '52%'] },
+]
+
+function AnatomyFrame() {
+  return (
+    <div>
+      <div className="relative">
+        <ScreenFrame view="deploy:dep_91a" label="the record shape" />
+        <div aria-hidden className="pointer-events-none absolute inset-0">
+          {ANATOMY.map((a) => (
+            <span
+              key={a.n}
+              className="absolute flex h-5 w-5 -translate-x-1/2 -translate-y-1/2 items-center justify-center border border-foreground bg-background font-mono text-[11px] font-semibold"
+              style={{ left: a.at[0], top: a.at[1] }}
+            >
+              {a.n}
+            </span>
+          ))}
+        </div>
+      </div>
+      {/* The callouts are decoration; this list is the content, so the anatomy
+          is readable with the picture switched off. */}
+      <ol className="op-rows mt-3 border">
+        {ANATOMY.map((a) => (
+          <li key={a.n} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-3 py-2 text-sm">
+            <span aria-hidden className="flex h-5 w-5 shrink-0 items-center justify-center border font-mono text-[11px]">{a.n}</span>
+            <span className="op-label w-24 shrink-0">{a.part}</span>
+            <span className="op-prose min-w-0 flex-1 text-xs text-muted-foreground">{a.what}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  )
+}
+
+/** The three not-yet states, rendered by the primitive that owns them. */
+const NOT_YET: readonly { state: string; why: string; node: ReactNode }[] = [
+  {
+    state: 'empty',
+    why: 'Nothing to show, and that is fine. Say why, and offer the next step.',
+    node: (
+      <PageState
+        state="empty"
+        title="No deployments yet"
+        reason="This environment has never had a release. Push to main, or deploy a branch from the deploys tab."
+        next={<Button variant="outline" size="sm">deploy a branch</Button>}
+      />
+    ),
+  },
+  {
+    state: 'unconfigured',
+    why: 'The operator has not set something up. Name what is missing, show an example of what it would say, and link the page that fixes it. Never render nothing.',
+    node: (
+      <PageState
+        state="unconfigured"
+        title="Analytics is not receiving events"
+        missing="No SDK has sent an event from this project yet."
+        example={
+          <span className="op-prose text-xs text-muted-foreground">
+            With one installed this page reads: <span className="font-mono">4,812 visitors · 12,304 pageviews · LCP 1.8s</span>, by day, by page and by referrer.
+          </span>
+        }
+        settingsHref="/v1?p=analytics"
+        settingsLabel="open analytics settings"
+      />
+    ),
+  },
+  {
+    state: 'error',
+    why: 'The surface failed. Quote the other system verbatim, name the resource, and offer the retry — a self-hosted reader has nobody to ask.',
+    node: (
+      <PageState
+        state="error"
+        title="Could not read the error store"
+        message="connection refused (clickhouse:9000)"
+        resource="error store"
+        onRetry={() => {}}
+      />
+    ),
+  },
+]
+
+// ── night ──────────────────────────────────────────────────────────────
+
+/**
+ * The one place in the guide that is a picture rather than a live render:
+ * two themes at full size cannot share a page, and the claim being made —
+ * that night is a second set of values and not a re-skin — is only legible
+ * when the same screen is seen twice.
+ *
+ * Regenerate with `node scripts/capture-guide-shots.mjs` whenever the dark
+ * tokens move; the script states the route, the size and the theme it forces.
+ */
+const NIGHT_CORRECTIONS: readonly (readonly [string, string])[] = [
+  ['Frames', 'A light stroke on a dark ground weighs more than an ink stroke on paper — irradiation — so `--border` on night is 62% ink, not equal to the text. Text keeps full contrast; frames stop glowing.'],
+  ['The raise', 'The 3px hard shadow falls in `--border`, never in the foreground. A shadow cannot be lighter than the surface it falls from.'],
+  ['Subdued regions', 'The sampled band, no-data fills and skeletons sit *below* the ground on night as they do on paper. A fill lighter than the ground reads as a highlight and inverts the meaning of "less".'],
+  ['State hues', 'Chroma is held to 0.11–0.14 on night. Everything else on the screen is grey, so a hue at paper chroma reads as neon.'],
+]
+
+function NightBlock() {
+  return (
+    <div className="mt-6">
+      <h3 id="tokens--night-is-not-paper-inverted" className="op-h3 scroll-mt-16 border-t pt-6">
+        Night is not paper inverted
+      </h3>
+      <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
+        The same screen — <code className="font-mono">/console?p=api-gateway</code>, 1440×900 — under both
+        token layers. Dark swaps the pair and then corrects four things the swap gets wrong. Muted text is
+        also one step lighter on night than the ratio alone would need, because light text blooms on a dark
+        ground and 11px mono is where it shows.
+      </p>
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        {(['light', 'dark'] as const).map((theme) => (
+          <figure key={theme} className="min-w-0">
+            <img
+              src={`/guide/night-${theme}.png`}
+              width={1440}
+              height={900}
+              loading="lazy"
+              decoding="async"
+              alt={`The api-gateway record in ${theme} mode: the same layout, sections, chart and metric tiles, drawn from the ${theme} token layer.`}
+              className="w-full border"
+            />
+            <figcaption className="op-label mt-2">{theme}</figcaption>
+          </figure>
+        ))}
+      </div>
+      <ul className="op-rows mt-4 border">
+        {NIGHT_CORRECTIONS.map(([title, what]) => (
+          <li key={title} className="min-w-0 px-3 py-2 text-sm">
+            <span className="op-label">{title}</span>
+            <span className="op-prose mt-0.5 block text-xs text-muted-foreground">
+              <Md prefix={`tokens-night-${slug(title)}`}>{what}</Md>
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="op-prose mt-4 max-w-[72ch] text-xs text-muted-foreground">
+        <code className="font-mono">tokens.json</code> holds both layers and{' '}
+        <code className="font-mono">bun run lint</code> fails when they drift.
+      </p>
+    </div>
+  )
+}
+
 function BuildScreenSection() {
   return (
     <div>
       <p className="op-prose max-w-[72ch] text-sm">
-        Four steps. Pick the template from what the data is and what the reader does with it, paste the
-        skeleton, cover the states, then put each fact in exactly one place.
+        Five shapes. Pick the one the data and the reader's job describe, then paste the skeleton, cover the
+        states, and put each fact in exactly one place. Every frame below is the real screen, rendered live and
+        scaled down — click one to open it full size.
       </p>
 
-      <h3 id="build--1-pick-the-template" className="op-h3 mt-8 scroll-mt-16 border-t pt-6">
-        1. Pick the template
+      <h3 id="build--1-pick-the-shape" className="op-h3 mt-8 scroll-mt-16 border-t pt-6">
+        1. Pick the shape
       </h3>
-      <Md prefix="build-layouts">{HANDOFF_LAYOUTS}</Md>
-      <Md prefix="build-axis">{HANDOFF_AXIS}</Md>
+      <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
+        The shape follows from what the data is, not from what the feature is called. Two screens about
+        different subsystems with the same answer to "how many, and what does the reader do with them" are the
+        same shape.
+      </p>
+      <div data-allow-overflow className="mt-4 overflow-x-auto" tabIndex={0}>
+        <table className="w-full min-w-[46rem] border-separate border-spacing-0 border text-left text-xs">
+          <thead>
+            <tr>
+              <th scope="col" className="op-label border-b px-3 py-2 align-bottom">The data is</th>
+              <th scope="col" className="op-label border-b px-3 py-2 align-bottom">The shape</th>
+              <th scope="col" className="op-label border-b px-3 py-2 align-bottom">Reference screen</th>
+              <th scope="col" className="op-label border-b px-3 py-2 align-bottom">The rule that follows</th>
+            </tr>
+          </thead>
+          <tbody className="op-rows">
+            {SHAPES.map((sh) => (
+              <tr key={sh.id}>
+                <td className="px-3 py-2 align-top">{sh.data}</td>
+                <td className="px-3 py-2 align-top font-mono">{sh.shape}</td>
+                <td className="px-3 py-2 align-top">
+                  <Link to={`/v1?p=${sh.view}`} className="op-status font-mono text-[11px]">?p={sh.view}</Link>
+                </td>
+                <td className="op-prose px-3 py-2 align-top text-muted-foreground">{sh.rule}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* The pair is the argument: the same screen, two token sets. If dark
+          looked like light with the values flipped, there would be no reason
+          to show both. */}
+      <div className="mt-8 space-y-10">
+        {SHAPES.map((sh) => (
+          <section key={sh.id} id={`build--shape-${sh.id}`} className="scroll-mt-16">
+            <h4 className="op-h3 text-[0.9375rem]">
+              {sh.shape} <span className="font-normal text-muted-foreground">— {sh.data.toLowerCase()}</span>
+            </h4>
+            <p className="op-prose mt-1 max-w-[72ch] text-xs text-muted-foreground">{sh.rule}</p>
+            {sh.id === 'record' ? (
+              <div className="mt-3 grid gap-6 lg:grid-cols-2">
+                <AnatomyFrame />
+                <ScreenFrame view={sh.view} dark label={`${sh.shape}, dark`} />
+              </div>
+            ) : (
+              <div className="mt-3 grid gap-6 lg:grid-cols-2">
+                <ScreenFrame view={sh.view} label={sh.shape} />
+                <ScreenFrame view={sh.view} dark label={`${sh.shape}, dark`} />
+              </div>
+            )}
+          </section>
+        ))}
+      </div>
 
       <h3 id="build--2-paste-the-skeleton" className="op-h3 mt-10 scroll-mt-16 border-t pt-6">
         2. Paste the skeleton
@@ -1154,9 +1632,18 @@ function BuildScreenSection() {
       </h3>
       <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
         Seven, every time. A self-hosted reader debugs alone: a state that fails silently is a state they
-        discover by restarting.
+        discover by restarting. Three of them are drawn by one primitive, so here they are drawn.
       </p>
-      <ul className="op-rows mt-4 border">
+      <div className="mt-4 grid gap-6 lg:grid-cols-3">
+        {NOT_YET.map((n) => (
+          <div key={n.state} className="min-w-0">
+            <p className="op-label mb-2">{n.state}</p>
+            <p className="op-prose mb-3 text-xs text-muted-foreground">{n.why}</p>
+            {n.node}
+          </div>
+        ))}
+      </div>
+      <ul className="op-rows mt-6 border">
         {STATES_TO_COVER.map(([state, what]) => (
           <li key={state} className="min-w-0 px-3 py-2 text-sm">
             <span className="op-label">{state}</span>
@@ -1170,6 +1657,9 @@ function BuildScreenSection() {
       <h3 id="build--4-put-each-fact-in-one-place" className="op-h3 mt-10 scroll-mt-16 border-t pt-6">
         4. Put each fact in one place
       </h3>
+      <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
+        The five numbered parts of the record above, in the order a reader meets them.
+      </p>
       <ul className="op-rows mt-4 border">
         {FACT_PLACES.map(([place, what]) => (
           <li key={place} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-3 py-2 text-sm">
@@ -1185,6 +1675,12 @@ function BuildScreenSection() {
           fails the build on. If it is in the meta or the Lede, it is not a row in the aside.
         </span>
       </p>
+
+      <h3 id="build--the-layout-rules-behind-them" className="op-h3 mt-10 scroll-mt-16 border-t pt-6">
+        The layout rules behind them
+      </h3>
+      <Md prefix="build-layouts">{HANDOFF_LAYOUTS}</Md>
+      <Md prefix="build-axis">{HANDOFF_AXIS}</Md>
     </div>
   )
 }
@@ -1479,13 +1975,15 @@ const SECTIONS: readonly Section[] = [
   {
     id: 'build',
     label: 'Build a screen',
-    source: 'design-system-handoff.md §7 (layouts, axes) · skeletons for @temps-sdk/op',
+    source: 'design-system-handoff.md §7 (layouts, axes) · the real v1 screens, rendered live and scaled',
     md: [],
     extra: [
-      ['build--1-pick-the-template', '1. Pick the template'],
+      ['build--1-pick-the-shape', '1. Pick the shape'],
+      ...SHAPES.map((sh) => [`build--shape-${sh.id}`, `— ${sh.shape}`] as const),
       ['build--2-paste-the-skeleton', '2. Paste the skeleton'],
       ['build--3-cover-the-states', '3. Cover the states'],
       ['build--4-put-each-fact-in-one-place', '4. Put each fact in one place'],
+      ['build--the-layout-rules-behind-them', 'The layout rules behind them'],
     ],
     body: <BuildScreenSection />,
   },
@@ -1555,31 +2053,21 @@ const SECTIONS: readonly Section[] = [
     label: 'Components',
     source: 'design-system-handoff.md §6 · each name links to /op-components',
     md: [HANDOFF_COMPONENTS],
-    body: <Md prefix="components">{HANDOFF_COMPONENTS}</Md>,
+    body: <DocSections prefix="components" md={HANDOFF_COMPONENTS} depth={3} demos={DEMOS_COMPONENTS} />,
   },
   {
     id: 'forms',
     label: 'Forms',
     source: 'forms.md · Field, FormErrors and the sticky save, live',
     md: [DOC_FORMS],
-    body: (
-      <>
-        <Md prefix="forms">{DOC_FORMS}</Md>
-        <LiveBlocks><FormBlocks /></LiveBlocks>
-      </>
-    ),
+    body: <DocSections prefix="forms" md={DOC_FORMS} depth={2} demos={DEMOS_FORMS} />,
   },
   {
     id: 'notifications',
     label: 'Notifications',
     source: 'notifications.md · the five surfaces, live',
     md: [DOC_NOTIFICATIONS],
-    body: (
-      <>
-        <Md prefix="notifications">{DOC_NOTIFICATIONS}</Md>
-        <LiveBlocks><NotificationBlocks /></LiveBlocks>
-      </>
-    ),
+    body: <DocSections prefix="notifications" md={DOC_NOTIFICATIONS} depth={2} demos={DEMOS_NOTIFICATIONS} />,
   },
   {
     id: 'content',
@@ -1596,23 +2084,27 @@ const SECTIONS: readonly Section[] = [
   {
     id: 'dataviz',
     label: 'Data viz',
-    source: 'data-viz.md · the charts drawn with the real primitives',
+    source: 'data-viz.md §§1–23 · every chart drawn with the real primitive beside its rule',
     md: [DOC_DATAVIZ],
-    body: (
-      <>
-        <Md prefix="dataviz">{DOC_DATAVIZ}</Md>
-        <LiveBlocks><DataVizBlocks /></LiveBlocks>
-      </>
-    ),
+    body: <DocSections prefix="dataviz" md={DOC_DATAVIZ} depth={2} demos={DEMOS_DATAVIZ} />,
+  },
+  {
+    id: 'generative-ui',
+    label: 'Generative UI',
+    source: 'generative-ui.md · what an agent is allowed to draw, and what it must ask for',
+    md: [DOC_GENUI],
+    body: <DocSections prefix="generative-ui" md={DOC_GENUI} depth={2} demos={DEMOS_GENUI} />,
   },
   {
     id: 'tokens',
     label: 'Tokens',
-    source: 'design-system-handoff.md §4 · the table built from tokens.json, swatches read live',
+    source: 'design-system-handoff.md §4 · brand-guidelines.md §4 · the table built from tokens.json, swatches read live',
     md: [HANDOFF_TOKENS],
+    extra: [['tokens--night-is-not-paper-inverted', 'Night is not paper inverted']],
     body: (
       <>
         <Md prefix="tokens">{HANDOFF_TOKENS}</Md>
+        <NightBlock />
         <LiveBlocks><TokensBlock /></LiveBlocks>
       </>
     ),
@@ -1768,8 +2260,30 @@ export function sectionFromHash(hash?: string): string {
   return SECTIONS.some((s) => s.id === id) ? id : SECTIONS[0].id
 }
 
+/**
+ * The two new block sets publish their ids as a TOC, and `/op-components`
+ * builds its rail from the same constant. Checking the guide's map against it
+ * turns "the right column is empty" — which reads as a layout bug and gets
+ * fixed as one — into a named id in the console.
+ *
+ * Called from `GuidePage`, not at module scope: the check is about this page,
+ * and a module-scope warning would fire on every route in the app (and fail
+ * the overflow sweep, which asserts an empty console, somewhere unrelated).
+ */
+function checkDemoMap() {
+  const register = new Set<string>([...DATAVIZ2_TOC.map(([id]) => id), ...GENUI_TOC.map(([id]) => id)])
+  const elsewhere = new Set<string>(['viz-choice', 'viz-series', 'viz-legend', 'viz-a11y', 'form-field', 'form-validation', 'form-datetime', 'form-range-schedule', 'form-disabled', 'notify-table', 'notify-toast', 'notify-attention', 'content-error', 'content-time', 'content-fmt'])
+  for (const id of DEMO_IDS_USED) {
+    if (!register.has(id) && !elsewhere.has(id)) console.warn(`[guide] demo block "${id}" is in no register — its column will render empty`)
+  }
+  for (const [id] of [...DATAVIZ2_TOC, ...GENUI_TOC]) {
+    if (!DEMO_IDS_USED.has(id)) console.warn(`[guide] block "${id}" has a demo but no subsection in /guide pairs with it`)
+  }
+}
+
 export function GuidePage() {
   const [current, setCurrent] = useState<string>(() => sectionFromHash())
+  useEffect(() => { if (import.meta.env.DEV) checkDemoMap() }, [])
   // One filter box for the whole app: the shell owns it and `/` focuses it,
   // the guide reads the same string to search headings and taste rules.
   const { query: q, setQuery: setQ } = useShell()

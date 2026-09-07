@@ -6,8 +6,8 @@ import { cn } from '@/lib/utils'
 import { Activity, Bot, Compass, ExternalLink, Globe, Link, Mail, Megaphone, Monitor, Search, Share2, Smartphone, Tablet, Tag, Zap } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
-  ChartFooter, Detail, Ledger, Lede, Live, Metric, MetricGrid, Num, Phrase, RangePicker, PageState, Section, Segmented, Columns, Status, StatusLine, GeoMap, EchoDialog, KeyValue, StatusStrip, TimeChart, Timeline,
-  Breakdown, Sparkline, Funnel, Flow, type BreakdownRow, type KV, type LedgerRow, type State, type StatusBucket, type TimeRange,
+  ChartFooter, Detail, Ledger, Lede, Live, Metric, MetricGrid, Num, Phrase, RangePicker, PageState, Section, Segmented, Columns, Status, StatusLine, GeoMap, EchoDialog, KeyValue, StateTimeline, StatusStrip, TimeChart, Timeline, UsageBar,
+  Breakdown, Sparkline, Funnel, Flow, type BreakdownRow, type KV, type LedgerRow, type State, type StateSegment, type StatusBucket, type TimeRange,
 } from '@/components/op'
 import { fmtNum, fmtPct } from '@/components/op'
 import type { Notify, Plan } from './ConsoleV1Observe'
@@ -126,7 +126,7 @@ const VITALS: Vital[] = [
 ]
 const VITAL = Object.fromEntries(VITALS.map((v) => [v.k, v])) as Record<VitalKey, Vital>
 const rate = (k: VitalKey, v: number): State => (v > VITAL[k].poor ? 'error' : v > VITAL[k].good ? 'warn' : 'ok')
-const RATE_WORD: Record<State, string> = { ok: 'good', warn: 'needs work', error: 'poor', idle: 'no samples', sampled: 'sampled' }
+const RATE_WORD: Record<State, string> = { ok: 'good', warn: 'needs work', error: 'poor', idle: 'no samples', sampled: 'sampled', running: 'measuring' }
 const fmtV = (k: VitalKey, v: number) => (k === 'CLS' ? fmtNum(v, { digits: 2 }) : v >= 1000 ? `${fmtNum(v / 1000, { digits: 2 })}s` : `${Math.round(v)}ms`)
 type Vitals = Record<VitalKey, number>
 const P75: Record<'desktop' | 'mobile', Vitals> = { desktop: { TTFB: 880, FCP: 1120, LCP: 1540, INP: 64, CLS: 0.01 }, mobile: { TTFB: 1230, FCP: 1980, LCP: 2710, INP: 210, CLS: 0.06 } }
@@ -340,9 +340,13 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
             <Metric label="bounce" value={38} unit="%" baseline="one page then left" state="warn" />
           </MetricGrid>
           <div className="space-y-2">
+            {/* The prior period is a ghost, not a second series: it is the same
+                measure, so it must not read as a peer of the line it is behind. */}
             <TimeChart data={HOURLY} unit="visitors" height={200} xInterval={11}
-              series={compare ? [{ key: 'visitors', name: 'visitors' }, { key: 'prev', name: 'previous' }] : [{ key: 'visitors', name: 'visitors' }]}
+              series={[{ key: 'visitors', name: 'visitors' }]}
+              compare={compare ? { label: `previous ${range}`, data: HOURLY.map((h) => ({ t: String(h.t), visitors: Number(h.prev) })) } : undefined}
               markers={[{ id: 'dep_91a', x: '20:30' }]} selection={sel} onSelect={setSel}
+              title="visitors" range={range} verdict="Visitors follow the working day; the evening is ahead of the previous one."
               readoutFormat={(p) => `${p.t} · ${fmtNum(Number(p.visitors))} visitors${compare ? ` · previous ${fmtNum(Number(p.prev))}` : ''}`} />
             <ChartFooter><span>visitors / 30 min · {range}</span><span>· ┆ deploy</span><span>· drag to measure a window</span>{sel && <span>· {sel.from} → {sel.to} selected · the lists below cover the whole range</span>}</ChartFooter>
           </div>
@@ -352,6 +356,18 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
             <Section title="Pages" meta="top 5"><Breakdown rows={PAGES.slice(0, 5).map((p) => ({ label: <span className="font-mono">{p.path}</span>, key: p.path, count: p.views, onOpen: () => setTab('pages') }))} total={PAGES.reduce((a, p) => a + p.views, 0)} unit="views" limit={5} more={{ label: 'all pages', onClick: () => setTab('pages') }} /></Section>
             <Section title="Events" meta="by fires"><Breakdown rows={EVENTS.map((e) => ({ label: <span className="font-mono">{e.name}</span>, key: e.name, count: e.fires, state: e.state === 'ok' ? undefined : e.state, onOpen: () => go(`event:${e.name}`) }))} total={EVENTS.reduce((a, e) => a + e.fires, 0)} unit="fires" limit={5} more={{ label: 'all events', onClick: () => setTab('events') }} /></Section>
           </div>
+          {/* Why the numbers above are estimates, stated where the numbers are:
+              the allowance, what was used, and where sampling began. */}
+          {plan.ingestGb !== null && (
+            <Section title="Allowance" meta={`${plan.label} · this month`}>
+              <UsageBar label="telemetry ingest" used={plan.ingestUsedGb} allowance={plan.ingestGb} unit="GB"
+                format={(n) => fmtNum(n, { digits: 1 })}
+                plan={`${plan.label} · ${plan.ingest} · retention ${plan.retention}`}
+                sampledFrom={plan.sampled ? plan.ingestGb : undefined} sampledLabel="sampled 1 in 4 since 14:00"
+                resets="resets on the 1st"
+                action={<Phrase onClick={() => go('settings:plan')}>change plan</Phrase>} />
+            </Section>
+          )}
         </div>
       )}
 
@@ -584,6 +600,23 @@ const INCIDENTS = [
   { id: 'inc_29', t: '9d ago · 4 min', label: 'down · certificate expired', note: 'acme renewal had failed twice · renewed by hand', state: 'error' as State, icon: <Zap /> },
 ]
 const RT = (m: Monitor) => m.buckets.map((b) => ({ t: b.start, p50: b.p50_ms ?? 0, p95: b.p95_ms ?? 0 }))
+/* The same 24 hours the strip buckets, collapsed into the stretches the
+   monitor actually spent in one state. Consecutive buckets of the same state
+   are one segment: that is the difference between the two forms. */
+const SEG_WORD: Record<State, string> = { ok: 'up', warn: 'degraded', error: 'down', idle: 'paused', sampled: 'sampled', running: 'deploying' }
+const SEGMENTS = (m: Monitor): StateSegment[] => {
+  const out: StateSegment[] = []
+  for (const b of m.buckets) {
+    const last = out[out.length - 1]
+    if (last && last.state === b.state) { last.seconds += 1800; continue }
+    out.push({
+      state: b.state, word: SEG_WORD[b.state], from: b.start, seconds: 1800,
+      note: b.state === 'error' ? `${b.down ?? 0} of ${b.checks ?? 0} checks failed · connection refused from all 3 regions`
+        : b.state === 'warn' ? 'p95 above the 1s threshold' : undefined,
+    })
+  }
+  return out
+}
 export function MonitorScreen({ id, notify, go }: { id: string; notify: Notify; go: (v: string) => void }) {
   const m = MONITORS.find((x) => x.id === id) ?? MONITORS[0]
   const [range, setRange] = useState<'24h' | '7d' | '30d' | '90d'>('24h')
@@ -614,8 +647,17 @@ export function MonitorScreen({ id, notify, go }: { id: string; notify: Notify; 
       </>}>
       <Columns>
         <div>
-          <Section title="Checks" meta={`${range} · ${range === '24h' ? '30 min' : range === '7d' ? '3 h' : '1 day'} per segment`}>
-            <div><StatusStrip buckets={m.buckets} height={24} /><p className="mt-1 font-mono text-[11px] text-muted-foreground">● up · ◐ slow · × down · ← → reads a segment</p></div>
+          {/* The ledger keeps the bucketed StatusStrip, so a reader can compare
+              monitors by shape. The record needs the other question answered —
+              for how long — so it draws the real transitions and their durations. */}
+          <Section title="State" meta={`${range} · real transitions, not buckets`}>
+            <StateTimeline segments={SEGMENTS(m)} title={`${m.name} checks`} range={range}
+              verdict={m.state === 'error'
+                ? 'Up all day except ten minutes degraded and thirty minutes down from 20:30.'
+                : m.state === 'warn'
+                  ? 'Up all day; two stretches answered above the 1s threshold.'
+                  : 'Up for the whole window; no state change.'}
+              footer={<><span>state changes · {range}</span><span>· retention {'90d'}</span><span>· ← → reads a segment</span></>} />
           </Section>
           <Section title="Response time" meta="p50 thick · p95 thin · ┆ deploy · 1s threshold">
             <div className="border bg-background p-3">

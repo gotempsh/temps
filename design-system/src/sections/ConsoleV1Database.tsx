@@ -8,8 +8,8 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Callout, ChartFooter, DateTimeField, Detail, EchoDialog, Ledger, Lede, Metric, MetricGrid, Num, PageState, Phrase, Section, Segmented, KeyValue, Status, StatusLine, TimeChart, Columns, SecretValue, ProjectMark,
-  StatusStrip, LogLines, Histogram, quantile,
-  type KV, type LedgerRow, type State, type StatusBucket, type LogLine, type Pct, type HistBucket,
+  StatusStrip, LogLines, Histogram, quantile, WindowTimeline,
+  type KV, type LedgerRow, type State, type StatusBucket, type LogLine, type Pct, type HistBucket, type WindowMark,
 } from '@/components/op'
 import { EMPTY, fmtNum, fmtPct, fmtStamp } from '@/components/op'
 import type { Notify } from './ConsoleV1Observe'
@@ -81,6 +81,13 @@ const TABS = ['overview', 'backups', 'metrics', 'logs', 'queries', 'data'] as co
 const PITR_FLOOR = '2026-08-30T20:33:00'
 const PITR_CEIL = '2026-09-06T20:33:00'
 const PITR_LAST_BACKUP = '2026-09-06T18:33:00'
+/* The backups as marks on the recovery axis. `at` is relative on the ledger
+   ("2h ago") because that is what the operator scans for; here it has to be a
+   real stamp, because the picture is a clock. */
+const PITR_MARKS = (db: Db): WindowMark[] => db.backups.map((b, i) => ({
+  at: i === 0 ? PITR_LAST_BACKUP : `2026-09-0${6 - i}T02:00:00`,
+  label: b.id, state: b.state, note: b.note ?? (b.state === 'ok' ? `${b.size} · ${b.source}` : undefined),
+})).reverse()
 const ZONES = ['UTC', 'Europe/Madrid', 'America/New_York']
 type Tab = (typeof TABS)[number]
 export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
@@ -251,6 +258,15 @@ export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: b
           <Section title="Restore to a point in time" meta={db.pitr ? 'WAL replayed onto a new volume' : `${db.engine} ${db.version} · not available`}>
             {db.pitr ? (
               <div className="@container space-y-4 border bg-background p-4">
+                {/* The window the form accepts, drawn on the same axis as the
+                    cursor the field moves: a refused second is visible before
+                    it is typed, and the failed nightly is on the picture. */}
+                <WindowTimeline from={PITR_FLOOR} to={PITR_CEIL} zone={zone}
+                  covered={[{ from: PITR_FLOOR, to: PITR_CEIL, label: 'WAL covers' }]}
+                  marks={PITR_MARKS(db)} cursor={{ at: pit, label: 'restore to' }}
+                  title={`recoverable window · ${db.name}`}
+                  verdict={`Any second in the last 7 days; ${db.backups.length} full backups sit inside it.`}
+                  footer={<><span>retention 7d</span><span>· nightly at 02:00, keeps 14</span><span>· ← → reads a backup</span></>} />
                 <DateTimeField
                   id="pitr-at" label={`restore ${db.name} to`} precision="second"
                   value={pit} onChange={setPit} min={PITR_FLOOR} max={PITR_CEIL}

@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
-  ChartFooter, Detail, EchoDialog, Field, Kbd, Ledger, Metric, MetricGrid, Num, PageState, Phrase, Picker, Section, SectionTitle, Segmented, KeyValue, Timeline, Settings, Status, StatusLine, TimeChart,
+  ChartFooter, Detail, EchoDialog, Field, KbdPair, Ledger, Metric, MetricGrid, Num, PageState, Phrase, Picker, Section, SectionTitle, Segmented, KeyValue, Timeline, Settings, Status, StatusLine, TimeChart,
   type KV, type LedgerRow, type Page, type Series, type State, type StatusItem, type TimePoint, type TimeRange,
   Columns, Lede, type TimelineItem,
 } from '@/components/op'
@@ -475,4 +475,4 @@ export function EmailDomainScreen({ id, dense, notify, go }: { id: string; dense
   )
 }
 
-export const EMAIL_KEYS = <><Kbd keys="j" /> down · <Kbd keys="k" /> up</>
+export const EMAIL_KEYS = <KbdPair keys={['j', 'k']} does={['down', 'up']} />

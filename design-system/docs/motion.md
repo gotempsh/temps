@@ -66,15 +66,24 @@ not a state change, it is an animation, and it does not belong on the screen.
 tokens to `0s` and forces `transition-duration`, `animation-duration` and
 `animation-iteration-count` on every descendant of `.operator.ink`. One rule,
 one place. Every element still arrives at exactly the same end state, so
-nothing is lost — including the two exceptions below, which stop as well: a
-skeleton is still a skeleton and the retry button still reads "retrying…"
-without their animation. A reader who asked for no motion asked for no motion.
+nothing is lost — including the exceptions below, which stop as well: a
+skeleton is still a skeleton, the retry button still reads "retrying…", and the
+`running` glyph is still `◉` next to the word "building". The reduced-motion
+block carries its own line for the pulse, because `animation-duration: 0s` on
+an `alternate` animation would otherwise leave the glyph frozen at whatever
+opacity it was written with:
+
+```css
+.operator.ink .op-pulse { animation: none; opacity: 1; }
+```
+
+Full ink, held still. A reader who asked for no motion asked for no motion.
 
 Do not gate motion on `prefers-reduced-motion` in JavaScript. The one existing
 JS check (`design-system/src/components/system-map-section.tsx:312`) guards a
 sandbox-only demo animation and is not a pattern to copy.
 
-## The two exceptions that exist today
+## The four exceptions that exist today
 
 **1. The `.op-raise` shadow is a hard 3px offset that does not move.**
 `--op-raise-shadow: 3px 3px 0 0 var(--foreground)` is a printed offset, not a
@@ -87,15 +96,68 @@ must act on, not the thing the pointer happens to be over. Only
 to be felt. The earlier `.hardline` skin animated a hover lift on `.op-raise`;
 ink deliberately dropped it.
 
-**2. Two animations survive the "no motion" rule: `animate-pulse` and
-`animate-spin`.** The blanket transition rule excludes them by selector
-(`*:not(.animate-pulse):not(.animate-spin)`) because both communicate "still
-working", which an instant state change cannot express at all. They are used
-in exactly two places in the package: `Skeleton` (`ui/skeleton.tsx`, the
-`PageState` loading rows) and the retry button's `RefreshCw`
-(`page-state.tsx:80`). Anywhere else, a spinner is banned — `Loader2` as a
-page state is in the RULES ban list, and a shimmer on a skeleton is not one of
-these two.
+**2. `.op-pulse` — the one sanctioned animation in the system.** The system
+does not animate; this is the single exception, and it exists because one fact
+cannot be drawn still. A `running` glyph (`◉`, the sixth `State`) breathes
+while work is actually happening — a build, a restore, a scan — and stops the
+moment it stops. That is the whole argument: the motion *is* the fact. It is
+not a loading affordance, not a decoration, and not a way to make a page look
+busy; a thing that is not running must never carry it.
+
+```css
+@keyframes op-pulse { from { opacity: 1; } to { opacity: 0.45; } }
+.operator.ink .op-pulse { animation: op-pulse 1.6s ease-in-out infinite alternate; }
+```
+
+Opacity only. No scale, no colour, no travel — `running` takes no tone either
+(`GLYPH_CLASS.running` is plain `text-foreground`), because it is not a
+verdict. 1.6s is a breath, not a tick: fast enough to read as alive, slow
+enough that the eye stops going back to it. Applied by `glyphClass(state)` in
+`status.tsx`, so every glyph site gets it from one place.
+
+**It must stay in the `:not()` lists.** The blanket rules carry
+`transition-duration`/`animation-duration: 0s !important`, so anything they
+match cannot animate. `.op-pulse` is lifted out of all three of them —
+`.operator` (`op.css:141`), `.operator.hardline` (`op.css:322`) and
+`.operator.ink` (`op.css:477`) — alongside `.animate-pulse`/`.animate-spin`.
+The `.op-motion` / `.op-motion-fast` / `.op-motion-slow` utilities repeat the
+same `:not(.animate-spin):not(.op-pulse)` for a different reason: there it is a
+specificity match, not a filter, so the utilities can out-rank the blanket
+rule. **Do not "tidy" `:not(.op-pulse)` out of any of these five selectors.**
+Removing it from a blanket rule kills the pulse; removing it from a
+`.op-motion` selector silently breaks the motion utilities.
+
+**3. `animate-pulse` on a skeleton.** `Skeleton` (`ui/skeleton.tsx`, the
+`PageState` loading rows) is the only place it appears. A shimmer is not this;
+a shimmer is decoration on top of an absence.
+
+**4. `.op-busy` on a button doing the work.** The one spin in the system, and
+the sanctioned shape the paragraph below is about. `Button` takes `busy` and
+`busyLabel`: while busy it turns its own icon at `0.9s linear`, swaps the label
+for the verb in progress ("saving…", "reloading…", "deploying…"), locks its
+min-width to the idle width so the row it sits in does not move, sets
+`aria-busy`, and swallows clicks. It is deliberately **not** `disabled` —
+disabling greys the control out and, worse, drops focus, so a keyboard reader
+who has just pressed ⌘S is thrown to the top of the document at exactly the
+moment they are waiting to hear what happened. A minimum busy time of 400ms
+(`MIN_BUSY_MS`) stops a fast answer reading as a flicker.
+
+A reload spins because the thing it stands for goes round; a `running` glyph
+pulses because a state is not an action. That is the whole difference between
+exception 2 and exception 4, and it is why they do not share a class.
+
+Under `prefers-reduced-motion` the icon holds still and the label carries it
+alone — which is why `busyLabel` is not really optional. `.op-busy svg` is
+lifted out of the blanket rules by `:not(.op-busy svg)` on all three
+selectors, for the same reason `.op-pulse` is.
+
+`animate-spin` is **no longer an exception.** The one legitimate spin now has
+its own class (`.op-busy`, above), so nothing needs the bare utility.
+Everywhere else a spinner is banned: `Loader2` as a page state is in the RULES
+ban list, and the `PageState` retry button pulses instead of spinning
+(`page-state.tsx`, `p.retrying && 'op-pulse'`), because a retry in flight is
+the same fact as a build in flight. The selectors still name `.animate-spin`
+so any remaining third-party use keeps working.
 
 A third animation exists and is a deliberate borrowing rather than an
 exception: `.op-caret::after` (`op-blink`, `1s steps(1) infinite`) is the
@@ -104,10 +166,11 @@ text, it steps rather than fades, and it stops under reduced motion like
 everything else. Do not use it anywhere a terminal is not being imitated.
 
 Two things that look like they should move and deliberately do not, both
-verified in code: the `Live` indicator (`viz.tsx:486`) is a static `●` plus the
-word "live" — it does not pulse, because a pulsing dot is a decoration that
-says nothing a glyph and a word do not — and a `Num` that changes value
-re-renders without a transition.
+verified in code: the `Live` indicator is a static `●` plus the word "live" —
+it does not pulse, because "live" is a property of the stream, not work in
+flight, and a pulsing dot there is a decoration that says nothing a glyph and a
+word do not — and a `Num` that changes value re-renders without a transition.
+`running` is the only state that earns the pulse.
 
 ## Applying a different tier
 
@@ -141,3 +204,12 @@ duration comes from the token.
 
 Rules digest: `RULES.md` §Motion. Tokens: `web/packages/op/tokens.json`.
 Reference: `/op-components`, `/v1`.
+
+## Floating content appears in place
+
+A tooltip, popover, menu, select or drop is positioned by a transform that
+Radix sets after mount. It must never transition that transform, or the
+panel slides in from the corner it was laid out at. `op.css` excludes
+`[data-radix-popper-content-wrapper]` from the transform transition, and the
+primitives carry no entrance or exit animation classes. Appear, then be
+there.

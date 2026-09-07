@@ -5,16 +5,16 @@ import { LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface EmptyStep {
-  label: string
-  href: string
-  done?: boolean
+ label: string
+ href: string
+ done?: boolean
 }
 
 interface EmptyPlaceholderProps extends React.HTMLAttributes<HTMLDivElement> {
-  icon?: LucideIcon
-  title: string
-  description: string
-  action?: React.ReactNode
+ icon?: LucideIcon
+ title: string
+ description: string
+ action?: React.ReactNode
   /**
    * Operator-console onboarding treatment (temps/CLAUDE.md: unconfigured
    * features must onboard, never disappear). `preview` is a dimmed mock of
@@ -23,32 +23,32 @@ interface EmptyPlaceholderProps extends React.HTMLAttributes<HTMLDivElement> {
    * passed the layout switches to two columns; otherwise the stock centred
    * icon-disc layout is unchanged for every existing consumer.
    */
-  preview?: React.ReactNode
-  steps?: EmptyStep[]
+ preview?: React.ReactNode
+ steps?: EmptyStep[]
 }
 
 export function EmptyPlaceholder({
-  icon: Icon,
-  title,
-  description,
-  action,
-  preview,
-  steps,
-  className,
+ icon: Icon,
+ title,
+ description,
+ action,
+ preview,
+ steps,
+ className,
   ...props
 }: EmptyPlaceholderProps) {
-  if (preview || steps) {
-    return (
+ if (preview || steps) {
+ return (
       <div
-        className={cn(
+ className={cn(
           'grid gap-px overflow-hidden border bg-border md:grid-cols-[3fr_2fr]',
-          className
+ className
         )}
         {...props}
       >
         <div
-          aria-hidden
-          className="pointer-events-none relative select-none overflow-hidden bg-background p-3 opacity-60"
+ aria-hidden
+ className="pointer-events-none relative select-none overflow-hidden bg-background p-3 opacity-60"
         >
           {preview}
           <div className="absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-background to-transparent" />
@@ -64,18 +64,18 @@ export function EmptyPlaceholder({
               {steps.map((s) => (
                 <li key={s.label} className="flex items-start gap-2">
                   <span
-                    className={cn(
+ className={cn(
                       'shrink-0 tabular-nums',
-                      s.done ? 'text-success' : 'text-muted-foreground'
+ s.done ? 'text-success' : 'text-muted-foreground'
                     )}
                   >
-                    [{s.done ? 'x' : ' '}]
+ [{s.done ? 'x' : ' '}]
                   </span>
                   <a
-                    href={s.href}
-                    className={cn(
+ href={s.href}
+ className={cn(
                       'underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring',
-                      s.done && 'text-muted-foreground line-through'
+ s.done && 'text-muted-foreground line-through'
                     )}
                   >
                     {s.label}
@@ -90,11 +90,11 @@ export function EmptyPlaceholder({
     )
   }
 
-  return (
+ return (
     <div
-      className={cn(
-        'flex min-h-[400px] flex-col items-center justify-center rounded-md p-8 text-center animate-in fade-in-50',
-        className
+ className={cn(
+        'flex min-h-[400px] flex-col items-center justify-center rounded-md p-8 text-center',
+ className
       )}
       {...props}
     >

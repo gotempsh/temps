@@ -3,9 +3,10 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { ArrowUp, Bot, Box, Brain, Check, ChevronDown, Container, ShieldOff, Zap, ChevronRight, Copy, Pencil, X, FilePen, FileText, GitBranch, Globe, HelpCircle, ListChecks, ListOrdered, Paperclip, RotateCcw, Search, Square, Terminal, ThumbsDown, ThumbsUp, type LucideIcon } from 'lucide-react'
+import { ArrowUp, Bot, Box, Brain, Check, Container, FileText, Rocket, ShieldCheck, ShieldOff, Zap, Copy, Pencil, X, FilePen, GitBranch, HelpCircle, ListChecks, ListOrdered, Paperclip, RotateCcw, Square, ThumbsDown, ThumbsUp } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Drop, EchoDialog, Kbd, MOD, Phrase, Picker, Section, Status, StatusLine, GLYPH, GLYPH_CLASS, type State } from '@/components/op'
+import { Drop, EchoDialog, Kbd, KbdPair, Ledger, MOD, Phrase, Picker, Section, Segmented, Status, StatusLine, TimeChart, type LedgerRow, type Series, type State, type TimePoint } from '@/components/op'
+import { AgentGlyph as Glyph, AgentQuestion as Question, AgentRow as Row, AgentSources as Sources, Proposal, Provenance, RunAside, ToolRow as Tool, type ToolState } from '@/components/op'
 import { fmtNum } from '@/components/op'
 import { PAGE_BLEED } from '@/components/shell-context'
 import { cn } from '@/lib/utils'
@@ -38,29 +39,6 @@ import { writeToClipboard } from '@/lib/clipboard'
      context in words, each a Picker; the send button is the one ink fill
    ──────────────────────────────────────────────────────────────────────── */
 
-type ToolState = 'input-streaming' | 'input-available' | 'output-available' | 'output-error' | 'approval-requested' | 'approval-responded' | 'output-denied'
-const TOOL_STATE: Record<ToolState, { state: State; word: string }> = {
-  'input-streaming': { state: 'idle', word: 'preparing' },
-  'input-available': { state: 'warn', word: 'running' },
-  'output-available': { state: 'ok', word: 'done' },
-  'output-error': { state: 'error', word: 'failed' },
-  'approval-requested': { state: 'warn', word: 'needs approval' },
-  'approval-responded': { state: 'ok', word: 'approved' },
-  'output-denied': { state: 'idle', word: 'denied' },
-}
-
-function Glyph({ state, className }: { state: State; className?: string }) {
-  return <span aria-hidden className={cn('w-3 shrink-0 text-center', GLYPH_CLASS[state], className)}>{GLYPH[state]}</span>
-}
-
-/** Kind icon: what the thing IS. Muted by default; failure and approval tint it, running pulses it. */
-function Kind({ icon: I, state, className }: { icon: LucideIcon; state: State; className?: string }) {
-  return <I aria-hidden className={cn('h-3.5 w-3.5 shrink-0', state === 'error' ? 'text-destructive' : state === 'warn' ? 'text-warning' : 'text-muted-foreground', className)} />
-}
-
-const TOOL_ICON: Record<string, LucideIcon> = { run_command: Terminal, bash: Terminal, edit_file: FilePen, write_file: FilePen, read_file: FileText, grep: Search, glob: Search, fetch: Globe, web_search: Globe, git: GitBranch }
-const iconFor = (name: string, arg?: string) => (name === 'run_command' && arg?.startsWith('git ') ? GitBranch : TOOL_ICON[name] ?? Terminal)
-
 /** A turn: who, when, and the parts. */
 function Turn({ who, at, children, model }: { who: 'you' | 'agent'; at: string; children: ReactNode; model?: string }) {
   return (
@@ -76,47 +54,6 @@ function Turn({ who, at, children, model }: { who: 'you' | 'agent'; at: string; 
 
 function Prose({ children }: { children: ReactNode }) {
   return <div className="op-prose max-w-[68ch] space-y-2 text-sm leading-6">{children}</div>
-}
-
-/** Collapsible line: kind icon · title · state on the right. No frame; children hang under it, indented. */
-function Row({ icon, state, title, meta, open, onToggle, children, className, accent }: { icon: LucideIcon; state: State; title: ReactNode; meta?: ReactNode; open: boolean; onToggle: () => void; children?: ReactNode; className?: string; accent?: 'destructive' }) {
-  return (
-    <div className={cn(accent === 'destructive' && 'border-l-2 border-destructive pl-2', className)}>
-      <button type="button" onClick={onToggle} aria-expanded={open} className="group -mx-1 flex min-h-7 w-[calc(100%+0.5rem)] items-center gap-2 px-1 py-1 text-left text-xs hover:bg-muted">
-        <Kind icon={icon} state={state} />
-        <span className="min-w-0 flex-1 truncate [&>.break-all]:whitespace-normal">{title}</span>
-        {meta && <span className={cn('shrink-0 font-mono text-[11px]', state === 'error' ? 'text-destructive' : state === 'warn' ? 'text-warning' : 'text-muted-foreground')}>{meta}</span>}
-        {children !== undefined && (open ? <ChevronDown className="h-3 w-3 shrink-0 opacity-40 group-hover:opacity-70" /> : <ChevronRight className="h-3 w-3 shrink-0 opacity-40 group-hover:opacity-70" />)}
-      </button>
-      {open && <div className="pl-5">{children}</div>}
-    </div>
-  )
-}
-
-function Inset({ label, children, className }: { label?: string; children: ReactNode; className?: string }) {
-  return (
-    <div className={cn('op-inset my-1 px-2 py-1.5 font-mono text-[11px] leading-5', className)}>
-      {label && <p className="op-label mb-1 text-[9px]">{label}</p>}
-      <pre className="overflow-x-auto whitespace-pre-wrap break-words">{children}</pre>
-    </div>
-  )
-}
-
-/** A unified diff, line by line. Ink for what is there now, muted for what was removed; the sign is the only colour. */
-function Diff({ text }: { text: string }) {
-  return (
-    <pre className="op-inset my-1 overflow-x-auto px-2 py-1.5 font-mono text-[11px] leading-5">
-      {text.split('\n').map((l, i) => {
-        const k = l.startsWith('+') ? 'add' : l.startsWith('-') ? 'del' : l.startsWith('@@') ? 'hunk' : 'ctx'
-        return (
-          <div key={i} className={cn('flex gap-2', k === 'del' && 'text-muted-foreground line-through decoration-[var(--op-rule-soft)]', k === 'hunk' && 'text-muted-foreground', k === 'ctx' && 'text-muted-foreground')}>
-            <span aria-hidden className={cn('w-3 shrink-0 select-none text-center no-underline', k === 'add' && 'text-success', k === 'del' && 'text-destructive')}>{k === 'add' ? '+' : k === 'del' ? '−' : k === 'hunk' ? '@' : ' '}</span>
-            <span className="min-w-0 whitespace-pre-wrap break-words">{l.replace(/^[-+]/, '')}</span>
-          </div>
-        )
-      })}
-    </pre>
-  )
 }
 
 function FileChip({ f }: { f: string }) {
@@ -138,57 +75,6 @@ function Reasoning({ seconds, steps }: { seconds: number; steps: { label: string
           </li>
         ))}
       </ol>
-    </Row>
-  )
-}
-
-// ── Tool ───────────────────────────────────────────────────────────────
-
-function Tool({ name, arg, state, ms, input, output, diff, error, defaultOpen, approval, approved }: {
-  name: string; arg?: string; state: ToolState; ms?: number; input?: string; output?: ReactNode; diff?: string; error?: string; defaultOpen?: boolean
-  approval?: { reason: string; destructive?: boolean; onRespond: (r: 'once' | 'session' | 'deny') => void }
-  /** The call needed approval and got it; shown next to the timing so the record is honest. */
-  approved?: boolean
-}) {
-  // Edits and commands are open by default: the diff and the command's output ARE the content. Reads and searches collapse.
-  const isEdit = !!diff
-  const isCmd = name === 'run_command' || name === 'bash'
-  const [open, setOpen] = useState(defaultOpen ?? (isEdit || isCmd || state === 'approval-requested' || state === 'output-error'))
-  const s = TOOL_STATE[state]
-  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`)
-  // The badges promise Y / N; bind them while this approval is the pending one. Typing in the composer is left alone.
-  useEffect(() => {
-    if (state !== 'approval-requested' || !approval) return
-    const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || e.metaKey || e.ctrlKey || e.altKey) return
-      if (e.key === 'y' || e.key === 'Y') { e.preventDefault(); approval.onRespond('once') }
-      else if (e.key === 'n' || e.key === 'N') { e.preventDefault(); approval.onRespond('deny') }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [state, approval])
-  return (
-    <Row icon={iconFor(name, arg)} state={s.state} open={open} onToggle={() => setOpen((o) => !o)}
-      title={<span className={cn('font-mono', isCmd && 'whitespace-normal break-all')}><span className="font-medium">{isCmd ? '$' : name}</span>{arg && <span className={cn(isCmd ? 'text-foreground' : 'text-muted-foreground')}> {arg}</span>}</span>}
-      meta={<>{approved && state === 'output-available' ? 'approved · ' : ''}{s.word}{ms !== undefined && state === 'output-available' && ` · ${fmt(ms)}`}{state === 'input-streaming' && <span className="op-caret" />}</>}
-      accent={approval?.destructive && state === 'approval-requested' ? 'destructive' : undefined}>
-      {input && !isCmd && <Inset label="input">{input}</Inset>}
-      {diff && state === 'output-available' && <Diff text={diff} />}
-      {state === 'approval-requested' && approval && (
-        <div className="space-y-2 py-1 text-xs">
-          <p>{approval.reason}</p>
-          <div className="flex flex-wrap gap-2">
-            <Button size="sm" className={cn('h-7 text-xs', approval.destructive ? 'op-fill-destructive' : 'op-primary')} onClick={() => approval.onRespond('once')}>{approval.destructive ? 'run it' : 'approve'} <Kbd keys="Y" className="ml-1 opacity-70" /></Button>
-            {!approval.destructive && <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => approval.onRespond('session')}>always for this session</Button>}
-            <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => approval.onRespond('deny')}>deny <Kbd keys="N" className="ml-1 opacity-70" /></Button>
-            <span className="ml-auto self-center text-[11px] text-muted-foreground">the agent waits; nothing runs until you answer</span>
-          </div>
-        </div>
-      )}
-      {state === 'output-denied' && <div className="py-1 text-xs text-muted-foreground">denied · the agent was told why and will try another way</div>}
-      {output !== undefined && state === 'output-available' && !diff && <Inset label={isCmd ? undefined : 'output'}>{output}</Inset>}
-      {error && state === 'output-error' && <Inset label="error" className="text-destructive">{error}</Inset>}
     </Row>
   )
 }
@@ -255,51 +141,6 @@ function Tasks({ tasks, compact }: { tasks: Task[]; compact?: boolean }) {
 }
 
 /**
- * A question is answered in two steps: pick, then confirm. One click used to
- * send the answer, which made a misclick irreversible mid-run; now the pick
- * is a radio (○ → ●, 1–4 from the keyboard) and nothing leaves until
- * "confirm" (⏎). The confirm button says which option it will send.
- */
-function Question({ q, options, answer, onAnswer }: { q: string; options: { label: string; note: string }[]; answer: string | null; onAnswer: (a: string) => void }) {
-  const [picked, setPicked] = useState<string | null>(null)
-  const chosen = answer ?? picked
-  useEffect(() => {
-    if (answer) return
-    const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || e.metaKey || e.ctrlKey) return
-      const n = Number(e.key)
-      if (n >= 1 && n <= options.length) setPicked(options[n - 1].label)
-      else if (e.key === 'Enter' && picked) { e.preventDefault(); onAnswer(picked) }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [answer, picked, options, onAnswer])
-  return (
-    <div className={cn('border', !answer && 'op-raise')} role="radiogroup" aria-label={q}>
-      <p className="flex items-center gap-2 border-b px-2 py-1.5 text-xs"><Kind icon={HelpCircle} state={answer ? 'ok' : 'warn'} /><span className="font-medium">{q}</span>{answer && <span className="ml-auto font-mono text-[11px] text-muted-foreground">answered</span>}</p>
-      <div className="grid gap-px sm:grid-cols-2">
-        {options.map((o, i) => (
-          <button key={o.label} type="button" role="radio" aria-checked={chosen === o.label} disabled={!!answer} onClick={() => setPicked(o.label)}
-            className={cn('flex items-start gap-2 px-2 py-2 text-left text-xs', !answer && 'hover:bg-muted', answer === o.label && 'op-fill-ink border-0', !answer && picked === o.label && 'bg-muted', answer && answer !== o.label && 'text-muted-foreground')}>
-            <span aria-hidden className="mt-px w-3 text-center">{chosen === o.label ? '●' : '○'}</span>
-            <span className="min-w-0 flex-1"><span className="block font-medium">{o.label}</span><span className={cn('block text-[11px]', answer === o.label ? 'text-background/70' : 'text-muted-foreground')}>{o.note}</span></span>
-            {!answer && <Kbd keys={String(i + 1)} className="hidden opacity-60 sm:inline-flex" />}
-          </button>
-        ))}
-      </div>
-      {!answer && (
-        <div className="flex flex-wrap items-center gap-2 border-t px-2 py-1.5 text-[11px] text-muted-foreground">
-          <Button size="sm" className="op-primary h-7 text-xs" disabled={!picked} onClick={() => picked && onAnswer(picked)}>{picked ? <>confirm “{picked}”</> : 'pick an answer'} <Kbd keys="⏎" className="ml-1 opacity-70" /></Button>
-          {picked && <button type="button" className="underline underline-offset-4 hover:text-foreground" onClick={() => setPicked(null)}>clear</button>}
-          <span className="ml-auto">or type an answer below · the agent waits</span>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/**
  * A restore point in the transcript. Restoring throws away work, so it is an
  * EchoDialog like every other irreversible action, never a bare link: the row
  * says what it did once it is done, on the row itself.
@@ -325,15 +166,6 @@ function Checkpoint({ n, files, at, onRestore }: { n: number; files: number; at:
       )}
       <span className="h-px flex-1 bg-[var(--op-rule-soft)]" />
     </div>
-  )
-}
-
-function Sources({ items }: { items: { label: string; href: string }[] }) {
-  return (
-    <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-      <span className="op-label text-[9px]">sources</span>
-      {items.map((s) => <a key={s.href} href={s.href} onClick={(e) => e.preventDefault()} className="font-mono">{s.label}</a>)}
-    </p>
   )
 }
 
@@ -397,6 +229,21 @@ const SPACES = [
   { value: 'sandbox', label: 'sandbox · sbx_9f3', meta: 'docker · fsn1', state: 'ok' as State, icon: <Container /> },
 ]
 
+/* The console assistant runs in an environment, not a checkout, and its modes
+   are the autonomy levels (brand §0), not file-edit permissions. Two different
+   agents, so two different vocabularies: the composer must never claim a
+   worktree the run aside does not have. */
+const CONSOLE_MODES = [
+  { value: 'read', label: 'Read only', meta: 'reads run · writes are proposed', icon: <FileText /> },
+  { value: 'approve', label: 'Act with approval', meta: 'allowlisted writes ask, then run', icon: <ShieldCheck /> },
+  { value: 'observe', label: 'Observe', meta: 'reads only · no writes offered', state: undefined as State | undefined, icon: <HelpCircle /> },
+]
+const CONSOLE_SPACES = [
+  { value: 'production', label: 'checkout-web · production', meta: '3 containers · fsn1', state: 'ok' as State, icon: <Rocket /> },
+  { value: 'staging', label: 'checkout-web · staging', meta: '1 container · fsn1', state: 'ok' as State, icon: <Rocket /> },
+  { value: 'orders', label: 'orders-api · production', meta: '2 containers · fsn1', state: 'warn' as State, icon: <Rocket /> },
+]
+
 /**
  * The context meter and what it opens. The panel is a `Drop`, not a hand-rolled
  * absolute div, so it gets the one phone form, Escape, an outside click and the
@@ -435,7 +282,7 @@ function ContextBadge({ used, max }: { used: number; max: number }) {
   )
 }
 
-function PromptBar({ value, onChange, running, busy, onSend, onStop, queued, onQueueEdit, onQueueSend, onQueueRemove }: { value: string; onChange: (v: string) => void; running: boolean; busy: boolean; onSend: () => void; onStop: () => void; queued: string[]; onQueueEdit: (i: number) => void; onQueueSend: (i: number) => void; onQueueRemove: (i: number) => void }) {
+function PromptBar({ value, onChange, running, busy, onSend, onStop, queued, onQueueEdit, onQueueSend, onQueueRemove, scenario }: { value: string; onChange: (v: string) => void; running: boolean; busy: boolean; onSend: () => void; onStop: () => void; queued: string[]; onQueueEdit: (i: number) => void; onQueueSend: (i: number) => void; onQueueRemove: (i: number) => void; scenario: 'coding' | 'console' }) {
   useEffect(() => {
     if (!running) return
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !document.querySelector('[role=dialog]:not(.hidden), [cmdk-root]')) { e.preventDefault(); onStop() } }
@@ -443,10 +290,20 @@ function PromptBar({ value, onChange, running, busy, onSend, onStop, queued, onQ
     return () => window.removeEventListener('keydown', onKey)
   }, [running, onStop])
   const [model, setModel] = useState('sonnet-5')
+  const [consoleModel, setConsoleModel] = useState('opus-5')
   const [think, setThink] = useState('high')
   const [mode, setMode] = useState('edits')
   const [space, setSpace] = useState('worktree')
-  const modeState = MODES.find((m) => m.value === mode)?.state
+  const [consoleMode, setConsoleMode] = useState('read')
+  const [consoleSpace, setConsoleSpace] = useState('production')
+  // The two agents share one composer but not one vocabulary: an environment is
+  // not a checkout, and an autonomy level is not a file-edit permission.
+  const isConsole = scenario === 'console'
+  const modes = isConsole ? CONSOLE_MODES : MODES
+  const spaces = isConsole ? CONSOLE_SPACES : SPACES
+  const modeValue = isConsole ? consoleMode : mode
+  const spaceValue = isConsole ? consoleSpace : space
+  const modeState = modes.find((m) => m.value === modeValue)?.state
   return (
     <div className="op-sticky-bottom -mx-4 border-t bg-background px-4 pb-3 pt-2 sm:-mx-6 sm:px-6">
       {queued.length > 0 && (
@@ -471,12 +328,12 @@ function PromptBar({ value, onChange, running, busy, onSend, onStop, queued, onQ
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSend() } }} />
         <div className="flex flex-wrap items-center gap-1 border-t px-2 py-1.5">
           <button type="button" className="inline-flex h-7 w-7 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground" aria-label="Attach files"><Paperclip className="h-3.5 w-3.5" /></button>
-          <Picker value={model} onChange={setModel} options={MODELS} mono={false} className="h-7 w-auto border-0 px-2 text-xs hover:bg-muted" width="280px" />
+          <Picker value={isConsole ? consoleModel : model} onChange={isConsole ? setConsoleModel : setModel} options={MODELS} mono={false} className="h-7 w-auto border-0 px-2 text-xs hover:bg-muted" width="280px" />
           <Picker value={think} onChange={setThink} options={THINKING.map((t) => ({ ...t, label: `thinking ${t.value}` }))} mono={false} className="h-7 w-auto border-0 px-2 text-xs hover:bg-muted" width="240px" />
-          <Picker value={mode} onChange={setMode} options={MODES} mono={false} className={cn('h-7 w-auto border-0 px-2 text-xs hover:bg-muted', modeState === 'warn' && 'text-warning')} width="300px" />
-          <Picker value={space} onChange={setSpace} options={SPACES} mono={false} className="h-7 w-auto border-0 px-2 text-xs hover:bg-muted" width="300px" />
+          <Picker value={modeValue} onChange={isConsole ? setConsoleMode : setMode} options={modes} mono={false} className={cn('h-7 w-auto border-0 px-2 text-xs hover:bg-muted', modeState === 'warn' && 'text-warning')} width="300px" />
+          <Picker value={spaceValue} onChange={isConsole ? setConsoleSpace : setSpace} options={spaces} mono={false} className="h-7 w-auto border-0 px-2 text-xs hover:bg-muted" width="300px" />
           <span className="ml-auto flex items-center gap-1">
-            <ContextBadge used={48825} max={200000} />
+            <ContextBadge used={isConsole ? 21480 : 48825} max={200000} />
             {running ? (
               <Button size="sm" variant="outline" className="h-7 text-xs" onClick={onStop}><Square className="h-3 w-3" /> stop <Kbd keys="esc" className="ml-1 opacity-70" /></Button>
             ) : (
@@ -486,8 +343,8 @@ function PromptBar({ value, onChange, running, busy, onSend, onStop, queued, onQ
         </div>
       </div>
       <p className="mt-1 flex flex-wrap gap-x-3 text-[10px] text-muted-foreground">
-        <span><Kbd keys="⏎" /> send</span><span><Kbd keys={['⇧', '⏎']} /> newline</span><span><Kbd keys="Y" /> / <Kbd keys="N" /> answer an approval</span><span><Kbd keys="esc" /> stop</span>
-        <span className="ml-auto">{MODES.find((m) => m.value === mode)?.meta} · {SPACES.find((s) => s.value === space)?.label}</span>
+        <span><Kbd keys="⏎" /> send</span><span><Kbd keys={['⇧', '⏎']} /> newline</span><span><KbdPair keys={['Y', 'N']} does={['approve', 'deny']} /> the waiting approval</span><span><Kbd keys="esc" /> stop</span>
+        <span className="ms-auto">{modes.find((m) => m.value === modeValue)?.meta} · {spaces.find((s) => s.value === spaceValue)?.label}</span>
       </p>
     </div>
   )
@@ -622,7 +479,138 @@ function SimTurnView({ t, onAnswer, onDecide, onRetry, running }: { t: SimTurn; 
   )
 }
 
+// ── Scenario 2: the console assistant ──────────────────────────────────
+// The same ledger, answering an operator's question with the console's own
+// blocks. Every generated block is wrapped in <Provenance>, so the reader can
+// always get from a picture back to the call that drew it; the one write is a
+// <Proposal> that does nothing until it is confirmed. Fixture data.
+
+const ERR_HOURS = ['06:00', '06:30', '07:00', '07:30', '08:00', '08:30', '09:00', '09:30', '10:00', '10:30', '11:00', '11:30']
+const ERR_RATE = [0.2, 0.3, 0.2, 0.4, 0.3, 0.5, 6.1, 8.4, 9.2, 8.8, 9.6, 9.1]
+const ERR_BASE = [0.3, 0.2, 0.3, 0.3, 0.4, 0.4, 0.4, 0.5, 0.4, 0.3, 0.4, 0.4]
+const ERR_POINTS: TimePoint[] = ERR_HOURS.map((t, i) => ({ t, rate: ERR_RATE[i], prior: ERR_BASE[i] }))
+const ERR_SERIES: Series[] = [
+  { key: 'rate', name: 'errors / min', state: 'error' },
+  { key: 'prior', name: 'same window, prior week', stroke: 'dotted', weight: 'thin' },
+]
+
+const ERR_GROUPS: { id: string; title: string; where: string; events: string; since: string; state: State }[] = [
+  { id: 'err_4f21', title: "TypeError: cannot read 'line1'", where: 'checkout-web · AddressForm.tsx:87', events: '1,204', since: 'dep_91a', state: 'error' },
+  { id: 'err_39c8', title: 'NotFound: order not found', where: 'orders-api · orders.ts:88', events: '96', since: 'dep_91a', state: 'error' },
+  { id: 'err_1a04', title: 'FetchError: ETIMEDOUT registry', where: 'checkout-web · build', events: '11', since: 'dep_8f2', state: 'warn' },
+  { id: 'err_0c77', title: 'AbortError: signal aborted', where: 'checkout-web · cart.ts:22', events: '4', since: 'dep_88a', state: 'idle' },
+]
+
+const METRICS_QUERY = `temps get_error_time_series
+  project      checkout-web
+  environment  production
+  from         2026-09-07T06:00
+  to           2026-09-07T11:45
+  bucket       30m
+  compare      prior_week`
+
+const GROUPS_QUERY = `temps list_error_groups
+  project      checkout-web
+  environment  production
+  since        dep_91a
+  order_by     events desc
+  limit        4`
+
+function ConsoleAssistantTurns({ decision, onDecide }: { decision: 'confirmed' | 'declined' | null; onDecide: (d: 'confirmed' | 'declined') => void }) {
+  const rows: LedgerRow[] = ERR_GROUPS.map((g) => ({
+    id: g.id,
+    state: g.state,
+    cells: [
+      <span key="t" className="min-w-0 truncate">{g.title}</span>,
+      <span key="w" className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{g.where}</span>,
+      <Status key="s" state={g.state} label={g.events} className="font-mono" />,
+      <span key="d" className="font-mono text-[11px] text-muted-foreground">{g.since}</span>,
+    ],
+    mobile: (
+      <span className="min-w-0">
+        <span className="block truncate">{g.title}</span>
+        <span className="block truncate font-mono text-[11px] text-muted-foreground">{g.events} events · since {g.since} · {g.where}</span>
+      </span>
+    ),
+  }))
+  return (
+    <>
+      <Turn who="you" at="11:46">
+        <Prose><p>Errors on checkout-web jumped this morning. What happened, and what should I do?</p></Prose>
+      </Turn>
+      <Turn who="agent" at="11:46" model="opus-5 · read only">
+        <Prose>
+          <p>
+            <strong>Roll back checkout-web production to dep_90c.</strong> The error rate went from 0.4 to 9.1 errors per minute at
+            09:00, when <span className="font-mono">dep_91a</span> shipped; 1,204 of the 1,315 events since are one group,
+            <span className="font-mono"> err_4f21</span>, in <span className="font-mono">AddressForm.tsx:87</span>. Nothing else changed in that window.
+          </p>
+        </Prose>
+
+        <Tool name="get_error_time_series" arg="checkout-web · production · 06:00→11:45" state="output-available" ms={412} output={'12 buckets · 2 series · 1,315 events'} defaultOpen={false} />
+        <Provenance tool="temps get_error_time_series" when="2m ago" range="5h45m · 30m buckets" note="checkout-web · production" query={METRICS_QUERY}>
+          <TimeChart
+            data={ERR_POINTS}
+            series={ERR_SERIES}
+            unit="/min"
+            title="checkout-web error rate"
+            range="06:00 → 11:45 · 30m buckets"
+            verdict="Flat at 0.4/min until 09:00, then 9.1/min from dep_91a onward."
+            markers={[{ id: 'dep_91a', x: '09:00', at: '09:00', note: 'checkout-web · production' }]}
+            thresholds={[{ y: 2, label: 'budget 2/min', state: 'warn' }]}
+          />
+        </Provenance>
+
+        <Tool name="list_error_groups" arg="checkout-web · production · since dep_91a" state="output-available" ms={188} output={'4 groups · 1,315 events · ordered by events'} defaultOpen={false} />
+        <Provenance tool="temps list_error_groups" when="2m ago" range="since dep_91a" note="4 of 4 groups" query={GROUPS_QUERY}>
+          <Ledger
+            status={null}
+            dense
+            columns={['error', 'where', { label: 'events', key: 'events', numeric: true }, 'since']}
+            grid="1.6fr 1.2fr 100px 90px"
+            rows={rows}
+            total={ERR_GROUPS.length}
+            hint="most events first"
+          />
+        </Provenance>
+
+        <Proposal
+          kind="deploy"
+          action="roll back"
+          target="checkout-web · production → dep_90c"
+          consequence="Production serves dep_90c again within about 40 seconds; the 9.1/min error rate should return to 0.4/min. The three commits in dep_91a stay on main."
+          reversal="Reversible: redeploy dep_91a from the deployment page, or ask me to."
+          autonomy="act with approval · rollback is on the write allowlist for this project"
+          confirmLabel="roll back to dep_90c"
+          decided={decision}
+          onConfirm={() => onDecide('confirmed')}
+          onDecline={() => onDecide('declined')}
+        />
+
+        {decision === 'confirmed' && (
+          <>
+            <Tool name="rollback_to_deployment" arg="checkout-web · production → dep_90c" state="output-available" ms={41200} approved
+              output={'dep_93a queued · rollback of dep_91a\nbuild skipped · reusing image sha256:4c1f…\nhealthy at 11:47 · traffic shifted\nerror rate 0.4/min at 11:52'} />
+            <Prose><p>Rolled back. <span className="font-mono">dep_93a</span> is serving production and the rate is back to 0.4/min. <span className="font-mono">err_4f21</span> is still open against <span className="font-mono">dep_91a</span> — fix it on a branch and I will watch the redeploy.</p></Prose>
+          </>
+        )}
+        {decision === 'declined' && (
+          <Prose><p>Nothing ran. Production stays on <span className="font-mono">dep_91a</span> at 9.1 errors per minute. Tell me to roll back, or ask me to open <span className="font-mono">err_4f21</span> with the stack and the 31 most recent events.</p></Prose>
+        )}
+
+        <Sources items={[
+          { label: 'err_4f21', href: '#', note: 'error tracking · 1,204 events' },
+          { label: 'dep_91a', href: '#', note: 'deployment · 09:00' },
+          { label: 'dep_90c', href: '#', note: 'deployment · last healthy' },
+        ]} />
+      </Turn>
+    </>
+  )
+}
+
 export function AgentChatPage() {
+  const [scenario, setScenario] = useState<'coding' | 'console'>('coding')
+  const [rollback, setRollback] = useState<'confirmed' | 'declined' | null>(null)
   const [prompt, setPrompt] = useState('')
   const [queued, setQueued] = useState<string[]>([])
   const [plan, setPlan] = useState<'approved' | 'edited' | null>('approved')
@@ -664,7 +652,8 @@ export function AgentChatPage() {
     const el = scroller.current
     if (el && pinned.current) el.scrollTop = el.scrollHeight
   }, [sims])
-  const scriptedRunning = pushState === 'approval-requested'
+  // A scripted turn is still open: the coding agent waits on the push approval, the console assistant on the rollback proposal.
+  const scriptedRunning = scenario === 'console' ? rollback === null : pushState === 'approval-requested'
   // "busy": a turn is open, so a new message queues. "working": the agent is executing right now, so the bar
   // shows stop. Waiting on an approval or a question is busy but not working: nothing to stop, and stop/esc
   // showing all the time was the bug. Derived, never stored, so it cannot go stale.
@@ -674,13 +663,63 @@ export function AgentChatPage() {
     if (active) return
     if (queued.length > 0) { const [head, ...rest] = queued; const id = setTimeout(() => { setQueued(rest); startTurn(head) }, 700); return () => clearTimeout(id) }
   }, [active, sims.length, queued, startTurn])
+  /**
+   * The badges in the composer hint are real keys. `Y` and `N` answer whichever
+   * approval is actually waiting — the scripted push, the rollback proposal, or
+   * a gated tool inside a simulated turn — and ⌘⏎ approves an undecided plan.
+   * A badge drawn over nothing is the first thing this system bans, and these
+   * four were drawn over nothing.
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement | null)?.isContentEditable) return
+      if (document.querySelector('[role=dialog]:not(.hidden), [cmdk-root]')) return
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        if (plan === null) { e.preventDefault(); setPlan('approved') }
+        return
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      const yes = e.key === 'y' || e.key === 'Y'
+      const no = e.key === 'n' || e.key === 'N'
+      if (!yes && !no) return
+      // The waiting approval inside a simulated turn wins: it is the newest thing on screen.
+      if (active && waitingOn) {
+        const i = active.shown - 1
+        const b = active.blocks[i]
+        if (b.kind === 'tool' && b.gated && !active.decisions[i]) {
+          e.preventDefault()
+          setSims((all) => all.map((t) => (t.id !== active.id ? t : { ...t, decisions: { ...t.decisions, [i]: yes ? 'ok' : 'deny' } })))
+          return
+        }
+        if (b.kind === 'plan' && !active.decisions[i]) {
+          e.preventDefault()
+          setSims((all) => all.map((t) => (t.id !== active.id ? t : { ...t, decisions: { ...t.decisions, [i]: yes ? 'approved' : 'edited' } })))
+          return
+        }
+        return
+      }
+      if (scenario === 'console' && rollback === null) { e.preventDefault(); setRollback(yes ? 'confirmed' : 'declined') }
+      else if (scenario === 'coding' && pushState === 'approval-requested') { e.preventDefault(); setPushState(yes ? 'approval-responded' : 'output-denied') }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [active, waitingOn, scenario, rollback, pushState, plan])
+
   const tasks: Task[] = [
     { label: 'Reproduce the null id in AddressForm', state: 'ok', files: ['src/checkout/AddressForm.tsx'] },
     { label: 'Fix normalize() and add a regression test', state: 'ok', files: ['src/checkout/address.ts', 'address.test.ts'] },
     { label: 'Run the checkout test suite', state: 'warn' },
     { label: 'Open a PR against main', state: pushState === 'approval-responded' ? 'warn' : 'idle' },
   ]
-  const status = active
+  const consoleStatus = rollback === 'confirmed'
+    ? <StatusLine state="ok">Rolled back to dep_90c. checkout-web production is at 0.4 errors per minute.</StatusLine>
+    : rollback === 'declined'
+      ? <StatusLine state="warn">Nothing ran. checkout-web production is still on dep_91a at 9.1 errors per minute.</StatusLine>
+      : <StatusLine state="warn" more={{ label: '1 proposal waiting', onClick: () => document.getElementById('proposal')?.scrollIntoView({ block: 'center' }) }}>Read only; <Phrase onClick={() => document.getElementById('proposal')?.scrollIntoView({ block: 'center' })}>one rollback is proposed</Phrase> and waiting for you.</StatusLine>
+  const status = scenario === 'console' && sims.length === 0
+    ? consoleStatus
+    : active
     ? <StatusLine state={waitingOn ? 'warn' : 'idle'} more={{ label: `step ${active.shown} of ${active.blocks.length}` }}>{waitingOn ? <><Phrase onClick={() => document.getElementById(`sim-${active.id}`)?.scrollIntoView({ block: 'end' })}>Waiting for your answer</Phrase> before continuing.</> : <>Working on “{active.prompt.length > 40 ? active.prompt.slice(0, 40) + '…' : active.prompt}”.</>}</StatusLine>
     : sims.length > 0
       ? <StatusLine state="ok">Finished. Reply to continue{queued.length ? `, ${queued.length} queued` : ''}.</StatusLine>
@@ -692,9 +731,22 @@ export function AgentChatPage() {
     // Fills the viewport under the docs header (h-14): the transcript column scrolls, the rail stays put.
     <div className={cn('operator ink v1 flex h-[calc(100dvh-3rem)] flex-col', PAGE_BLEED)}>
       <div className="shrink-0 border-b px-4 py-3 text-xs sm:px-6">
-        <p className="op-label">agent · an agentic conversation on v1</p>
+        <div className="flex flex-wrap items-center gap-3">
+          <p className="op-label">agent · an agentic conversation on v1</p>
+          <Segmented
+            className="ms-auto"
+            value={scenario}
+            onChange={setScenario}
+            options={[['coding', 'coding agent'], ['console', 'console assistant']] as const}
+          />
+        </div>
         <p className="op-prose mt-1 max-w-3xl text-sm text-muted-foreground">
-          The <a href="https://elements.ai-sdk.dev" className="underline underline-offset-4">AI Elements</a> vocabulary (message, reasoning, plan, tool in its six states, confirmation, task, subagent, question, queue, checkpoint, sources, actions, context, prompt input) drawn with the v1 rules. Tool calls are rows, approvals are inline, the status line says what the agent is doing, the prompt bar says the model, thinking, permission mode and workspace in words. Everything here is clickable. Console at <Link to="/v1" className="underline underline-offset-4">/v1</Link>; components at <Link to="/op-components" className="underline underline-offset-4">/op-components</Link>.
+          Two surfaces, one ledger: a <strong>coding agent</strong> in a worktree, and the <strong>console assistant</strong> answering an
+          operator with generated blocks under <Link to="/guide#generative-ui" className="underline underline-offset-4">the generative-UI rules</Link> —
+          every block carries the call that drew it, and the one write is a proposal.
+          The <a href="https://elements.ai-sdk.dev" className="underline underline-offset-4">AI Elements</a> vocabulary drawn with the v1 rules: tool calls are rows,
+          approvals are inline, the status line says what the agent is doing, the prompt bar says model, thinking, mode and workspace in words.
+          Everything here is clickable. Console at <Link to="/v1" className="underline underline-offset-4">/v1</Link>; components at <Link to="/op-components" className="underline underline-offset-4">/op-components</Link>.
         </p>
       </div>
 
@@ -702,12 +754,18 @@ export function AgentChatPage() {
         {/* Conversation: the one scrolling column */}
         <div ref={scroller} className="relative flex min-h-0 min-w-0 flex-col overflow-y-auto px-4 sm:px-6">
           <div className="flex flex-wrap items-baseline gap-x-2 pt-4">
-            <h1 className="op-title">fix: address form null id</h1>
-            <p className="font-mono text-[11px] text-muted-foreground">api-gateway · worktree feat/checkout-address · started 14:02 · {3 + sims.length} turns</p>
+            <h1 className="op-title">{scenario === 'console' ? 'why did checkout errors jump?' : 'fix: address form null id'}</h1>
+            <p className="font-mono text-[11px] text-muted-foreground">{scenario === 'console'
+              ? `checkout-web · production · started 11:46 · ${1 + sims.length} turns`
+              : `api-gateway · worktree feat/checkout-address · started 14:02 · ${3 + sims.length} turns`}</p>
           </div>
           <div className="mt-3">{status}</div>
 
           <div ref={content} className="flex-1 pb-6">
+            {scenario === 'console' ? (
+              <div id="proposal"><ConsoleAssistantTurns decision={rollback} onDecide={setRollback} /></div>
+            ) : (
+            <>
             <Turn who="you" at="14:02">
               <Prose><p>Checkout is throwing <span className="font-mono">TypeError: cannot read 'line1'</span> in AddressForm since dep_91a, 31 events. Find the cause, fix it with a test, run the suite, and open a PR. Don't touch the Stripe retry code.</p></Prose>
               <p className="flex flex-wrap gap-x-3 text-[11px]"><span className="op-label text-[9px]">attached</span><FileChip f="err_4f21 · 31 events" /><FileChip f="dep_91a" /></p>
@@ -769,6 +827,8 @@ export function AgentChatPage() {
               )}
               {pushState === 'output-denied' && <Prose><p>Understood, not pushing. The branch is ready in the worktree; push it yourself with <span className="font-mono">git push -u origin feat/checkout-address</span> or tell me what to change first.</p></Prose>}
             </Turn>
+            </>
+            )}
 
             {sims.map((t) => (
               <div key={t.id} id={`sim-${t.id}`}>
@@ -778,14 +838,16 @@ export function AgentChatPage() {
               </div>
             ))}
 
-            {sims.length === 0 && pushState === 'approval-requested' && (
+            {sims.length === 0 && (scenario === 'console' || pushState === 'approval-requested') && (
               <div className="flex flex-wrap gap-2 pt-2">
-                <span className="op-label self-center text-[9px]">try</span>{['Add a changelog entry', 'Explain the Stripe flakiness', 'Run the full suite instead'].map((s) => <button key={s} type="button" onClick={() => setPrompt(s)} className="px-2 py-1 text-xs text-muted-foreground underline decoration-[var(--op-rule-soft)] underline-offset-4 hover:text-foreground">{s}</button>)}
+                <span className="op-label self-center text-[9px]">try</span>{(scenario === 'console'
+                  ? ['Show me the stack for err_4f21', 'Compare this week with last', 'Which nodes served the errors?']
+                  : ['Add a changelog entry', 'Explain the Stripe flakiness', 'Run the full suite instead']).map((s) => <button key={s} type="button" onClick={() => setPrompt(s)} className="px-2 py-1 text-xs text-muted-foreground underline decoration-[var(--op-rule-soft)] underline-offset-4 hover:text-foreground">{s}</button>)}
               </div>
             )}
           </div>
 
-          <PromptBar value={prompt} onChange={setPrompt} running={working} busy={busy} queued={queued}
+          <PromptBar value={prompt} onChange={setPrompt} running={working} busy={busy} queued={queued} scenario={scenario}
             onSend={() => { if (!prompt.trim()) return; if (working) setQueued((q) => [...q, prompt.trim()]); else startTurn(prompt.trim()); setPrompt('') }}
             onStop={() => setSims((s) => s.map((t) => (t.done ? t : { ...t, done: true, stopped: true })))}
             onQueueEdit={(i) => { setPrompt(queued[i]); setQueued((q) => q.filter((_, j) => j !== i)) }}
@@ -796,6 +858,49 @@ export function AgentChatPage() {
         {/* Rail */}
         <aside className="hidden min-h-0 min-w-0 overflow-y-auto border-l px-4 py-4 text-xs xl:block">
           <div>
+            {/* The run, always first: which model answered, where, under what
+                policy, how much context is left, where the restore points are. */}
+            <Section title="Run" meta={scenario === 'console' ? '11:46 → now' : '14:02 → now'}>
+              {scenario === 'console' ? (
+                <RunAside
+                  model="opus-5"
+                  workspace="checkout-web · production"
+                  mode="read only · writes propose"
+                  context={{ used: 21480, max: 200000 }}
+                  rows={[
+                    { k: 'tools', v: '2 calls · 0 failed' },
+                    { k: 'proposals', v: rollback ? `1 ${rollback}` : '1 waiting', state: rollback === 'confirmed' ? 'ok' : rollback === 'declined' ? 'idle' : 'warn' },
+                    { k: 'cost', v: '$0.04 · 5 credits' },
+                  ]}
+                />
+              ) : (
+                <RunAside
+                  model="sonnet-5 · thinking high"
+                  workspace="worktree feat/checkout-address"
+                  mode="accept file edits"
+                  modeState="warn"
+                  context={{ used: 48825, max: 200000 }}
+                  checkpoints={[{ n: 1, at: '14:03' }]}
+                  rows={[
+                    { k: 'tools', v: '9 calls · 1 failed' },
+                    { k: 'subagents', v: '1 · test-runner' },
+                    { k: 'approvals', v: pushState === 'approval-requested' ? '1 waiting' : '2 answered', state: pushState === 'approval-requested' ? 'warn' : 'ok' },
+                    { k: 'cost', v: '$0.32 · 41 credits' },
+                  ]}
+                />
+              )}
+            </Section>
+            {scenario === 'console' ? (
+              <Section title="Autonomy" meta="per capability">
+                <div className="space-y-1 text-[11px] text-muted-foreground">
+                  <p className="flex items-center gap-2"><Status state="ok" label="read analytics, errors, traces" /> observe · auto</p>
+                  <p className="flex items-center gap-2"><Status state="ok" label="read env var names" /> observe · values masked</p>
+                  <p className="flex items-center gap-2"><Status state="warn" label="roll back, restart, pause" /> act with approval</p>
+                  <p className="flex items-center gap-2"><Status state="idle" label="delete anything" /> not on the allowlist</p>
+                </div>
+              </Section>
+            ) : (
+            <>
             <Section title="Tasks" meta={`${tasks.filter((t) => t.state === 'ok').length} of ${tasks.length} done`}>
               <Tasks tasks={tasks} compact />
             </Section>
@@ -805,11 +910,6 @@ export function AgentChatPage() {
               </div>
               <p className="mt-1 text-[11px] text-muted-foreground">in worktree feat/checkout-address · <a href="#" onClick={(e) => e.preventDefault()}>open diff</a></p>
             </Section>
-            <Section title="This run" meta="14:02 → now">
-              <div>
-                {[['tools', '9 calls · 1 failed'], ['subagents', '1 · test-runner'], ['approvals', pushState === 'approval-requested' ? '1 waiting' : '2 answered'], ['tokens', '48,825 · 24%'], ['cost', '$0.32 · 41 credits']].map(([k, v]) => <p key={k} className="flex items-baseline gap-2 py-1"><span className="op-label w-20 shrink-0">{k}</span><span className="min-w-0 truncate font-mono text-[11px]">{v}</span></p>)}
-              </div>
-            </Section>
             <Section title="Permissions" meta="Accept file edits">
               <div className="space-y-1 text-[11px] text-muted-foreground">
                 <p className="flex items-center gap-2"><Status state="ok" label="read files, grep" /> auto</p>
@@ -818,6 +918,8 @@ export function AgentChatPage() {
                 <p className="flex items-center gap-2"><Status state="error" label="git push, rm, deploy" /> always asks</p>
               </div>
             </Section>
+            </>
+            )}
           </div>
         </aside>
       </div>
