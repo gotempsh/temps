@@ -1716,7 +1716,7 @@
         "type": "object"
       },
       "AiStatusBreakdownRow": {
-        "description": "One row in the AI-agent HTTP status breakdown: the request count for a\nstatus class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.",
+        "description": "One row in the AI-agent HTTP status breakdown: the request count for a\nstatus class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.",
         "properties": {
           "request_count": {
             "format": "int64",
@@ -1756,6 +1756,76 @@
               "string",
               "null"
             ]
+          }
+        },
+        "type": "object"
+      },
+      "AiWorkspaceFileLimitsSettings": {
+        "description": "Runtime limits for workspace file transfer and browser previews.\n\nThe HTTP layer additionally enforces absolute ceilings so a malformed or\nlegacy settings row cannot turn a configurable limit into unbounded control\nplane memory use.",
+        "properties": {
+          "max_download_size_mb": {
+            "default": 32,
+            "example": 32,
+            "format": "int32",
+            "maximum": 32,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_file_size_mb": {
+            "default": 16,
+            "example": 16,
+            "format": "int32",
+            "maximum": 32,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_files_per_upload": {
+            "default": 32,
+            "example": 32,
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_image_preview_size_mb": {
+            "default": 8,
+            "example": 8,
+            "format": "int32",
+            "maximum": 16,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_text_preview_kb": {
+            "default": 256,
+            "example": 256,
+            "format": "int32",
+            "maximum": 1024,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_upload_size_mb": {
+            "default": 32,
+            "example": 32,
+            "format": "int32",
+            "maximum": 32,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_workspace_entries": {
+            "default": 5000,
+            "example": 5000,
+            "format": "int32",
+            "maximum": 50000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_workspace_size_mb": {
+            "default": 256,
+            "example": 256,
+            "format": "int32",
+            "maximum": 2048,
+            "minimum": 1,
+            "type": "integer"
           }
         },
         "type": "object"
@@ -2761,6 +2831,24 @@
               }
             ]
           },
+          "ai_workspace_file_limits": {
+            "default": {
+              "max_download_size_mb": 32,
+              "max_file_size_mb": 16,
+              "max_files_per_upload": 32,
+              "max_image_preview_size_mb": 8,
+              "max_text_preview_kb": 256,
+              "max_upload_size_mb": 32,
+              "max_workspace_entries": 5000,
+              "max_workspace_size_mb": 256
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
+                "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
+              }
+            ]
+          },
           "build_limits": {
             "default": {
               "cpu_limit_cores": 0,
@@ -3010,7 +3098,7 @@
               "auto_upgrade": true,
               "container_name": "temps-preview-gateway",
               "host_port": 8090,
-              "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
+              "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
             },
             "oneOf": [
               {
@@ -3134,6 +3222,10 @@
           },
           "ai_config": {
             "$ref": "#/components/schemas/AiConfigSettings"
+          },
+          "ai_workspace_file_limits": {
+            "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
+            "description": "Persistent AI workspace file transfer and preview limits."
           },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
@@ -3305,6 +3397,7 @@
           "cluster_dns",
           "build_limits",
           "ai_chat_limits",
+          "ai_workspace_file_limits",
           "request_timeouts",
           "connection_limits",
           "tenant_resource_ceilings",
@@ -3564,6 +3657,104 @@
         "required": [
           "path",
           "diff",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceDirectoryEntryResponse": {
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "size_bytes"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceDirectoryResponse": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryEntryResponse"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "entries",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceFileContentResponse": {
+        "properties": {
+          "binary": {
+            "type": "boolean"
+          },
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_b64": {
+            "description": "Base64-encoded raster image bytes when this file has a verified,\nbrowser-safe image signature and is within the configured preview cap.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "media_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "binary",
+          "size_bytes",
           "truncated"
         ],
         "type": "object"
@@ -23290,6 +23481,31 @@
         ],
         "type": "object"
       },
+      "ListProviderDomainsResponse": {
+        "description": "Domains discoverable on a provider's side for the \"import existing\ndomain\" picker.\n\n`supported: false` means this provider type has no domain-listing API at\nall (SMTP) — the UI must fall back to manual domain entry rather than\ntreat it as an error to retry. `error` is set when `supported` is `true`\nbut the live fetch still failed (network, revoked credentials); the same\nmanual-entry fallback applies, but it's worth surfacing as a warning.",
+        "properties": {
+          "domains": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderDomainIdentityResponse"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supported",
+          "domains"
+        ],
+        "type": "object"
+      },
       "ListRenewalAttemptsResponse": {
         "description": "Paginated renewal-attempt history for one domain, newest first.",
         "properties": {
@@ -32054,6 +32270,30 @@
         "required": [
           "key",
           "models"
+        ],
+        "type": "object"
+      },
+      "ProviderDomainIdentityResponse": {
+        "description": "A single domain identity already registered on the provider's side,\noffered for import.",
+        "properties": {
+          "domain": {
+            "example": "example.com",
+            "type": "string"
+          },
+          "provider_identity_id": {
+            "example": "12345678-1234-1234-1234-123456789012",
+            "type": "string"
+          },
+          "status": {
+            "description": "The provider's current verification status for this domain\n(\"verified\", \"pending\", \"failed\", \"not_started\", \"temporary_failure\")",
+            "example": "verified",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "provider_identity_id",
+          "status"
         ],
         "type": "object"
       },
@@ -51086,8 +51326,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "post": {
         "operationId": "create_application",
@@ -51129,8 +51368,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}": {
@@ -51172,8 +51410,7 @@
         "summary": "Archive an AI application",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "get": {
         "operationId": "get_application",
@@ -51224,8 +51461,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/conversations": {
@@ -51306,8 +51542,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "post": {
         "operationId": "create_application_conversation",
@@ -51359,8 +51594,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts": {
@@ -51415,8 +51649,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "post": {
         "operationId": "create_thread_artifact",
@@ -51479,8 +51712,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/preview-link": {
@@ -51541,8 +51773,7 @@
         "summary": "Mint a short-lived URL for a port running in the application harness\nsandbox. This intentionally does not return the bare `ws-…` hostname:\napplication sandboxes always have a private preview password and only the\ngateway can exchange this grant for the preview cookie.",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/projects": {
@@ -51601,8 +51832,7 @@
         "summary": "Create and link an application project",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/projects/link": {
@@ -51660,8 +51890,7 @@
         "summary": "Link an existing project to an application",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}": {
@@ -51719,8 +51948,7 @@
         "summary": "Unlink an application project",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/deploy": {
@@ -51794,8 +52022,7 @@
         "summary": "Deploy an application workspace project with Drop",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/primary": {
@@ -51849,13 +52076,12 @@
         "summary": "Choose the application's primary project",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/workspace/files": {
       "post": {
-        "description": "Re-authorizes every linked project and writes at most 32 project-relative files and 4 MiB per request into the selected persistent workspace directory.",
+        "description": "Re-authorizes every linked project and writes a configured, bounded batch of project-relative files into the selected persistent workspace directory.",
         "operationId": "write_application_workspace_files",
         "parameters": [
           {
@@ -51921,8 +52147,7 @@
         "summary": "Write a bounded batch of local files into an application project",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/workspace/source": {
@@ -51989,8 +52214,7 @@
         "summary": "Import a Git repository into an application project",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/restore": {
@@ -52036,8 +52260,7 @@
         "summary": "Restore an archived AI application",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/workspace": {
@@ -52084,8 +52307,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "patch": {
         "description": "Persists desired runtime and resource settings server-side, then replaces compute while retaining the application files.",
@@ -52142,8 +52364,7 @@
         "summary": "Update desired application workspace resources",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/workspace/actions": {
@@ -52205,8 +52426,7 @@
         "summary": "Control an application workspace",
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/workspace/changes": {
@@ -52279,8 +52499,7 @@
         ],
         "tags": [
           "AI Applications"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/applications/{application_public_id}/workspace/diff": {
@@ -52344,8 +52563,276 @@
         ],
         "tags": [
           "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/directory": {
+      "get": {
+        "operationId": "get_application_workspace_directory",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Workspace-relative directory; omit for the root",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Position returned by the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page (1-100, default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
         ],
-        "x-maturity": "experimental"
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/file": {
+      "get": {
+        "operationId": "get_application_workspace_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceFileContentResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/file/download": {
+      "get": {
+        "operationId": "download_application_workspace_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Download one application workspace file",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/files": {
+      "post": {
+        "description": "Writes a configured, bounded batch of safe workspace-relative files into the persistent workspace without waking compute.",
+        "operationId": "upload_application_workspace_files",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Upload files into an application workspace",
+        "tags": [
+          "AI Applications"
+        ]
       }
     },
     "/ai/conversations": {
@@ -52425,8 +52912,7 @@
         "summary": "List the current user's active conversations across all projects,\nmost-recently-active first, annotated with project name/slug.",
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "post": {
         "operationId": "create_global_conversation",
@@ -52475,8 +52961,7 @@
         "summary": "Create a private user-owned operator thread without binding its lifetime or\nauthority to a project. Project access is selected per tool call and checked\nagainst the user's current role and memberships.",
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}": {
@@ -52544,8 +53029,7 @@
         "summary": "Load one bounded history page for a private conversation by its owner-facing\nid. Project/application context is revalidated, but never used as the\nownership key.",
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "patch": {
         "operationId": "rename_user_conversation",
@@ -52600,8 +53084,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/archive": {
@@ -52638,8 +53121,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/attachments": {
@@ -52699,8 +53181,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/attachments/{attachment_id}": {
@@ -52768,8 +53249,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/messages": {
@@ -52827,8 +53307,7 @@
         "summary": "Submit a turn to a user-owned conversation. The authenticated user's\ncurrent role and permissions are captured for this turn's tool executor;\nno project id from the browser is trusted or required.",
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/pending-actions": {
@@ -52875,8 +53354,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/permission-mode": {
@@ -52936,8 +53414,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/permissions/{permission_id}/resolve": {
@@ -53001,8 +53478,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/restore": {
@@ -53040,8 +53516,7 @@
         "summary": "Restore a user-owned archived conversation.",
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/conversations/{public_id}/stop": {
@@ -53078,8 +53553,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/pending-actions/{action_public_id}": {
@@ -53123,8 +53597,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/pending-actions/{action_public_id}/confirm": {
@@ -53171,8 +53644,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/pending-actions/{action_public_id}/reject": {
@@ -53219,8 +53691,7 @@
         ],
         "tags": [
           "AI Chat"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/ai/pricing": {
@@ -55015,8 +55486,441 @@
         ],
         "tags": [
           "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/changes": {
+      "get": {
+        "operationId": "get_global_workspace_changes",
+        "parameters": [
+          {
+            "description": "Position returned by the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Files per page (1-200, default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
         ],
-        "x-maturity": "experimental"
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceChangesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          },
+          "504": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/diff": {
+      "get": {
+        "operationId": "get_global_workspace_diff",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceDiffResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          },
+          "504": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/directory": {
+      "get": {
+        "operationId": "get_global_workspace_directory",
+        "parameters": [
+          {
+            "description": "Workspace-relative directory; omit for the root",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Position returned by the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page (1-100, default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/file": {
+      "get": {
+        "operationId": "get_global_workspace_file",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceFileContentResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/file-limits": {
+      "get": {
+        "description": "Returns the non-sensitive effective transfer and preview policy for the current workspace user.",
+        "operationId": "get_workspace_file_limits",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get effective AI workspace file limits",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/file/download": {
+      "get": {
+        "operationId": "download_global_workspace_file",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Download one global AI workspace file",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/files": {
+      "post": {
+        "description": "Writes a configured, bounded batch of safe workspace-relative files into the user's persistent global workspace without waking compute.",
+        "operationId": "upload_global_workspace_files",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Upload files into the global AI workspace",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/preview-link": {
+      "post": {
+        "operationId": "create_global_workspace_preview_link",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApplicationPreviewLinkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mint a short-lived preview URL for a port in the user's shared global AI\nworkspace. The gateway grant is identical to application previews; the\nonly difference is how the owning sandbox is resolved.",
+        "tags": [
+          "AI Chat"
+        ]
       }
     },
     "/analytics/active-visitors": {
@@ -64364,6 +65268,7 @@
     },
     "/email-domains/{id}": {
       "delete": {
+        "description": "By default this only removes the Temps-side record; the domain identity\non the provider (Scaleway/SES) is left intact, since it may be shared\nwith other tools against that provider account. Pass\n`delete_from_provider=true` to also remove it on the provider's side. In\neither case, the local record is deleted regardless of whether that\nprovider-side deletion succeeds — an unreachable provider never blocks\nremoving the domain from Temps.",
         "operationId": "delete_email_domain",
         "parameters": [
           {
@@ -64374,6 +65279,15 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Also remove the domain identity on the provider's side (Scaleway/SES),\nnot just the local Temps record. Defaults to `false`: the same domain\nmay be shared with other tools against that provider account, so\ndeleting it from Temps must not silently un-register it elsewhere\nunless explicitly requested. If the provider-side deletion fails\n(network error, revoked credentials), the local record is still\ndeleted -- an unreachable provider never blocks removing it from Temps.",
+            "in": "query",
+            "name": "delete_from_provider",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -64391,7 +65305,7 @@
             "description": "Domain not found"
           },
           "500": {
-            "description": "Internal server error"
+            "description": "Internal server error (includes provider-side cleanup failure; the local record is still deleted)"
           }
         },
         "security": [
@@ -65020,6 +65934,57 @@
           }
         ],
         "summary": "Update an email provider",
+        "tags": [
+          "Email Providers"
+        ]
+      }
+    },
+    "/email-providers/{id}/discoverable-domains": {
+      "get": {
+        "description": "Always returns `200`, even when the provider type has no domain-listing\nAPI (SMTP) or the live fetch failed — `supported: false` or a non-null\n`error` signal the caller to fall back to manual entry instead of\ntreating this as a hard failure. Only a genuine failure to resolve the\nprovider itself (not found, undecryptable credentials) returns an error\nstatus.",
+        "operationId": "list_discoverable_domains",
+        "parameters": [
+          {
+            "description": "Provider ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListProviderDomainsResponse"
+                }
+              }
+            },
+            "description": "Discoverable domains (see `supported`/`error` for fallback state)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Provider not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List domain identities already registered on a provider's side, for\npopulating an \"import existing domain\" picker instead of requiring the\noperator to type the domain name (and, for Scaleway, its internal UUID)\nby hand.",
         "tags": [
           "Email Providers"
         ]
@@ -108117,7 +109082,7 @@
       "name": "Events"
     },
     {
-      "description": "Analytics metrics collection endpoints including performance web vitals",
+      "description": "Time-series metrics and alert rule endpoints",
       "name": "Metrics"
     },
     {
@@ -108215,10 +109180,6 @@
     {
       "description": "Data querying and exploration endpoints",
       "name": "External Services - Query"
-    },
-    {
-      "description": "Time-series metrics and alert rule endpoints",
-      "name": "Metrics"
     },
     {
       "description": "Key-Value storage operations",

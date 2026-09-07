@@ -23,8 +23,8 @@ pub use email_service::{
     TrackingRewriter,
 };
 pub use provider_service::{
-    CreateProviderRequest, ProviderCredentials, ProviderService, TestEmailResult,
-    UpdateProviderOutcome, UpdateProviderRequest,
+    CreateProviderRequest, ListProviderDomainsResult, ProviderCredentials, ProviderService,
+    TestEmailResult, UpdateProviderOutcome, UpdateProviderRequest,
 };
 pub use suppression_service::{SuppressionReason, SuppressionService};
 pub use tracking_service::{ExtractedLink, TrackingEvent, TrackingService, TransformResult};

@@ -844,7 +844,7 @@ export type AiStatusBreakdownResponse = {
 
 /**
  * One row in the AI-agent HTTP status breakdown: the request count for a
- * status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+ * status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
  */
 export type AiStatusBreakdownRow = {
     request_count: number;
@@ -868,6 +868,24 @@ export type AiSummaryPreferenceDto = {
      * `null` uses the selected model's default reasoning depth.
      */
     thinking_level?: string | null;
+};
+
+/**
+ * Runtime limits for workspace file transfer and browser previews.
+ *
+ * The HTTP layer additionally enforces absolute ceilings so a malformed or
+ * legacy settings row cannot turn a configurable limit into unbounded control
+ * plane memory use.
+ */
+export type AiWorkspaceFileLimitsSettings = {
+    max_download_size_mb?: number;
+    max_file_size_mb?: number;
+    max_files_per_upload?: number;
+    max_image_preview_size_mb?: number;
+    max_text_preview_kb?: number;
+    max_upload_size_mb?: number;
+    max_workspace_entries?: number;
+    max_workspace_size_mb?: number;
 };
 
 /**
@@ -1369,6 +1387,12 @@ export type AppSettings = {
     ai_chat_limits?: AiChatLimitsSettings;
     ai_config?: AiConfigSettings;
     /**
+     * Transfer and preview limits for files in persistent AI workspaces.
+     * These are runtime settings because operators have different control
+     * plane memory budgets and commonly work with very different asset sizes.
+     */
+    ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -1545,6 +1569,10 @@ export type AppSettingsResponse = {
      */
     ai_chat_limits: AiChatLimitsSettings;
     ai_config: AiConfigSettings;
+    /**
+     * Persistent AI workspace file transfer and preview limits.
+     */
+    ai_workspace_file_limits: AiWorkspaceFileLimitsSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
@@ -1740,6 +1768,34 @@ export type ApplicationWorkspaceChangesResponse = {
 export type ApplicationWorkspaceDiffResponse = {
     diff: string;
     path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceDirectoryEntryResponse = {
+    kind: string;
+    name: string;
+    path: string;
+    size_bytes: number;
+};
+
+export type ApplicationWorkspaceDirectoryResponse = {
+    entries: Array<ApplicationWorkspaceDirectoryEntryResponse>;
+    next_cursor?: number | null;
+    path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceFileContentResponse = {
+    binary: boolean;
+    content?: string | null;
+    /**
+     * Base64-encoded raster image bytes when this file has a verified,
+     * browser-safe image signature and is within the configured preview cap.
+     */
+    content_b64?: string | null;
+    media_type?: string | null;
+    path: string;
+    size_bytes: number;
     truncated: boolean;
 };
 
@@ -10857,6 +10913,22 @@ export type ListPresetsResponse = {
 };
 
 /**
+ * Domains discoverable on a provider's side for the "import existing
+ * domain" picker.
+ *
+ * `supported: false` means this provider type has no domain-listing API at
+ * all (SMTP) — the UI must fall back to manual domain entry rather than
+ * treat it as an error to retry. `error` is set when `supported` is `true`
+ * but the live fetch still failed (network, revoked credentials); the same
+ * manual-entry fallback applies, but it's worth surfacing as a warning.
+ */
+export type ListProviderDomainsResponse = {
+    domains: Array<ProviderDomainIdentityResponse>;
+    error?: string | null;
+    supported: boolean;
+};
+
+/**
  * Paginated renewal-attempt history for one domain, newest first.
  */
 export type ListRenewalAttemptsResponse = {
@@ -14890,6 +14962,20 @@ export type ProviderDescriptor = {
 export type ProviderDetailResponse = {
     key: ProviderKeyResponse;
     models: Array<ProviderModelResponse>;
+};
+
+/**
+ * A single domain identity already registered on the provider's side,
+ * offered for import.
+ */
+export type ProviderDomainIdentityResponse = {
+    domain: string;
+    provider_identity_id: string;
+    /**
+     * The provider's current verification status for this domain
+     * ("verified", "pending", "failed", "not_started", "temporary_failure")
+     */
+    status: string;
 };
 
 export type ProviderKeyResponse = {
@@ -24112,6 +24198,117 @@ export type GetApplicationWorkspaceDiffResponses = {
 
 export type GetApplicationWorkspaceDiffResponse = GetApplicationWorkspaceDiffResponses[keyof GetApplicationWorkspaceDiffResponses];
 
+export type GetApplicationWorkspaceDirectoryData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/directory';
+};
+
+export type GetApplicationWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetApplicationWorkspaceDirectoryResponse = GetApplicationWorkspaceDirectoryResponses[keyof GetApplicationWorkspaceDirectoryResponses];
+
+export type GetApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file';
+};
+
+export type GetApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetApplicationWorkspaceFileResponse = GetApplicationWorkspaceFileResponses[keyof GetApplicationWorkspaceFileResponses];
+
+export type DownloadApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file/download';
+};
+
+export type DownloadApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadApplicationWorkspaceFileResponses = {
+    200: Array<number>;
+};
+
+export type DownloadApplicationWorkspaceFileResponse = DownloadApplicationWorkspaceFileResponses[keyof DownloadApplicationWorkspaceFileResponses];
+
+export type UploadApplicationWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace/files';
+};
+
+export type UploadApplicationWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadApplicationWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -25404,6 +25601,202 @@ export type GetGlobalAiWorkspaceResponses = {
 };
 
 export type GetGlobalAiWorkspaceResponse = GetGlobalAiWorkspaceResponses[keyof GetGlobalAiWorkspaceResponses];
+
+export type GetGlobalWorkspaceChangesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Files per page (1-200, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/changes';
+};
+
+export type GetGlobalWorkspaceChangesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceChangesResponses = {
+    200: ApplicationWorkspaceChangesResponse;
+};
+
+export type GetGlobalWorkspaceChangesResponse = GetGlobalWorkspaceChangesResponses[keyof GetGlobalWorkspaceChangesResponses];
+
+export type GetGlobalWorkspaceDiffData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/diff';
+};
+
+export type GetGlobalWorkspaceDiffErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceDiffResponses = {
+    200: ApplicationWorkspaceDiffResponse;
+};
+
+export type GetGlobalWorkspaceDiffResponse = GetGlobalWorkspaceDiffResponses[keyof GetGlobalWorkspaceDiffResponses];
+
+export type GetGlobalWorkspaceDirectoryData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/directory';
+};
+
+export type GetGlobalWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetGlobalWorkspaceDirectoryResponse = GetGlobalWorkspaceDirectoryResponses[keyof GetGlobalWorkspaceDirectoryResponses];
+
+export type GetGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file';
+};
+
+export type GetGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetGlobalWorkspaceFileResponse = GetGlobalWorkspaceFileResponses[keyof GetGlobalWorkspaceFileResponses];
+
+export type GetWorkspaceFileLimitsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/file-limits';
+};
+
+export type GetWorkspaceFileLimitsErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type GetWorkspaceFileLimitsResponses = {
+    200: AiWorkspaceFileLimitsSettings;
+};
+
+export type GetWorkspaceFileLimitsResponse = GetWorkspaceFileLimitsResponses[keyof GetWorkspaceFileLimitsResponses];
+
+export type DownloadGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file/download';
+};
+
+export type DownloadGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadGlobalWorkspaceFileResponses = {
+    200: Array<number>;
+};
+
+export type DownloadGlobalWorkspaceFileResponse = DownloadGlobalWorkspaceFileResponses[keyof DownloadGlobalWorkspaceFileResponses];
+
+export type UploadGlobalWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/files';
+};
+
+export type UploadGlobalWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadGlobalWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadGlobalWorkspaceFilesResponse = UploadGlobalWorkspaceFilesResponses[keyof UploadGlobalWorkspaceFilesResponses];
+
+export type CreateGlobalWorkspacePreviewLinkData = {
+    body: CreateApplicationPreviewLinkRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/preview-link';
+};
+
+export type CreateGlobalWorkspacePreviewLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponse = CreateGlobalWorkspacePreviewLinkResponses[keyof CreateGlobalWorkspacePreviewLinkResponses];
 
 export type GetAnalyticsActiveVisitorsData = {
     body?: never;
@@ -31206,7 +31599,18 @@ export type DeleteEmailDomainData = {
          */
         id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Also remove the domain identity on the provider's side (Scaleway/SES),
+         * not just the local Temps record. Defaults to `false`: the same domain
+         * may be shared with other tools against that provider account, so
+         * deleting it from Temps must not silently un-register it elsewhere
+         * unless explicitly requested. If the provider-side deletion fails
+         * (network error, revoked credentials), the local record is still
+         * deleted -- an unreachable provider never blocks removing it from Temps.
+         */
+        delete_from_provider?: boolean;
+    };
     url: '/email-domains/{id}';
 };
 
@@ -31224,7 +31628,7 @@ export type DeleteEmailDomainErrors = {
      */
     404: unknown;
     /**
-     * Internal server error
+     * Internal server error (includes provider-side cleanup failure; the local record is still deleted)
      */
     500: unknown;
 };
@@ -31739,6 +32143,46 @@ export type UpdateEmailProviderResponses = {
 };
 
 export type UpdateEmailProviderResponse = UpdateEmailProviderResponses[keyof UpdateEmailProviderResponses];
+
+export type ListDiscoverableDomainsData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}/discoverable-domains';
+};
+
+export type ListDiscoverableDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDiscoverableDomainsResponses = {
+    /**
+     * Discoverable domains (see `supported`/`error` for fallback state)
+     */
+    200: ListProviderDomainsResponse;
+};
+
+export type ListDiscoverableDomainsResponse = ListDiscoverableDomainsResponses[keyof ListDiscoverableDomainsResponses];
 
 export type TestProviderData = {
     body: TestEmailRequest;

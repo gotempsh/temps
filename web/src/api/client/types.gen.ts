@@ -8795,7 +8795,7 @@ export type GatewayStatus = {
      */
     health: string;
     /**
-     * Host port that the ingress relay's :8080 is published on.
+     * Host port that the container's :8080 is published on.
      */
     host_port?: number | null;
     /**
@@ -10910,6 +10910,22 @@ export type ListOrdersResponse = {
 export type ListPresetsResponse = {
     presets: Array<PresetResponse>;
     total: number;
+};
+
+/**
+ * Domains discoverable on a provider's side for the "import existing
+ * domain" picker.
+ *
+ * `supported: false` means this provider type has no domain-listing API at
+ * all (SMTP) — the UI must fall back to manual domain entry rather than
+ * treat it as an error to retry. `error` is set when `supported` is `true`
+ * but the live fetch still failed (network, revoked credentials); the same
+ * manual-entry fallback applies, but it's worth surfacing as a warning.
+ */
+export type ListProviderDomainsResponse = {
+    domains: Array<ProviderDomainIdentityResponse>;
+    error?: string | null;
+    supported: boolean;
 };
 
 /**
@@ -13960,13 +13976,11 @@ export type PreviewGatewayLogsResponse = {
 /**
  * Workspace preview gateway settings.
  *
- * The preview gateway uses a private routing container plus a hardened ingress
- * relay bound to host loopback. The router joins each sandbox's isolated
- * network and routes requests to workspace dev servers based on the `Host`
- * header (`ws-<sid>-<port>.<preview_domain>`), while the relay never joins a
- * tenant network. `temps serve` reconciles both containers on startup; these
- * settings let an operator override the router image, host port, and
- * auto-upgrade behavior.
+ * The preview gateway is a single shared Docker container that lives on the
+ * `temps-sandbox-net` network and routes requests to workspace sandbox dev
+ * servers based on the `Host` header (`ws-<sid>-<port>.<preview_domain>`).
+ * `temps serve` reconciles this container on startup; these settings let an
+ * operator override the image, host port, and auto-upgrade behavior.
  */
 export type PreviewGatewaySettings = {
     /**
@@ -14948,6 +14962,20 @@ export type ProviderDescriptor = {
 export type ProviderDetailResponse = {
     key: ProviderKeyResponse;
     models: Array<ProviderModelResponse>;
+};
+
+/**
+ * A single domain identity already registered on the provider's side,
+ * offered for import.
+ */
+export type ProviderDomainIdentityResponse = {
+    domain: string;
+    provider_identity_id: string;
+    /**
+     * The provider's current verification status for this domain
+     * ("verified", "pending", "failed", "not_started", "temporary_failure")
+     */
+    status: string;
 };
 
 export type ProviderKeyResponse = {
@@ -31571,7 +31599,18 @@ export type DeleteEmailDomainData = {
          */
         id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Also remove the domain identity on the provider's side (Scaleway/SES),
+         * not just the local Temps record. Defaults to `false`: the same domain
+         * may be shared with other tools against that provider account, so
+         * deleting it from Temps must not silently un-register it elsewhere
+         * unless explicitly requested. If the provider-side deletion fails
+         * (network error, revoked credentials), the local record is still
+         * deleted -- an unreachable provider never blocks removing it from Temps.
+         */
+        delete_from_provider?: boolean;
+    };
     url: '/email-domains/{id}';
 };
 
@@ -31589,7 +31628,7 @@ export type DeleteEmailDomainErrors = {
      */
     404: unknown;
     /**
-     * Internal server error
+     * Internal server error (includes provider-side cleanup failure; the local record is still deleted)
      */
     500: unknown;
 };
@@ -32104,6 +32143,46 @@ export type UpdateEmailProviderResponses = {
 };
 
 export type UpdateEmailProviderResponse = UpdateEmailProviderResponses[keyof UpdateEmailProviderResponses];
+
+export type ListDiscoverableDomainsData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}/discoverable-domains';
+};
+
+export type ListDiscoverableDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDiscoverableDomainsResponses = {
+    /**
+     * Discoverable domains (see `supported`/`error` for fallback state)
+     */
+    200: ListProviderDomainsResponse;
+};
+
+export type ListDiscoverableDomainsResponse = ListDiscoverableDomainsResponses[keyof ListDiscoverableDomainsResponses];
 
 export type TestProviderData = {
     body: TestEmailRequest;
