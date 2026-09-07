@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Cal.diy is Cal.com's MIT-licensed, self-hosted community edition. Upstream
+# recommends it for personal/non-production use, not customer-facing booking
+# infrastructure -- see https://github.com/calcom/cal.diy. This template is
+# for self-hosting it as internal tooling (e.g. an onboarding "book a call"
+# step), not as a production dependency.
+slug: cal-diy
+name: Cal.diy Scheduling
+kind: starter
+description: Self-hosted scheduling and booking pages -- Cal.com's open-source community edition. MIT-licensed, no license key. Upstream recommends personal/non-production use only.
+git:
+  url: https://github.com/calcom/cal.diy.git
+  ref: main
+preset: dockerfile
+exposed_port: 3000
+health_check_path: /
+tags:
+  - scheduling
+  - booking
+  - calendar
+  - self-hosted
+  - nextjs
+features:
+  - Booking pages, availability rules, and buffers
+  - Calendar sync with Google, Outlook, and Apple Calendar
+  - "Team scheduling: round-robin and collective event types"
+  - Postgres-backed, MIT-licensed, no vendor lock-in
+services:
+  - postgres
+env_vars:
+  - name: DATABASE_URL
+    description: Postgres connection string. Set this to the POSTGRES_URL value shown on the linked Postgres service.
+    example: postgresql://user:password@host:5432/calendso
+    required: true
+    secret: true
+  - name: DATABASE_DIRECT_URL
+    description: Direct (non-pooled) Postgres connection string used for migrations. Same value as DATABASE_URL unless a connection pooler sits in front of Postgres.
+    example: postgresql://user:password@host:5432/calendso
+    required: true
+    secret: true
+  - name: NEXT_PUBLIC_WEBAPP_URL
+    description: Public URL this app is served on.
+    required: true
+    default_generator: app_url
+  - name: NEXTAUTH_URL
+    description: Must equal NEXT_PUBLIC_WEBAPP_URL.
+    required: true
+    default_generator: app_url
+  - name: NEXTAUTH_SECRET
+    description: Session-signing secret for NextAuth. Generate with `openssl rand -base64 32`.
+    required: true
+    secret: true
+    default_generator: random_secret
+  - name: CALENDSO_ENCRYPTION_KEY
+    description: Symmetric key (AES-256, 32 bytes) used to encrypt stored calendar credentials. Generate with `openssl rand -base64 24`.
+    required: true
+    secret: true
+    default_generator: random_secret
+  - name: EMAIL_FROM
+    description: From address for booking confirmation and reminder emails.
+    example: notifications@yourselfhostedcal.example
+    required: false
+  - name: EMAIL_SERVER_HOST
+    description: SMTP server host for outgoing email.
+    required: false
+  - name: EMAIL_SERVER_PORT
+    description: SMTP server port.
+    example: "587"
+    required: false
+is_public: true
+is_featured: false
+sort_order: 3
