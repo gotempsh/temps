@@ -864,6 +864,19 @@ fn validate_backup_upload_target(
         });
     }
 
+    let is_r2_endpoint = matches!(
+        &host,
+        url::Host::Domain(domain)
+            if domain.to_ascii_lowercase().ends_with(".r2.cloudflarestorage.com")
+    );
+    if !is_r2_endpoint && !(allow_loopback_http && loopback) {
+        return Err(CloudError::InvalidBackupTarget {
+            reason: format!(
+                "destination host {host} is not a Cloudflare R2 object-storage endpoint"
+            ),
+        });
+    }
+
     let mut validated_headers = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
         let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
@@ -1628,21 +1641,23 @@ mod tests {
 
         assert!(client
             .validate_backup_upload_target(
-                "https://objects.example.com/backup?X-Amz-Signature=signed",
+                "https://account.r2.cloudflarestorage.com/backup?X-Amz-Signature=signed",
                 expires,
                 &allowed_headers,
             )
             .is_ok());
 
         for invalid in [
-            "http://objects.example.com/backup",
-            "https://user:secret@objects.example.com/backup",
-            "https://objects.example.com/backup#fragment",
+            "http://account.r2.cloudflarestorage.com/backup",
+            "https://user:secret@account.r2.cloudflarestorage.com/backup",
+            "https://account.r2.cloudflarestorage.com/backup#fragment",
             "https://127.0.0.1/backup",
             "https://10.0.0.1/backup",
             "https://169.254.169.254/latest/meta-data",
             "https://localhost/backup",
             "file:///tmp/backup",
+            "https://objects.example.com/backup",
+            "https://r2.cloudflarestorage.com.evil.example.com/backup",
         ] {
             assert!(
                 client
@@ -1655,14 +1670,14 @@ mod tests {
         let unsafe_headers = BTreeMap::from([("authorization".into(), "Bearer secret".into())]);
         assert!(client
             .validate_backup_upload_target(
-                "https://objects.example.com/backup",
+                "https://account.r2.cloudflarestorage.com/backup",
                 expires,
                 &unsafe_headers,
             )
             .is_err());
         assert!(client
             .validate_backup_upload_target(
-                "https://objects.example.com/backup",
+                "https://account.r2.cloudflarestorage.com/backup",
                 Utc::now().timestamp_millis() - 1,
                 &BTreeMap::new(),
             )
