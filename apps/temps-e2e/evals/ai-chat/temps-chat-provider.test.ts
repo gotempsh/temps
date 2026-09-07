@@ -68,6 +68,7 @@ describe('Temps Promptfoo provider', () => {
           { 'Content-Type': 'text/event-stream' },
         )
       }
+      if (url.endsWith('/pending-actions')) return response([])
       if (url.endsWith('/archive')) return response('', 204)
       return response({ messages: [{ role: 'assistant', content: 'I found one project.' }] })
     }) as typeof fetch
@@ -81,10 +82,69 @@ describe('Temps Promptfoo provider', () => {
     expect(result.error).toBeUndefined()
     expect(result.output).toBe('I found one project.')
     expect(result.metadata?.operations).toEqual(['get_projects'])
-    expect(result.metadata?.toolCalls).toEqual([{ name: 'temps', operation: 'get_projects' }])
+    expect(result.metadata?.toolCalls).toEqual([
+      {
+        name: 'temps',
+        operation: 'get_projects',
+        command: 'projects get_projects --page 1',
+        sequence: 0,
+      },
+    ])
+    expect(result.metadata?.pendingActions).toEqual([])
     expect(requests.at(-1)?.url).toEndWith('/archive')
     expect(requests[0]?.init?.body).toContain('promptfoo-claude_cli-')
     expect(JSON.stringify(result)).not.toContain('tk_test_secret_123456789')
+  })
+
+  test('records redacted server-side proposal state without confirming it', async () => {
+    const fetchMock = (async (input: URL | RequestInfo) => {
+      const url = String(input)
+      if (url.endsWith('/ai/conversations')) {
+        return response({ public_id: 'conv-proposal', ai_provider: 'codex_cli' })
+      }
+      if (url.endsWith('/messages')) {
+        return response(
+          'event: tool_call\ndata: {"name":"temps","arguments":"{\\"command\\":\\"projects get_project --project_id 7\\"}"}\n\nevent: tool_call\ndata: {"name":"temps_write","arguments":"{\\"command\\":\\"environments update_environment_settings --project_id 7 --automatic_deploy true\\"}"}\n\nevent: turn_complete\ndata:\n\n',
+          200,
+          { 'Content-Type': 'text/event-stream' },
+        )
+      }
+      if (url.endsWith('/pending-actions')) {
+        return response([
+          {
+            operation_id: 'update_environment_settings',
+            method: 'PATCH',
+            status: 'proposed',
+            required_permission: 'projects:write',
+            params: { project_id: 7, token: 'tk_private_value' },
+          },
+        ])
+      }
+      if (url.endsWith('/archive')) return response('', 204)
+      return response({ messages: [{ role: 'assistant', content: 'The environment override is off.' }] })
+    }) as typeof fetch
+
+    const provider = new TempsChatProvider(
+      { config: { aiProvider: 'codex_cli', permissionMode: 'auto' } },
+      fetchMock,
+    )
+    const result = await provider.callApi('Diagnose automatic deployments')
+
+    expect(result.error).toBeUndefined()
+    expect(result.metadata?.operations).toEqual([
+      'get_project',
+      'update_environment_settings',
+    ])
+    expect(result.metadata?.pendingActions).toEqual([
+      {
+        operationId: 'update_environment_settings',
+        method: 'PATCH',
+        status: 'proposed',
+        requiredPermission: 'projects:write',
+        params: { project_id: 7, token: '[REDACTED]' },
+      },
+    ])
+    expect(JSON.stringify(result)).not.toContain('tk_private_value')
   })
 
   test('sanitizes API error bodies and still archives an already-created conversation', async () => {

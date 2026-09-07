@@ -9,7 +9,7 @@
 // `AiProviderIcon`'s switch below. Keep the `id` string matched to the
 // backend's provider enum (lowercase, no spaces).
 
-export type AiProviderId = 'openai' | 'anthropic' | 'xai' | 'gemini'
+export type AiProviderId = 'openai' | 'anthropic' | 'xai' | 'gemini' | 'openrouter'
 
 export interface AiProviderMeta {
   id: AiProviderId
@@ -69,6 +69,16 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
     defaultModel: 'gemini-3.5-flash-lite',
     accentClass: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
     keyDocsUrl: 'https://aistudio.google.com/app/apikey',
+  },
+  {
+    id: 'openrouter',
+    name: 'OpenRouter',
+    tagline: 'One key, hundreds of models from every vendor',
+    models: 'GPT-4o, Claude Sonnet 5, Llama 3.3, DeepSeek, and more',
+    defaultModel: 'openai/gpt-4o-mini',
+    accentClass:
+      'bg-violet-500/10 text-violet-600 dark:text-violet-400',
+    keyDocsUrl: 'https://openrouter.ai/keys',
   },
 ]
 

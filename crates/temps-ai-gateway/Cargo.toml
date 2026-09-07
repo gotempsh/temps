@@ -50,3 +50,4 @@ tower = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
+wiremock = "0.6"

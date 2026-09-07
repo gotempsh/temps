@@ -7,7 +7,7 @@ use tokio::process::Command;
 
 use super::{
     copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
-    AiRunConfig, AiRunResult,
+    AiRunConfig, AiRunResult, NativeToolEvent,
 };
 use crate::error::AgentError;
 use crate::sandbox::user::SANDBOX_USER;
@@ -37,16 +37,15 @@ fn cancellation_safe_command(program: &str) -> Command {
 }
 
 async fn configure_chat_mcp(cmd: &mut Command, config: &AiRunConfig) -> Result<(), AgentError> {
-    // A chat turn must never inherit Claude Code's host shell/filesystem
-    // tools, even when no Temps MCP server is configured. Interactive mode
-    // additionally needs the two protocol tools that produce question/plan
-    // control requests.
-    cmd.arg("--tools")
-        .arg(if config.permission_bridge.is_some() {
-            "AskUserQuestion,ExitPlanMode"
-        } else {
-            ""
-        });
+    // A non-interactive turn must never inherit Claude Code's host
+    // shell/filesystem tools. Interactive turns intentionally keep Claude's
+    // native tool set: every sensitive invocation is paused by
+    // `--permission-prompt-tool stdio` and forwarded through PermissionBridge.
+    // Restricting the list to AskUserQuestion/ExitPlanMode made Bash/Edit/Write
+    // impossible to approve and caused Claude to ask for approval in prose.
+    if config.permission_bridge.is_none() {
+        cmd.arg("--tools").arg("");
+    }
 
     let Some(server) = &config.mcp_server else {
         return Ok(());
@@ -150,7 +149,10 @@ fn model_display_name(model: &serde_json::Value, id: &str) -> String {
         .and_then(serde_json::Value::as_str)
         .and_then(resolved_model_display_name);
     match (id, resolved) {
-        ("default", Some(resolved)) => format!("Default · {resolved}"),
+        // The CLI needs the moving `default` alias as its value, but that is an
+        // implementation detail rather than a useful model label. Show the
+        // concrete account-resolved model in the composer.
+        ("default", Some(resolved)) => resolved,
         (_, Some(resolved)) => resolved,
         (_, None) => fallback.to_string(),
     }
@@ -420,6 +422,10 @@ impl AiCliProvider for ClaudeCliProvider {
 
     fn extract_partial_text(&self, line: &str) -> Option<String> {
         extract_partial_text(line)
+    }
+
+    fn extract_native_tool_events(&self, line: &str) -> Vec<NativeToolEvent> {
+        extract_native_tool_events(line)
     }
 
     fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
@@ -760,7 +766,7 @@ impl ClaudeCliProvider {
         config: super::AiRunConfig,
     ) -> Result<super::AiRunResult, crate::error::AgentError> {
         use std::time::Duration;
-        use temps_ai::streaming::{PermissionKind, PermissionRequest};
+        use temps_ai::streaming::PermissionRequest;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let is_root = unsafe { libc::geteuid() } == 0;
@@ -947,26 +953,6 @@ impl ClaudeCliProvider {
                             .unwrap_or(serde_json::Value::Null);
 
                         if let Some(bridge) = &permission_bridge {
-                            if !matches!(tool_name.as_str(), "AskUserQuestion" | "ExitPlanMode") {
-                                tracing::warn!(
-                                    provider = %provider_name,
-                                    request_id = %request_id,
-                                    tool_name = %tool_name,
-                                    "denying native Claude tool outside the chat allowlist"
-                                );
-                                let response_json = build_deny_response(&request_id);
-                                if stdin.write_all(response_json.as_bytes()).await.is_err()
-                                    || stdin.write_all(b"\n").await.is_err()
-                                    || stdin.flush().await.is_err()
-                                {
-                                    tracing::warn!(
-                                        provider = %provider_name,
-                                        request_id = %request_id,
-                                        "failed to write native-tool denial to claude stdin"
-                                    );
-                                }
-                                continue;
-                            }
                             // Derive the permission kind from `tool_name`, not
                             // `subtype`.  The Claude CLI uses `subtype` only for
                             // its own internal flow control; the human-visible
@@ -976,11 +962,7 @@ impl ClaudeCliProvider {
                             //   • "ExitPlanMode"     → the model is proposing
                             //     a plan and asking whether to proceed
                             //   • everything else    → generic tool approval
-                            let kind = match tool_name.as_str() {
-                                "AskUserQuestion" => PermissionKind::Question,
-                                "ExitPlanMode" => PermissionKind::PlanApproval,
-                                _ => PermissionKind::ToolApproval,
-                            };
+                            let kind = claude_permission_kind(&tool_name);
                             let perm_request = PermissionRequest {
                                 id: request_id.clone(),
                                 kind,
@@ -1038,14 +1020,27 @@ impl ClaudeCliProvider {
                                 );
                             }
                         } else {
-                            // No bridge (milestone 2 fallback): warn and skip.
+                            // Fail closed when no caller can present the
+                            // request. Explicitly answer instead of leaving
+                            // Claude blocked on an unread control request.
                             tracing::warn!(
                                 provider = %provider_name,
                                 tool_name = %tool_name,
                                 request_id = %request_id,
                                 "claude interactive control_request received but no \
-                                 permission bridge is configured; ignoring (see ADR-038)"
+                                 permission bridge is configured; auto-denying"
                             );
+                            let response_json = build_deny_response(&request_id);
+                            if stdin.write_all(response_json.as_bytes()).await.is_err()
+                                || stdin.write_all(b"\n").await.is_err()
+                                || stdin.flush().await.is_err()
+                            {
+                                tracing::warn!(
+                                    provider = %provider_name,
+                                    request_id = %request_id,
+                                    "failed to write fail-closed control_response to claude stdin"
+                                );
+                            }
                         }
 
                         if let Some(ref cb) = on_event {
@@ -1150,6 +1145,19 @@ fn build_deny_response(request_id: &str) -> String {
         }
     })
     .to_string()
+}
+
+/// Classify Claude's native control request without filtering tools by name.
+/// New Claude Code tools must automatically participate in the same approval
+/// protocol instead of silently falling back to a prose request.
+fn claude_permission_kind(tool_name: &str) -> temps_ai::streaming::PermissionKind {
+    use temps_ai::streaming::PermissionKind;
+
+    match tool_name {
+        "AskUserQuestion" => PermissionKind::Question,
+        "ExitPlanMode" => PermissionKind::PlanApproval,
+        _ => PermissionKind::ToolApproval,
+    }
 }
 
 /// Build the appropriate `control_response` JSON line for a given
@@ -1383,6 +1391,75 @@ pub fn extract_partial_text(line: &str) -> Option<String> {
     }
 }
 
+/// Extract native Claude Code tool calls and their results from one
+/// `stream-json` line. These events are descriptive only: execution remains
+/// inside Claude's selected workspace/sandbox.
+pub fn extract_native_tool_events(line: &str) -> Vec<NativeToolEvent> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("assistant") => value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+            })
+            .filter_map(|block| {
+                let id = block.get("id").and_then(serde_json::Value::as_str)?;
+                let name = block.get("name").and_then(serde_json::Value::as_str)?;
+                let arguments =
+                    serde_json::to_string(block.get("input").unwrap_or(&serde_json::Value::Null))
+                        .ok()?;
+                Some(NativeToolEvent::Call {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                })
+            })
+            .collect(),
+        Some("user") => value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+            })
+            .filter_map(|block| {
+                let call_id = block
+                    .get("tool_use_id")
+                    .and_then(serde_json::Value::as_str)?;
+                let content = block.get("content").unwrap_or(&serde_json::Value::Null);
+                let result = match content {
+                    serde_json::Value::String(text) => text.clone(),
+                    serde_json::Value::Array(blocks) => blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        })
+                        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<String>(),
+                    value => serde_json::to_string(value).ok()?,
+                };
+                Some(NativeToolEvent::Result {
+                    call_id: call_id.to_string(),
+                    result,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Name the tool a `tool_use` content block invoked, when `line` is an
 /// `assistant` event whose content is a tool call rather than (or alongside)
 /// text — e.g. `AskUserQuestion`, `ExitPlanMode`, `Bash`. Returns `None` for
@@ -1454,7 +1531,7 @@ mod tests {
         let models = parse_model_initialize_response(&response);
         assert_eq!(models.len(), 3);
         assert_eq!(models[0].id, "default");
-        assert_eq!(models[0].name, "Default · Opus 5 (1M context)");
+        assert_eq!(models[0].name, "Opus 5 (1M context)");
         assert_eq!(models[1].id, "opus[1m]");
         assert_eq!(models[1].name, "Opus 5 (1M context)");
         assert_eq!(
@@ -1574,7 +1651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_claude_only_exposes_protocol_and_scoped_mcp_tools() {
+    async fn interactive_claude_keeps_native_tools_for_the_approval_bridge() {
         let scratch = tempfile::tempdir().expect("create scratch directory");
         let config = super::super::AiRunConfig {
             work_dir: scratch.path().to_owned(),
@@ -1607,9 +1684,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--tools"));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--tools", "AskUserQuestion,ExitPlanMode"]));
+            .any(|pair| pair == ["--allowedTools", "mcp__temps-chat__*"]));
     }
 
     #[tokio::test]
@@ -1645,7 +1723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_claude_only_exposes_protocol_tools_without_mcp() {
+    async fn interactive_claude_keeps_native_tools_without_mcp() {
         let scratch = tempfile::tempdir().expect("create scratch directory");
         let config = super::super::AiRunConfig {
             work_dir: scratch.path().to_owned(),
@@ -1676,9 +1754,7 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--tools", "AskUserQuestion,ExitPlanMode"]));
+        assert!(!args.iter().any(|arg| arg == "--tools"));
         assert!(!args.iter().any(|arg| arg == "--mcp-config"));
         assert!(!args.iter().any(|arg| arg == "--allowedTools"));
     }
@@ -1763,6 +1839,31 @@ mod tests {
     fn test_extract_assistant_text_ignores_tool_use_blocks() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"1","name":"bash","input":{}}]}}"#;
         assert_eq!(extract_assistant_text(line), None);
+    }
+
+    #[test]
+    fn test_extract_native_tool_call_from_assistant_event() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"pwd"}}]}}"#;
+        assert_eq!(
+            extract_native_tool_events(line),
+            vec![NativeToolEvent::Call {
+                id: "toolu_bash".to_string(),
+                name: "Bash".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_extract_native_tool_result_from_user_event() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":[{"type":"text","text":"/workspace\n"}]}]}}"#;
+        assert_eq!(
+            extract_native_tool_events(line),
+            vec![NativeToolEvent::Result {
+                call_id: "toolu_bash".to_string(),
+                result: "/workspace\n".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1933,6 +2034,27 @@ mod tests {
             !resp["response"]["message"].is_null(),
             "deny must have message"
         );
+    }
+
+    #[test]
+    fn claude_permission_kind_forwards_all_native_tools() {
+        use temps_ai::streaming::PermissionKind;
+
+        assert_eq!(
+            claude_permission_kind("AskUserQuestion"),
+            PermissionKind::Question
+        );
+        assert_eq!(
+            claude_permission_kind("ExitPlanMode"),
+            PermissionKind::PlanApproval
+        );
+        for tool in ["Bash", "Read", "Write", "Edit", "WebFetch", "FutureTool"] {
+            assert_eq!(
+                claude_permission_kind(tool),
+                PermissionKind::ToolApproval,
+                "{tool} must be bridged instead of auto-denied"
+            );
+        }
     }
 
     #[test]

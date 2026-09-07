@@ -24,3 +24,8 @@ pub mod error;
 pub mod handlers;
 pub mod plugin;
 pub mod services;
+
+// Internal consumers such as the AI application chat depend on the sandbox
+// lifecycle service, not on its HTTP handlers. Re-export this narrow service
+// boundary so those crates never reach through a private module path.
+pub use services::{ApplicationWorkspaceSandbox, SandboxService};

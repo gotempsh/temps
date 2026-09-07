@@ -74,31 +74,20 @@ async function readiness(
   header(`AI readiness · ${project.name}`)
   newline()
   keyValue('AI provider configured', mark(status.ai_configured))
-  keyValue('Chat enabled', mark(status.chat_enabled))
-  keyValue('Write actions enabled', mark(status.write_actions_enabled))
   newline()
 
-  // Each gate fails for a different reason and is fixed in a different place,
-  // so name the specific next step rather than printing a generic "not ready".
   const fixes: string[] = []
   if (!status.ai_configured) {
     fixes.push(
       'Add an AI provider key in the dashboard under Settings → AI Providers (instance-wide).'
     )
   }
-  if (!status.chat_enabled) {
-    fixes.push(
-      `Re-enable AI chat for this project: it has been explicitly turned off in ${resolved.slug}'s AI settings.`
-    )
-  }
-  if (!status.write_actions_enabled) {
-    fixes.push(
-      'Enable AI write actions for this project (Settings → Security) to let the assistant propose changes such as alert rules. Every proposal still waits for your confirmation.'
-    )
-  }
-
   if (fixes.length === 0) {
-    console.log(colors.success('Ready — the assistant can run and propose changes.'))
+    console.log(
+      colors.success(
+        'Ready — chat tools follow your user permissions and selected approval mode.'
+      )
+    )
   } else {
     console.log(colors.warning('Not fully ready:'))
     for (const fix of fixes) {

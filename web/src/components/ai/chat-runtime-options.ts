@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { ProviderCatalogDto } from '@/api/client'
+
 export interface ChatSelectOption {
   id: string
   name: string
@@ -28,6 +30,76 @@ export interface ChatRuntimeSelection {
   modelId: string | null
   thinkingOptionId: string | null
   permissionModeId: string | null
+}
+
+export type ChatHarnessCatalogOption = Pick<
+  ProviderCatalogDto,
+  | 'id'
+  | 'name'
+  | 'workspace_ready'
+  | 'runtime_models'
+  | 'default_runtime_model_id'
+  | 'permission_modes'
+  | 'default_permission_mode_id'
+>
+
+/** Host CLI threads use the Agent Sandbox catalog, regardless of scope. */
+export function usesHarnessCatalog(contextType: string): boolean {
+  return contextType === 'application' || contextType === 'global'
+}
+
+/** Convert the Agent Sandbox catalog into the provider-neutral chat shape. */
+export function chatHarnessProviderOptions(
+  providers: ChatHarnessCatalogOption[]
+): ChatProviderOption[] {
+  return providers
+    .filter((provider) => provider.workspace_ready)
+    .map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      auth_source: 'host_environment',
+      models: (provider.runtime_models ?? []).map((model) => ({
+        id: model.id,
+        name: model.name,
+        thinking_options: model.thinking_modes,
+        tool_thinking_options: model.tool_thinking_modes,
+        default_thinking_option_id: model.default_thinking_mode_id,
+      })),
+      default_model_id: provider.default_runtime_model_id,
+      model_discovery_status:
+        (provider.runtime_models?.length ?? 0) > 0 ? 'ready' : 'unavailable',
+      model_discovery_error:
+        (provider.runtime_models?.length ?? 0) > 0
+          ? null
+          : `Could not resolve models for ${provider.name}.`,
+      permission_modes: provider.permission_modes ?? [],
+      default_permission_mode_id: provider.default_permission_mode_id,
+    }))
+}
+
+/**
+ * Isolate drafts by durable conversation identity. Before the first message
+ * creates a conversation, retain a context-scoped key so lazy-create drafts
+ * still survive a reload.
+ */
+export function chatDraftStorageKey({
+  userScoped,
+  projectId,
+  contextType,
+  contextId,
+  conversationPublicId,
+}: {
+  userScoped: boolean
+  projectId?: number
+  contextType: string
+  contextId: string
+  conversationPublicId?: string | null
+}): string {
+  const owner = userScoped ? 'user' : String(projectId)
+  const target = conversationPublicId
+    ? `conversation:${conversationPublicId}`
+    : `context:${contextType}:${contextId}`
+  return `temps.ai.draft.${owner}:${target}`
 }
 
 function firstValidId(
@@ -115,4 +187,38 @@ export function chatProviderLabel(provider: ChatProviderOption): string {
       ? 'Host environment'
       : 'configured key'
   return `${provider.name} · ${source}`
+}
+
+/** Keep provider protocol sentinels out of the user-facing runtime controls. */
+export function chatModelLabel(
+  provider: ChatProviderOption,
+  model: ChatModelOption
+): string {
+  const name = model.name.trim()
+  if (model.id === 'default' && name.toLowerCase() === 'default') {
+    return `${provider.name} model`
+  }
+  return name.replace(/^default\s*·\s*/i, '')
+}
+
+export function chatThinkingLabel(option: ChatSelectOption): string {
+  return option.id === 'default' ? 'Auto' : option.name
+}
+
+/** Radix copies a selected item's content into SelectValue. Keep that content
+ * text-only: the trigger owns the single thinking icon. */
+export function chatThinkingItemContent(option: ChatSelectOption): string {
+  return chatThinkingLabel(option)
+}
+
+export function chatPermissionLabel(option: ChatSelectOption): string {
+  switch (option.id) {
+    case 'auto':
+    case 'full-access':
+      return 'Auto'
+    case 'default':
+      return 'Ask each time'
+    default:
+      return option.name
+  }
 }

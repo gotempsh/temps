@@ -685,9 +685,21 @@ if [[ "$websocket_upgraded" != "true" ]]; then
   echo "admin ingress did not preserve a WebSocket upgrade" >&2
   exit 1
 fi
-websocket_request="$(POSTGRES_PASSWORD="$safe_postgres" \
-  "${compose[@]}" exec --no-TTY websocket-upstream-probe cat /tmp/websocket-request)"
-websocket_request_clean="$(tr -d '\r' <<<"$websocket_request")"
+# A 101 response lets curl return before the mock upstream's `nc` process has
+# necessarily flushed the captured request to disk. Wait for the request line
+# so this assertion checks proxy behavior rather than racing the recorder.
+websocket_request=""
+websocket_request_clean=""
+for _ in {1..20}; do
+  websocket_request="$(POSTGRES_PASSWORD="$safe_postgres" \
+    "${compose[@]}" exec --no-TTY websocket-upstream-probe \
+    cat /tmp/websocket-request)"
+  websocket_request_clean="$(tr -d '\r' <<<"$websocket_request")"
+  if grep -Eq '^GET /socket HTTP/1\.1$' <<<"$websocket_request_clean"; then
+    break
+  fi
+  sleep 0.25
+done
 if ! grep -Eiq '^Upgrade:[[:space:]]*websocket$' <<<"$websocket_request_clean" || \
   ! grep -Eiq '^Connection:[[:space:]]*upgrade$' <<<"$websocket_request_clean"; then
   printf '%s\n' "$websocket_request_clean" >&2

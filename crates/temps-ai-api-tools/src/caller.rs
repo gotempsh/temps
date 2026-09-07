@@ -45,7 +45,7 @@ use tracing::{debug, warn};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// The authentication + project-scoping context for a single tool invocation.
+/// The authentication + optional project context for a single tool invocation.
 /// This is supplied by the substrate adapter (OSS `ChatTool`, EE rig `Tool`),
 /// never derived from anything the model says.
 #[derive(Debug, Clone)]
@@ -53,10 +53,30 @@ pub struct ApiCallScope {
     /// Resolved auth context for the caller.  This is inserted into the Axum
     /// request extensions so the router's `permission_guard!` can evaluate it.
     pub auth: AuthContext,
-    /// Accessible project IDs for this caller in this turn.  Used for the
-    /// client-side project-scope guard in [`build_request_parts`].
-    /// Empty means "no project constraint" (admin-level calls).
-    pub project_ids: Vec<i32>,
+    /// How project selectors are constrained for this call. Global operations
+    /// are unaffected and always inherit authorization from `auth`.
+    pub project_scope: ProjectSelectorScope,
+}
+
+/// Independent policy for project selectors embedded in API operations.
+///
+/// `Allowed([])` deliberately denies every project-specific operation. Global
+/// workspace chats use `Unrestricted`: the synthetic request still carries the
+/// current user's `AuthContext`, and each routed handler remains the authority
+/// for both RBAC and project membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectSelectorScope {
+    Unrestricted,
+    Allowed(Vec<i32>),
+}
+
+impl ProjectSelectorScope {
+    fn allowed_ids(&self) -> Option<&[i32]> {
+        match self {
+            Self::Unrestricted => None,
+            Self::Allowed(project_ids) => Some(project_ids),
+        }
+    }
 }
 
 /// The result of the pure param-routing step.
@@ -166,9 +186,12 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
 ///   regardless of their (often-unreliable) `required` flag; the real router is
 ///   the source of truth and returns a real 4xx if needed.
 /// - **Enum check**: `ApiToolError::BadEnum` if a value is not in `param.enum_values`.
-/// - **Project scoping**: when `allowed_project_ids` is non-empty, the operation
-///   must expose a recognized project selector. The selector is validated
-///   against the allowed set and auto-filled when exactly one project is allowed.
+/// - **Project context**: when `allowed_project_ids` is non-empty and the
+///   operation exposes a recognized project selector, that selector is
+///   validated against the allowed set and auto-filled when exactly one project
+///   is allowed. Operations without a project selector remain available: their
+///   authorization is evaluated by the real router using the authenticated
+///   user's current role and permissions.
 /// - **Limit injection**: if a param named `limit` exists in the operation:
 ///   - absent → `default_limit` is injected.
 ///   - present → clamped to `[1, max_limit]`.
@@ -177,8 +200,8 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
 ///
 /// - `op`: the operation whose params define the routing rules.
 /// - `params`: a flat JSON object `{"param_name": value, …}`.
-/// - `allowed_project_ids`: the caller's accessible project IDs (from
-///   [`ApiCallScope::project_ids`]).  Empty slice = no constraint applied.
+/// - `allowed_project_ids`: legacy convenience scope. An empty slice is
+///   unrestricted; a non-empty slice constrains project selectors.
 /// - `default_limit`: default page size to inject when `limit` is absent.
 /// - `max_limit`: upper bound that `limit` is clamped to.
 pub fn build_request_parts(
@@ -188,6 +211,25 @@ pub fn build_request_parts(
     default_limit: i64,
     max_limit: i64,
 ) -> Result<BuiltRequest, ApiToolError> {
+    let project_scope = if allowed_project_ids.is_empty() {
+        ProjectSelectorScope::Unrestricted
+    } else {
+        ProjectSelectorScope::Allowed(allowed_project_ids.to_vec())
+    };
+    build_request_parts_scoped(op, params, &project_scope, default_limit, max_limit)
+}
+
+/// Policy-aware request builder used by chat tool calls. Unlike the public
+/// convenience wrapper, this preserves `Allowed([])` as an explicit deny-all
+/// project-selector boundary for an application with no selected project.
+fn build_request_parts_scoped(
+    op: &ApiOperation,
+    params: &Value,
+    project_scope: &ProjectSelectorScope,
+    default_limit: i64,
+    max_limit: i64,
+) -> Result<BuiltRequest, ApiToolError> {
+    let allowed_project_ids = project_scope.allowed_ids();
     let params_obj = params.as_object();
 
     // Pre-pass: reject parameters this operation does not have.
@@ -243,7 +285,9 @@ pub fn build_request_parts(
             {
                 return false;
             }
-            if is_project_scope_param(op, param) && allowed_project_ids.len() == 1 {
+            if is_project_scope_param(op, param)
+                && allowed_project_ids.is_some_and(|project_ids| project_ids.len() == 1)
+            {
                 return false; // auto-filled
             }
             if param.name == "limit" && matches!(param.location, ParamLocation::Query) {
@@ -277,24 +321,14 @@ pub fn build_request_parts(
     let mut query_parts: Vec<String> = Vec::new();
     let mut body_map = serde_json::Map::new();
 
-    if !allowed_project_ids.is_empty()
-        && !op
-            .params
-            .iter()
-            .any(|param| is_project_scope_param(op, param))
-    {
-        return Err(ApiToolError::UnscopedOperation {
-            operation_id: op.operation_id.clone(),
-        });
-    }
-
     for param in &op.params {
         // Special handling: auto-fill the project selector when the caller has
         // exactly one project. This matches both `project_id` and the common
         // `/projects/{id}/…` shape where the project's own path param is named
         // `id` (see `is_project_scope_param`) — so the model never has to supply
         // (or be asked for) a project id the chat is already scoped to.
-        let value = if is_project_scope_param(op, param) && !allowed_project_ids.is_empty() {
+        let value = if is_project_scope_param(op, param) && allowed_project_ids.is_some() {
+            let allowed_project_ids = allowed_project_ids.unwrap_or_default();
             let raw = params_obj.and_then(|o| o.get(&param.name));
             match raw {
                 Some(v) => {
@@ -322,16 +356,33 @@ pub fn build_request_parts(
                     v.clone()
                 }
                 None => {
+                    // An optional body-level project selector is an association,
+                    // not an operation scope. For example, create_service may
+                    // create a standalone database and optionally link it to a
+                    // project. With no single selected project, preserve the
+                    // API's omission semantics instead of inventing a mandatory
+                    // project requirement. Optional query selectors remain
+                    // constrained because omitting one can broaden a read across
+                    // projects outside an application context.
+                    if matches!(param.location, ParamLocation::Body) && !param.required {
+                        continue;
+                    }
                     if allowed_project_ids.len() == 1 {
                         // Auto-fill the single accessible project.
                         Value::Number(allowed_project_ids[0].into())
-                    } else if param.required {
-                        return Err(ApiToolError::MissingParam {
-                            name: param.name.clone(),
-                            operation_id: op.operation_id.clone(),
-                        });
                     } else {
-                        continue; // optional, absent, skip
+                        return Err(ApiToolError::ProjectSelectionRequired {
+                            operation_id: op.operation_id.clone(),
+                            allowed: if allowed_project_ids.is_empty() {
+                                "none".to_string()
+                            } else {
+                                allowed_project_ids
+                                    .iter()
+                                    .map(i32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            },
+                        });
                     }
                 }
             }
@@ -774,10 +825,10 @@ impl InternalApiCaller {
             crate::cli::CliAction::Execute(op, params) => {
                 // Validate by running build_request_parts but discarding the
                 // built request — we only care whether it succeeds or errors.
-                match build_request_parts(
+                match build_request_parts_scoped(
                     op,
                     &params,
-                    &scope.project_ids,
+                    &scope.project_scope,
                     self.default_limit,
                     self.max_limit,
                 ) {
@@ -875,10 +926,10 @@ impl InternalApiCaller {
         );
 
         // Step 2: validate params and build path + query + optional body.
-        let built = build_request_parts(
+        let built = build_request_parts_scoped(
             op,
             &params,
-            &scope.project_ids,
+            &scope.project_scope,
             self.default_limit,
             self.max_limit,
         )?;
@@ -2318,30 +2369,112 @@ mod tests {
     }
 
     #[test]
-    fn non_project_id_path_param_is_rejected_for_project_scoped_call() {
-        // An `id` that is NOT the leading `/projects/{id}` segment (here a
-        // resource id) cannot prove the replay stays inside the chat project.
+    fn resource_id_path_param_is_not_rewritten_by_project_context() {
+        // An `id` that is NOT the leading `/projects/{id}` segment is a resource
+        // selector, not a project selector. Leave it alone and let the real
+        // endpoint authorize that resource for the current user.
         let op = make_op("get_thing", "/things/{id}", vec![path_param("id")]);
 
-        let err = build_request_parts(&op, &serde_json::json!({ "id": 99 }), &[42], 20, 100)
-            .expect_err("resource-id-only operation must be rejected");
-        assert!(
-            matches!(err, ApiToolError::UnscopedOperation { ref operation_id } if operation_id == "get_thing"),
-            "unexpected error: {err:?}"
-        );
+        let result = build_request_parts(&op, &serde_json::json!({ "id": 99 }), &[42], 20, 100)
+            .expect("resource authorization belongs to the real endpoint");
+        assert_eq!(result.path, "/things/99");
     }
 
     #[test]
-    fn global_operation_is_rejected_for_project_scoped_call() {
+    fn global_operation_inherits_user_authorization_despite_project_context() {
         let mut limit = query_param("limit", false);
         limit.ty = "integer".to_string();
         let op = make_op("list_audit_logs", "/audit/logs", vec![limit]);
 
-        let err = build_request_parts(&op, &serde_json::json!({ "limit": 20 }), &[42], 20, 100)
-            .expect_err("global operation must be rejected in project scope");
-        assert!(
-            matches!(err, ApiToolError::UnscopedOperation { ref operation_id } if operation_id == "list_audit_logs"),
-            "unexpected error: {err:?}"
+        let result = build_request_parts(&op, &serde_json::json!({ "limit": 20 }), &[42], 20, 100)
+            .expect("the router must decide from the authenticated user's role");
+        assert_eq!(result.path, "/audit/logs");
+        assert_eq!(result.query, "limit=20");
+    }
+
+    #[test]
+    fn global_operation_remains_available_with_deny_all_project_scope() {
+        let op = make_op("list_services", "/external-services", vec![]);
+
+        let result = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({}),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect("global authorization belongs to the authenticated router");
+
+        assert_eq!(result.path, "/external-services");
+    }
+
+    #[test]
+    fn empty_application_scope_rejects_inline_project_selector() {
+        let op = make_op(
+            "get_project",
+            "/projects/{project_id}",
+            vec![path_param("project_id")],
+        );
+
+        let error = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({ "project_id": 42 }),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect_err("an inline selector cannot escape the application context");
+
+        assert!(matches!(
+            error,
+            ApiToolError::ProjectNotAllowed { project_id: 42, .. }
+        ));
+    }
+
+    #[test]
+    fn empty_application_scope_requires_selection_for_optional_project_filter() {
+        let op = make_op(
+            "list_project_resources",
+            "/resources",
+            vec![query_param("project_id", false)],
+        );
+
+        let error = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({}),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect_err("an omitted optional selector must not broaden application scope");
+
+        assert!(matches!(
+            error,
+            ApiToolError::ProjectSelectionRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_application_scope_allows_omitting_optional_project_link() {
+        let op = make_op(
+            "create_service",
+            "/external-services",
+            vec![body_param("name", true), body_param("project_id", false)],
+        );
+
+        let request = build_request_parts_scoped(
+            &op,
+            &serde_json::json!({ "name": "redis-hvcm" }),
+            &ProjectSelectorScope::Allowed(vec![]),
+            20,
+            100,
+        )
+        .expect("an optional project link must remain optional");
+
+        assert_eq!(request.path, "/external-services");
+        assert_eq!(
+            request.body,
+            Some(serde_json::json!({ "name": "redis-hvcm" }))
         );
     }
 
@@ -2538,10 +2671,34 @@ mod tests {
             ))
             .build();
 
+        // POST /external-services — `project_id` is an optional association,
+        // not a prerequisite for creating the service.
+        let create_service = OperationBuilder::new()
+            .operation_id(Some("create_service"))
+            .summary(Some("Create an external service"))
+            .tag("External Services")
+            .request_body(Some(
+                RequestBodyBuilder::new()
+                    .content(
+                        "application/json",
+                        build_inline_body_schema(&[
+                            ("name", "string", true, &[]),
+                            ("project_id", "integer", false, &[]),
+                        ]),
+                    )
+                    .build(),
+            ))
+            .build();
+
         let paths = PathsBuilder::new()
             .path("/deployments", {
                 let mut item = PathItem::default();
                 item.post = Some(create_deploy);
+                item
+            })
+            .path("/external-services", {
+                let mut item = PathItem::default();
+                item.post = Some(create_service);
                 item
             })
             .build();
@@ -2555,7 +2712,10 @@ mod tests {
         InternalApiCaller::new_write_allowlisted(
             router,
             &openapi,
-            vec!["create_deployment".to_string()],
+            vec![
+                "create_deployment".to_string(),
+                "create_service".to_string(),
+            ],
         )
     }
 
@@ -2590,7 +2750,7 @@ mod tests {
         let auth = AuthContext::new_session(user, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         let outcome = caller.prepare_write_cli("--help", &scope);
@@ -2631,7 +2791,7 @@ mod tests {
         let auth = AuthContext::new_session(user, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         // Supply the required `branch` param.
@@ -2651,6 +2811,56 @@ mod tests {
             }
             WritePrepareOutcome::Help(h) => panic!("expected Prepared, got Help: {h}"),
             WritePrepareOutcome::Invalid(e) => panic!("expected Prepared, got Invalid: {e}"),
+        }
+    }
+
+    #[test]
+    fn prepare_create_service_without_a_project_returns_unlinked_proposal() {
+        use chrono::Utc;
+        use temps_auth::{context::AuthContext, permissions::Role};
+        use temps_entities::users;
+
+        let now = Utc::now();
+        let user = users::Model {
+            id: 1,
+            name: "Test".into(),
+            email: "t@t.com".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(user, Role::Admin),
+            project_scope: ProjectSelectorScope::Allowed(Vec::new()),
+        };
+
+        let outcome =
+            make_write_caller().prepare_write_cli("create_service --name redis-hvcm", &scope);
+
+        match outcome {
+            WritePrepareOutcome::Prepared(proposal) => {
+                assert_eq!(proposal.operation_id, "create_service");
+                assert_eq!(proposal.params, serde_json::json!({ "name": "redis-hvcm" }));
+                assert!(proposal.params.get("project_id").is_none());
+            }
+            WritePrepareOutcome::Help(help) => {
+                panic!("expected an unlinked proposal, got help: {help}")
+            }
+            WritePrepareOutcome::Invalid(error) => {
+                panic!("expected an unlinked proposal, got error: {error}")
+            }
         }
     }
 
@@ -2685,7 +2895,7 @@ mod tests {
         let auth = AuthContext::new_session(user, Role::Admin);
         let scope = ApiCallScope {
             auth,
-            project_ids: vec![],
+            project_scope: ProjectSelectorScope::Unrestricted,
         };
 
         // Do NOT supply `branch` — should get Invalid.

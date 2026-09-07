@@ -312,6 +312,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 dsn_service.clone(),
                 encryption_service.clone(),
             ));
+            let source_drop_planner = workflow_planner.clone();
 
             // Capture the secrets-resolver handle BEFORE moving workflow_planner
             // into the job processor.  This is the two-phase handoff: the actual
@@ -342,7 +343,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let workflow_execution_service_for_processor = workflow_execution_service.clone();
 
             let mut job_processor = JobProcessorService::with_external_service_manager(
-                db,
+                db.clone(),
                 job_receiver,
                 queue_service.clone(),
                 workflow_execution_service_for_processor,
@@ -371,6 +372,24 @@ impl TempsPlugin for DeploymentsPlugin {
             {
                 unreachable!("register_services runs exactly once per plugin instance");
             }
+
+            let deployment_gate = self.deployment_gate_slot.get().cloned().ok_or_else(|| {
+                PluginError::InitializationFailed(
+                    "deployment gate slot was not initialized for source Drop".to_string(),
+                )
+            })?;
+            let source_drop_service = Arc::new(crate::services::SourceDropService::new(
+                db.clone(),
+                config_service.data_dir(),
+                source_drop_planner,
+                workflow_execution_service.clone(),
+                queue_service.clone(),
+                deployment_gate,
+            ));
+            context.register_service(source_drop_service.clone());
+            let source_drop_deployer =
+                source_drop_service as Arc<dyn temps_core::SourceDropDeployer>;
+            context.register_service(source_drop_deployer);
 
             // Start the job processor in a background task
             tokio::spawn(async move {

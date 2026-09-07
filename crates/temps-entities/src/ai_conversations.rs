@@ -3,8 +3,8 @@
 
 //! Persistent AI debugging conversation (ADR-023).
 //!
-//! One row per resumable chat, scoped to a project and a polymorphic
-//! `(context_type, context_id)` — `deployment` first, then `alert`/`error_group`.
+//! One row per resumable chat, owned by a user and optionally attached to a
+//! project plus a polymorphic `(context_type, context_id)`.
 //! The turns live in [`crate::ai_messages`].
 
 use sea_orm::entity::prelude::*;
@@ -18,7 +18,11 @@ pub struct Model {
     pub id: i64,
     /// URL-safe opaque id used in the API.
     pub public_id: String,
-    pub project_id: i32,
+    /// Optional relevance/execution context. Conversation ownership is always
+    /// determined by `created_by`, never by this project id.
+    pub project_id: Option<i32>,
+    /// Optional multi-project application scope for AI-first threads.
+    pub application_id: Option<i64>,
     /// `"deployment" | "alert" | "error_group" | "general"`.
     pub context_type: String,
     /// The attached entity's id (ints stringified).
@@ -26,7 +30,8 @@ pub struct Model {
     pub title: Option<String>,
     /// `"active" | "archived"`.
     pub status: String,
-    pub created_by: Option<i32>,
+    /// The user who owns this private conversation.
+    pub created_by: i32,
     /// Seed refs (log_ids, deployment state) + e.g. autofixer_run_id on hand-off.
     pub metadata: Option<serde_json::Value>,
     pub created_at: DBDateTime,
@@ -50,6 +55,17 @@ pub struct Model {
     /// used to create `cli_session_id`. A session is resumable only when this
     /// matches the contract assembled for the current turn.
     pub cli_session_fingerprint: Option<String>,
+    /// Server-authoritative lifecycle of the most recent turn. `running` is
+    /// the only non-terminal value; terminal values remain useful for recovery
+    /// and diagnostics until the next turn starts.
+    pub turn_status: String,
+    /// Opaque idempotency key for the currently running turn.
+    pub active_turn_id: Option<String>,
+    /// Most recently accepted idempotency key, retained after completion so a
+    /// delayed HTTP retry cannot replay the same mutation.
+    pub last_turn_id: Option<String>,
+    /// When the active turn was claimed by the server.
+    pub turn_started_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

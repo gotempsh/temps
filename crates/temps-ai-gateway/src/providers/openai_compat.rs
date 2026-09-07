@@ -20,7 +20,7 @@ const MAX_RESPONSES_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSES_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
 /// A provider adapter for any OpenAI API-compatible service.
-/// OpenAI, xAI, and any compatible endpoint reuse this
+/// OpenAI, xAI, OpenRouter, and any compatible endpoint reuse this
 /// implementation — only the `ProviderInfo` and model list differ.
 pub struct OpenAiCompatProvider {
     info: ProviderInfo,
@@ -283,6 +283,41 @@ impl OpenAiCompatProvider {
                 model("grok-4.5", "xai"),
                 model("grok-4.20", "xai"),
                 model("grok-4.20-0309-reasoning", "xai"),
+            ],
+        )
+    }
+
+    /// OpenRouter aggregates many upstream vendors behind one OpenAI-compatible
+    /// endpoint. Model ids are always `vendor/model` (e.g. "openai/gpt-4o"),
+    /// which is what `route_model_to_provider` uses to route here. The list
+    /// below is only a bootstrap fallback shown before a key's live catalog
+    /// has been discovered — OpenRouter's actual catalog has hundreds of
+    /// models and changes continuously.
+    pub fn openrouter() -> Self {
+        Self::new(
+            ProviderInfo {
+                id: "openrouter",
+                display_name: "OpenRouter",
+                default_base_url: "https://openrouter.ai/api/v1",
+                capabilities: &[
+                    ProviderCapability::ChatCompletion,
+                    ProviderCapability::ChatCompletionStreaming,
+                    ProviderCapability::ToolUse,
+                    ProviderCapability::Vision,
+                    ProviderCapability::JsonMode,
+                ],
+            },
+            vec![
+                model("openai/gpt-5.6", "openai"),
+                model("openai/gpt-4o", "openai"),
+                model("openai/gpt-4o-mini", "openai"),
+                model("anthropic/claude-sonnet-5", "anthropic"),
+                model("anthropic/claude-haiku-4-5", "anthropic"),
+                model("google/gemini-3.5-flash", "google"),
+                model("x-ai/grok-4.5", "x-ai"),
+                model("meta-llama/llama-3.3-70b-instruct", "meta-llama"),
+                model("deepseek/deepseek-chat", "deepseek"),
+                model("mistralai/mistral-large-2411", "mistralai"),
             ],
         )
     }
@@ -642,6 +677,28 @@ mod tests {
     }
 
     #[test]
+    fn test_openrouter_provider_info() {
+        let provider = OpenAiCompatProvider::openrouter();
+        assert_eq!(provider.info().id, "openrouter");
+        assert_eq!(
+            provider.info().default_base_url,
+            "https://openrouter.ai/api/v1"
+        );
+        assert!(!provider
+            .info()
+            .capabilities
+            .contains(&ProviderCapability::Embeddings));
+    }
+
+    #[test]
+    fn test_openrouter_supports_model() {
+        let provider = OpenAiCompatProvider::openrouter();
+        assert!(provider.supports_model("openai/gpt-4o"));
+        assert!(provider.supports_model("meta-llama/llama-3.3-70b-instruct"));
+        assert!(!provider.supports_model("gpt-4o"));
+    }
+
+    #[test]
     fn test_resolve_base_url() {
         let provider = OpenAiCompatProvider::openai();
         assert_eq!(provider.resolve_base_url(None), "https://api.openai.com/v1");
@@ -835,5 +892,143 @@ mod tests {
         assert!(uses_default_sampling("gpt-5.6"));
         assert!(!uses_default_sampling("gpt-4o"));
         assert!(!uses_default_sampling("grok-3"));
+    }
+
+    // -------------------------------------------------------------------------
+    // OpenRouter — integration tests against a local mock HTTP server
+    // (wiremock). OpenRouter has no dedicated test double, but its API is a
+    // plain OpenAI-compatible endpoint, so a generic mock exercises the real
+    // request/response wire format: auth header, path, JSON shape, SSE
+    // framing, and upstream error propagation.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_openrouter_chat_completion_via_mock_server() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer test-openrouter-key"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "openai/gpt-4o-mini",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-mock-1",
+                "object": "chat.completion",
+                "created": 1_700_000_000i64,
+                "model": "openai/gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "mock reply" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::openrouter();
+        let request = test_request("openai/gpt-4o-mini");
+
+        let response = provider
+            .chat_completion("test-openrouter-key", Some(&server.uri()), &request)
+            .await
+            .expect("mock server call should succeed");
+
+        assert_eq!(response.model, "openai/gpt-4o-mini");
+        assert_eq!(
+            response.choices[0]
+                .message
+                .content
+                .as_ref()
+                .and_then(|content| content.as_text()),
+            Some("mock reply")
+        );
+        assert_eq!(response.usage.as_ref().unwrap().total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn test_openrouter_chat_completion_stream_via_mock_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"id\":\"gen-mock-1\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1700000000,\"model\":\"openai/gpt-4o-mini\",\"choices\":",
+            "[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"mock\"},",
+            "\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-mock-1\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1700000000,\"model\":\"openai/gpt-4o-mini\",\"choices\":",
+            "[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::openrouter();
+        let request = test_request("openai/gpt-4o-mini");
+
+        let mut stream = provider
+            .chat_completion_stream("test-openrouter-key", Some(&server.uri()), &request)
+            .await
+            .expect("mock stream call should succeed");
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.expect("stream chunk should not error"));
+        }
+        let text = String::from_utf8(collected).expect("stream body should be valid UTF-8");
+
+        assert!(text.contains("mock"));
+        assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_openrouter_chat_completion_upstream_error_via_mock_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": { "message": "Rate limit exceeded", "type": "rate_limit_error" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::openrouter();
+        let request = test_request("openai/gpt-4o-mini");
+
+        let error = provider
+            .chat_completion("test-openrouter-key", Some(&server.uri()), &request)
+            .await
+            .expect_err("mock server 429 should surface as an error");
+
+        match error {
+            AiGatewayError::UpstreamError {
+                status, message, ..
+            } => {
+                assert_eq!(status, 429);
+                assert!(message.contains("Rate limit"));
+            }
+            other => panic!("expected UpstreamError, got {other:?}"),
+        }
     }
 }

@@ -113,6 +113,7 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Build & deliver',
     items: [
+      { title: 'AI workspace', url: '/ai-first', icon: Sparkles },
       { title: 'Projects', url: '/projects', icon: Folder },
       { title: 'Git providers', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
@@ -164,6 +165,12 @@ const AI_MODE_PREFIXES = [
   '/ai-workflows',
 ]
 const aiNavItems: PlatformNavItem[] = [
+  {
+    title: 'Harnesses',
+    url: '/agent-sandbox/providers',
+    icon: Terminal,
+    featureKey: 'ai-chat',
+  },
   {
     title: 'Providers',
     url: '/ai-gateway',

@@ -40,3 +40,5 @@ mis = "mis"
 # git-cliff nightly-tag changelog entry (CHANGELOG.md) — the short commit
 # hash "ba96c0f7" isolates to "ba", mistaken for "by"/"be".
 "ba96c0f7" = "ba96c0f7"
+# rustix's write-only file-open flag.
+WRONLY = "WRONLY"

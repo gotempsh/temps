@@ -486,6 +486,7 @@ impl TempsPlugin for AgentsPlugin {
             let git_provider_manager = context.require_service::<dyn GitProviderManagerTrait>();
 
             let notification_service = context.require_service::<NotificationService>();
+            let platform_config_service = context.require_service::<temps_config::ConfigService>();
 
             // Load global sandbox settings to configure the Docker provider
             let global_sandbox = {
@@ -523,9 +524,20 @@ impl TempsPlugin for AgentsPlugin {
                                     default_cpu_limit: global_sandbox.cpu_limit,
                                     default_memory_limit_mb: global_sandbox.memory_limit_mb,
                                     network_mode: global_sandbox.network_mode.clone(),
+                                    control_plane_url: platform_config_service
+                                        .resolve_internal_url()
+                                        .await,
                                 };
                                 let provider =
                                     Arc::new(DockerSandboxProvider::new(docker.clone(), config));
+                                provider
+                                    .quarantine_stale_sandboxes()
+                                    .await
+                                    .map_err(|error| {
+                                        PluginError::InitializationFailed(format!(
+                                            "validate existing sandbox isolation: {error}"
+                                        ))
+                                    })?;
                                 tracing::info!(
                                     "Docker sandbox provider initialized (image built on demand at first agent run)"
                                 );
@@ -682,7 +694,7 @@ impl TempsPlugin for AgentsPlugin {
                 secret_service,
                 definition_service,
                 docker: context.require_service::<bollard::Docker>(),
-                platform_config_service: context.require_service::<temps_config::ConfigService>(),
+                platform_config_service,
                 telemetry: context
                     .get_service::<dyn temps_core::TelemetryReporter>()
                     .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),

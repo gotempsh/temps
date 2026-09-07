@@ -613,25 +613,23 @@ function AlertFormBody({
         </Card>
       )}
 
-      {isEditing &&
-        (project.ai_debug_chat_enabled === true ||
-          project.ai_write_actions_enabled === true) && (
-          <DebugChat
-            projectId={project.id}
-            contextType="alert"
-            contextId={id}
-            title={
-              existing
-                ? `Investigate alert: ${existing.name}`
-                : 'Investigate alert'
-            }
-            triggerLabel="Investigate with AI"
-            description="Ask AI what this alert means, why it may be firing, and the prioritized steps to act on it."
-            startPrompt="Explain what this alert means, why it may be firing, and the prioritized steps to investigate and resolve it."
-            projectSlug={project.slug}
-            projectName={project.name}
-          />
-        )}
+      {isEditing && (
+        <DebugChat
+          projectId={project.id}
+          contextType="alert"
+          contextId={id}
+          title={
+            existing
+              ? `Investigate alert: ${existing.name}`
+              : 'Investigate alert'
+          }
+          triggerLabel="Investigate with AI"
+          description="Ask AI what this alert means, why it may be firing, and the prioritized steps to act on it."
+          startPrompt="Explain what this alert means, why it may be firing, and the prioritized steps to investigate and resolve it."
+          projectSlug={project.slug}
+          projectName={project.name}
+        />
+      )}
 
       <Form {...form}>
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">

@@ -104,7 +104,7 @@ impl PreviewHost {
 }
 
 /// Derives a Pingora connection-pool partition key (`HttpPeer::group_key`)
-/// from a preview target. All preview traffic is forwarded through the same
+/// from a preview target and request. All preview traffic is forwarded through the same
 /// physical peer (`PREVIEW_GATEWAY_PEER`), so without a distinguishing
 /// `group_key`, every sandbox's requests look like the same logical peer to
 /// Pingora's connection pool: pooling is keyed by `Peer::reuse_hash()`
@@ -112,15 +112,19 @@ impl PreviewHost {
 /// pingora-core's `upstreams/peer.rs`), and a pooled keep-alive connection
 /// opened while serving one sandbox can be handed back out to serve a
 /// different sandbox's request on a completely different hostname —
-/// silently splicing one app's bytes into another's response. Folding the
-/// target hex+port into `group_key` makes each sandbox+port combination its
-/// own pool partition, so a connection can never cross between them.
-pub fn preview_peer_group_key(host: &PreviewHost) -> u64 {
+/// silently splicing one app's bytes into another's response. The gateway
+/// consumes and strips its bearer token at the start of each TCP connection,
+/// so that connection must also never carry a second HTTP request. Folding
+/// the request id into `group_key` gives every request its own pool partition;
+/// retries of that same request remain stable without permitting later
+/// requests to reuse the authenticated connection.
+pub fn preview_request_group_key(host: &PreviewHost, request_id: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     host.hex.hash(&mut hasher);
     host.port.hash(&mut hasher);
+    request_id.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -879,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_peer_group_key_differs_for_different_sandboxes() {
+    fn preview_request_group_key_differs_for_different_sandboxes() {
         let a = PreviewHost {
             hex: "7702c56bfb804b49".into(),
             port: 3000,
@@ -888,11 +892,14 @@ mod tests {
             hex: "c5d8e38f791dbc40".into(),
             port: 3000,
         };
-        assert_ne!(preview_peer_group_key(&a), preview_peer_group_key(&b));
+        assert_ne!(
+            preview_request_group_key(&a, "request-1"),
+            preview_request_group_key(&b, "request-1")
+        );
     }
 
     #[test]
-    fn preview_peer_group_key_differs_for_different_ports_same_sandbox() {
+    fn preview_request_group_key_differs_for_different_ports_same_sandbox() {
         // Same sandbox, two different exposed ports (e.g. HMR websocket vs.
         // the app's own HTTP port) must not share a pooled connection.
         let http = PreviewHost {
@@ -903,11 +910,14 @@ mod tests {
             hex: "7702c56bfb804b49".into(),
             port: 3001,
         };
-        assert_ne!(preview_peer_group_key(&http), preview_peer_group_key(&ws));
+        assert_ne!(
+            preview_request_group_key(&http, "request-1"),
+            preview_request_group_key(&ws, "request-1")
+        );
     }
 
     #[test]
-    fn preview_peer_group_key_stable_for_same_target() {
+    fn preview_request_group_key_is_unique_per_request_and_stable_for_retry() {
         let a = PreviewHost {
             hex: "7702c56bfb804b49".into(),
             port: 3000,
@@ -916,7 +926,9 @@ mod tests {
             hex: "7702c56bfb804b49".into(),
             port: 3000,
         };
-        assert_eq!(preview_peer_group_key(&a), preview_peer_group_key(&a2));
+        let first = preview_request_group_key(&a, "request-1");
+        assert_eq!(first, preview_request_group_key(&a2, "request-1"));
+        assert_ne!(first, preview_request_group_key(&a, "request-2"));
     }
 
     #[test]

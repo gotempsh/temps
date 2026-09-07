@@ -3,9 +3,15 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  chatHarnessProviderOptions,
+  chatModelLabel,
+  chatPermissionLabel,
   chatProviderLabel,
+  chatThinkingItemContent,
+  chatThinkingLabel,
   reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
+  usesHarnessCatalog,
   type ChatProviderOption,
 } from './chat-runtime-options'
 
@@ -47,6 +53,14 @@ const providers: ChatProviderOption[] = [
     default_permission_mode_id: 'auto',
   },
 ]
+
+describe('usesHarnessCatalog', () => {
+  test('uses host harness capabilities for application and global threads', () => {
+    expect(usesHarnessCatalog('application')).toBe(true)
+    expect(usesHarnessCatalog('global')).toBe(true)
+    expect(usesHarnessCatalog('deployment')).toBe(false)
+  })
+})
 
 describe('resolveChatRuntimeSelection', () => {
   test('uses provider and model defaults for a new chat', () => {
@@ -123,6 +137,103 @@ describe('resolveChatRuntimeSelection', () => {
 
 test('provider labels identify ambient host credentials', () => {
   expect(chatProviderLabel(providers[1])).toBe('Codex · Host environment')
+})
+
+test('runtime labels expose behavior instead of provider sentinels', () => {
+  const claude: ChatProviderOption = {
+    id: 'claude_cli',
+    name: 'Claude Code',
+    auth_source: 'host_environment',
+    models: [],
+    permission_modes: [],
+  }
+
+  expect(
+    chatModelLabel(claude, {
+      id: 'default',
+      name: 'Default · Opus 5',
+      thinking_options: [],
+    })
+  ).toBe('Opus 5')
+  expect(
+    chatModelLabel(claude, {
+      id: 'default',
+      name: 'default',
+      thinking_options: [],
+    })
+  ).toBe('Claude Code model')
+  expect(chatThinkingLabel({ id: 'default', name: 'Default' })).toBe('Auto')
+  expect(typeof chatThinkingItemContent({ id: 'medium', name: 'Medium' })).toBe(
+    'string'
+  )
+  expect(chatThinkingItemContent({ id: 'medium', name: 'Medium' })).toBe(
+    'Medium'
+  )
+  expect(chatPermissionLabel({ id: 'default', name: 'Default' })).toBe(
+    'Ask each time'
+  )
+  expect(chatPermissionLabel({ id: 'auto', name: 'Default permissions' })).toBe(
+    'Auto'
+  )
+})
+
+test('harness catalog options preserve resolved runtime controls', () => {
+  expect(
+    chatHarnessProviderOptions([
+      {
+        id: 'claude_cli',
+        name: 'Claude Code',
+        workspace_ready: true,
+        runtime_models: [
+          {
+            id: 'default',
+            name: 'Opus 5',
+            thinking_modes: [{ id: 'high', name: 'High' }],
+            default_thinking_mode_id: 'high',
+          },
+        ],
+        default_runtime_model_id: 'default',
+        permission_modes: [{ id: 'full-access', name: 'Auto' }],
+        default_permission_mode_id: 'full-access',
+      },
+    ])
+  ).toEqual([
+    {
+      id: 'claude_cli',
+      name: 'Claude Code',
+      auth_source: 'host_environment',
+      models: [
+        {
+          id: 'default',
+          name: 'Opus 5',
+          thinking_options: [{ id: 'high', name: 'High' }],
+          tool_thinking_options: undefined,
+          default_thinking_option_id: 'high',
+        },
+      ],
+      default_model_id: 'default',
+      model_discovery_status: 'ready',
+      model_discovery_error: null,
+      permission_modes: [{ id: 'full-access', name: 'Auto' }],
+      default_permission_mode_id: 'full-access',
+    },
+  ])
+})
+
+test('harness catalog excludes a host-only CLI without a workspace relay', () => {
+  expect(
+    chatHarnessProviderOptions([
+      {
+        id: 'codex_cli',
+        name: 'Codex',
+        workspace_ready: false,
+        runtime_models: [],
+        default_runtime_model_id: null,
+        permission_modes: [],
+        default_permission_mode_id: 'default',
+      },
+    ])
+  ).toEqual([])
 })
 
 test('a model refresh drops a stale thinking sentinel without switching harnesses', () => {

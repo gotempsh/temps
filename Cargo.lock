@@ -10397,13 +10397,16 @@ version = "0.1.0-beta.56"
 dependencies = [
  "async-trait",
  "axum",
+ "bytes",
  "futures",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "subtle",
  "tempfile",
  "temps-agents",
  "temps-ai",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tracing",
@@ -10446,7 +10449,9 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "nix 0.31.3",
  "regex",
+ "rustix",
  "sea-orm",
  "serde",
  "serde_json",
@@ -10462,11 +10467,15 @@ dependencies = [
  "temps-entities",
  "temps-git",
  "temps-logs",
+ "temps-projects",
+ "temps-sandbox",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
  "uuid",
+ "walkdir",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -10505,6 +10514,7 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -12781,6 +12791,7 @@ dependencies = [
  "futures",
  "hex",
  "http 1.5.0",
+ "percent-encoding",
  "rand 0.10.2",
  "sea-orm",
  "serde",

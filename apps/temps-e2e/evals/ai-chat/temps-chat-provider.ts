@@ -24,6 +24,16 @@ interface ConversationResponse {
 interface ToolCall {
   name: string
   operation?: string
+  command?: string
+  sequence: number
+}
+
+interface PendingAction {
+  operationId: string
+  method: string
+  status: string
+  requiredPermission?: string
+  params: Record<string, unknown>
 }
 
 interface EvalMetadata {
@@ -32,6 +42,7 @@ interface EvalMetadata {
   conversationPublicId: string
   toolCalls: ToolCall[]
   operations: string[]
+  pendingActions: PendingAction[]
   errors: string[]
   permissionRequests: string[]
 }
@@ -130,6 +141,56 @@ function extractOperation(argumentsJson: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+function extractCommand(argumentsJson: string, apiKey: string): string | undefined {
+  try {
+    const parsed = JSON.parse(argumentsJson) as { command?: unknown; commands?: unknown }
+    const command =
+      typeof parsed.command === 'string'
+        ? parsed.command
+        : Array.isArray(parsed.commands) && parsed.commands.every((item) => typeof item === 'string')
+          ? parsed.commands.join(' -> ')
+          : undefined
+    return command ? redactSensitiveText(command, apiKey).slice(0, 2_000) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function normalizePendingActions(value: unknown, apiKey: string): PendingAction[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return []
+    const action = item as Record<string, unknown>
+    if (
+      typeof action.operation_id !== 'string' ||
+      typeof action.method !== 'string' ||
+      typeof action.status !== 'string'
+    ) {
+      return []
+    }
+    const safeParams = redactSensitiveText(JSON.stringify(action.params ?? {}), apiKey)
+    let params: Record<string, unknown> = {}
+    try {
+      const parsed = JSON.parse(safeParams)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) params = parsed
+    } catch {
+      // A malformed diagnostic payload must not make the eval lose the rest of
+      // the turn metadata. The server remains the source of truth.
+    }
+    return [
+      {
+        operationId: action.operation_id,
+        method: action.method,
+        status: action.status,
+        ...(typeof action.required_permission === 'string'
+          ? { requiredPermission: action.required_permission }
+          : {}),
+        params,
+      },
+    ]
+  })
 }
 
 function joinUrl(base: URL, path: string): URL {
@@ -245,7 +306,12 @@ export default class TempsChatProvider {
             const tool = JSON.parse(event.data) as { name?: unknown; arguments?: unknown }
             if (typeof tool.name === 'string') {
               const argumentsJson = typeof tool.arguments === 'string' ? tool.arguments : '{}'
-              toolCalls.push({ name: tool.name, operation: extractOperation(argumentsJson) })
+              toolCalls.push({
+                name: tool.name,
+                operation: extractOperation(argumentsJson),
+                command: extractCommand(argumentsJson, apiKey),
+                sequence: toolCalls.length,
+              })
             }
           } catch {
             errors.push('Temps returned an invalid tool_call SSE event')
@@ -267,12 +333,24 @@ export default class TempsChatProvider {
         ?.filter((message) => message.role === 'assistant' && typeof message.content === 'string')
         .at(-1)?.content
       const output = redactSensitiveText(persistedOutput || tokenText.join(''), apiKey).trim()
+      const pendingActions = normalizePendingActions(
+        await this.requestJson<unknown>(
+          joinUrl(
+            apiUrl,
+            `/projects/${projectId}/ai/conversations/${encodeURIComponent(conversation.public_id)}/pending-actions`,
+          ),
+          apiKey,
+          signal,
+        ),
+        apiKey,
+      )
       const metadata: EvalMetadata = {
         provider: this.aiProvider,
         ...(this.model ? { model: this.model } : {}),
         conversationPublicId: conversation.public_id,
         toolCalls,
         operations: [...new Set(toolCalls.flatMap((call) => (call.operation ? [call.operation] : [])))],
+        pendingActions,
         errors,
         permissionRequests,
       }

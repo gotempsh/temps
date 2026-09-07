@@ -60,6 +60,11 @@ impl TempsPlugin for ProvidersPlugin {
             ));
             context.register_service(external_service_manager.clone());
 
+            let sandbox_runtime_credentials: Arc<
+                dyn temps_core::SandboxRuntimeCredentialsProvider,
+            > = external_service_manager.clone();
+            context.register_service(sandbox_runtime_credentials);
+
             // Register the cross-crate ProjectEnvVarsProvider so the environments
             // plugin can assemble the resolved (manual + integration) env-var view
             // without depending on this crate.
@@ -115,6 +120,8 @@ impl TempsPlugin for ProvidersPlugin {
         let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
 
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let application_network_reconciler =
+            context.get_service::<dyn temps_core::ApplicationDataNetworkReconciler>();
 
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
@@ -128,6 +135,7 @@ impl TempsPlugin for ProvidersPlugin {
             config_service,
             telemetry,
             project_access_checker,
+            application_network_reconciler,
         });
 
         // Configure routes with the app state

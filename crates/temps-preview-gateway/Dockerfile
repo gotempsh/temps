@@ -21,6 +21,11 @@ RUN cargo build --release && \
 
 FROM debian:bookworm-slim AS runtime
 
+# The supervisor refuses to route preview traffic through images that do not
+# attest the protocol which authenticates the proxy and strips its bearer
+# token before crossing into a tenant sandbox.
+LABEL sh.temps.preview-gateway-security-protocol="strip-token-v1"
+
 # Debug tooling kept in the image deliberately: the gateway sits on a
 # private docker network with no host port, so the only way to poke it
 # is `docker exec`. Shipping curl/wget/ss/dig/bash is worth ~30 MB.

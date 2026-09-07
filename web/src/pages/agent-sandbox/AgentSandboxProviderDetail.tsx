@@ -58,6 +58,8 @@ interface ProviderCatalogDto {
   max_turns_fix: number | null
   max_turns_feedback: number | null
   supports_max_turns: boolean
+  workspace_ready: boolean
+  workspace_readiness_hint: string | null
 }
 
 interface ProviderCatalogResponse {
@@ -176,12 +178,15 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   useEffect(() => {
     const fresh = provider.default_model ?? ''
     if (fresh !== serverModel) {
-      setServerModel(fresh)
-      setModelDraft(fresh)
-      setCustomMode(
-        provider.models.length === 0 ||
-          (fresh !== '' && !provider.models.includes(fresh))
-      )
+      const reset = window.setTimeout(() => {
+        setServerModel(fresh)
+        setModelDraft(fresh)
+        setCustomMode(
+          provider.models.length === 0 ||
+            (fresh !== '' && !provider.models.includes(fresh))
+        )
+      }, 0)
+      return () => window.clearTimeout(reset)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider.default_model])
@@ -361,6 +366,15 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                     Configured
                   </span>
                 )}
+                <span
+                  className={
+                    provider.workspace_ready
+                      ? 'inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-300'
+                      : 'inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300'
+                  }
+                >
+                  {provider.workspace_ready ? 'Workspace ready' : 'Host only'}
+                </span>
               </CardTitle>
               <CardDescription className="mt-1 space-y-0.5">
                 <span className="block">
@@ -369,6 +383,12 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                     {provider.install_command}
                   </code>
                 </span>
+                {!provider.workspace_ready &&
+                  provider.workspace_readiness_hint && (
+                    <span className="block text-amber-700 dark:text-amber-300">
+                      {provider.workspace_readiness_hint}
+                    </span>
+                  )}
                 <span className="block">
                   Auth:{' '}
                   <code className="bg-muted px-1 rounded">
@@ -417,7 +437,9 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
         <CardHeader>
           <CardTitle className="text-base">Credential</CardTitle>
           <CardDescription>
-            Encrypted with AES-256-GCM at rest and injected into each session.
+            Encrypted with AES-256-GCM at rest. Workspace-capable providers use
+            it only through a short-lived server relay; the reusable credential
+            is never injected into the sandbox.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

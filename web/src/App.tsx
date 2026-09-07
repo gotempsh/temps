@@ -373,6 +373,11 @@ const AiChat = lazy(() =>
     default: m.AiChat,
   }))
 )
+const AiFirstPrototype = lazy(() =>
+  import('./pages/AiFirstPrototype').then((m) => ({
+    default: m.AiFirstPrototype,
+  }))
+)
 const AiWorkflowsOverview = lazy(() =>
   import('./pages/AiWorkflowsOverview').then((m) => ({
     default: m.AiWorkflowsOverview,
@@ -783,6 +788,7 @@ const FullAppRoutes = () => {
                       element={<AiGatewaySetupPage />}
                     />
                     <Route path="/chat" element={<AiChat />} />
+                    <Route path="/ai-first" element={<AiFirstPrototype />} />
                     <Route
                       path="/ai-workflows"
                       element={<AiWorkflowsOverview />}

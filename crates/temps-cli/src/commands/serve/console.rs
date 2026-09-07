@@ -1469,6 +1469,13 @@ fn ai_read_allowlist() -> Vec<String> {
         //    Without these it proposes duplicates of rules that exist.
         "list_alerts",
         "get_alert",
+        // Notification provider responses use decrypt_provider_config(),
+        // which masks secret fields before serialization. That lets the AI
+        // discover and manage providers without receiving reusable secrets.
+        "list_notification_providers",
+        "get_notification_provider",
+        "list_notification_routes",
+        "get_notification_route",
         // ── Service inventory / status / health / types (NOT params/env) ──
         // `list_services` is filtered by the current user's
         // ExternalServicesRead permission, and deployment tokens are rejected
@@ -1816,7 +1823,7 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_all_conversations",
         "get_pending_action",
         "list_pending_actions",
-        // Readiness booleans: ai_configured, chat_enabled, write_actions_enabled.
+        // Instance AI-provider readiness; project access is enforced separately.
         "get_chat_readiness",
         // ── OTel dashboards ──
         // Dashboard config (queries, panel layout) — no secrets. Gated OtelRead.
@@ -1994,12 +2001,11 @@ fn ai_read_allowlist() -> Vec<String> {
     .collect()
 }
 
-/// Mutating operations the AI may PROPOSE, for a human to confirm.
+/// Mutating operations the AI may invoke through the native harness policy.
 ///
-/// The AI never executes these — calling `temps_write` only stages a `proposed`
-/// `ai_pending_actions` row; a human confirm endpoint replays the mutation
-/// through the same router (`permission_guard!` + audit). The tool is also
-/// gated per-project behind `projects.ai_write_actions_enabled` (default OFF).
+/// `temps_write` records an encrypted pending action, applies the conversation's
+/// approval mode, and replays approved mutations through the same router
+/// (`permission_guard!` + audit). Destructive operations always remain explicit.
 ///
 /// Conservative by design: high-value, mostly-reversible lifecycle + config
 /// operations. Adding an entry is a product + security decision — what may the
@@ -2042,6 +2048,15 @@ fn ai_write_allowlist() -> Vec<String> {
         //    Values are microcores (1_000_000 = 1 core) and MB.
         //    Reversible: it's a config change, re-applicable.
         "update_environment_settings",
+        // ── Automatic deployment + Git delivery repairs ──
+        // These are the smallest reversible fixes for the common "pushes do
+        // not deploy" workflow. `update_git_settings` and webhook reinstall
+        // can contact the configured Git provider, but `temps_write` only
+        // stages the exact request: the current user must still have the
+        // operation's permission and the harness policy must authorize replay.
+        "update_automatic_deploy",
+        "update_git_settings",
+        "reinstall_gitlab_webhook",
         // ── Environment variables (set / change) ──
         "create_environment_variable",
         "update_environment_variable",
@@ -2056,6 +2071,18 @@ fn ai_write_allowlist() -> Vec<String> {
         //    unlinked / left running unused; nothing is deleted).
         "create_service",
         "link_service_to_project",
+        // ── AI application topology ──
+        // Composite create is the only safe way for the model to create a
+        // Temps project and immediately link its generated id to the current
+        // application. Each operation is still replayed with current user
+        // authorization after native approval.
+        "create_application_project",
+        "deploy_application_workspace_project",
+        "link_application_project",
+        "unlink_application_project",
+        "set_application_primary_project",
+        "update_application_workspace",
+        "control_application_workspace",
         // ── Metric alert rules (OTel) ──
         // Create/update an alert rule. Reversible (a rule
         // can be disabled or deleted) and non-destructive:
@@ -2070,6 +2097,26 @@ fn ai_write_allowlist() -> Vec<String> {
         // incident it would have caught happens.
         "create_alert",
         "update_alert",
+        // ── Global notification control plane ──
+        // Provider payloads may contain credentials. `temps_write` encrypts
+        // executable parameters at rest and redacts both the approval card and
+        // result returned to the model. DELETE operations remain explicit even
+        // in Auto mode through `platform_request_is_destructive`.
+        "create_notification_provider",
+        "update_notification_provider",
+        "delete_notification_provider",
+        "create_slack_provider",
+        "update_slack_provider",
+        "create_notification_email_provider",
+        "update_notification_email_provider",
+        "create_webhook_provider",
+        "update_webhook_provider",
+        "create_cloudflare_provider",
+        "update_cloudflare_provider",
+        "test_notification_provider",
+        "create_notification_route",
+        "update_notification_route",
+        "delete_notification_route",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -2374,19 +2421,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let teams_plugin = Box::new(TeamsPlugin::new());
     plugin_manager.register_plugin(teams_plugin);
 
-    // 5.2. AI Gateway Plugin - registers the provider-neutral AiService.
-    // It depends on config, encryption, audit, and project access services.
-    debug!("Registering AiGatewayPlugin");
-    let ai_gateway_plugin = Box::new(temps_ai_gateway::AiGatewayPlugin::new());
-    plugin_manager.register_plugin(ai_gateway_plugin);
-
-    // 5.3. AnalyticsPlugin - depends on the database and AiService. The AI
-    // registry itself is always present; provider availability remains a
-    // runtime concern surfaced by the summary endpoint.
-    debug!("Registering AnalyticsPlugin");
-    let analytics_plugin = Box::new(AnalyticsPlugin::new());
-    plugin_manager.register_plugin(analytics_plugin);
-
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");
     let git_plugin = Box::new(GitPlugin::new());
@@ -2480,6 +2514,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering AgentsPlugin");
     let agents_plugin = Box::new(AgentsPlugin::new());
     plugin_manager.register_plugin(agents_plugin);
+
+    // 8.7. AI Gateway Plugin - registers the provider-neutral AiService.
+    // Application harness turns must see the sandbox provider registered by
+    // AgentsPlugin. Registering this earlier snapshots `None` and makes every
+    // sandboxed application thread fail closed for the server lifetime.
+    debug!("Registering AiGatewayPlugin");
+    let ai_gateway_plugin = Box::new(temps_ai_gateway::AiGatewayPlugin::new());
+    plugin_manager.register_plugin(ai_gateway_plugin);
+
+    // Analytics depends on the provider-neutral AiService, so it follows the
+    // gateway registration rather than relying on an earlier incidental order.
+    debug!("Registering AnalyticsPlugin");
+    let analytics_plugin = Box::new(AnalyticsPlugin::new());
+    plugin_manager.register_plugin(analytics_plugin);
 
     // 9. DeploymentsPlugin - provides deployment orchestration (depends on deployer, screenshots, and vulnerability scanner)
     debug!("Registering DeploymentsPlugin");
@@ -3471,15 +3519,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     handle.set(caller);
                     debug!("ADR-024: InternalApiCaller populated in ApiToolsHandle");
 
-                    // ── Propose-then-confirm WRITE tool ──
+                    // ── Approval-aware WRITE tool ──
                     // Populate the separate WriteApiToolsHandle with a method-aware
-                    // caller over a CURATED allowlist of mutating operations. The AI
-                    // never executes these — calling `temps_write` only stages a
-                    // `proposed` ai_pending_actions row; a human confirm endpoint
-                    // replays the mutation through this same router (permission_guard!
-                    // + audit). The tool itself is also gated per-project behind
-                    // projects.ai_write_actions_enabled (default OFF). This allowlist
-                    // is conservative by design: high-value, mostly-reversible
+                    // caller over a CURATED allowlist of mutating operations.
+                    // `temps_write` applies the active harness approval mode and
+                    // replays authorized mutations through this same router
+                    // (permission_guard! + audit). This allowlist is conservative
+                    // by design: high-value, mostly-reversible
                     // lifecycle + config operations. Adding an entry is a product +
                     // security decision (what may the AI propose for a human to run).
                     if let Some(write_handle) =
@@ -4115,7 +4161,7 @@ mod ai_tool_allowlist_tests {
         );
         let scope = ApiCallScope {
             auth: admin_auth(),
-            project_ids: vec![1],
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
         };
 
         let base = "alerts create_alert --name p95 --metric_name http.server.duration \
@@ -4161,10 +4207,15 @@ mod ai_tool_allowlist_tests {
             ),
             &scope,
         );
-        assert!(
-            matches!(outcome, WritePrepareOutcome::Prepared(_)),
-            "a well-formed static detector must still be proposable"
-        );
+        match outcome {
+            WritePrepareOutcome::Prepared(_) => {}
+            WritePrepareOutcome::Invalid(message) => {
+                panic!("a well-formed static detector must still be proposable: {message}")
+            }
+            WritePrepareOutcome::Help(message) => {
+                panic!("a well-formed static detector unexpectedly returned help: {message}")
+            }
+        }
     }
 
     /// `preview_alert` must be reachable from the read CLI, and its help must
@@ -4190,7 +4241,7 @@ mod ai_tool_allowlist_tests {
         let auth = admin_auth();
         let scope = ApiCallScope {
             auth: auth.clone(),
-            project_ids: vec![1],
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
         };
 
         // Discoverable by browsing, which is how the model finds anything.
@@ -4244,6 +4295,74 @@ mod ai_tool_allowlist_tests {
         );
     }
 
+    #[test]
+    fn automatic_deployment_repairs_are_proposable() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+
+        for operation in [
+            "update_automatic_deploy",
+            "update_environment_settings",
+            "update_git_settings",
+            "reinstall_gitlab_webhook",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "automatic-deployment diagnosis cannot stage `{operation}`"
+            );
+        }
+    }
+
+    #[test]
+    fn application_workspace_drop_is_proposable() {
+        let openapi = temps_ai_chat::handlers::AiChatApiDoc::openapi();
+        let caller = temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+            axum::Router::new(),
+            &openapi,
+            ai_write_allowlist(),
+        );
+
+        assert!(caller
+            .indexed_operation_ids()
+            .contains(&"deploy_application_workspace_project".to_string()));
+    }
+
+    #[test]
+    fn global_notification_operations_are_available_to_workspace_chats() {
+        use utoipa::OpenApi;
+
+        let openapi = temps_notifications::NotificationProvidersApiDoc::openapi();
+        let writes = temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+            axum::Router::new(),
+            &openapi,
+            ai_write_allowlist(),
+        )
+        .indexed_operation_ids();
+        for operation in [
+            "create_notification_provider",
+            "update_notification_provider",
+            "delete_notification_provider",
+            "create_notification_route",
+            "update_notification_route",
+            "delete_notification_route",
+        ] {
+            assert!(
+                writes.contains(&operation.to_string()),
+                "missing {operation}"
+            );
+        }
+
+        let reads = temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+            axum::Router::new(),
+            &openapi,
+            ai_read_allowlist(),
+        )
+        .indexed_operation_ids();
+        assert!(reads.contains(&"list_notification_routes".to_string()));
+        assert!(reads.contains(&"get_notification_route".to_string()));
+        assert!(reads.contains(&"list_notification_providers".to_string()));
+        assert!(reads.contains(&"get_notification_provider".to_string()));
+    }
+
     /// Every safe-POST entry must resolve to a real operation, or it silently
     /// does nothing — the same failure mode the read-allowlist test guards.
     #[test]
@@ -4294,7 +4413,7 @@ mod ai_tool_allowlist_tests {
 
         let scope = ApiCallScope {
             auth: admin_auth(),
-            project_ids: vec![],
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
         };
         let catalog = caller.run_cli("projects --help", &scope).await;
         assert!(catalog.contains("get_projects"), "catalog: {catalog}");
@@ -4313,7 +4432,7 @@ mod ai_tool_allowlist_tests {
             InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
         let scope = ApiCallScope {
             auth: admin_auth(),
-            project_ids: vec![1],
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
         };
 
         let recovery = caller
@@ -4372,7 +4491,7 @@ mod ai_tool_allowlist_tests {
 
         let scope = ApiCallScope {
             auth: admin_auth(),
-            project_ids: vec![],
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
         };
         let catalog = caller.run_cli("external-services --help", &scope).await;
         assert!(catalog.contains("list_services"), "catalog: {catalog}");

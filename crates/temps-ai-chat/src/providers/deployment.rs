@@ -74,7 +74,8 @@ impl ConversationContextProvider for DeploymentChatProvider {
         "deployment"
     }
 
-    async fn seed(&self, project_id: i32, context_id: &str) -> Option<ConversationSeed> {
+    async fn seed(&self, project_id: Option<i32>, context_id: &str) -> Option<ConversationSeed> {
+        let project_id = project_id?;
         let deployment_id: i32 = context_id.parse().ok()?;
         let dep = deployments::Entity::find_by_id(deployment_id)
             .one(self.db.as_ref())
@@ -179,7 +180,7 @@ impl ConversationContextProvider for DeploymentChatProvider {
     // list_repo_tags) are supplied by the __repo_tools__ sentinel provider and
     // merged into this context by ConversationService. This provider offers no
     // additional tools beyond what the sentinel provides.
-    async fn tools(&self, _project_id: i32, _context_id: &str) -> Vec<ChatTool> {
+    async fn tools(&self, _project_id: Option<i32>, _context_id: &str) -> Vec<ChatTool> {
         Vec::new()
     }
 }
