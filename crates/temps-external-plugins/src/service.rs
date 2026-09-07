@@ -24,7 +24,7 @@ use crate::install::{
     normalize_digest, platform_target, validate_plugin_name, validate_version, InstallError,
     PluginInstaller,
 };
-use crate::manager::{ExternalPluginConfig, ExternalPluginManager};
+use crate::manager::{ExternalPluginConfig, ExternalPluginManager, PluginReloadResult};
 use crate::proxy;
 
 /// Service that manages the external plugin lifecycle and provides data
@@ -249,11 +249,11 @@ impl ExternalPluginsService {
     /// 4. Rebuilds the proxy router
     /// 5. Restarts the event listener if needed
     ///
-    /// Returns the manifests of all successfully started plugins.
-    pub async fn reload_plugins(&self) -> Vec<PluginManifest> {
+    /// Returns every successful manifest and every verification/start failure.
+    pub async fn reload_plugins(&self) -> Result<PluginReloadResult, ExternalPluginsError> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.closing.load(Ordering::Acquire) {
-            return self.manifests().await;
+            return Err(ExternalPluginsError::ShuttingDown);
         }
         // Stop event listener
         {
@@ -264,7 +264,8 @@ impl ExternalPluginsService {
         }
 
         // Reload all plugins via manager (shutdown + re-discover + re-start)
-        let new_manifests = self.manager.reload_all().await;
+        let result = self.manager.reload_all().await;
+        let new_manifests = &result.manifests;
 
         info!(
             "Reloaded {} external plugin(s): {}",
@@ -277,7 +278,7 @@ impl ExternalPluginsService {
         );
 
         // Rebuild proxy router and swap it in
-        let new_router = Self::build_proxy_router_from(&self.manager, &new_manifests).await;
+        let new_router = Self::build_proxy_router_from(&self.manager, new_manifests).await;
         {
             let mut router = self.proxy_router.write().await;
             *router = new_router;
@@ -286,8 +287,7 @@ impl ExternalPluginsService {
         // Restart event listener
         {
             let new_listener =
-                Self::start_event_listener(&self.manager, &new_manifests, self.queue.as_ref())
-                    .await;
+                Self::start_event_listener(&self.manager, new_manifests, self.queue.as_ref()).await;
             let mut listener = self.event_listener.write().await;
             *listener = new_listener;
         }
@@ -298,7 +298,7 @@ impl ExternalPluginsService {
             *manifests = new_manifests.clone();
         }
 
-        new_manifests
+        Ok(result)
     }
 
     /// Fetch and authenticate the complete remote catalogue.
@@ -440,13 +440,6 @@ impl ExternalPluginsService {
         })
     }
 
-    /// Convenience entrypoint for non-HTTP callers that do not need a
-    /// pre-execution audit hook.
-    pub async fn install_plugin(&self, name: &str) -> Result<InstallOutcome, ExternalPluginsError> {
-        let selected = self.select_plugin(name).await?;
-        self.install_selected(selected).await
-    }
-
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         self.closing.store(true, Ordering::Release);
@@ -544,6 +537,7 @@ impl ExternalPluginsService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn service() -> ExternalPluginsService {
         let database = Arc::new(
@@ -573,10 +567,10 @@ mod tests {
 
     #[tokio::test]
     async fn install_rejects_path_traversal_before_network_access() {
-        let error = service()
-            .install_plugin("../../escape")
-            .await
-            .expect_err("path traversal must be rejected");
+        let error = match service().select_plugin("../../escape").await {
+            Ok(_) => panic!("path traversal must be rejected"),
+            Err(error) => error,
+        };
         assert!(matches!(
             error,
             ExternalPluginsError::Install(InstallError::UnsafePluginName { .. })
@@ -587,10 +581,95 @@ mod tests {
     async fn shutdown_rejects_later_installs_before_registry_access() {
         let service = service();
         service.shutdown_all().await;
-        let error = service
-            .install_plugin("safe")
-            .await
-            .expect_err("closed service must reject installs");
+        let error = match service.select_plugin("safe").await {
+            Ok(_) => panic!("closed service must reject installs"),
+            Err(error) => error,
+        };
         assert!(matches!(error, ExternalPluginsError::ShuttingDown));
+    }
+
+    #[tokio::test]
+    async fn test_install_selected_queued_during_shutdown_is_rejected_without_writes() {
+        // Arrange: hold the lifecycle lock so shutdown and install both queue,
+        // then wait until shutdown has atomically closed admission.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let plugins_dir = config.plugins_dir.clone();
+        let database = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let service = Arc::new(ExternalPluginsService::new_empty(config, None, database));
+        let lifecycle = service.lifecycle.lock().await;
+        let shutdown_service = service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown_all().await });
+        while !service.closing.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let platform = platform_target().expect("supported test platform");
+        let plugin = RegistryPlugin {
+            name: "safe-plugin".to_string(),
+            title: "Safe plugin".to_string(),
+            summary: "test".to_string(),
+            description: "test".to_string(),
+            author: "Temps Contributors".to_string(),
+            category: "test".to_string(),
+            keywords: vec!["test".to_string()],
+            logo_url: None,
+            repository: None,
+            docs_url: None,
+            version: "1.0.0".to_string(),
+            platforms: BTreeMap::from([(
+                platform.clone(),
+                crate::catalog::PlatformRelease {
+                    url: "https://registry.temps.sh/safe-plugin".to_string(),
+                    sha256: "00".repeat(32),
+                },
+            )]),
+        };
+        let selected = SelectedPlugin {
+            registry: VerifiedRegistry {
+                envelope: crate::catalog::RegistryEnvelope {
+                    key_id: "test-key".to_string(),
+                    payload: String::new(),
+                    signature: String::new(),
+                },
+                document: crate::catalog::RegistryDocument {
+                    schema_version: 1,
+                    revision: 1,
+                    issued_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    plugins: vec![plugin.clone()],
+                },
+            },
+            identity: ReleaseIdentity {
+                name: plugin.name.clone(),
+                version: plugin.version.clone(),
+                platform,
+                sha256: "00".repeat(32),
+                signer_key_id: "test-key".to_string(),
+                registry_source: "https://registry.temps.sh/api/plugins".to_string(),
+            },
+            plugin,
+        };
+        let install_service = service.clone();
+        let install = tokio::spawn(async move { install_service.install_selected(selected).await });
+
+        // Act
+        drop(lifecycle);
+        shutdown.await.expect("shutdown task");
+        let error = install
+            .await
+            .expect("install task")
+            .expect_err("shutdown must reject queued installation");
+
+        // Assert
+        assert!(matches!(error, ExternalPluginsError::ShuttingDown));
+        assert!(
+            !plugins_dir.exists(),
+            "a rejected queued install must not create plugin state"
+        );
     }
 }

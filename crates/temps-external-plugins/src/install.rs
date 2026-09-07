@@ -217,46 +217,64 @@ impl PluginInstaller {
         let stage = staging_root.join(format!("{}-{unique}", plugin.name));
         create_unique_directory(&plugin.name, &stage).await?;
         let staged_binary = stage.join(BINARY_FILE);
-
-        let result = self
-            .download_binary(plugin, release, &sha256, &staged_binary)
-            .await;
-        if let Err(error) = result {
-            let _ = tokio::fs::remove_dir_all(&stage).await;
-            return Err(error);
-        }
-
-        let receipt = InstallReceipt {
-            envelope: registry.envelope.clone(),
-            plugin_name: plugin.name.clone(),
-            version: plugin.version.clone(),
-            platform: platform.clone(),
-            sha256: sha256.clone(),
-        };
-        write_json_synced(&plugin.name, &stage.join(RECEIPT_FILE), &receipt).await?;
-        sync_directory(&plugin.name, &stage).await?;
-
         let plugin_root = plugins_dir.join(&plugin.name);
-        ensure_directory(&plugin.name, &plugin_root).await?;
-        // Install directories are immutable and unique. This means even a
-        // same-version reinstall cannot modify the directory referenced by
-        // the current active record before its candidate passes startup.
         let directory = format!("{}-{unique}", plugin.version);
         let version_dir = plugin_root.join(&directory);
-        tokio::fs::rename(&stage, &version_dir)
-            .await
-            .map_err(|error| io_error(&plugin.name, &version_dir, error))?;
-        sync_directory(&plugin.name, &plugin_root).await?;
+        let mut moved_to_version_dir = false;
+        let prepared = async {
+            self.download_binary(plugin, release, &sha256, &staged_binary)
+                .await?;
+            let receipt = InstallReceipt {
+                envelope: registry.envelope.clone(),
+                plugin_name: plugin.name.clone(),
+                version: plugin.version.clone(),
+                platform: platform.clone(),
+                sha256: sha256.clone(),
+            };
+            write_json_synced(&plugin.name, &stage.join(RECEIPT_FILE), &receipt).await?;
+            sync_directory(&plugin.name, &stage).await?;
+            ensure_directory(&plugin.name, &plugin_root).await?;
+            // Install directories are immutable and unique. This means even a
+            // same-version reinstall cannot modify the directory referenced by
+            // the current active record before its candidate passes startup.
+            tokio::fs::rename(&stage, &version_dir)
+                .await
+                .map_err(|error| io_error(&plugin.name, &version_dir, error))?;
+            moved_to_version_dir = true;
+            sync_directory(&plugin.name, &plugin_root).await?;
 
-        Ok(InstallCandidate {
-            name: plugin.name.clone(),
-            version: plugin.version.clone(),
-            platform,
-            sha256,
-            binary_path: version_dir.join(BINARY_FILE),
-            plugin_root,
-            install_directory: directory,
-        })
+            Ok(InstallCandidate {
+                name: plugin.name.clone(),
+                version: plugin.version.clone(),
+                platform,
+                sha256,
+                binary_path: version_dir.join(BINARY_FILE),
+                plugin_root,
+                install_directory: directory,
+            })
+        }
+        .await;
+
+        if let Err(primary) = prepared {
+            let cleanup_path = if moved_to_version_dir {
+                &version_dir
+            } else {
+                &stage
+            };
+            if let Err(cleanup_error) = tokio::fs::remove_dir_all(cleanup_path).await {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        plugin = %plugin.name,
+                        path = %cleanup_path.display(),
+                        error = %cleanup_error,
+                        "Failed to remove incomplete plugin installation"
+                    );
+                }
+            }
+            return Err(primary);
+        }
+
+        prepared
     }
 
     /// Persist the signed global registry revision before any artifact from it
@@ -1195,6 +1213,135 @@ mod tests {
         installer.activate(&candidate).await.expect("activate");
         let active = discover_active(&plugins_dir, &config).await;
         assert!(matches!(&active[..], [Ok(found)] if found.version == "1.2.3"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_receipt_write_failure_removes_staging_directory() {
+        // Arrange: place a receipt in the newly-created staging directory
+        // while the installer is waiting for the artifact response. This
+        // forces the post-download create_new receipt write to fail.
+        let bytes = b"standalone executable bytes".to_vec();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugins_dir = temp.path().join("plugins");
+        let staging_root = plugins_dir.join(".staging");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let url = format!("http://{}/plugin", listener.local_addr().expect("address"));
+        let server_staging_root = staging_root.clone();
+        let response_body = bytes.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let stage = std::fs::read_dir(&server_staging_root)
+                .expect("staging root")
+                .next()
+                .expect("staging child")
+                .expect("staging entry")
+                .path();
+            std::fs::write(stage.join(RECEIPT_FILE), b"occupied").expect("occupy receipt path");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response headers");
+            stream
+                .write_all(&response_body)
+                .await
+                .expect("write response body");
+        });
+        let (registry, signing) = signed_registry(plugin(url.clone(), &bytes, "1.2.3"));
+        let (installer, _) = installer(&url, &signing);
+
+        // Act
+        let result = installer
+            .prepare(&plugins_dir, &registry, &registry.document.plugins[0])
+            .await;
+        server.await.expect("test server task");
+
+        // Assert
+        assert!(matches!(result, Err(InstallError::Io { .. })));
+        let remaining = std::fs::read_dir(&staging_root)
+            .expect("staging root remains")
+            .count();
+        assert_eq!(remaining, 0, "failed preparation must remove its stage");
+    }
+
+    #[tokio::test]
+    async fn test_discover_active_tampered_receipt_is_rejected() {
+        // Arrange
+        let bytes = b"standalone executable bytes";
+        let url = serve_once("200 OK", &[], bytes.to_vec()).await;
+        let (registry, signing) = signed_registry(plugin(url.clone(), bytes, "1.2.3"));
+        let (installer, config) = installer(&url, &signing);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let candidate = installer
+            .prepare(temp.path(), &registry, &registry.document.plugins[0])
+            .await
+            .expect("prepare binary");
+        installer.activate(&candidate).await.expect("activate");
+        let receipt_path = candidate
+            .plugin_root
+            .join(&candidate.install_directory)
+            .join(RECEIPT_FILE);
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read original receipt"))
+                .expect("parse receipt");
+        receipt["sha256"] = serde_json::Value::String("00".repeat(32));
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("serialize tampered receipt"),
+        )
+        .expect("tamper receipt");
+
+        // Act
+        let discovered = discover_active(temp.path(), &config).await;
+
+        // Assert
+        assert!(matches!(
+            &discovered[..],
+            [Err(InstallError::InvalidReceipt { reason, .. })]
+                if reason.contains("do not match the signed release")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_discover_active_tampered_binary_returns_digest_mismatch() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Arrange
+        let bytes = b"standalone executable bytes";
+        let url = serve_once("200 OK", &[], bytes.to_vec()).await;
+        let (registry, signing) = signed_registry(plugin(url.clone(), bytes, "1.2.3"));
+        let (installer, config) = installer(&url, &signing);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let candidate = installer
+            .prepare(temp.path(), &registry, &registry.document.plugins[0])
+            .await
+            .expect("prepare binary");
+        installer.activate(&candidate).await.expect("activate");
+        std::fs::set_permissions(
+            &candidate.binary_path,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make installed binary writable for tampering");
+        std::fs::write(&candidate.binary_path, b"tampered executable")
+            .expect("tamper installed binary");
+
+        // Act
+        let discovered = discover_active(temp.path(), &config).await;
+
+        // Assert
+        assert!(matches!(
+            &discovered[..],
+            [Err(InstallError::DigestMismatch { plugin, version, .. })]
+                if plugin == "test-plugin" && version == "1.2.3"
+        ));
     }
 
     #[tokio::test]

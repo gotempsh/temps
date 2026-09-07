@@ -112,8 +112,17 @@ pub struct ReloadResponse {
     pub loaded: usize,
     /// Names of loaded plugins
     pub plugins: Vec<String>,
+    /// Activated installs that could not be verified or started.
+    pub failures: Vec<ReloadFailureResponse>,
     /// Human-readable status message
     pub message: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReloadFailureResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    pub reason: String,
 }
 
 /// Reload all external plugins.
@@ -128,7 +137,9 @@ pub struct ReloadResponse {
     post,
     path = "/x/plugins/reload",
     responses(
-        (status = 200, description = "Plugins reloaded successfully", body = ReloadResponse),
+        (status = 200, description = "All plugins reloaded successfully", body = ReloadResponse),
+        (status = 207, description = "Some plugins reloaded and some failed", body = ReloadResponse),
+        (status = 502, description = "No activated plugin could be reloaded", body = ReloadResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
@@ -143,32 +154,73 @@ async fn reload_plugins(
 
     tracing::info!("Admin triggered plugin reload");
 
-    let manifests = state.service.reload_plugins().await;
-    let names: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
+    let result = state
+        .service
+        .reload_plugins()
+        .await
+        .map_err(|error| service_problem(&error))?;
+    let names: Vec<String> = result.manifests.iter().map(|m| m.name.clone()).collect();
     let count = names.len();
+    let failures: Vec<ReloadFailureResponse> = result
+        .failures
+        .iter()
+        .map(|failure| ReloadFailureResponse {
+            plugin: failure.plugin.clone(),
+            reason: failure.reason.clone(),
+        })
+        .collect();
+    let status = if failures.is_empty() {
+        StatusCode::OK
+    } else if count == 0 {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    let operation = if failures.is_empty() {
+        "EXTERNAL_PLUGINS_RELOADED"
+    } else if count == 0 {
+        "EXTERNAL_PLUGINS_RELOAD_FAILED"
+    } else {
+        "EXTERNAL_PLUGINS_RELOAD_PARTIAL"
+    };
+    let failure_detail = (!failures.is_empty()).then(|| {
+        failures
+            .iter()
+            .map(|failure| failure.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
 
     record_audit(
         &state,
         &ExternalPluginWriteAudit {
             context: audit_context(&auth, &metadata),
-            operation: "EXTERNAL_PLUGINS_RELOADED".to_string(),
+            operation: operation.to_string(),
             plugin_name: None,
             version: None,
             platform: None,
             sha256: None,
             signer_key_id: None,
             registry_source: None,
-            failure: None,
+            failure: failure_detail,
         },
     )
     .await;
 
     Ok((
-        StatusCode::OK,
+        status,
         Json(ReloadResponse {
             loaded: count,
             plugins: names,
-            message: format!("Reload complete. {} plugin(s) loaded.", count),
+            message: if failures.is_empty() {
+                format!("Reload complete. {count} plugin(s) loaded.")
+            } else {
+                format!(
+                    "Reload complete with failures. {count} plugin(s) loaded; {} failed.",
+                    failures.len()
+                )
+            },
+            failures,
         }),
     ))
 }
@@ -219,10 +271,13 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
         | ExternalPluginsError::DuplicateRegistryEntry { .. } => {
             (StatusCode::BAD_REQUEST, "Plugin Cannot Be Installed")
         }
-        ExternalPluginsError::Catalog(CatalogError::TrustNotConfigured { .. })
-        | ExternalPluginsError::Catalog(CatalogError::UntrustedKey { .. }) => (
+        ExternalPluginsError::Catalog(CatalogError::TrustNotConfigured { .. }) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Plugin Registry Trust Is Not Configured",
+        ),
+        ExternalPluginsError::Catalog(CatalogError::UntrustedKey { .. }) => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Registry Authentication Failed",
         ),
         ExternalPluginsError::Catalog(_) => (
             StatusCode::BAD_GATEWAY,
@@ -258,7 +313,61 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
     };
     temps_core::problemdetails::new(status)
         .with_title(title)
-        .with_detail(error.to_string())
+        .with_detail(public_error_detail(error))
+}
+
+/// Render an operator-facing error without exposing local paths, transport
+/// internals, or plugin-controlled diagnostics. Full typed errors remain in
+/// server logs at their origin.
+fn public_error_detail(error: &ExternalPluginsError) -> String {
+    use crate::catalog::CatalogError;
+    use crate::install::InstallError;
+
+    match error {
+        ExternalPluginsError::Install(
+            error @ (InstallError::UnsafePluginName { .. }
+            | InstallError::UnsafeVersion { .. }
+            | InstallError::UnsupportedPlatform { .. }
+            | InstallError::NoRelease { .. }
+            | InstallError::InvalidDigest { .. }
+            | InstallError::RegistryRollback { .. }),
+        ) => error.to_string(),
+        ExternalPluginsError::NotInRegistry { .. }
+        | ExternalPluginsError::DuplicateRegistryEntry { .. }
+        | ExternalPluginsError::ShuttingDown => error.to_string(),
+        ExternalPluginsError::Catalog(CatalogError::TrustNotConfigured { .. }) => {
+            "Configure a trusted plugin-registry key ID and Ed25519 public key before using the registry"
+                .to_string()
+        }
+        ExternalPluginsError::Catalog(CatalogError::UntrustedKey { key_id, .. }) => {
+            format!("The plugin registry used untrusted signing key ID '{key_id}'")
+        }
+        ExternalPluginsError::Catalog(_) => {
+            "The signed plugin registry response could not be authenticated".to_string()
+        }
+        ExternalPluginsError::Install(InstallError::DigestMismatch {
+            plugin, version, ..
+        }) => format!(
+            "Downloaded artifact for plugin '{plugin}' v{version} did not match its signed digest"
+        ),
+        ExternalPluginsError::Install(
+            InstallError::UnsafeArtifactUrl { plugin, .. }
+            | InstallError::Download { plugin, .. },
+        ) => format!("Plugin '{plugin}' could not be downloaded securely"),
+        ExternalPluginsError::Install(
+            InstallError::Client { .. }
+            | InstallError::DownloadStatus { .. }
+            | InstallError::TooLarge { .. },
+        ) => "The plugin artifact could not be downloaded securely".to_string(),
+        ExternalPluginsError::Install(
+            InstallError::Io { plugin, .. }
+            | InstallError::MissingActiveRecord { plugin, .. }
+            | InstallError::InvalidReceipt { plugin, .. },
+        ) => format!("Plugin '{plugin}' could not be installed or verified locally"),
+        ExternalPluginsError::CandidateRejected { name, version, .. } => {
+            format!("Plugin '{name}' v{version} did not pass startup verification")
+        }
+    }
 }
 
 #[utoipa::path(
@@ -343,7 +452,7 @@ async fn install_plugin(
                     sha256: None,
                     signer_key_id: None,
                     registry_source: Some(state.service.manager().config().registry.url.clone()),
-                    failure: Some(error.to_string()),
+                    failure: Some(public_error_detail(&error)),
                 },
             )
             .await;
@@ -380,7 +489,7 @@ async fn install_plugin(
                     sha256: Some(identity.sha256),
                     signer_key_id: Some(identity.signer_key_id),
                     registry_source: Some(identity.registry_source),
-                    failure: Some(error.to_string()),
+                    failure: Some(public_error_detail(&error)),
                 },
             )
             .await;
@@ -466,6 +575,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             UiManifest,
             UiRoute,
             ReloadResponse,
+            ReloadFailureResponse,
             crate::catalog::RegistryEnvelope,
             crate::catalog::RegistryPlugin,
             crate::catalog::PlatformRelease,
@@ -639,11 +749,132 @@ mod tests {
 
     #[tokio::test]
     async fn reload_plugins_allows_platform_admin() {
-        let state = test_state();
-        let (status, _) = reload_plugins(user_auth(Role::PlatformAdmin), State(state), metadata())
-            .await
-            .expect("a PlatformAdmin must be able to reload plugins");
+        // Arrange
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        // Act
+        let (status, response) =
+            reload_plugins(user_auth(Role::PlatformAdmin), State(state), metadata())
+                .await
+                .expect("a PlatformAdmin must be able to reload plugins");
+
+        // Assert
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.loaded, 0);
+        assert!(response.failures.is_empty());
+        assert_eq!(
+            *audit.operations.lock().expect("audit operation lock"),
+            vec!["EXTERNAL_PLUGINS_RELOADED".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reload_plugins_all_failed_returns_bad_gateway_and_failure_audit() {
+        // Arrange
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        std::fs::create_dir_all(config.plugins_dir.join("broken-plugin"))
+            .expect("broken active plugin directory");
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        // Act
+        let (status, response) =
+            reload_plugins(user_auth(Role::PlatformAdmin), State(state), metadata())
+                .await
+                .expect("reload reports individual failures in a typed response");
+
+        // Assert
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(response.loaded, 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(
+            response.failures[0].reason,
+            "Activated plugin installation failed verification"
+        );
+        assert_eq!(
+            *audit.operations.lock().expect("audit operation lock"),
+            vec!["EXTERNAL_PLUGINS_RELOAD_FAILED".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_plugin_catalog_non_admin_returns_forbidden() {
+        // Arrange
+        let state = test_state();
+
+        // Act
+        let error = list_plugin_catalog(user_auth(Role::User), State(state))
+            .await
+            .expect_err("catalogue access must require system administration");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_install_plugin_non_admin_returns_forbidden_without_audit() {
+        // Arrange
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = test_state_with_audit(audit.clone());
+
+        // Act
+        let error = install_plugin(
+            user_auth(Role::User),
+            State(state),
+            metadata(),
+            Json(InstallPluginRequest {
+                name: "safe-plugin".to_string(),
+            }),
+        )
+        .await
+        .expect_err("install must require system administration");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert!(
+            audit
+                .operations
+                .lock()
+                .expect("audit operation lock")
+                .is_empty(),
+            "a rejected caller must not create an install audit entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_plugin_status_non_admin_returns_forbidden() {
+        // Arrange
+        let state = test_state();
+
+        // Act
+        let error = get_plugin_status(
+            user_auth(Role::User),
+            State(state),
+            Path("safe-plugin".to_string()),
+        )
+        .await
+        .expect_err("status reveals host plugin state and must require an administrator");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -770,6 +1001,76 @@ mod tests {
     }
 
     #[test]
+    fn test_service_problem_untrusted_registry_key_returns_authentication_bad_gateway() {
+        // Arrange
+        let error = ExternalPluginsError::Catalog(crate::catalog::CatalogError::UntrustedKey {
+            url: "https://registry.temps.sh/api/plugins".to_string(),
+            key_id: "rotated-without-anchor".to_string(),
+        });
+
+        // Act
+        let problem = service_problem(&error);
+
+        // Assert
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            problem
+                .body
+                .get("title")
+                .and_then(serde_json::Value::as_str),
+            Some("Plugin Registry Authentication Failed")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|detail| detail.contains("rotated-without-anchor")));
+    }
+
+    #[test]
+    fn test_service_problem_and_audit_detail_hide_local_install_paths() {
+        let secret_path = "/srv/temps/private/plugins/example/receipt.json";
+        let sentinel_secret = "postgres://admin:must-not-leak@example.test/temps";
+        let error = ExternalPluginsError::Install(crate::install::InstallError::InvalidReceipt {
+            plugin: "example".to_string(),
+            path: secret_path.to_string(),
+            reason: sentinel_secret.to_string(),
+        });
+
+        let public_detail = public_error_detail(&error);
+        let problem = service_problem(&error);
+        let audit = ExternalPluginWriteAudit {
+            context: temps_core::audit::AuditContext {
+                user_id: 1,
+                ip_address: Some("192.0.2.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            operation: "EXTERNAL_PLUGIN_INSTALL_FAILED".to_string(),
+            plugin_name: Some("example".to_string()),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: Some(public_detail.clone()),
+        };
+        let serialized_audit = temps_core::audit::AuditOperation::serialize(&audit)
+            .expect("safe audit event must serialize");
+
+        assert!(!public_detail.contains(secret_path));
+        assert!(!public_detail.contains(sentinel_secret));
+        assert!(!serialized_audit.contains(secret_path));
+        assert!(!serialized_audit.contains(sentinel_secret));
+        assert_eq!(
+            problem
+                .body
+                .get("detail")
+                .and_then(serde_json::Value::as_str),
+            Some(public_detail.as_str())
+        );
+    }
+
+    #[test]
     fn test_openapi_spec_has_reload_response_schema() {
         let spec = ExternalPluginsApiDoc::openapi();
         let components = spec.components.expect("should have components");
@@ -784,6 +1085,7 @@ mod tests {
         let response = ReloadResponse {
             loaded: 2,
             plugins: vec!["seo-analyzer".into(), "monitoring".into()],
+            failures: Vec::new(),
             message: "Reload complete. 2 plugin(s) loaded.".into(),
         };
         let json = serde_json::to_value(&response).unwrap();

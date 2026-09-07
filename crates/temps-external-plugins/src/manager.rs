@@ -59,6 +59,18 @@ pub(crate) struct PendingPlugin {
     process: ExternalPluginProcess,
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginLoadFailure {
+    pub plugin: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PluginReloadResult {
+    pub manifests: Vec<PluginManifest>,
+    pub failures: Vec<PluginLoadFailure>,
+}
+
 impl ExternalPluginProcess {
     /// Send SIGKILL to the plugin process (non-blocking).
     ///
@@ -363,13 +375,23 @@ impl ExternalPluginManager {
     ///
     /// Returns the list of successfully started plugin manifests.
     pub async fn discover_and_start(&self) -> Vec<PluginManifest> {
+        self.discover_and_start_report().await.manifests
+    }
+
+    async fn discover_and_start_report(&self) -> PluginReloadResult {
         #[cfg(unix)]
         if let Err(error) = secure_socket_directory(&self.config.sockets_dir) {
             error!(
                 directory = %self.config.sockets_dir.display(),
                 "Failed to create a secure 0700 plugin socket directory: {error}"
             );
-            return Vec::new();
+            return PluginReloadResult {
+                manifests: Vec::new(),
+                failures: vec![PluginLoadFailure {
+                    plugin: None,
+                    reason: "Plugin socket directory could not be prepared".to_string(),
+                }],
+            };
         }
         #[cfg(not(unix))]
         if let Err(error) = tokio::fs::create_dir_all(&self.config.sockets_dir).await {
@@ -377,7 +399,13 @@ impl ExternalPluginManager {
                 directory = %self.config.sockets_dir.display(),
                 "Failed to create plugin socket directory: {error}"
             );
-            return Vec::new();
+            return PluginReloadResult {
+                manifests: Vec::new(),
+                failures: vec![PluginLoadFailure {
+                    plugin: None,
+                    reason: "Plugin socket directory could not be prepared".to_string(),
+                }],
+            };
         }
 
         for dir in [
@@ -388,21 +416,31 @@ impl ExternalPluginManager {
         ] {
             if let Err(e) = tokio::fs::create_dir_all(dir).await {
                 error!("Failed to create directory {}: {}", dir.display(), e);
-                return Vec::new();
+                return PluginReloadResult {
+                    manifests: Vec::new(),
+                    failures: vec![PluginLoadFailure {
+                        plugin: None,
+                        reason: "A required plugin runtime directory could not be prepared"
+                            .to_string(),
+                    }],
+                };
             }
         }
         // Kill any stale plugin processes left over from a previous run
         // (e.g. if the server was killed without graceful shutdown).
         self.kill_stale_processes().await;
 
-        let binaries = self.scan_plugins_dir().await;
+        let (binaries, mut failures) = self.scan_plugins_dir().await;
 
         if binaries.is_empty() {
             debug!(
                 "No external plugins found in {}",
                 self.config.plugins_dir.display()
             );
-            return Vec::new();
+            return PluginReloadResult {
+                manifests: Vec::new(),
+                failures,
+            };
         }
 
         info!(
@@ -436,29 +474,48 @@ impl ExternalPluginManager {
                         binary = %installation.binary_path.display(),
                         "Failed to start external plugin: {}", e
                     );
+                    failures.push(PluginLoadFailure {
+                        plugin: Some(installation.name),
+                        reason: "Plugin failed startup verification".to_string(),
+                    });
                 }
             }
         }
 
-        manifests
+        PluginReloadResult {
+            manifests,
+            failures,
+        }
     }
 
     /// Discover only activated binaries whose local receipt still verifies
     /// against a trusted signed registry document. Flat executable files are
     /// intentionally ignored: dropping a file into this directory must never
     /// turn it into code executed by the Temps server.
-    async fn scan_plugins_dir(&self) -> Vec<crate::install::ActiveInstallation> {
+    async fn scan_plugins_dir(
+        &self,
+    ) -> (
+        Vec<crate::install::ActiveInstallation>,
+        Vec<PluginLoadFailure>,
+    ) {
         let mut binaries = Vec::new();
+        let mut failures = Vec::new();
         for result in
             crate::install::discover_active(&self.config.plugins_dir, &self.config.registry).await
         {
             match result {
                 Ok(installation) => binaries.push(installation),
-                Err(error) => warn!(error = %error, "Ignoring unverified external plugin install"),
+                Err(error) => {
+                    warn!(error = %error, "Ignoring unverified external plugin install");
+                    failures.push(PluginLoadFailure {
+                        plugin: None,
+                        reason: "Activated plugin installation failed verification".to_string(),
+                    });
+                }
             }
         }
         binaries.sort_by(|left, right| left.name.cmp(&right.name));
-        binaries
+        (binaries, failures)
     }
 
     /// Remove stale plugin bookkeeping left over from a previous run.
@@ -1074,14 +1131,14 @@ impl ExternalPluginManager {
     /// and start everything fresh.
     ///
     /// Returns the manifests of all successfully started plugins.
-    pub async fn reload_all(&self) -> Vec<PluginManifest> {
+    pub async fn reload_all(&self) -> PluginReloadResult {
         info!("Reloading all external plugins");
 
         // Phase 1: Shut down all running plugins
         self.shutdown_all().await;
 
         // Phase 2: Re-discover and start
-        self.discover_and_start().await
+        self.discover_and_start_report().await
     }
 
     /// Reload a single plugin by name: shut it down (if running), then
@@ -1126,6 +1183,7 @@ impl ExternalPluginManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest as _, Sha256};
 
     /// Create a mock database connection for tests.
     fn mock_db() -> Arc<DatabaseConnection> {
@@ -1151,6 +1209,56 @@ mod tests {
         assert_ne!(first, second);
         assert!(!first.is_empty());
         assert!(!second.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_frame_partial_eof_returns_complete_frame() {
+        // Arrange
+        let mut reader = BufReader::new(&b"{\"type\":\"hello\"}"[..]);
+
+        // Act
+        let frame = read_handshake_frame(&mut reader, "fixture", "startup hello")
+            .await
+            .expect("partial final frame should be readable");
+
+        // Assert
+        assert_eq!(frame.as_deref(), Some("{\"type\":\"hello\"}"));
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_frame_crlf_strips_line_terminator() {
+        // Arrange
+        let mut reader = BufReader::new(&b"{\"type\":\"ready\"}\r\nsecond\n"[..]);
+
+        // Act
+        let first = read_handshake_frame(&mut reader, "fixture", "ready signal")
+            .await
+            .expect("CRLF frame should be readable");
+        let second = read_handshake_frame(&mut reader, "fixture", "next frame")
+            .await
+            .expect("reader must retain bytes after the first newline");
+
+        // Assert
+        assert_eq!(first.as_deref(), Some("{\"type\":\"ready\"}"));
+        assert_eq!(second.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_frame_over_limit_returns_bounded_error() {
+        // Arrange: the newline itself counts toward the protocol frame limit.
+        let mut bytes = vec![b'a'; MAX_HANDSHAKE_FRAME_BYTES];
+        bytes.push(b'\n');
+        let mut reader = BufReader::new(bytes.as_slice());
+
+        // Act
+        let error = read_handshake_frame(&mut reader, "oversized-plugin", "startup hello")
+            .await
+            .expect_err("an oversized frame must be rejected before allocation grows further");
+
+        // Assert
+        assert!(error.contains("oversized-plugin"), "{error}");
+        assert!(error.contains("startup hello"), "{error}");
+        assert!(error.contains("byte limit"), "{error}");
     }
 
     #[test]
@@ -1184,6 +1292,64 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn test_prepare_candidate_wrong_identity_receives_no_launch_configuration() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Arrange: the child identifies itself, then records stdin only if the
+        // host sends the second (secret-bearing) handshake frame.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://admin:must-not-leak@example.test/temps".to_string(),
+        );
+        config.handshake_timeout = Duration::from_secs(2);
+        std::fs::create_dir_all(&config.plugins_dir).expect("plugins directory");
+        let marker = temp.path().join("launch-config-received");
+        let manifest = PluginManifest::builder("wrong-plugin", "1.0.0")
+            .requires_db(true)
+            .requires_host_data_access(true)
+            .build();
+        let hello = serde_json::to_string(&HandshakeMessage::Hello(
+            temps_core::external_plugin::PluginHello {
+                protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+                manifest: Box::new(manifest),
+            },
+        ))
+        .expect("serialize hello");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\nif IFS= read -r launch; then printf '%s' \"$launch\" > '{}'; fi\n",
+            hello.replace('\'', "'\\''"),
+            marker.display()
+        );
+        let binary = config.plugins_dir.join("wrong-identity-fixture");
+        std::fs::write(&binary, script.as_bytes()).expect("fixture script");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o500))
+            .expect("fixture permissions");
+        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+        let manager = ExternalPluginManager::new(config, mock_db());
+
+        // Act
+        let error = match manager
+            .prepare_candidate("expected-plugin", "1.0.0", &digest, &binary)
+            .await
+        {
+            Ok(_) => panic!("signed and declared identities must match"),
+            Err(error) => error,
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Assert
+        assert!(error.contains("wrong-plugin"), "{error}");
+        assert!(error.contains("expected-plugin"), "{error}");
+        assert!(!error.contains("must-not-leak"), "{error}");
+        assert!(
+            !marker.exists(),
+            "identity rejection must happen before the launch secret is written"
+        );
+    }
+
+    #[tokio::test]
     async fn test_empty_plugins_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let config = ExternalPluginConfig::new(
@@ -1210,9 +1376,34 @@ mod tests {
         assert!(manifests.is_empty());
 
         // Reload — should also be empty with no plugins
-        let manifests = manager.reload_all().await;
-        assert!(manifests.is_empty());
+        let result = manager.reload_all().await;
+        assert!(result.manifests.is_empty());
+        assert!(result.failures.is_empty());
         assert!(manager.manifests().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reload_all_invalid_active_install_reports_typed_failure() {
+        // Arrange
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        std::fs::create_dir_all(config.plugins_dir.join("broken-plugin"))
+            .expect("broken plugin directory");
+        let manager = ExternalPluginManager::new(config, mock_db());
+
+        // Act
+        let result = manager.reload_all().await;
+
+        // Assert
+        assert!(result.manifests.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(
+            result.failures[0].reason,
+            "Activated plugin installation failed verification"
+        );
     }
 
     #[tokio::test]

@@ -133,6 +133,16 @@ pub struct ServeCommand {
     /// sibling proxy has a fixed address to forward console traffic to.
     #[arg(long, value_enum, default_value_t = ServeRole::All, env = "TEMPS_ROLE")]
     pub role: ServeRole,
+
+    /// Key ID expected on signed external-plugin registry documents.
+    /// Must be configured together with --plugin-registry-public-key.
+    #[arg(long, env = "TEMPS_PLUGIN_REGISTRY_KEY_ID")]
+    pub plugin_registry_key_id: Option<String>,
+
+    /// Hex-encoded 32-byte Ed25519 public key used to authenticate the
+    /// external-plugin registry. Must be paired with --plugin-registry-key-id.
+    #[arg(long, env = "TEMPS_PLUGIN_REGISTRY_PUBLIC_KEY")]
+    pub plugin_registry_public_key: Option<String>,
 }
 
 impl ServeCommand {
@@ -206,6 +216,12 @@ impl ServeCommand {
                  console would bind a random port the proxy process cannot find."
             );
         }
+
+        let external_plugin_registry =
+            temps_external_plugins::catalog::registry_config_from_anchor(
+                self.plugin_registry_key_id.as_deref(),
+                self.plugin_registry_public_key.as_deref(),
+            )?;
 
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
@@ -738,6 +754,7 @@ impl ServeCommand {
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
+            external_plugin_registry,
         };
 
         if self.role == ServeRole::Console {

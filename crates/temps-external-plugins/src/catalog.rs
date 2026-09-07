@@ -68,6 +68,69 @@ impl RegistryConfig {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum RegistryTrustConfigError {
+    #[error("External-plugin registry trust configuration is incomplete: {provided} is set but {missing} is missing")]
+    Incomplete {
+        provided: &'static str,
+        missing: &'static str,
+    },
+    #[error("External-plugin registry key ID must not be empty and may contain only ASCII letters, digits, '.', '_', or '-'")]
+    InvalidKeyId,
+    #[error("External-plugin registry public key for key ID '{key_id}' is not valid hexadecimal: {reason}")]
+    InvalidPublicKeyHex { key_id: String, reason: String },
+    #[error("External-plugin registry public key for key ID '{key_id}' decoded to {actual} bytes; Ed25519 public keys must be exactly 32 bytes")]
+    InvalidPublicKeyLength { key_id: String, actual: usize },
+}
+
+/// Build the production registry configuration from the paired bootstrap
+/// values accepted by `temps serve`. Neither value alone grants any trust;
+/// absent values keep the catalogue visible but fail closed on fetch/startup.
+pub fn registry_config_from_anchor(
+    key_id: Option<&str>,
+    public_key_hex: Option<&str>,
+) -> Result<RegistryConfig, RegistryTrustConfigError> {
+    let (key_id, public_key_hex) = match (key_id, public_key_hex) {
+        (None, None) => return Ok(RegistryConfig::default()),
+        (Some(_), None) => {
+            return Err(RegistryTrustConfigError::Incomplete {
+                provided: "registry key ID",
+                missing: "registry public key",
+            });
+        }
+        (None, Some(_)) => {
+            return Err(RegistryTrustConfigError::Incomplete {
+                provided: "registry public key",
+                missing: "registry key ID",
+            });
+        }
+        (Some(key_id), Some(public_key_hex)) => (key_id.trim(), public_key_hex.trim()),
+    };
+    if key_id.is_empty()
+        || key_id.len() > 128
+        || !key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(RegistryTrustConfigError::InvalidKeyId);
+    }
+    let decoded = hex::decode(public_key_hex).map_err(|error| {
+        RegistryTrustConfigError::InvalidPublicKeyHex {
+            key_id: key_id.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    let actual = decoded.len();
+    let key: [u8; 32] =
+        decoded
+            .try_into()
+            .map_err(|_| RegistryTrustConfigError::InvalidPublicKeyLength {
+                key_id: key_id.to_string(),
+                actual,
+            })?;
+    Ok(RegistryConfig::default().with_trust_anchor(key_id, key))
+}
+
 /// The outer envelope signs the decoded bytes in `payload`. Encoding the
 /// payload instead of reserializing a JSON object avoids ambiguous map order,
 /// whitespace, and number representations.
@@ -382,6 +445,98 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer as _, SigningKey};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn test_registry_config_from_anchor_without_values_returns_unconfigured_defaults() {
+        // Arrange / Act
+        let config = registry_config_from_anchor(None, None).expect("empty configuration is valid");
+
+        // Assert
+        assert_eq!(config.url, REGISTRY_URL);
+        assert!(config.trust_anchors.is_empty());
+        assert!(!config.allow_http);
+        assert_eq!(
+            config.allowed_artifact_hosts,
+            BTreeSet::from(["registry.temps.sh".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_registry_config_from_anchor_with_pair_configures_trimmed_anchor() {
+        // Arrange
+        let expected_key = [0xabu8; 32];
+        let encoded_key = hex::encode(expected_key);
+
+        // Act
+        let config = registry_config_from_anchor(
+            Some("  production-key_1  "),
+            Some(&format!("  {encoded_key}  ")),
+        )
+        .expect("a complete valid trust anchor must be accepted");
+
+        // Assert
+        assert_eq!(
+            config.trust_anchors.get("production-key_1"),
+            Some(&expected_key)
+        );
+        assert_eq!(config.trust_anchors.len(), 1);
+        assert_eq!(config.url, REGISTRY_URL);
+        assert!(!config.allow_http);
+    }
+
+    #[test]
+    fn test_registry_config_from_anchor_with_half_pair_returns_incomplete_error() {
+        // Arrange / Act / Assert
+        assert!(matches!(
+            registry_config_from_anchor(Some("key-1"), None),
+            Err(RegistryTrustConfigError::Incomplete {
+                provided: "registry key ID",
+                missing: "registry public key"
+            })
+        ));
+        assert!(matches!(
+            registry_config_from_anchor(None, Some(&hex::encode([7u8; 32]))),
+            Err(RegistryTrustConfigError::Incomplete {
+                provided: "registry public key",
+                missing: "registry key ID"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_registry_config_from_anchor_with_malformed_key_returns_precise_error() {
+        // Arrange / Act / Assert
+        assert!(matches!(
+            registry_config_from_anchor(Some("key-1"), Some("not-hex")),
+            Err(RegistryTrustConfigError::InvalidPublicKeyHex { ref key_id, .. })
+                if key_id == "key-1"
+        ));
+        assert!(matches!(
+            registry_config_from_anchor(Some("key-1"), Some("abcd")),
+            Err(RegistryTrustConfigError::InvalidPublicKeyLength {
+                ref key_id,
+                actual: 2
+            }) if key_id == "key-1"
+        ));
+    }
+
+    #[test]
+    fn test_registry_config_from_anchor_with_invalid_key_id_is_rejected() {
+        // Arrange
+        let key = hex::encode([7u8; 32]);
+        let too_long = "a".repeat(129);
+
+        // Act / Assert
+        for key_id in ["", "contains space", "path/key", "keyé", &too_long] {
+            assert!(
+                matches!(
+                    registry_config_from_anchor(Some(key_id), Some(&key)),
+                    Err(RegistryTrustConfigError::InvalidKeyId)
+                ),
+                "invalid key ID was accepted: {key_id:?}"
+            );
+        }
+    }
 
     async fn oversized_registry_url() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
