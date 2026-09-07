@@ -219,7 +219,24 @@ pub(crate) async fn open_static_file(
 
     // This is intentionally the last pathname operation before File::open.
     // It catches directory-index symlinks as well as ordinary file symlinks.
-    let canonical_path = canonicalize(&final_candidate, "resolve final file").await?;
+    let canonical_path = match canonicalize(&final_candidate, "resolve final file").await {
+        Ok(path) => path,
+        Err(error) if candidate_metadata.is_dir() && is_spa_route(&relative_request_path) => {
+            // The request matched a real directory (e.g. an asset-only folder
+            // that happens to share a name with a client-side route) with no
+            // `index.html` of its own. Treat it the same as a missing file on
+            // an extensionless path: fall back to the deployment's root SPA
+            // shell instead of 404ing just because a same-named directory
+            // exists on disk.
+            let _ = error;
+            canonicalize(
+                &canonical_deployment_root.join("index.html"),
+                "resolve SPA fallback",
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
     ensure_contained(
         &canonical_path,
         &canonical_deployment_root,
@@ -415,6 +432,39 @@ mod tests {
                 .expect("valid static request");
             assert!(opened.canonical_path.ends_with(suffix), "{request}");
         }
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_root_index_for_a_real_directory_with_no_index_of_its_own() {
+        let (root, deployment) = deployment().await;
+        let assets_only_dir = deployment.join("guide");
+        fs::create_dir_all(&assets_only_dir)
+            .await
+            .expect("create asset-only directory");
+        fs::write(assets_only_dir.join("screenshot.png"), b"png")
+            .await
+            .expect("write asset inside directory");
+
+        // The bare directory path (no index.html inside it) must still resolve
+        // to the SPA shell — this is a client-side route that happens to share
+        // its first path segment with an asset directory in the build output.
+        for request in ["/guide", "/guide/"] {
+            let opened = open_static_file(root.path(), STORED_DIR, request)
+                .await
+                .unwrap_or_else(|error| panic!("{request} should fall back to SPA shell: {error}"));
+            assert!(
+                opened.canonical_path.ends_with("index.html")
+                    && !opened.canonical_path.ends_with("guide/index.html"),
+                "{request} resolved to {:?}, expected the deployment root index.html",
+                opened.canonical_path
+            );
+        }
+
+        // A real file inside that same directory must still resolve normally.
+        let asset = open_static_file(root.path(), STORED_DIR, "/guide/screenshot.png")
+            .await
+            .expect("existing asset inside the directory should still open");
+        assert!(asset.canonical_path.ends_with("guide/screenshot.png"));
     }
 
     #[tokio::test]
