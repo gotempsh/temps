@@ -402,7 +402,7 @@ impl EmailProvider for ScalewayProvider {
         // provider-side check against it — the check is a side-effecting call
         // on Scaleway's identity, so a stale or mistyped `provider_identity_id`
         // must be rejected before it reaches a different domain's identity,
-        // the same way `delete_identity` validates before its DELETE.
+        // the same way `delete_identity` validates before its revoke call.
         let precheck_response = self
             .client
             .get(self.api_url(&format!("/domains/{}", identity_id)))
@@ -691,9 +691,12 @@ impl EmailProvider for ScalewayProvider {
 
         check_identity_domain_matches(identity_id, &domain_response.name, domain)?;
 
+        // Scaleway's TEM API has no DELETE handler on /domains/{id} (it
+        // 405s); domain removal is a POST to /domains/{id}/revoke instead —
+        // see the Go SDK's RevokeDomain.
         let response = self
             .client
-            .delete(self.api_url(&format!("/domains/{}", identity_id)))
+            .post(self.api_url(&format!("/domains/{}/revoke", identity_id)))
             .header("X-Auth-Token", &self.api_key)
             .send()
             .await
