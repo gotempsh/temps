@@ -133,11 +133,12 @@
   stroke-width: 1.5;
 }
 
-/* Motion: state changes are instant. Skeleton pulse and spinners are the
-   only two animations kept — both communicate "still working", which an
-   instant state change cannot. Reduced-motion is satisfied for free. */
+/* Motion: state changes are instant. Skeleton pulse, spinners and the
+   `running` glyph's `.op-pulse` are the only animations kept — each
+   communicates "still working", which an instant state change cannot.
+   Reduced-motion is satisfied for free. */
 .operator,
-.operator *:not(.animate-pulse):not(.animate-spin),
+.operator *:not(.animate-pulse):not(.animate-spin):not(.op-pulse):not(.op-busy svg),
 .operator *::before,
 .operator *::after {
   transition-duration: 0s !important;
@@ -318,7 +319,7 @@
 /* Motion comes back for this skin: press/lift only, 120ms, no easing curve
    longer than that. Overrides the operator 0s rule via higher specificity. */
 .operator.hardline,
-.operator.hardline *:not(.animate-pulse):not(.animate-spin),
+.operator.hardline *:not(.animate-pulse):not(.animate-spin):not(.op-pulse):not(.op-busy svg),
 .operator.hardline *::before,
 .operator.hardline *::after {
   transition-duration: 120ms !important;
@@ -420,10 +421,10 @@
   --background: oklch(0.17 0.004 95);
   --foreground: oklch(0.95 0.008 95);
   /* Same states on ink: lighter and less saturated so they clear 4.5 against the dark paper. */
-  --destructive: oklch(0.72 0.18 23);
+  --destructive: oklch(0.72 0.14 23);
   --destructive-foreground: oklch(0.17 0.004 95); /* ink text on the lighter red fill: white would be 2.7:1 */
-  --success: oklch(0.72 0.15 150);
-  --warning: oklch(0.80 0.15 75);
+  --success: oklch(0.74 0.11 150);
+  --warning: oklch(0.78 0.11 75);
   --card: oklch(0.17 0.004 95);
   --card-foreground: oklch(0.95 0.008 95);
   --popover: oklch(0.21 0.004 95);
@@ -432,16 +433,17 @@
   --primary-foreground: oklch(0.17 0.004 95);
   --secondary: oklch(0.26 0.004 95);
   --secondary-foreground: oklch(0.95 0.008 95);
-  --muted: oklch(0.24 0.004 95);
-  --muted-foreground: oklch(0.68 0 0);
+  --muted: oklch(0.14 0.004 95);
+  --muted-foreground: oklch(0.74 0 0);
   --accent: oklch(0.3 0.004 95);
   --accent-foreground: oklch(0.95 0.008 95);
-  --border: oklch(0.95 0.008 95);
-  --input: oklch(0.95 0.008 95);
+  --border: oklch(0.62 0.006 95);
+  --input: oklch(0.62 0.006 95);
   --chart-1: oklch(0.95 0.008 95);
   --chart-2: oklch(0.55 0 0);
   --op-inset: oklch(0.13 0.004 95);
   --op-inset-foreground: oklch(0.95 0.008 95);
+  --op-raise-shadow: 3px 3px 0 0 var(--border);
 }
 .operator.ink .op-label { font-family: var(--font-sans); letter-spacing: 0.1em; font-weight: 500; }
 .operator.ink .op-prose { font-family: var(--font-sans); }
@@ -472,24 +474,52 @@
    transition is --op-duration on --op-ease, and only the four properties a
    control changes about itself. Layout, opacity and size are absent on
    purpose — a row must not slide, a panel must not grow. docs/motion.md. */
-.operator.ink, .operator.ink *:not(.animate-pulse):not(.animate-spin), .operator.ink *::before, .operator.ink *::after {
+.operator.ink, .operator.ink *:not(.animate-pulse):not(.animate-spin):not(.op-pulse):not(.op-busy svg), .operator.ink *::before, .operator.ink *::after {
   transition-duration: var(--op-duration) !important;
   transition-timing-function: var(--op-ease);
   transition-property: transform, box-shadow, background-color, color;
 }
+/* Floating content (tooltip, popover, menu, select, drop) is positioned by a
+   transform set after mount. Transitioning it would slide the panel in from
+   the corner, so poppers never transition transform: they appear in place. */
+.operator.ink [data-radix-popper-content-wrapper], .operator.ink [data-radix-popper-content-wrapper] *, [data-radix-popper-content-wrapper].operator, [data-radix-popper-content-wrapper] .operator, [data-radix-popper-content-wrapper] .operator * {
+  transition-property: box-shadow, background-color, color !important;
+}
 /* Opt a single element into a different tier, or into a property the blanket
    rule leaves out (an inline action icon fading up from muted on hover).
-   The `:not(.animate-spin)` is not a filter — it is what lifts these three to
-   the blanket rule's specificity, so that being written after it is enough to
-   win. Without it the blanket rule (which carries `!important`) swallows them
-   and the classes do nothing. */
-.operator.ink .op-motion:not(.animate-spin) { transition-property: transform, box-shadow, background-color, border-color, color, opacity; transition-timing-function: var(--op-ease); }
-.operator.ink .op-motion-fast:not(.animate-spin) { transition-duration: var(--op-duration-fast) !important; }
-.operator.ink .op-motion-slow:not(.animate-spin) { transition-duration: var(--op-duration-slow) !important; }
+   The `:not(.animate-spin):not(.op-pulse)` is not a filter — it is what lifts
+   these three to the blanket rule's specificity, so that being written after
+   it is enough to win. Without it the blanket rule (which carries
+   `!important`) swallows them and the classes do nothing. Both lifted classes
+   must be repeated here verbatim: `.animate-spin` (a spinner, now only
+   sanctioned inline on a submitting button) and `.op-pulse` (the `running`
+   glyph). Drop one and the count no longer matches the blanket rule, the
+   blanket rule wins again, and `.op-motion` silently stops working. */
+.operator.ink .op-motion:not(.animate-spin):not(.op-pulse):not(.op-busy svg) { transition-property: transform, box-shadow, background-color, border-color, color, opacity; transition-timing-function: var(--op-ease); }
+.operator.ink .op-motion-fast:not(.animate-spin):not(.op-pulse):not(.op-busy svg) { transition-duration: var(--op-duration-fast) !important; }
+.operator.ink .op-motion-slow:not(.animate-spin):not(.op-pulse):not(.op-busy svg) { transition-duration: var(--op-duration-slow) !important; }
+/* The one sanctioned animation: a `running` glyph (◉) breathing while work is
+   actually happening — a build, a restore, a scan. Opacity only, ~1.6s, no
+   scale and no colour, because the glyph already carries the state and a
+   moving glyph is harder to read than a still one. It stops when the work
+   stops, which is the whole point: motion here is the fact, not decoration.
+   Lifted out of the blanket rule by `:not(.op-pulse)` above — see
+   docs/motion.md. */
+@keyframes op-pulse { from { opacity: 1; } to { opacity: 0.45; } }
+
+/* The second sanctioned animation, and the only spin: a button whose work is
+   still running turns its own icon. A reload spins because the thing it stands
+   for goes round; a state glyph pulses instead, because a state is not an
+   action. `.op-busy` keeps the button's colour and its focus — it is never
+   `disabled` — so this is the only signal, which is why it has to move.
+   Lifted out of the blanket rules above by `:not(.op-busy svg)`. */
+@keyframes op-busy-spin { to { transform: rotate(360deg); } }
+.operator.ink .op-busy svg { animation: op-busy-spin 0.9s linear infinite; }
+.operator.ink .op-pulse { animation: op-pulse 1.6s ease-in-out infinite alternate; }
 /* Reduced motion: durations go to zero, everything still arrives at the same
-   end state. The two animations that survive elsewhere (skeleton pulse, retry
-   spinner) say "still working", which a zero-duration change cannot — but they
-   stop here too, because a reader who asked for no motion asked for no motion;
+   end state. The animations that survive elsewhere (skeleton pulse, the
+   `running` glyph's `.op-pulse`) say "still working", which a zero-duration
+   change cannot — but they stop here too, because a reader who asked for no motion asked for no motion;
    the skeleton is still a skeleton and the retry button still says "retrying…". */
 @media (prefers-reduced-motion: reduce) {
   .operator.ink {
@@ -503,6 +533,12 @@
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
   }
+  /* The running pulse stops too, at full ink: the glyph and the word still say
+     "running", so nothing is lost by holding still. */
+  .operator.ink .op-pulse { animation: none; opacity: 1; }
+  /* A busy button holds its icon still; the label alone says it is working,
+     which is why `busyLabel` is not optional in practice. */
+  .operator.ink .op-busy svg { animation: none; }
 }
 /* Status line: the sentence. Each phrase is a link. */
 .operator.ink .op-status a { text-decoration: underline; text-decoration-color: var(--op-rule-soft); text-underline-offset: 3px; }
@@ -518,6 +554,15 @@
 .operator.ink.v1[data-density='dense'] { --row-h: 1.75rem; --cell-px: 0.5rem; }
 .operator.ink.v1 .op-row { height: var(--row-h); padding-left: var(--cell-px); padding-right: var(--cell-px); }
 .dark .operator.ink.v1 { --op-inset: oklch(0 0 0); }
+/* Density washes (`inkCell`: cohort grids, latency heatmaps, calendars).
+   Night is not paper inverted: a density fill sits BELOW the ground on both
+   layers, so "more" is always darker and never reads as a highlight. The wash
+   is therefore black on both, and only the colour of a number sitting inside a
+   dense cell changes — `--background` on paper, ink on night. Painting the
+   wash in `--foreground` instead put a 50% grey in the middle of the ladder
+   that neither text colour could sit on, which axe caught on night. */
+.operator.ink { --op-ink-wash: oklch(0 0 0); --op-ink-on-dense: var(--background); }
+.dark .operator.ink { --op-ink-on-dense: var(--foreground); }
 .operator.ink.v1 .op-sticky { position: sticky; top: 0; z-index: 20; background: var(--background); }
 .operator.ink.v1 .op-sticky-bottom { position: sticky; bottom: 0; z-index: 20; }
 .operator.ink.v1 .op-marker-hot { background: var(--muted); }
@@ -690,3 +735,47 @@
 .operator.ink input[type='number'] { border-radius: 0; font-variant-numeric: tabular-nums; }
 .operator.ink input[type='number']::-webkit-outer-spin-button,
 .operator.ink input[type='number']::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+/* ── Agent surfaces (agent.tsx) ─────────────────────────────────────────
+   The generative-UI primitives (ToolRow, Proposal, Provenance, StreamBlock,
+   AgentQuestion, AgentSources, RunAside) add no rule of their own: they are
+   built from `.op-inset` (a tool's input/output and the revealed query),
+   `.op-caret` (partial text and a preparing call), `.op-raise` (the one thing
+   waiting on the reader — an unanswered question or a pending proposal),
+   `.op-kv` via KeyValue, `.op-label`, `--op-rule-soft` for nested rails, and
+   `bg-muted` for the streaming skeletons, which never shimmer.
+   See design-system/docs/generative-ui.md. ─────────────────────────────── */
+
+/* ── Ink patterns for the second wave of visualisations ──────────────────
+   `viz-ink.tsx` defines four SVG `<pattern>`s (`#op-hatch`, `#op-hatch-soft`,
+   `#op-cross`, `#op-dot`) that any SVG in the document can reference as a
+   fill. Two figures draw their band on an HTML element rather than inside an
+   SVG — `UsageBar`'s overage segment and `WindowTimeline`'s covered window —
+   and an HTML background cannot reference an SVG pattern by id. These two
+   classes are the CSS half of the same vocabulary, kept here so the angle,
+   the spacing and the ink weight are written once.
+
+   Hatch means "beyond the line" or "not a plain value": an overage past an
+   allowance, a range rather than a point, a bucket still filling. It never
+   means a category — categories are told apart by the SVG patterns, and by
+   pattern rather than by hue. See design-system/docs/data-viz.md. */
+.operator.ink .op-ink-hatch {
+  background: repeating-linear-gradient(45deg, transparent 0 3px, color-mix(in oklch, var(--foreground) 28%, transparent) 3px 4px);
+}
+.operator.ink .op-ink-hatch-error {
+  background: repeating-linear-gradient(45deg, transparent 0 3px, var(--destructive) 3px 4px);
+}
+
+/* ── Hover lifts the whole row ─────────────────────────────────────────
+   A hovered, selected or focused row takes a fill; its muted text and its
+   icons step up with it, so the right side of a row is never dimmer while
+   the reader is on it. Ink-filled selection (palette, filled tabs) turns
+   muted into paper at 78%. Utilities read var(--muted-foreground), so one
+   variable does it for text, glyphs and lucide icons alike. */
+.operator.ink .op-row:hover, .operator.ink .op-row[aria-selected='true'], .operator.ink .op-row:focus-within,
+.operator.ink [role='option']:hover, .operator.ink [role='option'][aria-selected='true'], .operator.ink [role='tab']:hover {
+  --muted-foreground: color-mix(in oklch, var(--foreground) 80%, var(--background));
+}
+.operator.ink .bg-foreground, .operator.ink [cmdk-item][data-selected='true'], .operator.ink [role='tab'][aria-selected='true'] {
+  --muted-foreground: color-mix(in oklch, var(--background) 78%, var(--foreground));
+}

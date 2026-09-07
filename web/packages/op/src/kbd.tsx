@@ -9,8 +9,8 @@ export const MOD = IS_MAC ? '⌘' : 'Ctrl'
 
 /**
  * Key badge. Sits inside primary buttons ("deploy ⌘⏎"), in footers
- * ("j k move"), and next to inputs ("/"). Never the only way to reach an
- * action: a badge is an accelerator, the button is the entry point.
+ * ("j / k · down / up"), and next to inputs ("/"). Never the only way to reach
+ * an action: a badge is an accelerator, the button is the entry point.
  */
 export function Kbd({ keys, className }: { keys: string | string[]; className?: string }) {
   const arr = (Array.isArray(keys) ? keys : [keys]).map((k) => (k === '⌘' ? MOD : k))
@@ -19,6 +19,25 @@ export function Kbd({ keys, className }: { keys: string | string[]; className?: 
       {arr.map((k, i) => (
         <kbd key={i} className="inline-flex h-4 min-w-4 items-center justify-center border px-1 font-mono text-[10px] leading-none">{k}</kbd>
       ))}
+    </span>
+  )
+}
+
+/**
+ * Two keys that are one idea, said once: `j / k · down / up`.
+ *
+ * `j` and `k` are not two shortcuts a reader learns separately — they are a
+ * pair, and a footer that lists them as two entries ("j down · k up") makes
+ * the eye do the pairing every time it reads the strip. The mapping is
+ * unchanged; only the way it is said is.
+ */
+export function KbdPair({ keys, does, className }: { keys: readonly [string, string]; does: readonly [string, string]; className?: string }) {
+  return (
+    <span className={cn('inline-flex items-center gap-1 whitespace-nowrap', className)}>
+      <Kbd keys={keys[0]} />
+      <span aria-hidden className="text-muted-foreground">/</span>
+      <Kbd keys={keys[1]} />
+      <span>· {does[0]} / {does[1]}</span>
     </span>
   )
 }

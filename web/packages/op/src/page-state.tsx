@@ -77,7 +77,9 @@ export function PageState(p: PageStateProps & { className?: string }) {
       <p className="mt-1 font-mono text-xs">{p.message}</p>
       <p className="mt-1 text-xs text-muted-foreground">resource: <span className="font-mono">{p.resource}</span></p>
       <Button size="sm" variant="outline" className="mt-4 h-8 text-xs" onClick={p.onRetry} disabled={p.retrying}>
-        <RefreshCw className={cn(p.retrying && 'animate-spin')} /> {p.retrying ? 'retrying…' : 'retry'}
+        {/* Retrying is work in flight, so it takes the `running` pulse, not a spin: a
+            spinner is now only sanctioned inline on a submitting button. docs/motion.md. */}
+        <RefreshCw className={cn(p.retrying && 'op-pulse')} /> {p.retrying ? 'retrying…' : 'retry'}
       </Button>
     </div>
   )

@@ -8,7 +8,7 @@ import { Drop } from './drop'
 import { cn } from './lib/cn'
 
 /**
- * The five states a thing can be in. Colour is only ever applied through
+ * The six states a thing can be in. Colour is only ever applied through
  * these, and always next to a glyph and a word.
  *
  *  ok       ●  green   healthy, deployed, passing
@@ -18,18 +18,32 @@ import { cn } from './lib/cn'
  *  sampled  ◌  muted   telemetry head-sampled past the plan allowance.
  *                      From pricing.md: "the console says so; it is never
  *                      silently dropped."
+ *  running  ◉  ink     building, restoring, scanning: work happening now.
+ *                      The word comes from the operation; the pulse is the
+ *                      only motion in the system.
  */
-export type State = 'ok' | 'warn' | 'error' | 'idle' | 'sampled'
-export const GLYPH: Record<State, string> = { ok: '●', warn: '◐', error: '×', idle: '○', sampled: '◌' }
+export type State = 'ok' | 'warn' | 'error' | 'idle' | 'sampled' | 'running'
+export const GLYPH: Record<State, string> = { ok: '●', warn: '◐', error: '×', idle: '○', sampled: '◌', running: '◉' }
 export const GLYPH_CLASS: Record<State, string> = {
   ok: 'text-success',
   warn: 'text-warning',
   error: 'text-destructive',
   idle: 'text-muted-foreground',
   sampled: 'text-muted-foreground',
+  // Running is not a verdict, so it takes no tone: plain ink, and the pulse
+  // carries the meaning. See docs/motion.md.
+  running: 'text-foreground',
 }
 /** Sort order when a list is "needs attention first". */
-export const STATE_RANK: Record<State, number> = { error: 0, warn: 1, sampled: 2, ok: 3, idle: 4 }
+export const STATE_RANK: Record<State, number> = { error: 0, warn: 1, running: 2, sampled: 3, ok: 4, idle: 5 }
+
+/**
+ * The glyph's classes. Identical to GLYPH_CLASS except for `running`, which
+ * also gets `.op-pulse` — the one sanctioned animation in the system.
+ */
+export function glyphClass(state: State) {
+  return cn(GLYPH_CLASS[state], state === 'running' && 'op-pulse')
+}
 
 export function worst(states: State[]): State {
   return states.reduce<State>((w, s) => (STATE_RANK[s] < STATE_RANK[w] ? s : w), 'idle')
@@ -39,7 +53,7 @@ export function worst(states: State[]): State {
 export function Status({ state, label, className }: { state: State; label: string; className?: string }) {
   return (
     <span className={cn('inline-flex items-center gap-1.5 whitespace-nowrap', className)}>
-      <span aria-hidden className={cn('w-3 text-center', GLYPH_CLASS[state])}>{GLYPH[state]}</span>
+      <span aria-hidden className={cn('w-3 text-center', glyphClass(state))}>{GLYPH[state]}</span>
       {label}
     </span>
   )
@@ -97,7 +111,7 @@ function AttentionEntry({ state, children, more }: { state: State; children: Rea
     <>
       {all.map((it, i) => (
         <li key={i} data-state={it.state} className="flex items-baseline gap-3 py-0.5">
-          <span aria-hidden className={cn('w-3 shrink-0 text-center', GLYPH_CLASS[it.state])}>{GLYPH[it.state]}</span>
+          <span aria-hidden className={cn('w-3 shrink-0 text-center', glyphClass(it.state))}>{GLYPH[it.state]}</span>
           <span className="min-w-0 flex-1">{it.children}</span>
         </li>
       ))}
@@ -143,10 +157,10 @@ export function AttentionHost({ onSlot }: { onSlot: (el: HTMLElement | null) => 
     <div ref={ref} className="relative">
       <button ref={btn} type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-haspopup="dialog" aria-label={label} title={label}
         className={cn('flex h-7 items-center gap-2 border px-2 font-mono text-[11px] tabular-nums hover:bg-muted', quiet && 'text-muted-foreground')}>
-        {quiet ? <span aria-hidden className={counts.total ? GLYPH_CLASS.ok : GLYPH_CLASS.idle}>{counts.total ? GLYPH.ok : GLYPH.idle}</span> : (
+        {quiet ? <span aria-hidden className={counts.total ? glyphClass('ok') : glyphClass('idle')}>{counts.total ? GLYPH.ok : GLYPH.idle}</span> : (
           <>
-            {counts.errors > 0 && <span className="flex items-center gap-1"><span aria-hidden className={GLYPH_CLASS.error}>{GLYPH.error}</span>{counts.errors}</span>}
-            {counts.warns > 0 && <span className="flex items-center gap-1"><span aria-hidden className={GLYPH_CLASS.warn}>{GLYPH.warn}</span>{counts.warns}</span>}
+            {counts.errors > 0 && <span className="flex items-center gap-1"><span aria-hidden className={glyphClass('error')}>{GLYPH.error}</span>{counts.errors}</span>}
+            {counts.warns > 0 && <span className="flex items-center gap-1"><span aria-hidden className={glyphClass('warn')}>{GLYPH.warn}</span>{counts.warns}</span>}
           </>
         )}
       </button>
@@ -165,7 +179,7 @@ export function StatusLineInline({ state, children, more, sticky = true, classNa
   return (
     <div className={cn('op-status -mx-4 overflow-hidden border-b px-4 py-2 text-sm leading-6 sm:-mx-6 sm:px-6', sticky && 'op-sticky', className)}>
       <p className="flex items-baseline gap-3">
-        <span aria-hidden className={cn('w-3 shrink-0 text-center', GLYPH_CLASS[state])}>{GLYPH[state]}</span>
+        <span aria-hidden className={cn('w-3 shrink-0 text-center', glyphClass(state))}>{GLYPH[state]}</span>
         <span className="min-w-0 flex-1 sm:truncate">{children}</span>
         {more && (
           <a href="#" aria-expanded={unfolds ? open : undefined} onClick={(e) => { e.preventDefault(); if (unfolds) setOpen((o) => !o); else more.onClick?.() }} className="shrink-0 text-xs text-muted-foreground">
@@ -177,7 +191,7 @@ export function StatusLineInline({ state, children, more, sticky = true, classNa
         <ul className="mt-2 space-y-1 border-t border-[var(--op-rule-soft)] pt-2">
           {more!.items!.map((it, i) => (
             <li key={i} className="flex items-baseline gap-3">
-              <span aria-hidden className={cn('w-3 shrink-0 text-center', GLYPH_CLASS[it.state])}>{GLYPH[it.state]}</span>
+              <span aria-hidden className={cn('w-3 shrink-0 text-center', glyphClass(it.state))}>{GLYPH[it.state]}</span>
               <span className="min-w-0 flex-1 sm:truncate">{it.children}</span>
             </li>
           ))}

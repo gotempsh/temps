@@ -15,7 +15,7 @@ import { GLYPH, GLYPH_CLASS, type State } from './status'
  * sentence of consequence and what the action changes, and the action. Error is red, warn amber, ok green,
  * idle ink. Never used for decoration: if nothing is wrong, nothing shows.
  */
-const RULE: Record<State, string> = { error: 'border-l-destructive', warn: 'border-l-warning', ok: 'border-l-success', idle: 'border-l-foreground', sampled: 'border-l-muted-foreground' }
+const RULE: Record<State, string> = { error: 'border-l-destructive', warn: 'border-l-warning', ok: 'border-l-success', idle: 'border-l-foreground', sampled: 'border-l-muted-foreground', running: 'border-l-foreground' }
 export function Callout({ state, title, quote, action, children, className }: { state: State; title: ReactNode; /** What the other system said, verbatim. */ quote?: ReactNode; action?: ReactNode; children?: ReactNode; className?: string }) {
   return (
     <div role={state === 'error' ? 'alert' : 'status'} className={cn('border-l-2 py-1 pl-4 text-xs', RULE[state], className)}>

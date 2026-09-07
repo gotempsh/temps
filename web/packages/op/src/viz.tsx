@@ -6,7 +6,7 @@ import worldTopo from './assets/geo/countries-110m.json'
 import { useMemo, useRef, useState, type ReactNode } from 'react'
 import { ChevronRight } from 'lucide-react'
 import { cn } from './lib/cn'
-import { GLYPH, GLYPH_CLASS, type State } from './status'
+import { GLYPH, GLYPH_CLASS, glyphClass, type State } from './status'
 import { Num } from './num'
 import { fmtNum, fmtPct } from './fmt'
 import { Kbd } from './kbd'
@@ -19,7 +19,7 @@ import { Kbd } from './kbd'
    None of them needs a library: they are SVG and CSS.
    ──────────────────────────────────────────────────────────────────────── */
 
-const TONE: Record<State, string> = { ok: 'bg-success', warn: 'bg-warning', error: 'bg-destructive', idle: 'bg-muted-foreground/40', sampled: 'bg-[repeating-linear-gradient(135deg,transparent_0_2px,var(--op-rule-soft)_2px_4px)]' }
+const TONE: Record<State, string> = { ok: 'bg-success', warn: 'bg-warning', error: 'bg-destructive', idle: 'bg-muted-foreground/40', sampled: 'bg-[repeating-linear-gradient(135deg,transparent_0_2px,var(--op-rule-soft)_2px_4px)]', running: 'bg-foreground' }
 
 // ── Breakdown ──────────────────────────────────────────────────────────
 
@@ -174,27 +174,119 @@ export function ScoreRing({ value, size = 56, label, className }: { value: numbe
 // ── CalendarHeatmap ────────────────────────────────────────────────────
 
 /**
- * Activity per day over weeks: a grid of 12px cells, columns are weeks,
- * rows are weekdays, five ink intensities. Ink, not green: the colour of a
- * cell is how much, not how well. Hover reads date and count.
+ * Activity per day over weeks: a grid of 12px cells, columns are weeks, rows
+ * are weekdays, five ink intensities. Ink, not green: the colour of a cell is
+ * how much, not how well.
+ *
+ * The density is never the only encoding. The hovered or focused day reads in
+ * full — date, count, and the deploy ids when `ids` is given — and the legend
+ * prints the numbers behind the five swatches (`0 · 1–2 · 3–4 · 5–7 · 8+`), so
+ * a reader can tell a dark cell from a darker one without pointing at either.
+ *
+ * The readout follows the same rule as `GeoMap`: on a fine pointer it sits at
+ * the cursor and nothing is added under the grid; below `md` (touch) it is a
+ * row under the grid — tap a day to read it, tap it again to open it. The grid
+ * itself is one focusable region: `←` `→` move a week, `↑` `↓` move a day, and
+ * `⏎` opens the day when `onOpen` is set.
  */
-export type ActivityDay = { date: string; count: number }
-export function CalendarHeatmap({ days, cell = 12, className }: { days: ActivityDay[]; cell?: number; className?: string }) {
+export type ActivityDay = { date: string; count: number; /** What happened that day (deploy tags, run ids). Named in the readout instead of just counted. */ ids?: string[] }
+export function CalendarHeatmap({ days, cell = 12, unit = 'deploys', onOpen, className }: {
+  days: ActivityDay[]
+  cell?: number
+  /** What is being counted, plural ("deploys", "runs", "backups"). */
+  unit?: string
+  /** Open the day. Makes the cells clickable and `⏎` meaningful. */
+  onOpen?: (day: ActivityDay) => void
+  className?: string
+}) {
+  const [i, setI] = useState<number | null>(null)
+  const [at, setAt] = useState<{ x: number; y: number } | null>(null)
+  const box = useRef<HTMLDivElement>(null)
+  const touched = useRef(false)
+  const coarse = () => touched.current || (typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches)
   const max = Math.max(1, ...days.map((d) => d.count))
   const weeks: ActivityDay[][] = []
-  days.forEach((d, i) => { if (i % 7 === 0) weeks.push([]); weeks[weeks.length - 1].push(d) })
+  days.forEach((d, n) => { if (n % 7 === 0) weeks.push([]); weeks[weeks.length - 1].push(d) })
   const level = (n: number) => (n === 0 ? 0 : Math.min(4, 1 + Math.floor((n / max) * 3.999)))
   const tones = ['bg-foreground/[0.06]', 'bg-foreground/25', 'bg-foreground/45', 'bg-foreground/70', 'bg-foreground']
+  // The numbers behind the swatches, derived from `level` so the legend cannot
+  // drift from the shading: a swatch with no number is a key the reader has to
+  // guess at.
+  const over = (L: number) => { for (let n = 1; n <= max; n += 1) if (level(n) > L) return n; return max + 1 }
+  const stepWord = (L: number) => {
+    if (L === 0) return '0'
+    const lo = L === 1 ? 1 : over(L - 1)
+    if (L === 4) return `${lo}+`
+    const hi = over(L) - 1
+    return lo >= hi ? `${lo}` : `${lo}–${hi}`
+  }
+  const total = days.reduce((a, d) => a + d.count, 0)
+  const busiest = days.reduce((b, d) => (d.count > b.count ? d : b), days[0] ?? { date: '', count: 0 })
+  const day = i === null ? null : days[i]
+  const text = day ? `${day.date} · ${day.count} ${unit}${day.ids?.length ? ` · ${day.ids.join(', ')}` : ''}` : ''
+  const move = (d: number) => setI((p) => Math.max(0, Math.min(days.length - 1, (p ?? 0) + d)))
+  const readout = day ? (
+    <>
+      <span className="text-foreground">{day.date}</span>
+      <span className="text-muted-foreground">· {day.count === 0 ? `no ${unit}` : `${fmtNum(day.count)} ${unit}`}{day.ids?.length ? ` · ${day.ids.join(', ')}` : ''}</span>
+    </>
+  ) : null
   return (
-    <div className={cn('inline-flex flex-col gap-2', className)}>
-      <div className="flex gap-0.5" role="img" aria-label={`${days.length} days`}>
-        {weeks.map((w, i) => (
-          <div key={i} className="flex flex-col gap-0.5">
-            {w.map((d) => <span key={d.date} title={`${d.date} · ${d.count}`} className={cn('block', tones[level(d.count)])} style={{ width: cell, height: cell }} />)}
+    <div ref={box} className={cn('relative inline-flex flex-col gap-2', className)} onTouchStart={() => { touched.current = true }}>
+      <div
+        role="img" tabIndex={0}
+        aria-label={`${unit} per day, ${days.length} days, ${fmtNum(total)} in total. Busiest day ${busiest.date} with ${busiest.count}. Use arrow keys to read a day${onOpen ? '; enter opens it' : ''}.`}
+        onFocus={() => setI((p) => p ?? days.length - 1)} onBlur={() => { setI(null); setAt(null) }}
+        onKeyDown={(e) => {
+          const step = { ArrowLeft: -7, ArrowRight: 7, ArrowUp: -1, ArrowDown: 1 }[e.key]
+          if (step !== undefined) { e.preventDefault(); move(step) }
+          if (e.key === 'Enter' && day) { e.preventDefault(); onOpen?.(day) }
+        }}
+        onMouseMove={(e) => { const r = box.current?.getBoundingClientRect(); if (r && !coarse()) setAt({ x: e.clientX - r.left, y: e.clientY - r.top }) }}
+        className="flex gap-0.5 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+      >
+        {weeks.map((w, wi) => (
+          <div key={wi} className="flex flex-col gap-0.5">
+            {w.map((d, di) => {
+              const n = wi * 7 + di
+              return (
+                <span key={d.date} aria-hidden
+                  onMouseEnter={() => { if (!coarse()) setI(n) }}
+                  onMouseLeave={() => { if (!coarse()) { setI(null); setAt(null) } }}
+                  onClick={() => {
+                    if (!coarse()) { onOpen?.(d); return }
+                    // Touch: the first tap reads the day in the row under the grid, a second opens it.
+                    if (i === n) onOpen?.(d)
+                    else setI(n)
+                  }}
+                  className={cn('block', tones[level(d.count)], i === n && 'ring-1 ring-foreground', onOpen && 'cursor-pointer')}
+                  style={{ width: cell, height: cell }} />
+              )
+            })}
           </div>
         ))}
       </div>
-      <div className="flex items-center gap-1 self-end text-[11px] text-muted-foreground">less {tones.map((t) => <span key={t} className={cn('block', t)} style={{ width: 8, height: 8 }} />)} more</div>
+      {/* fine pointer: the readout follows the cursor, nothing under the grid */}
+      {day && at && (
+        <div aria-hidden className="pointer-events-none absolute z-10 hidden items-center gap-2 whitespace-nowrap border bg-background px-2 py-1 font-mono text-[11px] md:flex"
+          style={{ left: at.x + 12, top: at.y + 12, ...(box.current && at.x > box.current.clientWidth * 0.6 ? { left: 'auto', right: box.current.clientWidth - at.x + 12 } : {}) }}>
+          {readout}
+        </div>
+      )}
+      {/* touch: the readout is a row under the grid */}
+      <div aria-hidden className="flex min-h-[1.5rem] flex-wrap items-center gap-2 font-mono text-[11px] md:hidden">
+        {readout ?? <span className="text-muted-foreground">tap a day to read it{onOpen ? ' · tap it again to open' : ''}</span>}
+      </div>
+      {/* The legend says how many, not "less … more": a swatch with no number cannot be read. */}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 self-end font-mono text-[10px] text-muted-foreground">
+        {[0, 1, 2, 3, 4].map((L) => (
+          <span key={L} className="flex items-center gap-1">
+            <span aria-hidden className={cn('block', tones[L])} style={{ width: 8, height: 8 }} />{stepWord(L)}
+          </span>
+        ))}
+        <span>{unit}</span>
+      </div>
+      <span className="sr-only" aria-live="polite">{text}</span>
     </div>
   )
 }
@@ -380,7 +472,9 @@ export function LogLines({ lines, live, height = 240, search, className }: { lin
         {search && <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="find in log" aria-label="find in log" className="h-6 min-w-0 flex-1 basis-32 border bg-background px-2 font-mono text-[11px] outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring sm:max-w-56" />}
         <span className="ml-auto text-muted-foreground">{shown.length} of {lines.length}{live && <> · <span className="text-success">● live</span></>}</span>
       </div>
-      <ol className="op-inset overflow-y-auto" style={{ maxHeight: height }}>
+      {/* Focusable: this pane scrolls, and a scrollable region a keyboard cannot
+          reach is a serious axe violation. Same treatment as the doc code panes. */}
+      <ol tabIndex={0} aria-label="log lines" className="op-inset overflow-y-auto focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring" style={{ maxHeight: height }}>
         {shown.map((l, i) => (
           <li key={i} className="grid grid-cols-[4.5rem_1rem_minmax(0,1fr)] gap-2 px-3 py-0.5 leading-5 hover:bg-muted/60 sm:grid-cols-[4.5rem_1rem_7rem_minmax(0,1fr)]">
             <span className="tabular-nums text-muted-foreground">{l.t}</span>
@@ -412,7 +506,9 @@ export type Stage = {
   phase?: string
 }
 export function Stages({ stages, className }: { stages: Stage[]; className?: string }) {
-  const running = stages.findIndex((s) => s.state === 'idle' && s.lines)
+  // `running` is the state for a step in flight; `idle` + `lines` is the older
+  // shape and still reads as the running step so existing fixtures keep working.
+  const running = stages.findIndex((s) => s.state === 'running' || (s.state === 'idle' && s.lines))
   const [open, setOpen] = useState<number>(running >= 0 ? running : stages.findIndex((s) => s.state === 'error'))
   const pending = (i: number) => running >= 0 && i > running
   return (
@@ -423,12 +519,12 @@ export function Stages({ stages, className }: { stages: Stage[]; className?: str
           {s.phase && s.phase !== stages[i - 1]?.phase && <p className={cn('op-label border-b border-[var(--op-rule-soft)] px-3 py-1 sm:col-span-full', i > 0 && 'border-t')}>{s.phase}</p>}
           <button type="button" disabled={!s.lines} aria-expanded={s.lines ? open === i : undefined} onClick={() => setOpen((o) => (o === i ? -1 : i))} className={cn('grid w-full grid-cols-[1.5rem_1rem_minmax(0,1fr)_auto] items-center gap-x-3 px-3 py-2 text-left sm:col-span-full sm:grid-cols-subgrid', s.lines && 'hover:bg-muted/60', pending(i) && 'text-muted-foreground')}>
             <span className="font-mono text-[11px] text-muted-foreground">{i + 1}</span>
-            <span aria-hidden className={cn('text-center', GLYPH_CLASS[s.state])}>{GLYPH[s.state]}</span>
-            <span className="min-w-0 truncate font-medium">{s.name}{s.state === 'idle' && s.lines && <span className="ml-2 font-normal text-muted-foreground">running…</span>}</span>
+            <span aria-hidden className={cn('text-center', glyphClass(s.state))}>{GLYPH[s.state]}</span>
+            <span className="min-w-0 truncate font-medium">{s.name}{(s.state === 'running' || (s.state === 'idle' && s.lines)) && <span className="ml-2 font-normal text-muted-foreground">running…</span>}</span>
             <span className={cn('col-span-full col-start-3 min-w-0 truncate font-mono text-[11px] sm:col-span-1 sm:col-start-auto', s.state === 'error' ? 'text-destructive' : 'text-muted-foreground')}>{s.result ?? ''}</span>
             <span className="col-start-4 row-start-1 inline-flex items-center justify-end gap-1.5 font-mono text-[11px] tabular-nums text-muted-foreground sm:col-start-auto sm:row-start-auto">{s.duration ?? ''}{s.lines && <ChevronRight aria-hidden className={cn('h-3 w-3 transition-transform', open === i && 'rotate-90')} />}</span>
           </button>
-          {open === i && s.lines && <LogLines lines={s.lines} live={s.state === 'idle'} height={200} className="border-x-0 border-b-0 border-t border-[var(--op-rule-soft)] sm:col-span-full" />}
+          {open === i && s.lines && <LogLines lines={s.lines} live={s.state === 'running' || s.state === 'idle'} height={200} className="border-x-0 border-b-0 border-t border-[var(--op-rule-soft)] sm:col-span-full" />}
         </li>
       ))}
     </ol>
@@ -501,6 +597,8 @@ const GEO_FILL: Record<State, string> = {
   warn: 'color-mix(in oklch, var(--warning) 55%, var(--background))',
   error: 'color-mix(in oklch, var(--destructive) 60%, var(--background))',
   idle: 'var(--muted)', sampled: 'var(--muted)',
+  // Running is ink, not a hue: the map says work is under way, not a verdict.
+  running: 'color-mix(in oklch, var(--foreground) 25%, var(--background))',
 }
 /**
  * Countries filled by state, nothing else: no gradient, no legend of ten

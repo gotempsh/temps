@@ -3,8 +3,10 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  Area,
   ComposedChart,
   Line,
+  ReferenceDot,
   ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
@@ -15,6 +17,7 @@ import {
 import { cn } from './lib/cn'
 import { fmtAbsolute, fmtNum } from './fmt'
 import { Strip } from './datetime'
+import { InkPatterns } from './viz-ink'
 
 /**
  * Every Temps time axis carries three things:
@@ -72,7 +75,26 @@ export type Series = {
    * never coloured to tell it from a neighbour: that is what `stroke` is for.
    */
   state?: 'ok' | 'warn' | 'error'
+  /**
+   * Draw this line above the others regardless of its place in the legend. For
+   * the one case where reading order and stacking order differ: an out-of-band
+   * segment belongs last in the legend and on top of the line it marks.
+   */
+  top?: boolean
+  /**
+   * Off for a series that is a derived copy of another — the out-of-band
+   * stretch of a line is the same numbers as the line, and the table already
+   * has a `vs expected` column. A column of en dashes is not a fact.
+   */
+  inTable?: boolean
 }
+
+/** An expected range drawn behind the line: two keys of the same points, hatched. */
+export type Band = { lower: string; upper: string; label?: string }
+/** A point the model calls out of band. Drawn as a × on the line and listed by the caller. */
+export type Anomaly = { x: string; note?: string; state?: 'warn' | 'error' }
+/** The same measure over the period before this one, as a dotted ghost. */
+export type Compare = { label: string; data: TimePoint[] }
 
 const TICK = { fontSize: 10, fill: 'var(--muted-foreground)', fontFamily: 'Geist Mono' }
 const TONE = { ok: 'var(--success)', warn: 'var(--warning)', error: 'var(--destructive)' } as const
@@ -88,9 +110,15 @@ const colorOf = (s: Series) => (s.state ? TONE[s.state] : 'var(--foreground)')
  * weight, same ink), so a label can be matched to a line without a hue. The
  * value at the cursor rides the label, so the legend is a readout too.
  */
-function Legend({ series, point, unit }: { series: Series[]; point: TimePoint | null; unit: string }) {
+function Legend({ series, point, unit, compare, delta, band }: { series: Series[]; point: TimePoint | null; unit: string; compare?: Compare; delta?: string; band?: Band }) {
   return (
     <ul className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-muted-foreground">
+      {band && (
+        <li className="flex items-center gap-1.5">
+          <svg aria-hidden width={18} height={8} viewBox="0 0 18 8" className="shrink-0"><rect x={0} y={0} width={18} height={8} fill="url(#op-hatch-soft)" stroke="var(--op-rule-soft)" /></svg>
+          <span>{band.label ?? 'expected range'}</span>
+        </li>
+      )}
       {series.map((s, i) => (
         <li key={s.key} className="flex items-center gap-1.5">
           <svg aria-hidden width={18} height={6} viewBox="0 0 18 6" className="shrink-0 overflow-visible">
@@ -102,8 +130,41 @@ function Legend({ series, point, unit }: { series: Series[]; point: TimePoint | 
           )}
         </li>
       ))}
+      {compare && (
+        <li className="flex items-center gap-1.5">
+          <svg aria-hidden width={18} height={6} viewBox="0 0 18 6" className="shrink-0 overflow-visible">
+            <line x1={0} y1={3} x2={18} y2={3} stroke="var(--muted-foreground)" strokeWidth={1} strokeDasharray="1 3" />
+          </svg>
+          <span>{compare.label}</span>
+          {point && point[PREV] !== undefined && <span className="tabular-nums text-foreground">{fmtNum(Number(point[PREV]))}{unit ? ` ${unit}` : ''}</span>}
+          {/* A delta with no baseline is a rumour: the baseline is the compare label itself. */}
+          {delta && <span className="text-foreground">{delta} vs {compare.label}</span>}
+        </li>
+      )}
     </ul>
   )
+}
+
+/** The merged key the prior period lands on; never a caller's own key. */
+const PREV = '__prev'
+
+/** Is this point outside its own expected range? */
+export function outside(p: TimePoint, band: Band, key: string): 0 | 1 | -1 {
+  const v = Number(p[key]), lo = Number(p[band.lower]), hi = Number(p[band.upper])
+  if (!Number.isFinite(v) || !Number.isFinite(lo) || !Number.isFinite(hi)) return 0
+  if (v > hi) return 1
+  if (v < lo) return -1
+  return 0
+}
+/** "inside", "+141% above", "−22% below" — the column a reader scans for the excursions. */
+export function vsExpected(p: TimePoint, band: Band, key: string): string {
+  const side = outside(p, band, key)
+  if (p[key] === undefined || p[band.lower] === undefined) return '—'
+  if (!side) return 'inside'
+  const v = Number(p[key])
+  const bound = side > 0 ? Number(p[band.upper]) : Number(p[band.lower])
+  const pct = bound ? ((v - bound) / Math.abs(bound)) * 100 : 0
+  return `${pct >= 0 ? '+' : ''}${fmtNum(pct, { digits: Math.abs(pct) < 10 ? 1 : 0 })}% ${side > 0 ? 'above' : 'below'}`
 }
 
 function InkTooltip({ active, payload, label }: { active?: boolean; payload?: { name: string; value: number }[]; label?: string }) {
@@ -116,12 +177,30 @@ function InkTooltip({ active, payload, label }: { active?: boolean; payload?: { 
   )
 }
 
-export function TimeChart({ data, series, markers = [], thresholds = [], hot, onHot, onOpen, sampled, unit = '', yTicks, height = 176, xInterval, className, readoutFormat, selection: selectionProp, onSelect, legend, table = true, title, range, verdict }: {
+export function TimeChart({ data: rawData, series, markers = [], thresholds = [], band, anomalies = [], compare, hot, onHot, onOpen, sampled, unit = '', yTicks, height = 176, xInterval, className, readoutFormat, selection: selectionProp, onSelect, legend, table = true, title, range, verdict }: {
   data: TimePoint[]
   series: Series[]
   markers?: Marker[]
   /** Horizontal reference lines (a good/poor threshold). Dashed, labelled at the right edge, coloured by state. */
   thresholds?: { y: number; label: string; state: 'ok' | 'warn' | 'error' }[]
+  /**
+   * An expected range behind the line, as two keys of the same points. Drawn
+   * as a hatched ink band with a generated legend entry — never a filled area,
+   * and never a second hue. `BandChart` wraps this for the metrics explorer.
+   */
+  band?: Band
+  /**
+   * Points the detector called out of band. Each is a × on the first series'
+   * line; the caller lists them under the plot, because a glyph on a plot is
+   * not reachable by a keyboard on its own.
+   */
+  anomalies?: Anomaly[]
+  /**
+   * The period before this one, point for point (index-aligned). Drawn as a
+   * dotted thin ghost, and the legend carries the delta with its baseline
+   * ("+9% vs prior 7d"). Compare the same length of window or say nothing.
+   */
+  compare?: Compare
   hot?: string | null
   onHot?: (id: string | null) => void
   /** Open a deploy from a cluster strip. */
@@ -150,6 +229,25 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
   /** The one-sentence verdict a sighted reader takes from the shape. Goes into the `aria-label`. */
   verdict?: string
 }) {
+  const primaryKey = series[0]?.key
+  // The prior period rides on the same points under one reserved key, so the
+  // plot, the legend, the readout and the table cannot drift apart.
+  const data: TimePoint[] = useMemo(() => {
+    if (!compare) return rawData
+    return rawData.map((p, i) => {
+      const prev = compare.data[i]?.[primaryKey]
+      return prev === undefined ? p : { ...p, [PREV]: prev }
+    })
+  }, [rawData, compare, primaryKey])
+  const delta = useMemo(() => {
+    if (!compare) return undefined
+    const now = rawData.reduce((a, p) => a + (Number(p[primaryKey]) || 0), 0)
+    const then = compare.data.reduce((a, p) => a + (Number(p[primaryKey]) || 0), 0)
+    if (!then) return undefined
+    const pct = ((now - then) / then) * 100
+    return `${pct >= 0 ? '+' : ''}${fmtNum(pct, { digits: Math.abs(pct) < 10 ? 1 : 0 })}%`
+  }, [compare, rawData, primaryKey])
+  const anomalyAt = useMemo(() => new Map(anomalies.map((a) => [a.x, a])), [anomalies])
   const [readout, setReadout] = useState<TimePoint | null>(null)
   const [asTable, setAsTable] = useState(false)
   const [selState, setSelState] = useState<TimeRange | null>(null)
@@ -158,7 +256,7 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
   const [drag, setDrag] = useState<{ from: string; to: string } | null>(null)
   const idxOf = (x: string) => data.findIndex((p) => p.t === x)
   const ordered = (a: string, b: string): TimeRange => (idxOf(a) <= idxOf(b) ? { from: a, to: b } : { from: b, to: a })
-  const band = drag ? ordered(drag.from, drag.to) : selection
+  const selBand = drag ? ordered(drag.from, drag.to) : selection
   const selCount = selection ? idxOf(selection.to) - idxOf(selection.from) + 1 : 0
   const selectable = !!onSelect || selectionProp !== undefined
   useEffect(() => {
@@ -199,10 +297,12 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
   const r = readout ?? last
   const primary = series[0]
   const fmt = readoutFormat ?? ((p: TimePoint) => `${p.t} · ${fmtNum(Number(p[primary.key]))}${unit ? ` ${unit}` : ''}`)
-  const showLegend = legend ?? series.length > 1
+  const showLegend = legend ?? (series.length > 1 || !!compare || !!band)
   const axis = data.length ? `${data[0].t} to ${data[data.length - 1].t}` : 'no points'
-  // Every chart is an image with a sentence: what it is, over what window, and the verdict.
-  const ariaLabel = `${title ?? series.map((s) => s.name).join(' and ')}${unit ? ` in ${unit}` : ''}, ${range ?? axis}${verdict ? `. ${verdict.replace(/\.\s*$/, '')}` : ''}. ${data.length} points; switch to the table view to read every value.`
+  // Every chart is an image with a sentence: what it is, over what window, and
+  // the verdict. A caller whose verdict already counts the anomalies (BandChart
+  // names the worst one) is not made to say it twice.
+  const ariaLabel = `${title ?? series.map((s) => s.name).join(' and ')}${unit ? ` in ${unit}` : ''}, ${range ?? axis}${verdict ? `. ${verdict.replace(/\.\s*$/, '')}` : ''}.${anomalies.length && !/anomal/i.test(verdict ?? '') ? ` ${anomalies.length} point${anomalies.length === 1 ? '' : 's'} outside the expected range.` : ''}${delta && compare ? ` ${delta} vs ${compare.label}.` : ''} ${data.length} points; switch to the table view to read every value.`
   if (import.meta.env.DEV && series.length > 4) console.warn(`[chart] TimeChart has ${series.length} series; more than four lines cannot be told apart by pattern alone. Use small multiples or a table (handoff §8, data-viz.md).`)
   return (
     <div className={cn('space-y-1', className)}>
@@ -219,9 +319,12 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
             <thead>
               <tr>
                 <th scope="col" className="op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-left text-[9px]">bucket</th>
-                {series.map((s) => (
+                {series.filter((s) => s.inTable !== false).map((s) => (
                   <th key={s.key} scope="col" className="op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-right text-[9px]">{s.name}{unit ? ` (${unit})` : ''}</th>
                 ))}
+                {compare && <th scope="col" className="op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-right text-[9px]">{compare.label}{unit ? ` (${unit})` : ''}</th>}
+                {band && <th scope="col" className="op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-right text-[9px]">{band.label ?? 'expected'}</th>}
+                {band && <th scope="col" className="op-label sticky top-0 z-10 border-b bg-background px-2 py-1 text-right text-[9px]">vs expected</th>}
               </tr>
             </thead>
             <tbody className="op-rows">
@@ -230,15 +333,25 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
                   <th scope="row" className="whitespace-nowrap px-2 py-1 text-left font-normal text-muted-foreground">
                     {p.t}{markerAt.get(p.t) ? <span className="ml-1.5 text-foreground">┆ {markerAt.get(p.t)}</span> : null}
                   </th>
-                  {series.map((s) => (
-                    <td key={s.key} className="px-2 py-1 text-right tabular-nums">{p[s.key] === undefined || p[s.key] === null ? '—' : fmtNum(Number(p[s.key]))}</td>
+                  {series.filter((s) => s.inTable !== false).map((s) => (
+                    <td key={s.key} className="px-2 py-1 text-right tabular-nums">
+                      {p[s.key] === undefined || p[s.key] === null ? '—' : fmtNum(Number(p[s.key]))}
+                      {/* The × the plot draws, in the row it belongs to: an anomaly a keyboard can reach. */}
+                      {s.key === primaryKey && anomalyAt.has(p.t) && <span className="ml-1.5 text-destructive" title={anomalyAt.get(p.t)?.note}>× out of band</span>}
+                    </td>
                   ))}
+                  {compare && <td className="px-2 py-1 text-right tabular-nums text-muted-foreground">{p[PREV] === undefined || p[PREV] === null ? '—' : fmtNum(Number(p[PREV]))}</td>}
+                  {band && <td className="px-2 py-1 text-right tabular-nums text-muted-foreground">{p[band.lower] === undefined ? '—' : `${fmtNum(Number(p[band.lower]))}–${fmtNum(Number(p[band.upper]))}`}</td>}
+                  {/* How far outside, in words: "inside" and "+141% above" are the
+                      two facts a reader scans this column for. */}
+                  {band && <td className={cn('px-2 py-1 text-right tabular-nums', outside(p, band, primaryKey) ? 'text-destructive' : 'text-muted-foreground')}>{vsExpected(p, band, primaryKey)}</td>}
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
+      {band && <InkPatterns />}
       {!asTable && (
       <div ref={wrap} role="img" aria-label={ariaLabel} style={{ height }} className={cn('w-full', selectable && 'select-none', drag && 'cursor-col-resize')} onMouseLeave={() => { setReadout(null); if (drag) { const r = ordered(drag.from, drag.to); setDrag(null); if (r.from !== r.to) setSelection(r) } }}>
         <ResponsiveContainer>
@@ -248,7 +361,7 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
             onMouseMove={(s) => { const idx = Number((s as { activeIndex?: unknown })?.activeIndex); if (!Number.isNaN(idx) && data[idx]) { setReadout(data[idx]); if (drag) setDrag((d) => (d ? { ...d, to: data[idx].t } : d)) } }}>
             <XAxis dataKey="t" interval={xInterval ?? Math.max(1, Math.floor(data.length / 4) - 1)} tickLine={false} axisLine={{ stroke: 'var(--op-rule-soft)' }} tick={TICK} />
             <YAxis width={34} tickLine={false} axisLine={false} ticks={yTicks} tickFormatter={(v: number) => (v >= 1000 ? `${v / 1000}k` : String(v))} tick={TICK} />
-            {band && <ReferenceArea x1={band.from} x2={band.to} fill="var(--foreground)" fillOpacity={0.06} stroke="var(--foreground)" strokeOpacity={0.5} strokeDasharray="2 2" />}
+            {selBand && <ReferenceArea x1={selBand.from} x2={selBand.to} fill="var(--foreground)" fillOpacity={0.06} stroke="var(--foreground)" strokeOpacity={0.5} strokeDasharray="2 2" />}
             {sampled && <ReferenceArea x1={sampled.from} x2={sampled.to} fill="var(--muted)" fillOpacity={1} stroke="none" label={{ value: `◌ ${sampled.label}`, position: 'insideBottomRight', fontSize: 10, fill: 'var(--muted-foreground)', fontFamily: 'Geist Mono' }} />}
             {clusters.flatMap((c) => c.members.map((m, j) => {
               const isHead = j === 0
@@ -267,12 +380,33 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
                 />
               )
             }))}
+            {/* The expected range sits behind everything: hatched ink, no fill, no hue. */}
+            {band && (
+              <Area type="linear" dataKey={(d: TimePoint) => [Number(d[band.lower]), Number(d[band.upper])]} name={band.label ?? 'expected range'}
+                fill="url(#op-hatch-soft)" fillOpacity={1} stroke="var(--op-rule-soft)" strokeWidth={1} strokeDasharray="2 3" activeDot={false} tooltipType="none" legendType="none" isAnimationActive={false} />
+            )}
+            {compare && (
+              <Line type="linear" dataKey={PREV} name={compare.label} stroke="var(--muted-foreground)" strokeWidth={1} strokeDasharray="1 3" strokeLinecap="square" dot={false} isAnimationActive={false} />
+            )}
             {thresholds.map((t) => (
               <ReferenceLine key={t.label} y={t.y} stroke={t.state === 'error' ? 'var(--destructive)' : t.state === 'warn' ? 'var(--warning)' : 'var(--success)'} strokeDasharray="2 3" label={{ value: t.label, position: 'insideRight', fontSize: 10, fill: t.state === 'error' ? 'var(--destructive)' : t.state === 'warn' ? 'var(--warning)' : 'var(--success)', fontFamily: 'Geist Mono' }} />
             ))}
+            {/* × on the line, at the value that was out of band. The list under the plot is the keyboard's copy. */}
+            {anomalies.map((a) => {
+              const at = data.find((p) => p.t === a.x)
+              if (!at || at[primaryKey] === undefined) return null
+              return (
+                <ReferenceDot key={a.x} x={a.x} y={Number(at[primaryKey])} r={0}
+                  shape={(props: { cx?: number; cy?: number }) => (
+                    <text x={props.cx} y={props.cy} dy={4} textAnchor="middle" fontSize={11} fontFamily="Geist Mono" fill={a.state === 'warn' ? 'var(--warning)' : 'var(--destructive)'}>×</text>
+                  )} />
+              )
+            })}
             <RechartsTooltip content={<InkTooltip />} cursor={{ stroke: 'var(--op-rule-soft)' }} isAnimationActive={false} />
-            {/* Drawn back to front so series[0] sits on top; ink for every line, tone only when the series is itself a state. */}
-            {series.map((s, i) => ({ s, i })).reverse().map(({ s, i }) => (
+            {/* Drawn back to front so series[0] sits on top, except for a `top`
+                series, which is drawn last whatever the legend order. Ink for
+                every line; tone only when the series is itself a state. */}
+            {series.map((s, i) => ({ s, i })).sort((a, b) => (a.s.top ? 1 : 0) - (b.s.top ? 1 : 0) || b.i - a.i).map(({ s, i }) => (
               <Line key={s.key} type="linear" dataKey={s.key} name={s.name} stroke={colorOf(s)} strokeWidth={widthOf(s, i)} strokeDasharray={DASH[strokeOf(s, i)]} strokeLinecap="square" strokeLinejoin="miter" dot={false} isAnimationActive={false} />
             ))}
           </ComposedChart>
@@ -281,7 +415,7 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
       )}
       {(showLegend || table) && (
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
-          {showLegend ? <Legend series={series} point={r ?? null} unit={unit} /> : <span />}
+          {showLegend ? <Legend series={series} point={r ?? null} unit={unit} compare={compare} delta={delta} band={band} /> : <span />}
           {table && (
             <button type="button" aria-pressed={asTable} onClick={() => setAsTable((v) => !v)} className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground underline underline-offset-4 hover:text-foreground">
               {asTable ? 'chart' : 'table'}

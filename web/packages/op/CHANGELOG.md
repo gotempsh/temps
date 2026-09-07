@@ -2,6 +2,93 @@
 
 ## 0.1.2
 
+- A hover, a selection or a focused row lifts the whole row: `--muted-foreground`
+  goes to 80% ink under the fill, and to 78% paper under an ink-filled selection
+  (the palette's current item, a filled tab). Utilities read the variable, so
+  text, state glyphs and lucide icons all step up together and the right-hand
+  side of a row is never dimmer than the rest while the reader is on it.
+- `Button` takes `busy` and `busyLabel`: while the work runs it spins its own
+  icon (`.op-busy`, `0.9s linear` — the one spin in the system), says the verb
+  in progress, and keeps its width, its colour and its focus. It is **not**
+  `disabled`, because disabling drops focus at exactly the moment the reader is
+  waiting to hear what happened. `Settings` takes `saving` and passes it to the
+  sticky save bar. Both labels share one grid cell, so the width never moves.
+- Switching a tab never scrolls the document; the strip reveals the active tab
+  sideways only (`revealInRow`, replacing a `scrollIntoView` that also moved
+  the page vertically).
+- `Ledger` arrow keys no longer act while another widget has focus. `j`/`k`
+  stay page-wide accelerators; `ArrowUp`/`ArrowDown` act only when the ledger
+  has focus or nothing does, so one arrow on a heatmap no longer moves the
+  cursor in every ledger on the page.
+- `Inspector`: a right-hand panel that inspects a ledger row beside the list.
+- `KbdPair` renders two keys that are one idea as one badge — `j / k · down / up`.
+- Density washes (`inkCell`) paint in `--op-ink-wash`, which is black on both
+  token layers, so "more" is always darker than the ground. Painting them in
+  `--foreground` put a 50% grey in the middle of the ladder that no text colour
+  could sit on, which axe caught on night.
+
+- A sixth `State`, `running` (`◉`), for work happening now: building,
+  restoring, scanning. It is ink, not a hue — `GLYPH_CLASS.running` is
+  `text-foreground` — because running is not a verdict; the word comes from the
+  operation and the pulse is what says "now". `STATE_RANK` places it between
+  `warn` and `sampled`, so "needs attention first" sorts error 0, warn 1,
+  running 2, sampled 3, ok 4, idle 5. **`State` is now six values, so every exhaustive
+  `Record<State, …>` needs a sixth arm** — tone maps take the neutral/ink value
+  they already use for a non-tone, never a hue.
+- `.op-pulse`: an opacity-only animation (`1.6s ease-in-out infinite
+  alternate`, 1 → 0.45), the one sanctioned exception to "the system does not
+  animate". `glyphClass(state)` (exported from `status.tsx`) applies it to a
+  `running` glyph and is now used at every glyph site in `status.tsx` and in
+  `Stages`. It is lifted out of the blanket `.operator`, `.operator.hardline`
+  and `.operator.ink` motion rules by `:not(.op-pulse)`, and zeroed under
+  `prefers-reduced-motion: reduce` (`animation: none; opacity: 1`). See
+  `design-system/docs/motion.md`.
+- `PageState`'s retry button no longer spins while retrying: its `RefreshCw`
+  takes `.op-pulse`. `animate-spin` is now sanctioned only inline on a button
+  that is submitting.
+- `Stages` reads `state: 'running'` as the step in flight (the older
+  `idle` + `lines` shape still works), so the running step's glyph pulses and
+  its log streams.
+- Night is not paper inverted: dark `--border`/`--input` are 62% ink and the
+  raise falls in `--border`; `--muted` sits below the ground; `--muted-foreground`
+  0.68 → 0.74; state hues at chroma 0.11–0.14. See brand §4 "Night is not paper
+  inverted".
+- Floating content (tooltip, popover, menu, select) appears in place: the
+  skin no longer transitions `transform` on Radix poppers, which used to slide
+  every panel in from the top-left corner. The shadcn entrance/exit animation
+  classes were removed from the popover and dialog primitives.
+- Agent primitives (`agent.tsx`): the blocks an AI is allowed to render, and
+  what proves it (see `design-system/docs/generative-ui.md`).
+
+  - `ToolRow` is one typed call as one row — kind icon · state word · title ·
+    meta · duration — collapsing to its input, output, diff or error, with the
+    inline approval (`Y` / `N`, and a red left rule with `run it` only when the
+    action is irreversible). `TOOL_STATE` fixes the eight state words;
+    `toolKind` maps a tool name (a coding agent's `run_command`, the console
+    assistant's `get_error_time_series`) to its icon.
+
+  - `Provenance` wraps any generated block with the call that produced it —
+    `from query_metrics · 41m ago · 7d` — and a `show query` toggle. `tool` and
+    `when` are required, so the component cannot render an unsourced chart.
+
+  - `Proposal` is the propose-then-confirm gate for every write: action ·
+    target · consequence · reversibility · autonomy level, confirm or decline,
+    routed through `EchoDialog` when `irreversible`. Nothing runs until a human
+    answers, and the agent never confirms its own proposal.
+
+  - `StreamBlock` holds the shape of the block that is coming (text, chart,
+    ledger, detail, keyvalue, tool) at the height it will land at. Static: no
+    shimmer, nothing draws itself.
+
+  - `AgentQuestion` (typed options, pick then confirm, `1`–`4` and `⏎`),
+    `AgentSources` (what was read, as links into the console's own records) and
+    `RunAside` (model · workspace · mode · context · checkpoints as `KeyValue`).
+
+  - `AgentRow`, `AgentInset`, `AgentDiff`, `AgentGlyph` and `AgentKindIcon` are
+    the shared pieces the sandbox's `/agent` transcript is built from; they
+    moved out of `AgentChat.tsx` unchanged so the console and the sandbox draw
+    the same ledger.
+
 - Date, time, range, duration and schedule fields (`datetime.tsx`), so a form
   can ask for a moment without inventing a control (see
   `design-system/docs/forms.md` §"Dates, times and ranges").
@@ -161,6 +248,60 @@
   exceptions that exist today) and `design-system/docs/icons.md` (lucide,
   stroke 1.75, 16px in rows and 14px in labels, and the concept → icon table
   that stops two screens using two icons for one thing).
+
+- Data visualisation, second wave (`viz-ink.tsx`, `viz-time.tsx`,
+  `viz-grid.tsx`, `viz-graph.tsx`, `viz-usage.tsx`): the forms the Temps
+  console needs that `TimeChart`, `Breakdown`, `Funnel` and `StatusStrip`
+  could not draw. Rules in `design-system/docs/data-viz.md` §§9–23; rendered
+  in `DataVizBlocks2` (`viz-band` … `viz-topology`).
+
+  - `TimeChart` gains `band` (an expected range as a hatched ink band, never a
+    filled area), `anomalies` (× on the line, listed by the caller) and
+    `compare` (the prior period as a dotted thin ghost, with the delta and its
+    baseline in the generated legend). `BandChart` wraps them for the metrics
+    explorer: it derives the excursions from the data and the band, draws the
+    out-of-band stretch of the line in the state tone with a × at its peak —
+    colour is allowed there because that segment *is* a state — and adds the
+    focusable list of anomalies and a "vs expected" column in the table view.
+
+  - `StackedInk` is composition over time as stacked **bars** from zero — at
+    most four layers told apart by hatch, dot and solid at three greys, with
+    state tone only on the layer that *is* a state. A stacked area stays
+    banned. `LatencyHeatmap` is time × latency bucket at five ink steps, with
+    percentile overlays that land in the bucket they belong to.
+
+  - `PercentileLadder` (p50 · p95 · p99 · max, each with its own baseline
+    delta), `CohortGrid` (retention as a real `<table>`), `DeltaTable`
+    (metric · before · after · delta, tone only at a threshold).
+
+  - `PathTree` replaces the banned Sankey for analytics journeys;
+    `SessionTimeline` is the timeline-and-list contract around rrweb;
+    `Topology` is a deterministic layered graph with the same nodes as a list
+    beneath it, the way `GeoMap` sits under a ranked list.
+
+  - `UsageBar` states usage against an allowance in words before the bar, with
+    the overage hatched and the sampling point marked. `Gauge` is a
+    `MetricGrid`-shaped cpu/memory/disk tile with threshold ticks that carry
+    their own words; radial gauges are banned. `StateTimeline` draws a
+    resource's real transitions with their durations, where `StatusStrip`
+    draws equal buckets for a ledger. `WindowTimeline` puts backups, the
+    WAL-covered window and the restore cursor on one axis above the PITR form.
+
+  - Shared: `Figure` (`role="img"` sentence plus the "table" toggle),
+    `DataTable`, `InkPatterns`, `useReadout`, `ReadoutLive`, `inkCell`,
+    `inkStep` and the `INK_*` tokens, so no figure invents its own greys,
+    hatch or keyboard readout. `.op-ink-hatch` / `.op-ink-hatch-error` are the
+    CSS half of the same vocabulary for HTML bars.
+
+- `CalendarHeatmap` gets the readout it never had. Its cells used to carry
+  only a native `title` — a delayed tooltip that never appears on touch and is
+  unreachable by keyboard — and its legend said "less … more" with no numbers.
+  It now follows the `GeoMap` rule: the readout is at the cursor on a fine
+  pointer, a row under the grid below `md` (tap to read, tap again to open),
+  and the grid is one focusable region where `←` `→` move a week, `↑` `↓` move
+  a day and `⏎` opens, with one `aria-live` line. The legend prints the
+  numbers behind the five swatches. New props: `unit`, `ids` per day (so the
+  readout names what shipped) and `onOpen`.
 
 ## 0.1.1
 

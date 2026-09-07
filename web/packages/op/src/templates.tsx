@@ -4,12 +4,12 @@
 import { Children, isValidElement, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useShellSlots } from './shell-slots'
-import { Search } from 'lucide-react'
+import { Loader2, Search } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { cn } from './lib/cn'
 import { fmtNum } from './fmt'
-import { Kbd } from './kbd'
+import { Kbd, KbdPair } from './kbd'
 import { GLYPH, GLYPH_CLASS, Status, type State } from './status'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -17,7 +17,7 @@ import { GLYPH, GLYPH_CLASS, Status, type State } from './status'
    that does not fit is a reason to extend a template, not to start from a
    blank div.
 
-   Ledger    title · status line · filter (/) · actions · rows with j/k/⏎ · footer
+   Ledger    title · status line · filter (/) · actions · rows with j / k / ⏎ · footer
    Detail    title · status line · tabs with number keys · actions · body
    Settings  title · status line · sections · sticky save (⌘S) · danger zone
    ──────────────────────────────────────────────────────────────────────── */
@@ -394,6 +394,17 @@ export function Ledger({ title, meta, status, columns, grid, rows, total, filter
       // The cursor IS the focus: moving it focuses the row, so Enter always acts on the row the bar marks
       // (the row's own onKeyDown opens it). A cursor that only paints while focus sits on a link elsewhere
       // makes Enter follow that link and strands the reader.
+      //
+      // `j`/`k` are page accelerators and stay page-wide on purpose — on a page with
+      // several ledgers they move all of them, which is what the kitchen sink documents.
+      // Arrows are not a free letter: every other control on the page claims them too.
+      // So they act when this ledger has focus, or when nothing owns focus at all
+      // (target is the body — the "arrows do what j and k do" contract). They do NOT
+      // act while some other widget is focused: one ArrowUp on a calendar heatmap used
+      // to move the cursor in every ledger on the page.
+      const inside = !!listRef.current && e.target instanceof Node && listRef.current.contains(e.target)
+      const arrow = e.key === 'ArrowDown' || e.key === 'ArrowUp'
+      if (arrow && !inside && e.target !== document.body) return
       if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); focusRow(Math.min(sorted.length - 1, cursor + 1)) }
       else if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); focusRow(Math.max(0, cursor - 1)) }
       else if (page && e.key === ']' && page.page < Math.ceil(page.total / page.pageSize)) { page.onPage(page.page + 1); setCursor(0) }
@@ -489,8 +500,8 @@ export function Ledger({ title, meta, status, columns, grid, rows, total, filter
             {/* Paging is the ledger's own footer line: when `page` is set the Pager always renders, and `footer`
                 is extra text beside it, never a replacement for it. */}
             {page
-              ? <><Pager page={page} className="mr-2" />{footer ? <span className="mr-2">{footer}</span> : null}<span className="hidden lg:inline">· <Kbd keys="[" className="mx-1" /><Kbd keys="]" className="mr-1" /> page · <Kbd keys="j" className="mx-1" /> down · <Kbd keys="k" className="mx-1" /> up · <Kbd keys="⏎" className="mx-1" /> open{filterable && <> · <Kbd keys="/" className="mx-1" /> filter</>}</span></>
-              : footer ?? <>{sorted.length} of {total} · <Kbd keys="j" className="mx-1" /> down · <Kbd keys="k" className="mx-1" /> up · <Kbd keys="⏎" className="mx-1" /> open{filterable && <> · <Kbd keys="/" className="mx-1" /> filter</>}</>}
+              ? <><Pager page={page} className="mr-2" />{footer ? <span className="mr-2">{footer}</span> : null}<span className="hidden lg:inline">· <Kbd keys="[" className="mx-1" /><Kbd keys="]" className="mr-1" /> page · <KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="⏎" className="mx-1" /> open{filterable && <> · <Kbd keys="/" className="mx-1" /> filter</>}</span></>
+              : footer ?? <>{sorted.length} of {total} · <KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="⏎" className="mx-1" /> open{filterable && <> · <Kbd keys="/" className="mx-1" /> filter</>}</>}
             {sort && (
               <span className="ml-auto flex items-center gap-1">
                 sorted by {cols_.find((c) => c.key === sort.key)?.label ?? sort.key} {sort.dir === 'asc' ? '▲' : '▼'} · <button type="button" className="underline underline-offset-4 hover:text-foreground" onClick={() => setSort(null)}>clear</button>
@@ -508,6 +519,14 @@ function slug(t: string) { return t.toLowerCase().replace(/[^a-z0-9]+/g, '-').re
 
 // ── Detail ─────────────────────────────────────────────────────────────
 
+/** Keep the active tab visible inside its horizontally scrolling strip. Sideways only: `scrollIntoView({ block: 'nearest' })` would also move the document, so switching a tab used to drag the page. */
+function revealInRow(el: HTMLElement) {
+  const row = el.parentElement
+  if (!row || row.scrollWidth <= row.clientWidth) return
+  const left = el.offsetLeft, right = left + el.offsetWidth
+  if (left < row.scrollLeft) row.scrollTo({ left: Math.max(0, left - 8) })
+  else if (right > row.scrollLeft + row.clientWidth) row.scrollTo({ left: right - row.clientWidth + 8 })
+}
 export function Detail<T extends string>({ title, meta, mark, status, lede, tabs, tab, onTab, actions, children }: {
   title?: ReactNode
   meta?: ReactNode
@@ -558,7 +577,7 @@ export function Detail<T extends string>({ title, meta, mark, status, lede, tabs
         {/* Tabs scroll horizontally on narrow screens rather than overflowing the page; key badges hide below sm. */}
         {tabs && <ScrollRow role="tablist" className="[&>div]:border [&>div]:text-xs">
           {tabs.map((t, i) => (
-            <button key={t} role="tab" aria-selected={tab === t} onClick={() => onTab?.(t)} ref={(el) => { if (el && tab === t) el.scrollIntoView({ block: 'nearest', inline: 'nearest' }) }} className={cn('inline-flex h-8 shrink-0 items-center gap-1 whitespace-nowrap px-3 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring', i > 0 && 'border-l', tab === t ? 'bg-foreground text-background' : 'hover:bg-muted')}>
+            <button key={t} role="tab" aria-selected={tab === t} onClick={() => onTab?.(t)} ref={(el) => { if (el && tab === t) revealInRow(el) }} className={cn('inline-flex h-8 shrink-0 items-center gap-1 whitespace-nowrap px-3 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring', i > 0 && 'border-l', tab === t ? 'bg-foreground text-background' : 'hover:bg-muted')}>
               {t} <Kbd keys={String(i + 1)} className="ml-1 hidden opacity-60 sm:inline-flex" />
             </button>
           ))}
@@ -583,13 +602,15 @@ export function Segmented<T extends string>({ options, value, onChange, classNam
 
 // ── Settings ───────────────────────────────────────────────────────────
 
-export function Settings({ title, meta, status, sections, onSave, dirty, danger }: {
+export function Settings({ title, meta, status, sections, onSave, dirty, saving, danger }: {
   title?: ReactNode
   meta?: ReactNode
   status: ReactNode
   sections: { title: string; body: ReactNode }[]
   onSave: () => void
   dirty: boolean
+  /** The save is in flight. The bar says so and the button spins its own icon. */
+  saving?: boolean
   /** Contents of the danger zone. Use <EchoDialog> for the action. */
   danger: ReactNode
 }) {
@@ -629,9 +650,12 @@ export function Settings({ title, meta, status, sections, onSave, dirty, danger 
           </section>
         </div>
       </div>
-      <div className={cn('op-sticky-bottom flex items-center gap-3 border-t bg-background px-4 py-2 text-xs @3xl:-mx-6 @3xl:px-6', !dirty && 'text-muted-foreground')}>
-        <span>{dirty ? 'unsaved changes' : 'no changes'}</span>
-        <Button ref={saveBtn} size="sm" disabled={!dirty} onClick={onSave} className={cn('op-primary ml-auto h-8 text-xs', pressed && 'op-pressed')}>
+      <div className={cn('op-sticky-bottom flex items-center gap-3 border-t bg-background px-4 py-2 text-xs @3xl:-mx-6 @3xl:px-6', !dirty && !saving && 'text-muted-foreground')}>
+        <span>{saving ? 'saving' : dirty ? 'unsaved changes' : 'no changes'}</span>
+        {/* Busy, never disabled while saving: disabling drops focus, and a keyboard
+            reader who just pressed ⌘S would be thrown to the top of the document at
+            exactly the moment they are waiting to hear whether it worked. */}
+        <Button ref={saveBtn} size="sm" disabled={!dirty && !saving} busy={saving} busyLabel={<><Loader2 aria-hidden /> saving…</>} onClick={onSave} className={cn('op-primary ml-auto h-8 text-xs', pressed && 'op-pressed')}>
           save <Kbd keys={['⌘', 'S']} className="ml-1 opacity-70" />
         </Button>
       </div>
