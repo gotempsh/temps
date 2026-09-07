@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::externalsvc::{
-    mariadb::MariaDbSizeProfile, rustfs::DEFAULT_RUSTFS_IMAGE, ServiceResourceLimits,
+    mariadb::{validate_immutable_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
+    rustfs::DEFAULT_RUSTFS_IMAGE,
+    ServiceResourceLimits,
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
@@ -451,6 +453,19 @@ impl ParameterStrategy for MariaDbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
         reject_non_loopback_host(params)?;
+        // Absent/empty is fine here -- `auto_generate_missing` (which runs
+        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, same as every
+        // other optional field on this strategy. Only a caller-supplied
+        // image is held to the immutable-digest bar: our own default is a
+        // known-safe, logical-backup-only image we control, not something
+        // that needs pinning against drift.
+        if let Some(image) = params
+            .get("docker_image")
+            .and_then(JsonValue::as_str)
+            .filter(|image| !image.trim().is_empty())
+        {
+            validate_immutable_mariadb_image(image)?;
+        }
         validate_mariadb_credentials(params)?;
         mariadb_size_profile_from_params(params)?;
         validate_service_resource_limits(params)?;
@@ -482,7 +497,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("mariadb:lts".to_string()),
+                JsonValue::String(MARIADB_DEFAULT_IMAGE.to_string()),
             );
         }
 
@@ -527,6 +542,12 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                     self.updateable_keys().join(", ")
                 ));
             }
+        }
+        if let Some(image) = updates.get("docker_image") {
+            let image = image.as_str().ok_or_else(|| {
+                "MariaDB docker_image must be a string containing an immutable digest".to_string()
+            })?;
+            validate_immutable_mariadb_image(image)?;
         }
         Ok(())
     }
@@ -597,8 +618,8 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., mariadb:lts)",
-                    "default": "mariadb:lts"
+                    "description": "MariaDB image (updateable). Defaults to a plain upstream tag; set an immutable repository@sha256:<64-hex-digest> reference to enable continuous archiving (mariadb_physical backups).",
+                    "default": MARIADB_DEFAULT_IMAGE
                 },
                 "size_profile": {
                     "type": "string",
@@ -607,6 +628,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                     "enum": ["small", "standard", "dedicated"]
                 }
             },
+            "required": ["docker_image"],
             "readonly": ["host", "database", "username", "password", "root_password", "size_profile", "resources"]
         }))
     }
@@ -1463,10 +1485,15 @@ mod tests {
     fn test_mariadb_generates_defaults() {
         let strategy = MariaDbParameterStrategy;
         let mut params = HashMap::new();
+        let image = "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        params.insert(
+            "docker_image".to_string(),
+            JsonValue::String(image.to_string()),
+        );
 
         strategy
             .validate_for_creation(&params)
-            .expect("empty MariaDB params should use defaults");
+            .expect("digest-pinned MariaDB image is accepted");
         strategy
             .auto_generate_missing(&mut params)
             .expect("defaults should generate");
@@ -1481,7 +1508,7 @@ mod tests {
         );
         assert_eq!(
             params.get("docker_image"),
-            Some(&JsonValue::String("mariadb:lts".to_string()))
+            Some(&JsonValue::String(image.to_string()))
         );
         assert_eq!(
             params.get("size_profile"),
@@ -1502,6 +1529,40 @@ mod tests {
             .get("root_password")
             .and_then(|v| v.as_str())
             .is_some());
+    }
+
+    #[test]
+    fn test_mariadb_missing_image_defaults_instead_of_failing() {
+        // A caller who names no image at all gets the safe, mutable
+        // MARIADB_DEFAULT_IMAGE from auto_generate_missing -- creation must
+        // not require every caller to already know about WAL-G pinning.
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+        strategy
+            .validate_for_creation(&params)
+            .expect("missing image defers to auto_generate_missing, not an error");
+        strategy
+            .auto_generate_missing(&mut params)
+            .expect("defaults should generate");
+        assert_eq!(
+            params.get("docker_image"),
+            Some(&JsonValue::String(MARIADB_DEFAULT_IMAGE.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_mariadb_rejects_explicit_mutable_image() {
+        // A caller who *does* name an image is still held to the immutable
+        // bar -- only our own known-safe default is exempt.
+        let strategy = MariaDbParameterStrategy;
+        let params = HashMap::from([(
+            "docker_image".to_string(),
+            JsonValue::String("ghcr.io/gotempsh/mariadb-walg:11.4".to_string()),
+        )]);
+        let mutable = strategy
+            .validate_for_creation(&params)
+            .expect_err("mutable image tag must fail closed");
+        assert!(mutable.contains("must be immutable"));
     }
 
     #[test]

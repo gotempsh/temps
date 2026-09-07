@@ -113,6 +113,22 @@ jobs:
           docker run --rm --network temps-e2e_default --entrypoint /bin/sh minio/mc \
             -c 'until mc alias set backup http://minio:9000 minioadmin minioadmin; do sleep 2; done; mc mb --ignore-existing backup/temps-e2e-backups'
 
+      - name: Build immutable MariaDB WAL-G recovery image
+        if: matrix.shard == 'recovery'
+        run: |
+          docker build --build-arg TARGETARCH=amd64 --tag temps-e2e-mariadb-walg:ci images/mariadb-walg
+          MARIADB_IMAGE_ID=$(docker image inspect --format '{{.Id}}' temps-e2e-mariadb-walg:ci)
+          if [[ ! "$MARIADB_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Docker returned an invalid MariaDB image ID" >&2
+            exit 1
+          fi
+          printf 'TEMPS_E2E_MARIADB_IMAGE=%s\n' "$MARIADB_IMAGE_ID" >> "$GITHUB_ENV"
+
+      - name: Test recovery scenario contracts
+        if: matrix.shard == 'recovery'
+        working-directory: apps/temps-e2e
+        run: bun test src/lib/mariadb-image.test.ts
+
       - name: Prepare Temps instance
         # Authenticate public GitHub API requests made by the git-deploy
         # scenario. GitHub-hosted runners share the anonymous 60 req/hour

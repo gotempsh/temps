@@ -277,6 +277,11 @@ const DockerRegistryPage = lazy(() =>
     default: m.DockerRegistryPage,
   }))
 )
+const CloudSettingsPage = lazy(() =>
+  import('./pages/settings/CloudSettingsPage').then((m) => ({
+    default: m.CloudSettingsPage,
+  }))
+)
 const VersionPage = lazy(() =>
   import('./pages/settings/VersionPage').then((m) => ({
     default: m.VersionPage,
@@ -371,6 +376,11 @@ const AiGatewaySetupPage = lazy(() =>
 const AiChat = lazy(() =>
   import('./pages/AiChat').then((m) => ({
     default: m.AiChat,
+  }))
+)
+const AiFirstPrototype = lazy(() =>
+  import('./pages/AiFirstPrototype').then((m) => ({
+    default: m.AiFirstPrototype,
   }))
 )
 const AiWorkflowsOverview = lazy(() =>
@@ -701,6 +711,7 @@ const FullAppRoutes = () => {
                         path="metrics-monitoring"
                         element={<MetricsMonitoringPage />}
                       />
+                      <Route path="cloud" element={<CloudSettingsPage />} />
                       <Route path="nodes" element={<NodesPage />} />
                       <Route
                         path="nodes/:nodeId"
@@ -783,6 +794,7 @@ const FullAppRoutes = () => {
                       element={<AiGatewaySetupPage />}
                     />
                     <Route path="/chat" element={<AiChat />} />
+                    <Route path="/ai-first" element={<AiFirstPrototype />} />
                     <Route
                       path="/ai-workflows"
                       element={<AiWorkflowsOverview />}

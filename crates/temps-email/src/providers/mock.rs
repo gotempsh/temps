@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use crate::errors::EmailError;
 use crate::providers::{
     DnsRecord, DnsRecordStatus, DomainIdentity, DomainIdentityDetails, EmailProvider,
-    EmailProviderType, SendEmailRequest, SendEmailResponse, VerificationStatus,
+    EmailProviderType, ProviderDomainIdentity, SendEmailRequest, SendEmailResponse,
+    VerificationStatus,
 };
 
 /// Pre-scripted outcome for a single `MockEmailProvider::send()` call.
@@ -43,6 +44,13 @@ pub struct MockEmailProvider {
     pub verification_status: VerificationStatus,
     pub send_delay: std::time::Duration,
 
+    /// Domains returned by `list_identities`. Defaults to empty (not
+    /// unsupported -- see `with_list_identities_unsupported` for that case).
+    pub list_identities_response: Vec<ProviderDomainIdentity>,
+    /// When set, `list_identities` returns `UnsupportedOperation` instead of
+    /// `list_identities_response`, mirroring SMTP's real behavior.
+    pub list_identities_unsupported: bool,
+
     /// Pre-scripted per-call send outcomes. Consumed from the front of the
     /// queue on each `send()` call. When the queue is exhausted the provider
     /// falls back to `should_fail_send`.
@@ -66,6 +74,8 @@ impl MockEmailProvider {
             should_fail_verify: false,
             verification_status: VerificationStatus::Verified,
             send_delay: std::time::Duration::ZERO,
+            list_identities_response: Vec::new(),
+            list_identities_unsupported: false,
             scripted_responses: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -87,6 +97,17 @@ impl MockEmailProvider {
 
     pub fn with_verification_status(mut self, status: VerificationStatus) -> Self {
         self.verification_status = status;
+        self
+    }
+
+    pub fn with_list_identities_response(mut self, domains: Vec<ProviderDomainIdentity>) -> Self {
+        self.list_identities_response = domains;
+        self
+    }
+
+    /// Mimics SMTP: `list_identities` returns `UnsupportedOperation`.
+    pub fn with_list_identities_unsupported(mut self) -> Self {
+        self.list_identities_unsupported = true;
         self
     }
 
@@ -265,6 +286,16 @@ impl EmailProvider for MockEmailProvider {
 
     fn provider_type(&self) -> EmailProviderType {
         EmailProviderType::Ses // Use SES as default mock type
+    }
+
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+        if self.list_identities_unsupported {
+            return Err(EmailError::UnsupportedOperation {
+                provider_type: "mock".to_string(),
+                operation: "listing registered domains".to_string(),
+            });
+        }
+        Ok(self.list_identities_response.clone())
     }
 }
 

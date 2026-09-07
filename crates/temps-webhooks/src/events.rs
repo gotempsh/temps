@@ -26,6 +26,11 @@ pub enum WebhookEventType {
     DomainCreated,
     DomainProvisioned,
 
+    // Backup events
+    BackupStarted,
+    BackupCompleted,
+    BackupFailed,
+
     // Email events
     EmailDelivered,
     EmailBounced,
@@ -45,6 +50,9 @@ impl WebhookEventType {
             Self::ProjectDeleted,
             Self::DomainCreated,
             Self::DomainProvisioned,
+            Self::BackupStarted,
+            Self::BackupCompleted,
+            Self::BackupFailed,
             Self::EmailDelivered,
             Self::EmailBounced,
             Self::EmailComplained,
@@ -63,6 +71,9 @@ impl WebhookEventType {
             Self::ProjectDeleted => "project.deleted",
             Self::DomainCreated => "domain.created",
             Self::DomainProvisioned => "domain.provisioned",
+            Self::BackupStarted => "backup.started",
+            Self::BackupCompleted => "backup.completed",
+            Self::BackupFailed => "backup.failed",
             Self::EmailDelivered => "email.delivered",
             Self::EmailBounced => "email.bounced",
             Self::EmailComplained => "email.complained",
@@ -82,6 +93,9 @@ impl WebhookEventType {
             "project.deleted" | "project_deleted" => Some(Self::ProjectDeleted),
             "domain.created" | "domain_created" => Some(Self::DomainCreated),
             "domain.provisioned" | "domain_provisioned" => Some(Self::DomainProvisioned),
+            "backup.started" | "backup_started" => Some(Self::BackupStarted),
+            "backup.completed" | "backup_completed" => Some(Self::BackupCompleted),
+            "backup.failed" | "backup_failed" => Some(Self::BackupFailed),
             "email.delivered" | "email_delivered" => Some(Self::EmailDelivered),
             "email.bounced" | "email_bounced" => Some(Self::EmailBounced),
             "email.complained" | "email_complained" => Some(Self::EmailComplained),
@@ -135,6 +149,7 @@ pub enum WebhookPayload {
     Deployment(DeploymentPayload),
     Project(ProjectPayload),
     Domain(DomainPayload),
+    Backup(BackupPayload),
     Email(EmailEventPayload),
 }
 
@@ -173,6 +188,26 @@ pub struct DomainPayload {
     pub project_name: String,
     pub is_primary: bool,
     pub ssl_status: Option<String>,
+}
+
+/// Backup lifecycle event payload. Shared across `backup.started` /
+/// `backup.completed` / `backup.failed` — `status` distinguishes which,
+/// same convention as [`DeploymentPayload`]. `project_id`/`project_name`
+/// are `None` when the backup's underlying service isn't linked to exactly
+/// one project (unlinked, or linked to several) — a backup is scoped to a
+/// service and schedule, not a project, unlike a deployment.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BackupPayload {
+    pub backup_id: i32,
+    pub engine: String,
+    pub project_id: Option<i32>,
+    pub project_name: Option<String>,
+    pub status: String,
+    pub s3_location: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub error_message: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 /// Email event payload (bounces, complaints, deliveries)

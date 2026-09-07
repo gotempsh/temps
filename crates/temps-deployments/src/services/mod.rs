@@ -5,6 +5,9 @@
 pub mod services;
 pub use services::*;
 
+pub mod container_operations;
+pub use container_operations::*;
+
 pub mod types;
 pub use types::*;
 
@@ -73,3 +76,6 @@ pub use traefik_discovery_service::*;
 
 pub mod cert_validator;
 pub use cert_validator::*;
+
+pub mod source_drop_service;
+pub use source_drop_service::*;

@@ -1072,6 +1072,7 @@ impl MongodbService {
         walg_s3_prefix: &str,
         s3_credentials: &super::S3Credentials,
         mongodb_uri: &str,
+        backup_id: &str,
     ) -> anyhow::Result<()> {
         let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
         let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
@@ -1084,7 +1085,15 @@ impl MongodbService {
             format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
             format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
             format!("MONGODB_URI={}", mongodb_uri),
+            format!(
+                "WALG_SENTINEL_USER_DATA={}",
+                serde_json::json!({ "temps_backup_id": backup_id })
+            ),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if let Some(resolved_endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, container_name)
@@ -1221,6 +1230,10 @@ impl MongodbService {
             format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
             format!("MONGODB_URI={}", mongodb_uri),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials
@@ -2873,6 +2886,7 @@ impl ExternalService for MongodbService {
                 &walg_s3_prefix,
                 s3_credentials,
                 &mongodb_uri,
+                &backup.backup_id,
             )
             .await;
 

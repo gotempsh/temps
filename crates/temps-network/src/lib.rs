@@ -45,6 +45,8 @@ pub mod linux;
 /// sea-orm into their build.
 #[cfg(feature = "control_plane")]
 pub mod allocator;
+#[cfg(feature = "control_plane")]
+pub mod control_plane;
 
 pub use config::{NetworkConfig, NodeAlloc, Peer, Transport};
 pub use diff::{PeerDiff, RouteDiff};
@@ -53,3 +55,66 @@ pub use manager::NetworkManager;
 
 /// Convenient `Result` alias for the crate.
 pub type Result<T> = std::result::Result<T, NetworkError>;
+
+/// Auto-detect the underlay network device — the interface carrying the
+/// host's IPv4 default route — instead of assuming a hardcoded name like
+/// `eth0`. Cloud providers with predictable interface naming (Hetzner's
+/// `enp6s0`, AWS's `ens5`, etc.) never use `eth0`, so relying on that
+/// default fails VXLAN bootstrap on most real deployments.
+#[cfg(target_os = "linux")]
+pub async fn detect_underlay_device() -> Result<String> {
+    linux::detect_underlay_device().await
+}
+
+#[cfg(target_os = "linux")]
+pub async fn preflight_compute_pool_routes(
+    config: &NetworkConfig,
+    pool: ipnet::Ipv4Net,
+) -> Result<()> {
+    linux::preflight_compute_pool_routes(config, pool).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn preflight_compute_pool_routes(
+    _config: &NetworkConfig,
+    _pool: ipnet::Ipv4Net,
+) -> Result<()> {
+    Ok(())
+}
+
+/// Detect the MTU of the selected underlay interface. This must be resolved
+/// from the actual link rather than assumed to be 1500: VXLAN adds 50 bytes
+/// and Linux will reject an overlay MTU larger than the parent can carry.
+#[cfg(target_os = "linux")]
+pub async fn detect_underlay_mtu(device: &str) -> Result<u32> {
+    linux::detect_underlay_mtu(device).await
+}
+
+/// Find the interface that owns an operator-provided private/underlay IP.
+/// This is more reliable than the default-route device for VLAN and
+/// WireGuard based clusters.
+#[cfg(target_os = "linux")]
+pub async fn detect_device_for_address(address: std::net::IpAddr) -> Result<String> {
+    linux::detect_device_for_address(address).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn detect_device_for_address(_address: std::net::IpAddr) -> Result<String> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn detect_underlay_mtu(_device: &str) -> Result<u32> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn detect_underlay_device() -> Result<String> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}

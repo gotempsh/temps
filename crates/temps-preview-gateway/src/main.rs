@@ -43,6 +43,7 @@ const DEFAULT_SANDBOX_HOST_TEMPLATE: &str = "temps-sandbox-{sid}";
 const DEFAULT_MAX_HEADER_BYTES: usize = 16 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const PREVIEW_TOKEN_HEADER: &str = "x-temps-preview-token";
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -63,16 +64,15 @@ impl Config {
             .parse()
             .context("LISTEN_ADDR is not a valid socket address")?;
 
-        // Security model: the gateway must only be reachable from the host's
-        // loopback interface, where the host-side Pingora has already
-        // authenticated the request. This is enforced at the *docker port
-        // publish* layer (`-p 127.0.0.1:8090:8080`), not by the in-container
-        // bind, because inside the container we have to bind 0.0.0.0 for the
-        // published port to forward at all.
+        // Security model: the gateway must only receive requests from the
+        // host-side ingress relay after Pingora has authenticated them. The
+        // supervisor places this routing process exclusively on internal
+        // Docker networks; a separate hardened relay owns the host-loopback
+        // port publish and reaches this process over a private control network.
         //
         // We still refuse anything other than a loopback bind OR 0.0.0.0:
         // - 127.0.0.1 → fine for bare-metal / host-network runs
-        // - 0.0.0.0   → fine, but ONLY safe when paired with `-p 127.0.0.1:…`
+        // - 0.0.0.0   → fine only behind the supervisor's isolated relay
         // - any other IP → almost certainly an operator mistake
         let ip = listen_addr.ip();
         if !ip.is_loopback() && !ip.is_unspecified() {
@@ -84,8 +84,8 @@ impl Config {
         }
         if ip.is_unspecified() {
             warn!(
-                "Binding {} — this is only safe when the container is started with \
-                 `-p 127.0.0.1:<host_port>:{}` so the host loopback is the only ingress",
+                "Binding {} — this is only safe on the supervisor-managed internal \
+                 networks behind the loopback-published ingress relay on port {}",
                 listen_addr,
                 listen_addr.port()
             );
@@ -183,7 +183,7 @@ async fn handle_client(mut client: TcpStream, peer: SocketAddr, config: Config) 
     // the host-side Pingora is configured to inject. This is belt-and-suspenders
     // on top of the docker port-publish bind to 127.0.0.1.
     if let Some(expected) = config.shared_secret.as_deref() {
-        let presented = find_header(&buf[..header_end], "x-temps-preview-token");
+        let presented = find_header(&buf[..header_end], PREVIEW_TOKEN_HEADER);
         let ok = presented
             .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
             .unwrap_or(false);
@@ -274,10 +274,17 @@ async fn handle_client(mut client: TcpStream, peer: SocketAddr, config: Config) 
             }
         };
 
-    // Replay everything we've already buffered (the entire request head plus
-    // anything that may have followed in the same TCP read) before we splice.
+    // The preview token authenticates the host proxy to this gateway. It must
+    // never cross the tenant boundary: a sandbox that learned the singleton
+    // token could otherwise call the gateway directly over its private Docker
+    // network and route to another sandbox. Strip every occurrence, including
+    // obsolete folded continuations, before forwarding any buffered bytes.
+    let forwarded = strip_request_header(&buf, header_end, PREVIEW_TOKEN_HEADER)?;
+
+    // Replay the sanitized request head plus anything that may have followed
+    // in the same TCP read before we splice.
     upstream
-        .write_all(&buf)
+        .write_all(&forwarded)
         .await
         .context("failed to forward buffered request to upstream")?;
 
@@ -425,6 +432,52 @@ fn find_header<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Remove every occurrence of an internal authentication header from a
+/// buffered HTTP request while preserving the request line, all unrelated
+/// headers, the header terminator, and any already-buffered body bytes.
+fn strip_request_header(request: &[u8], header_end: usize, name: &str) -> Result<Vec<u8>> {
+    if header_end < 4
+        || header_end > request.len()
+        || &request[header_end - 4..header_end] != b"\r\n\r\n"
+    {
+        return Err(anyhow!("invalid buffered HTTP header boundary"));
+    }
+
+    let head = std::str::from_utf8(&request[..header_end - 4])
+        .context("buffered HTTP request head is not valid UTF-8")?;
+    let mut lines = head.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("buffered HTTP request is missing its request line"))?;
+
+    let mut sanitized = Vec::with_capacity(request.len());
+    sanitized.extend_from_slice(request_line.as_bytes());
+    sanitized.extend_from_slice(b"\r\n");
+
+    let mut stripping_continuation = false;
+    for line in lines {
+        if line.starts_with([' ', '\t']) {
+            if !stripping_continuation {
+                sanitized.extend_from_slice(line.as_bytes());
+                sanitized.extend_from_slice(b"\r\n");
+            }
+            continue;
+        }
+
+        let strip = line
+            .split_once(':')
+            .is_some_and(|(field, _)| field.eq_ignore_ascii_case(name));
+        stripping_continuation = strip;
+        if !strip {
+            sanitized.extend_from_slice(line.as_bytes());
+            sanitized.extend_from_slice(b"\r\n");
+        }
+    }
+    sanitized.extend_from_slice(b"\r\n");
+    sanitized.extend_from_slice(&request[header_end..]);
+    Ok(sanitized)
 }
 
 /// Constant-time byte comparison to avoid timing leaks on the shared secret.
@@ -589,6 +642,48 @@ mod tests {
     fn missing_host_header_returns_none() {
         let head = b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n";
         assert_eq!(parse_host_header(head), None);
+    }
+
+    #[test]
+    fn strips_all_preview_tokens_before_forwarding_to_tenant() {
+        let request = concat!(
+            "POST /echo HTTP/1.1\r\n",
+            "Host: ws-abcd1234ef567890-3000.localho.st\r\n",
+            "X-Temps-Preview-Token: first-secret\r\n",
+            "\tcontinued-secret\r\n",
+            "Content-Length: 4\r\n",
+            "x-temps-preview-token: second-secret\r\n",
+            "X-Visible: yes\r\n",
+            "\r\n",
+            "body"
+        )
+        .as_bytes();
+        let header_end = find_double_crlf(request).unwrap() + 4;
+
+        let sanitized = strip_request_header(request, header_end, PREVIEW_TOKEN_HEADER).unwrap();
+        let sanitized = std::str::from_utf8(&sanitized).unwrap();
+
+        assert_eq!(
+            sanitized,
+            concat!(
+                "POST /echo HTTP/1.1\r\n",
+                "Host: ws-abcd1234ef567890-3000.localho.st\r\n",
+                "Content-Length: 4\r\n",
+                "X-Visible: yes\r\n",
+                "\r\n",
+                "body"
+            )
+        );
+        for secret in ["first-secret", "continued-secret", "second-secret"] {
+            assert!(!sanitized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_header_boundary_before_forwarding() {
+        let error =
+            strip_request_header(b"GET / HTTP/1.1\r\n\r\n", 3, PREVIEW_TOKEN_HEADER).unwrap_err();
+        assert_eq!(error.to_string(), "invalid buffered HTTP header boundary");
     }
 
     #[test]

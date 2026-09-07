@@ -21,6 +21,8 @@ temps-deployer = { path = "../temps-deployer" }
 temps-auth = { path = "../temps-auth" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
+temps-cloud-client = { path = "../temps-cloud-client" }
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -65,9 +67,12 @@ zstd = "0.13"
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 
-# Crypto for API key hashing
+# Crypto for API key hashing, and for the ADR-042 `plan_token` HMAC that binds
+# a confirmed bulk-activation estimate to the job it creates.
 sha2 = { workspace = true }
 hex = { workspace = true }
+hmac = "0.13"
+base64 = { workspace = true }
 
 # ClickHouse client — compiled unconditionally; activated at runtime by
 # ServerConfig::is_clickhouse_enabled() (TEMPS_CLICKHOUSE_* env vars).
@@ -97,3 +102,4 @@ anyhow = { workspace = true }
 # `http_wait_plain` enables the HTTP /ping readiness wait — the clickhouse-server
 # image never logs "Ready for connections" to stdout/stderr, only to its log file.
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
+tempfile.workspace = true

@@ -9,6 +9,9 @@ members = [
     "crates/temps-vm-agent",
     # Library crates
     "crates/temps-core",
+    "crates/temps-cloud-protocol",
+    "crates/temps-cloud-client",
+    "crates/temps-cloud",
     "crates/temps-ai",
     "crates/temps-ai-chat",
     "crates/temps-entities",
@@ -200,7 +203,7 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 utoipa = { version = "5.4.0", features = ["axum_extras", "debug"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], default-features = false }
 schemars = { version = "1.2", features = ["preserve_order"] }
-jsonschema = { version = "0.52.0", default-features = false }
+jsonschema = { version = "0.53.0", default-features = false }
 
 # ============================================================================
 # Cryptography & Security
@@ -301,6 +304,7 @@ cron = "0.17.0"
 # ============================================================================
 url = "2.5.4"
 urlencoding = "2.1"
+percent-encoding = "2.3"
 slug = "0.1.6"
 regex = "1.11"
 

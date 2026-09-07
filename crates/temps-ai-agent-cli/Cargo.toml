@@ -24,6 +24,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 subtle = "2.6"
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

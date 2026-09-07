@@ -7,7 +7,7 @@ export const metadata = {
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-08-25
+> Generated on: 2026-09-04
 
 ## Installation
 
@@ -1479,6 +1479,7 @@ Manage notification providers (Slack, Email, Webhook, etc.)
 - `show` - Show notification provider details
 - `remove` (`rm`) - Remove a notification provider
 - `test` - Send a test notification
+- `routes` - Manage severity-based notification routes (which providers receive which severities)
 
 ### `notifications list` (alias: `ls`)
 
@@ -1592,6 +1593,83 @@ Send a test notification
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
+
+### `notifications routes`
+
+Manage severity-based notification routes (which providers receive which severities)
+
+**Subcommands:**
+
+- `list` (`ls`) - List notification routes
+- `show` - Show notification route details
+- `create` - Create a notification route
+- `update` - Update a notification route
+- `remove` (`rm`) - Remove a notification route
+
+#### `notifications routes list` (alias: `ls`)
+
+List notification routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes show`
+
+Show notification route details
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes create`
+
+Create a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Route name | - | Yes |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs | - | Yes |
+| `--enabled <enabled>` | Enable or disable (true/false, default: true) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+#### `notifications routes update`
+
+Update a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-n, --name <name>` | New route name | - | Yes |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs (replaces the current set) | - | Yes |
+| `--enabled <enabled>` | Enable or disable (true/false) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes remove` (alias: `rm`)
+
+Remove a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ## `dns`
 
@@ -1716,6 +1794,7 @@ Manage external services (databases, caches, storage)
 - `logs` - View persisted logs for an external service
 - `slow-queries` - Show slowest PostgreSQL queries from pg_stat_statements
 - `enable-pg-stat-statements` - Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)
+- `metrics` - Resource and engine metrics for a database/cache/storage service
 - `restore-capabilities` - Show what restore modes a service supports (in-place / new service / PITR)
 - `list-backups` - List backups stored on an S3 source
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
@@ -1962,6 +2041,159 @@ Enable pg_stat_statements on a standalone Postgres service by restarting its con
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
 | `-y, --yes` | Skip the restart confirmation prompt (for automation) | - | No |
+
+### `services metrics`
+
+Resource and engine metrics for a database/cache/storage service
+
+**Subcommands:**
+
+- `latest` - Show the most recent value of every tracked metric
+- `range` - Show a time-series range for a single metric
+- `status` - Show when metrics were last received for a service
+- `by-database` - Per-database metric breakdown (PostgreSQL services only)
+- `enable` - Enable metric collection for a service (seeds default alert rules)
+- `disable` - Disable metric collection for a service
+- `alert-rules` - Manage monitoring alert rules for a service
+
+#### `services metrics latest`
+
+Show the most recent value of every tracked metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics range`
+
+Show a time-series range for a single metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-r, --range <window>` | Time window: 1h, 6h, 24h, 7d (default: 24h) | - | Yes |
+| `-p, --percentile <n>` | Histogram percentile (0-100) instead of a plain average | - | Yes |
+| `--json` | Output raw JSON instead of a formatted table | - | No |
+
+#### `services metrics status`
+
+Show when metrics were last received for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics by-database`
+
+Per-database metric breakdown (PostgreSQL services only)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics enable`
+
+Enable metric collection for a service (seeds default alert rules)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics disable`
+
+Disable metric collection for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics alert-rules`
+
+Manage monitoring alert rules for a service
+
+**Subcommands:**
+
+- `list` (`ls`) - List alert rules for a service
+- `create` (`add`) - Create an alert rule for a service
+- `update` - Update an existing alert rule
+- `remove` (`rm`) - Delete an alert rule
+
+##### `services metrics alert-rules list` (alias: `ls`)
+
+List alert rules for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules create` (alias: `add`)
+
+Create an alert rule for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | Yes |
+| `-t, --threshold <n>` | Threshold value that triggers the alert | - | Yes |
+| `-s, --severity <level>` | warning or critical (default: warning) | - | Yes |
+| `--for-duration <secs>` | Seconds the breach must persist before firing (default: 0) | - | Yes |
+| `--disabled` | Create the rule disabled | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules update`
+
+Update an existing alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | Yes |
+| `-m, --metric <name>` | Metric name | - | Yes |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | Yes |
+| `-t, --threshold <n>` | Threshold value | - | Yes |
+| `-s, --severity <level>` | warning or critical | - | Yes |
+| `--for-duration <secs>` | Seconds the breach must persist before firing | - | Yes |
+| `--enable` | Enable the rule | - | No |
+| `--disable` | Disable the rule | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules remove` (alias: `rm`)
+
+Delete an alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-y, --yes` | Skip confirmation prompt | - | No |
 
 ### `services restore-capabilities`
 
@@ -2652,7 +2884,7 @@ Manage project containers in environments
 - `start` - Start a stopped container
 - `stop` - Stop a running container
 - `restart` - Restart a container
-- `history` - List every container that has ever run in an environment, including ones replaced by a later redeploy
+- `history` - List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 - `metrics` - Get container resource metrics (all containers if no container ID specified)
 
 ### `containers list` (alias: `ls`)
@@ -2719,7 +2951,7 @@ Restart a container
 
 ### `containers history`
 
-List every container that has ever run in an environment, including ones replaced by a later redeploy
+List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 
 **Options:**
 
@@ -2727,6 +2959,8 @@ List every container that has ever run in an environment, including ones replace
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
+| `-d, --deployment-id <id>` | Only list containers belonging to this deployment | - | Yes |
+| `-l, --limit <count>` | Max REPLACED container rows to return on top of the running ones, newest first (default 20, max 100) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `containers metrics`

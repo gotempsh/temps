@@ -57,6 +57,7 @@ axum = { workspace = true }
 axum-macros = { workspace = true }
 schemars = { workspace = true }
 urlencoding = "2.1"
+percent-encoding = { workspace = true }
 tokio-postgres = "0.7"
 base64 = { workspace = true }
 

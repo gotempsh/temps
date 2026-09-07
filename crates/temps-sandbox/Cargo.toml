@@ -37,6 +37,7 @@ rand = { workspace = true }
 argon2 = { workspace = true }
 hex = "0.4"
 url = { workspace = true }
+percent-encoding = "2.3"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { workspace = true, features = ["io"] }
 futures = { workspace = true }

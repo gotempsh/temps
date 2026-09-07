@@ -14,15 +14,16 @@
  * data verification — not just that the API calls returned 2xx.
  *
  * Flow:
- *   1. Provision a real standalone MariaDB service.
+ *   1. Provision a real standalone MariaDB service from a content-addressed
+ *      WAL-G image built by CI (or a published repository digest).
  *   2. Insert 3 recognizable "pre-backup" rows via `docker exec mariadb`
- *      (the real CLI client shipped in the `mariadb:lts` image — see
+ *      (the real CLI client shipped in the immutable WAL-G image — see
  *      `MariaDbService::execute_sql`'s own `command -v mariadb` check at
  *      mariadb.rs:880).
  *   3. Create an S3 source (MinIO) and trigger a real backup via the backup
  *      engine (`crates/temps-backup/src/engines/dispatch.rs` auto-selects
  *      `mariadb_physical` when `mariadb-backup`/`mariadb-binlog` are present
- *      in the container, which they are in the stock `mariadb:lts` image).
+ *      in the immutable `images/mariadb-walg` image).
  *   4. Poll the backup to a real `completed` state.
  *   5. Insert 2 more "post-backup" rows (distinct id / column values).
  *   6. Verify all 5 rows are present before restore (sanity check).
@@ -39,6 +40,8 @@
  * - MinIO running (from docker-compose.e2e.yml, port 9092).
  * - A bucket named `temps-e2e-backups` already created in MinIO.
  * - Docker accessible from the host running this test (for the mariadb exec).
+ * - `--mariadb-image` or `TEMPS_E2E_MARIADB_IMAGE` set to a repository digest
+ *   or a local content-addressed Docker image ID.
  */
 
 import {
@@ -60,8 +63,10 @@ import {
   makeRunId,
   sleep,
 } from '../lib/flows.ts'
+import { mariadbServiceParameters } from '../lib/mariadb-image.ts'
 
 export interface MariadbRestoreScenarioOptions {
+  mariadbImage?: string
   minioEndpoint?: string
   minioBucket?: string
   keep?: boolean
@@ -220,6 +225,10 @@ export async function mariadbRestoreScenarioCommand(
 
   const minioEndpoint = opts.minioEndpoint ?? 'http://localhost:9092'
   const minioBucket = opts.minioBucket ?? 'temps-e2e-backups'
+  const serviceParameters = mariadbServiceParameters(
+    opts.mariadbImage ?? process.env.TEMPS_E2E_MARIADB_IMAGE,
+    MARIADB_DATABASE,
+  )
 
   const runId = makeRunId(Date.now())
   const steps: StepLog[] = []
@@ -252,10 +261,7 @@ export async function mariadbRestoreScenarioCommand(
       createE2eService(client, {
         name: svcName,
         serviceType: 'mariadb',
-        parameters: {
-          database: MARIADB_DATABASE,
-          username: 'app',
-        },
+        parameters: serviceParameters,
       }),
     )
     serviceIds.push(service.id)

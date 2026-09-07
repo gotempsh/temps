@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-cloud-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol between a self-hosted Temps instance and an optional managed backend."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+# `serde` is not in the workspace uuid feature set, but every identifier on this
+# wire protocol is a Uuid, so it is enabled here rather than widened globally.
+uuid = { workspace = true, features = ["serde"] }
+thiserror.workspace = true

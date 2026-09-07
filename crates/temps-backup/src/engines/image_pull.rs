@@ -125,5 +125,7 @@ mod tests {
     fn split_image_tag_preserves_digest_reference() {
         let image = "minio/mc@sha256:0123456789abcdef";
         assert_eq!(split_image_tag(image), (image, None));
+        let tagged_image = "mongo:7.0.39-jammy@sha256:0123456789abcdef";
+        assert_eq!(split_image_tag(tagged_image), (tagged_image, None));
     }
 }

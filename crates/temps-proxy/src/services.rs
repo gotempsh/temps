@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use pingora_core::{upstreams::peer::HttpPeer, Result as PingoraResult};
 use std::sync::Arc;
 use temps_routes::CachedPeerTable;
-use tracing::{debug, warn};
+use tracing::debug;
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
 const ROUTE_PREFIX_OTEL: &str = "/api/otel";
@@ -161,7 +161,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
         }
 
         // No route found - route to console address as default
-        warn!(
+        debug!(
             "No route found in table for host: {}, routing to console (route_count={})",
             host,
             self.route_table.len()

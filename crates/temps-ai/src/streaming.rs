@@ -8,6 +8,8 @@
 //! the assistant's reply token-by-token — the substrate for persistent,
 //! resumable debugging conversations.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use futures::future::BoxFuture;
@@ -119,16 +121,24 @@ impl ChatMessage {
     }
 }
 
-/// A multi-turn request. The caller supplies the *full* replayed history (our DB
-/// is the source of truth — see ADR-023); the provider is stateless. When
-/// `tools` is non-empty the model may answer with tool calls instead of text
-/// (see [`crate::AiService::chat`]).
+/// A multi-turn request. The caller supplies the *full* replayed history because
+/// our database remains the source of truth (see ADR-023). Stateful harnesses
+/// may continue their provider-owned session and send only the newest user turn;
+/// stateless providers replay `messages` in full. When `tools` is non-empty the
+/// model may answer with tool calls instead of text (see [`crate::AiService::chat`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnRequest {
+    /// Stable opaque id used only to correlate latency and lifecycle telemetry
+    /// across chat orchestration, sandbox setup, and the harness adapter.
+    pub trace_id: Option<String>,
     /// Short tag for logging / usage attribution, e.g. `"deploy.debug_chat"`.
     pub purpose: String,
     /// Governance + usage scope.
     pub project_id: Option<i32>,
+    /// Authenticated user who initiated this server-owned turn. This is never
+    /// accepted from an HTTP payload; it binds ephemeral sandbox capabilities
+    /// to the audited principal that caused them to be issued.
+    pub principal_id: Option<i32>,
     /// Provider pinned by the caller for this conversation. `gateway` selects
     /// BYOK routing; an agent CLI catalog id selects that host CLI.
     pub provider: Option<String>,
@@ -144,8 +154,104 @@ pub struct ChatTurnRequest {
     /// Provider-specific execution permission mode selected when the
     /// conversation was created (for example `auto` or `full-access`).
     pub permission_mode: Option<String>,
+    /// Provider-owned session to continue for a development-harness turn.
+    ///
+    /// The chat service reads this opaque value from its conversation record;
+    /// HTTP clients cannot provide it. Harness adapters translate it to their
+    /// native continuation protocol (`--resume`, `exec resume`, or `--session`).
+    /// The full `messages` collection is retained as the server-owned recovery
+    /// source if native session state is ever unavailable.
+    pub resume_session_id: Option<String>,
+    /// Explicit, Temps-managed workspace for a development-harness turn.
+    ///
+    /// This is intentionally absent for API-gateway requests. Harness
+    /// adapters must reject a request without this value rather than falling
+    /// back to a host scratch directory: an application thread is always
+    /// executed in a Temps sandbox against its durable workspace.
+    pub harness_workspace: Option<HarnessWorkspace>,
+    /// Secret runtime variables scoped to the sandbox's attached project and
+    /// default environment. Server-side orchestration populates these; HTTP
+    /// clients cannot. The wrapper redacts values from Debug output.
+    pub sandbox_environment: SensitiveEnvironment,
+    /// Short-lived, turn-scoped MCP endpoint for platform operations from a
+    /// managed development sandbox. The endpoint is created by the chat
+    /// service from the initiating user's authenticated context and disappears
+    /// when the turn ends. It is never a reusable Temps API credential.
+    pub harness_mcp_server: Option<HarnessMcpServer>,
+    /// Resolve the provider-owned title for the newly created harness session.
+    /// Enabled only for the first user turn so adapters never scan session
+    /// metadata on routine follow-ups.
+    pub capture_session_title: bool,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SensitiveEnvironment(HashMap<String, String>);
+
+impl SensitiveEnvironment {
+    pub fn new(variables: HashMap<String, String>) -> Self {
+        Self(variables)
+    }
+
+    pub fn redaction_values(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().filter_map(|(name, value)| {
+            let upper = name.to_ascii_uppercase();
+            (!value.is_empty()
+                && ["PASSWORD", "TOKEN", "SECRET", "KEY", "URL", "DSN"]
+                    .iter()
+                    .any(|marker| upper.contains(marker)))
+            .then_some(value)
+        })
+    }
+
+    pub fn into_inner(self) -> HashMap<String, String> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for SensitiveEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut variable_names = self.0.keys().collect::<Vec<_>>();
+        variable_names.sort();
+        formatter
+            .debug_struct("SensitiveEnvironment")
+            .field("variable_names", &variable_names)
+            .finish()
+    }
+}
+
+/// Connection details for one turn's scoped platform-tool bridge.
+///
+/// The bearer is intentionally redacted from `Debug`: chat requests can be
+/// logged while diagnosing provider failures and this capability must never
+/// appear in logs. The bridge itself still re-checks the captured user/project
+/// authorization for every tool call.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HarnessMcpServer {
+    pub url: String,
+    pub authorization_token: String,
+}
+
+impl std::fmt::Debug for HarnessMcpServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HarnessMcpServer")
+            .field("url", &self.url)
+            .field("authorization_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// A durable, Temps-owned workspace mounted into a development sandbox.
+///
+/// `sandbox_label` is an opaque, validated identifier used only to recover a
+/// persistent sandbox. `host_work_dir` is never supplied by an HTTP client;
+/// the application workspace service derives it beneath `TEMPS_DATA_DIR`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessWorkspace {
+    pub sandbox_label: String,
+    pub host_work_dir: PathBuf,
 }
 
 /// A single non-streaming turn result: either assistant text, or a set of tool
@@ -236,6 +342,17 @@ pub enum ChatStreamDelta {
     /// emits this as a `permission_requested` event; the user resolves it via
     /// `POST .../permissions/{id}/resolve`, which unblocks the subprocess.
     PermissionRequested(PermissionRequest),
+    /// Provider-owned session identity discovered from the harness protocol.
+    ///
+    /// Harnesses do not agree on the wire shape (`session_id`, `thread_id`,
+    /// etc.), so adapters normalize it here. A title is optional because some
+    /// providers publish it only to their local session index after the turn.
+    /// Conversation orchestration may use a bounded first-prompt fallback when
+    /// the provider exposes the id but no separate title.
+    SessionMetadata {
+        session_id: Option<String>,
+        title: Option<String>,
+    },
 }
 
 /// A stream of [`ChatStreamDelta`]s for one agentic turn. Errors are terminal.
@@ -366,5 +483,60 @@ mod tests {
             back,
             PermissionDecision::RejectPlan { feedback: Some(ref f) } if f == "not ready yet"
         ));
+    }
+
+    #[test]
+    fn harness_mcp_debug_redacts_the_turn_capability() {
+        let server = HarnessMcpServer {
+            url: "http://internal/api/ai/sandbox-tools/id/mcp".to_string(),
+            authorization_token: "tmcp_must_not_appear".to_string(),
+        };
+
+        let rendered = format!("{server:?}");
+
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("tmcp_must_not_appear"));
+    }
+
+    #[test]
+    fn sensitive_environment_debug_never_contains_values() {
+        let environment = SensitiveEnvironment::new(HashMap::from([
+            (
+                "REDIS_URL".to_string(),
+                "redis://user:secret@redis:6379".to_string(),
+            ),
+            ("PGHOST".to_string(), "postgres-internal".to_string()),
+        ]));
+
+        let rendered = format!("{environment:?}");
+
+        assert!(rendered.contains("PGHOST"));
+        assert!(rendered.contains("REDIS_URL"));
+        assert!(!rendered.contains("redis://user:secret@redis:6379"));
+        assert!(!rendered.contains("postgres-internal"));
+    }
+
+    #[test]
+    fn sensitive_environment_redacts_credential_bearing_values_from_streams() {
+        let environment = SensitiveEnvironment::new(HashMap::from([
+            (
+                "REDIS_URL".to_string(),
+                "redis://user:secret@redis:6379".to_string(),
+            ),
+            ("PGPASSWORD".to_string(), "database-password".to_string()),
+            ("PGHOST".to_string(), "postgres-internal".to_string()),
+            ("EMPTY_TOKEN".to_string(), String::new()),
+        ]));
+
+        let mut values = environment.redaction_values().cloned().collect::<Vec<_>>();
+        values.sort();
+
+        assert_eq!(
+            values,
+            vec![
+                "database-password".to_string(),
+                "redis://user:secret@redis:6379".to_string(),
+            ]
+        );
     }
 }

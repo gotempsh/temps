@@ -4,6 +4,7 @@
 import {
   adminListNodesOptions,
   createServiceMutation,
+  getProjectOptions,
   getProviderMetadataOptions,
   getProvidersMetadataOptions,
   getServiceTypeParametersOptions,
@@ -16,6 +17,7 @@ import {
 } from '@/api/client/types.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Button } from '@/components/ui/button'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { JsonSchemaForm } from '@/components/forms/JsonSchemaForm'
 import { useServiceTypePreset } from '@/components/forms/ServiceTypePresets'
 import { Input } from '@/components/ui/input'
@@ -28,15 +30,24 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
+import {
+  serviceCreateHref,
+  serviceProjectId,
+  serviceProjectLink,
+} from '@/lib/service-project-link'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { customAlphabet } from 'nanoid'
-import { ArrowLeft, CheckCircle2, Plus, Server, Trash2 } from 'lucide-react'
+import {
+  ArrowLeft,
+  CheckCircle2,
+  Link2,
+  Plus,
+  Server,
+  Trash2,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
-
-// Create a custom nanoid with lowercase alphanumeric characters
-const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
@@ -273,6 +284,7 @@ export function CreateService() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const requestedServiceType = searchParams.get('type')
+  const projectId = serviceProjectId(searchParams.get('project_id'))
   const serviceType = CREATABLE_SERVICE_TYPES.includes(
     requestedServiceType as CreatableServiceTypeRoute
   )
@@ -280,12 +292,15 @@ export function CreateService() {
     : null
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  const defaultName = useMemo(
-    () => (serviceType ? `${serviceType}-${generateId()}` : ''),
-    [serviceType]
-  )
+  const projectQuery = useQuery({
+    ...getProjectOptions({ path: { id: projectId ?? 0 } }),
+    enabled: projectId !== null,
+    retry: false,
+  })
 
-  const [serviceName, setServiceName] = useState(defaultName)
+  const [serviceNameOverride, setServiceNameOverride] = useState<string | null>(
+    null
+  )
   const supportsCluster = useMemo(
     () =>
       serviceType !== null &&
@@ -371,6 +386,12 @@ export function CreateService() {
     enabled: !!serviceType,
   })
 
+  const creationDefaults = useMemo(
+    () => serviceCreationDefaults(jsonSchema),
+    [jsonSchema]
+  )
+  const serviceName = serviceNameOverride ?? creationDefaults?.name ?? ''
+
   const createServiceMut = useMutation({
     ...createServiceMutation(),
     meta: {
@@ -421,6 +442,7 @@ export function CreateService() {
         service_type: serviceType,
         name: serviceName,
         parameters: cleanedParameters,
+        ...serviceProjectLink(projectId),
         ...(topology === 'standalone' && {
           node_id:
             standaloneNodeId === 'control-plane'
@@ -472,7 +494,9 @@ export function CreateService() {
                   key={provider.service_type}
                   type="button"
                   onClick={() =>
-                    navigate(`/storage/create?type=${provider.service_type}`)
+                    navigate(
+                      serviceCreateHref(provider.service_type, projectId)
+                    )
                   }
                   className="flex items-center gap-4 rounded-lg border p-4 text-left hover:bg-accent transition-colors"
                 >
@@ -565,6 +589,21 @@ export function CreateService() {
           )}
         </div>
 
+        {projectId !== null && (
+          <Alert>
+            <Link2 className="size-4" />
+            <AlertTitle>
+              Create and link to{' '}
+              {projectQuery.data?.name ?? `project ${projectId}`}
+            </AlertTitle>
+            <AlertDescription>
+              Temps will create the service, provision this project&apos;s
+              database and runtime variables, and update its application sandbox
+              network as one operation.
+            </AlertDescription>
+          </Alert>
+        )}
+
         {/* Service Name Field */}
         <div className="space-y-2">
           <Label htmlFor="serviceName">
@@ -574,7 +613,7 @@ export function CreateService() {
           <Input
             id="serviceName"
             value={serviceName}
-            onChange={(e) => setServiceName(e.target.value)}
+            onChange={(e) => setServiceNameOverride(e.target.value)}
             placeholder={`my-${serviceType}`}
             aria-invalid={!serviceName.trim()}
             aria-describedby="serviceName-description"

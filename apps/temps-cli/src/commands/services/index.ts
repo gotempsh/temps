@@ -3,6 +3,7 @@
 
 import type { Command } from 'commander'
 import { registerRestoreCommands } from './restore.js'
+import { registerWalHealthCommands } from './wal-health.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -18,6 +19,7 @@ import {
   listServiceProjects,
   updateService,
   upgradeService,
+  repointContinuousArchiveSource,
   importExternalService,
   linkServiceToProject,
   unlinkServiceFromProject,
@@ -181,6 +183,11 @@ interface UpgradeOptions {
   version?: string
 }
 
+interface RepointContinuousArchiveSourceOptions {
+  id: string
+  s3Source: string
+}
+
 interface ImportOptions {
   type?: string
   name?: string
@@ -315,6 +322,18 @@ export function registerServicesCommands(program: Command): void {
     .requiredOption('--id <id>', 'Service ID')
     .option('-v, --version <version>', 'Docker image to upgrade to (e.g., postgres:18-alpine)')
     .action(upgradeServiceAction)
+
+  services
+    .command('repoint-continuous-archive-source')
+    .description(
+      "Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog " +
+        'shipper) to a different S3 source. Data archived before this call stays under the ' +
+        'previous source and will no longer be verifiable or replayable once archiving points ' +
+        'at the new one.',
+    )
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--s3-source <id>', 'S3 source ID to point continuous archiving at')
+    .action(repointContinuousArchiveSourceAction)
 
   services
     .command('import')
@@ -517,6 +536,9 @@ export function registerServicesCommands(program: Command): void {
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
   registerRestoreCommands(services)
+
+  // Live WAL / archive_command diagnostics for PostgreSQL services.
+  registerWalHealthCommands(services)
 }
 
 async function listServicesAction(options: { json?: boolean }): Promise<void> {
@@ -749,6 +771,13 @@ async function showService(options: ShowOptions): Promise<void> {
   }
   keyValue('Created', new Date(service.created_at).toLocaleString())
   keyValue('Updated', new Date(service.updated_at).toLocaleString())
+  if (service.continuous_archive_s3_source_id != null) {
+    keyValue('Continuous archive S3 source', String(service.continuous_archive_s3_source_id))
+    if (service.continuous_archive_pinned_at) {
+      keyValue('  pinned at', new Date(service.continuous_archive_pinned_at).toLocaleString())
+    }
+    info('Change with: temps services repoint-continuous-archive-source --id <id> --s3-source <id>')
+  }
 
   if (details.current_parameters && Object.keys(details.current_parameters).length > 0) {
     newline()
@@ -1067,6 +1096,42 @@ async function upgradeServiceAction(options: UpgradeOptions): Promise<void> {
 
   success('Service upgrade initiated')
   info(`Run: temps services show --id ${options.id} to check the status`)
+}
+
+async function repointContinuousArchiveSourceAction(options: RepointContinuousArchiveSourceOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID')
+    return
+  }
+
+  const newS3SourceId = parseInt(options.s3Source, 10)
+  if (isNaN(newS3SourceId)) {
+    warning('Invalid S3 source ID')
+    return
+  }
+
+  const result = await withSpinner('Repointing continuous archive source...', async () => {
+    const { data, error } = await repointContinuousArchiveSource({
+      client,
+      path: { id },
+      body: { new_s3_source_id: newS3SourceId },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  success('Continuous archive source repointed')
+  if (result) {
+    keyValue('Service ID', String(result.service_id))
+    keyValue('S3 source', String(result.continuous_archive_s3_source_id))
+    keyValue('Pinned at', result.continuous_archive_pinned_at)
+  }
 }
 
 async function importServiceAction(options: ImportOptions): Promise<void> {

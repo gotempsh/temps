@@ -267,6 +267,9 @@ pub struct EmailDomainDeletedAudit {
     pub context: AuditContext,
     pub domain_id: i32,
     pub domain: String,
+    /// Whether the caller also asked to remove the identity on the
+    /// provider's side (Scaleway/SES), as opposed to only the local record.
+    pub delete_from_provider: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

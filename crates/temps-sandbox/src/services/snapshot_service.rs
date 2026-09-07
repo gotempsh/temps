@@ -18,14 +18,16 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    sea_query::{Condition, Query},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
 };
 use tokio::sync::Mutex;
 
 use temps_agents::error::AgentError;
 use temps_agents::sandbox::{SandboxProvider, SnapshotArtifact, SnapshotCompanionArtifact};
-use temps_entities::sandbox_snapshots;
+use temps_entities::{sandbox_snapshots, sandboxes};
 
 use crate::error::SandboxSnapshotError;
 use crate::services::public_id;
@@ -665,6 +667,56 @@ impl SnapshotService {
         Ok((items, total))
     }
 
+    /// List snapshots exposed by the standalone sandbox API. Snapshots owned
+    /// by managed application workspaces are deliberately excluded: those
+    /// artifacts inherit authorization from every linked application project
+    /// and are available only through application workspace routes.
+    pub async fn list_standalone_snapshots(
+        &self,
+        user_id: i32,
+        project_id: Option<i32>,
+        status: Option<String>,
+        page: u64,
+        page_size: u64,
+    ) -> Result<(Vec<sandbox_snapshots::Model>, u64), SandboxSnapshotError> {
+        let page_size = page_size.clamp(1, 100);
+        let managed_sources = Query::select()
+            .column(sandboxes::Column::Id)
+            .from(sandboxes::Entity)
+            .and_where(sandboxes::Column::Name.starts_with("ai-application:"))
+            .to_owned();
+        let mut query = sandbox_snapshots::Entity::find()
+            .filter(sandbox_snapshots::Column::UserId.eq(user_id))
+            .filter(sandbox_snapshots::Column::Status.ne("deleted"))
+            .filter(
+                Condition::any()
+                    .add(sandbox_snapshots::Column::SourceSandboxId.is_null())
+                    .add(
+                        sandbox_snapshots::Column::SourceSandboxId.not_in_subquery(managed_sources),
+                    ),
+            );
+
+        if let Some(pid) = project_id {
+            query = query.filter(sandbox_snapshots::Column::ProjectId.eq(pid));
+        }
+        if let Some(s) = status {
+            query = query.filter(sandbox_snapshots::Column::Status.eq(s));
+        }
+
+        let paginator = query
+            .order_by_desc(sandbox_snapshots::Column::CreatedAt)
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator
+            .num_items()
+            .await
+            .map_err(SandboxSnapshotError::Database)?;
+        let items = paginator
+            .fetch_page(page.saturating_sub(1))
+            .await
+            .map_err(SandboxSnapshotError::Database)?;
+        Ok((items, total))
+    }
+
     // ── Get ───────────────────────────────────────────────────────────────────
 
     pub async fn get_snapshot(
@@ -688,6 +740,39 @@ impl SnapshotService {
         }
 
         Ok(row)
+    }
+
+    /// Resolve a snapshot for the standalone API while hiding managed
+    /// application snapshots exactly like a missing resource.
+    pub async fn get_standalone_snapshot(
+        &self,
+        user_id: i32,
+        public_id: &str,
+    ) -> Result<sandbox_snapshots::Model, SandboxSnapshotError> {
+        let row = self.get_snapshot(user_id, public_id).await?;
+        if let Some(source_id) = row.source_sandbox_id {
+            let managed = sandboxes::Entity::find_by_id(source_id)
+                .filter(sandboxes::Column::Name.starts_with("ai-application:"))
+                .count(self.db.as_ref())
+                .await
+                .map_err(SandboxSnapshotError::Database)?
+                > 0;
+            if managed {
+                return Err(SandboxSnapshotError::NotFound {
+                    snapshot_id: public_id.to_string(),
+                });
+            }
+        }
+        Ok(row)
+    }
+
+    pub async fn delete_standalone_snapshot(
+        &self,
+        user_id: i32,
+        public_id: &str,
+    ) -> Result<(), SandboxSnapshotError> {
+        self.get_standalone_snapshot(user_id, public_id).await?;
+        self.delete_snapshot(user_id, public_id).await
     }
 
     // ── Delete ────────────────────────────────────────────────────────────────
@@ -936,6 +1021,20 @@ impl SnapshotService {
             image_id: metadata.image_id,
             workspace,
         })
+    }
+
+    /// Resolve a snapshot for the public standalone-sandbox API. Application
+    /// workspace snapshots are intentionally private to their owning
+    /// application lifecycle and cannot be used to mint a generic sandbox.
+    pub async fn resolve_standalone_for_restore(
+        &self,
+        user_id: i32,
+        public_id: &str,
+        target_backend: Option<&str>,
+    ) -> Result<SnapshotArtifact, SandboxSnapshotError> {
+        self.get_standalone_snapshot(user_id, public_id).await?;
+        self.resolve_for_restore(user_id, public_id, target_backend)
+            .await
     }
 }
 
@@ -1390,6 +1489,42 @@ mod tests {
             "wrong-owner access must look like NotFound, got {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn standalone_snapshot_lookup_hides_managed_application_artifacts() {
+        let mut model = make_snapshot_model(1, "snap_application111222", 10, "ready", 1_000_000);
+        model.source_sandbox_id = Some(7);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .append_query_results(vec![vec![make_creating_count_row(1)]])
+                .into_connection(),
+        );
+        let svc = make_service(db);
+
+        let result = svc
+            .get_standalone_snapshot(10, "snap_application111222")
+            .await;
+        assert!(matches!(result, Err(SandboxSnapshotError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn standalone_restore_hides_managed_application_artifacts() {
+        let mut model = make_snapshot_model(1, "snap_application_restore1", 10, "ready", 1_000);
+        model.source_sandbox_id = Some(7);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .append_query_results(vec![vec![make_creating_count_row(1)]])
+                .into_connection(),
+        );
+        let svc = make_service(db);
+
+        let result = svc
+            .resolve_standalone_for_restore(10, "snap_application_restore1", Some("docker"))
+            .await;
+        assert!(matches!(result, Err(SandboxSnapshotError::NotFound { .. })));
     }
 
     #[tokio::test]
@@ -2329,6 +2464,35 @@ mod tests {
         let (items, total) = result.unwrap();
         assert_eq!(total, 2);
         assert_eq!(items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn standalone_snapshot_list_excludes_application_source_rows_in_query() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                .into_connection(),
+        );
+        let svc = make_service(db.clone());
+
+        let (_, total) = svc
+            .list_standalone_snapshots(10, None, None, 1, 20)
+            .await
+            .expect("standalone snapshot list");
+        assert_eq!(total, 0);
+        drop(svc);
+
+        let db = Arc::try_unwrap(db).expect("snapshot service released mock database");
+        let sql = format!("{:?}", db.into_transaction_log());
+        assert!(
+            sql.contains("ai-application:"),
+            "query must hide application snapshots: {sql}"
+        );
+        assert!(
+            sql.contains("NOT IN"),
+            "query must exclude managed source ids: {sql}"
+        );
     }
 
     // ── HIGH: TOCTOU quota race ───────────────────────────────────────────────

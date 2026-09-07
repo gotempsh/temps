@@ -10,6 +10,7 @@ import {
   Flag,
   GitFork,
   Globe,
+  HardDrive,
   KeyRound,
   Server,
   Settings2,
@@ -99,6 +100,13 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Manage API tokens injected into deployed applications.',
         url: 'settings/deployment-tokens',
         icon: KeyRound,
+      },
+      {
+        title: 'Telemetry storage',
+        description:
+          'Where this project’s spans are stored, and what leaves this instance.',
+        url: 'settings/telemetry',
+        icon: HardDrive,
       },
     ],
   },

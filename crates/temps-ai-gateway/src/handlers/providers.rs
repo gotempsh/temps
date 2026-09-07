@@ -268,7 +268,7 @@ pub struct UpdateProviderKeyRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TestProviderKeyRequest {
-    /// Provider ID: "openai", "anthropic", "xai", "gemini"
+    /// Provider ID: "openai", "anthropic", "xai", "gemini", "openrouter"
     pub provider: String,
     /// The raw API key to test
     pub api_key: String,

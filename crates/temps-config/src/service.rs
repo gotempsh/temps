@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
     PaginatorTrait, QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
@@ -10,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_database::DbConnection;
-use temps_entities::{external_services, settings};
+use temps_entities::{external_services, network_config, node_enrollment_tokens, nodes, settings};
 use thiserror::Error;
 use tokio::{
     fs as tokio_fs,
@@ -41,6 +42,12 @@ pub enum ConfigServiceError {
     #[error("Invalid configuration: {details}")]
     InvalidConfiguration { details: String },
 
+    #[error("Cluster CA is not initialized")]
+    ClusterCaNotInitialized,
+
+    #[error("Cluster CA fingerprint does not match the currently active trust root")]
+    ClusterCaFingerprintMismatch,
+
     #[error("Serialization error: {0}")]
     Serialization(String),
 
@@ -66,6 +73,12 @@ pub enum ConfigServiceError {
         #[source]
         source: sea_orm::DbErr,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterCaRotationResult {
+    pub previous_fingerprint: String,
+    pub revoked_enrollment_tokens: u64,
 }
 
 fn fill_secure_random_bytes(operation: &str, bytes: &mut [u8]) -> Result<(), ConfigServiceError> {
@@ -95,6 +108,18 @@ pub struct EffectiveTelemetryPolicies {
     pub otel_spans_retention_days: Option<u32>,
     pub otel_logs_retention_days: Option<u32>,
     pub otel_metrics_retention_days: Option<u32>,
+}
+
+/// Effective cluster-wide container-network allocation state.
+///
+/// The pool is mutable only before the first control-plane or worker subnet is
+/// allocated. Keeping that lock state beside the values lets operator surfaces
+/// explain why an established cluster cannot be edited in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterNetworkState {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -531,6 +556,16 @@ pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 /// proxy's per-request hot path (`request_filter`) never hammers Postgres.
 const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Default)]
+struct SettingsCacheState {
+    snapshot: Option<(AppSettings, std::time::Instant)>,
+    /// Monotonic generation protecting publication from stale in-flight
+    /// database reads. Kept under the same lock as the snapshot and global TLS
+    /// publication so invalidation cannot split the generation check from its
+    /// side effects.
+    generation: u64,
+}
+
 pub struct ConfigService {
     config: Arc<ServerConfig>,
     db: Arc<DbConnection>,
@@ -540,7 +575,7 @@ pub struct ConfigService {
     /// would amplify any request flood into a Postgres QPS flood. Invalidated
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
-    settings_cache: tokio::sync::RwLock<Option<(AppSettings, std::time::Instant)>>,
+    settings_cache: tokio::sync::RwLock<SettingsCacheState>,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -555,7 +590,7 @@ impl ConfigService {
         Self {
             config,
             db,
-            settings_cache: tokio::sync::RwLock::new(None),
+            settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
         }
     }
@@ -720,6 +755,39 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .map_err(ConfigServiceError::from)
     }
 
+    /// Read the cluster-wide overlay pool and whether any node already owns a
+    /// subnet. This is deliberately read-only: changes must go through the
+    /// allocator's exclusive-lock and no-existing-allocation guard.
+    pub async fn get_cluster_network_state(
+        &self,
+    ) -> Result<ClusterNetworkState, ConfigServiceError> {
+        let config = network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "network_config singleton row is missing".to_string(),
+            })?;
+        let subnet_prefix_len = u8::try_from(config.subnet_prefix_len).map_err(|_| {
+            ConfigServiceError::InvalidConfiguration {
+                details: format!(
+                    "network_config subnet prefix {} is outside the supported u8 range",
+                    config.subnet_prefix_len
+                ),
+            }
+        })?;
+        let worker_allocations = nodes::Entity::find()
+            .filter(nodes::Column::ComputeCidr.is_not_null())
+            .count(self.db.as_ref())
+            .await?;
+
+        Ok(ClusterNetworkState {
+            compute_pool_cidr: config.compute_pool_cidr,
+            subnet_prefix_len,
+            allocation_count: worker_allocations
+                + u64::from(config.control_plane_compute_cidr.is_some()),
+        })
+    }
+
     /// Check if using MySQL/MariaDB database
     pub fn is_mysql(&self) -> bool {
         matches!(self.get_database_backend(), DatabaseBackend::MySql)
@@ -844,12 +912,14 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // the proxy's per-request callers off the database (see field docs).
         {
             let cached = self.settings_cache.read().await;
-            if let Some((settings, fetched_at)) = cached.as_ref() {
+            if let Some((settings, fetched_at)) = cached.snapshot.as_ref() {
                 if fetched_at.elapsed() < SETTINGS_CACHE_TTL {
                     return Ok(settings.clone());
                 }
             }
         }
+
+        let generation = self.settings_cache.read().await.generation;
 
         // Cache miss or stale: load from the DB and repopulate.
         let record = settings::Entity::find_by_id(1)
@@ -859,13 +929,30 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let settings = record
             .map(|r| AppSettings::from_json(r.data))
             .unwrap_or_default();
-        // Republish process-wide TLS opt-in so server-side make_client()
-        // callsites (deployer, agent, providers) see the latest value
-        // without an explicit init step at startup.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
-
-        *self.settings_cache.write().await = Some((settings.clone(), std::time::Instant::now()));
+        self.cache_settings_if_current(generation, settings.clone())
+            .await;
         Ok(settings)
+    }
+
+    async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
+        let mut cache = self.settings_cache.write().await;
+        if cache.generation != generation {
+            return false;
+        }
+        // Publish the process-wide TLS opt-in under the same generation
+        // guard as the settings snapshot. A DB read started before an
+        // invalidation must not be able to restore stale TLS behavior after
+        // the newer settings have become authoritative.
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
+        true
+    }
+
+    async fn replace_settings_cache(&self, settings: AppSettings) {
+        let mut cache = self.settings_cache.write().await;
+        cache.generation = cache.generation.wrapping_add(1);
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
     }
 
     /// Update the application settings
@@ -1051,15 +1138,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         txn.commit().await?;
 
-        // Publish runtime settings only after the transaction commits. A
-        // failed policy replacement must not partially apply an unrelated TLS
-        // toggle in memory while the persisted settings remain unchanged.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
-
         // Write-through: refresh the cache with the just-written value so an
         // admin's change takes effect immediately in this process, rather than
-        // waiting out SETTINGS_CACHE_TTL.
-        *self.settings_cache.write().await = Some((settings, std::time::Instant::now()));
+        // waiting out SETTINGS_CACHE_TTL. Runtime TLS publication happens in
+        // the same generation-checked critical section.
+        self.replace_settings_cache(settings).await;
 
         Ok(())
     }
@@ -1070,7 +1153,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// reconnect-recovery (so a NOTIFY missed during a connection gap can't
     /// strand stale data). Takes the async write lock, so it must be awaited.
     pub async fn invalidate_settings_cache(&self) {
-        *self.settings_cache.write().await = None;
+        {
+            let mut cache = self.settings_cache.write().await;
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.snapshot = None;
+            // Fail closed until the authoritative row has been reloaded. This
+            // is important when the invalidated value had insecure TLS enabled.
+            temps_core::tls::set_insecure_tls(false);
+        }
+
+        // Reload immediately so cross-process settings changes (including an
+        // intentional insecure-TLS opt-in) become effective when the NOTIFY is
+        // processed, rather than waiting for an unrelated future caller.
+        if let Err(error) = self.get_settings().await {
+            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS remains enabled");
+        }
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
 
@@ -1180,6 +1277,212 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let mut settings = self.get_settings().await?;
         update_fn(&mut settings);
         self.update_settings(settings).await
+    }
+
+    /// Atomically update only managed Cloud export consent. The settings row
+    /// is shared by many subsystems, so reading through the cache and writing
+    /// the whole document would lose concurrent unrelated changes.
+    pub async fn update_cloud_features(
+        &self,
+        telemetry_enabled: bool,
+        backups_enabled: bool,
+        notifications_enabled: bool,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.telemetry_enabled = telemetry_enabled;
+        current.cloud.backups_enabled = backups_enabled;
+        current.cloud.notifications_enabled = notifications_enabled;
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        // Invalidate instead of publishing this transaction's clone: another
+        // writer may commit later but update the cache earlier, and publishing
+        // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
+    /// Persist cluster CA material exactly once and return the material that
+    /// owns the settings row after the transaction commits.
+    ///
+    /// Token minting and node registration can race during initial cluster
+    /// setup. Locking the singleton settings row keeps every enrollment pinned
+    /// to one trust root instead of allowing two callers to publish different
+    /// CAs. A half-populated CA is never repaired implicitly because replacing
+    /// either half could invalidate already-issued node identities.
+    pub async fn initialize_cluster_ca_material(
+        &self,
+        generated_cert_pem: String,
+        generated_key_encrypted: String,
+    ) -> Result<(String, String), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_sqlite() {
+            query
+        } else {
+            query.lock_exclusive()
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+
+        let material = match (
+            current.multi_node.cluster_ca_cert_pem.as_ref(),
+            current.multi_node.cluster_ca_key_encrypted.as_ref(),
+        ) {
+            (Some(cert), Some(key)) => (cert.clone(), key.clone()),
+            (None, None) => {
+                current.multi_node.cluster_ca_cert_pem = Some(generated_cert_pem.clone());
+                current.multi_node.cluster_ca_key_encrypted = Some(generated_key_encrypted.clone());
+                (generated_cert_pem, generated_key_encrypted)
+            }
+            (Some(_), None) => {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: "cluster CA certificate exists but its encrypted private key is missing; refusing automatic replacement"
+                        .to_string(),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: "cluster CA encrypted private key exists but its certificate is missing; refusing automatic replacement"
+                        .to_string(),
+                });
+            }
+        };
+
+        let needs_write = existing
+            .as_ref()
+            .map(|model| {
+                let saved = AppSettings::from_json(model.data.clone());
+                saved.multi_node.cluster_ca_cert_pem.is_none()
+                    && saved.multi_node.cluster_ca_key_encrypted.is_none()
+            })
+            .unwrap_or(true);
+
+        if needs_write {
+            let now = Utc::now();
+            if let Some(model) = existing {
+                let merged = current.to_json_merged(&model.data);
+                let mut active: settings::ActiveModel = model.into();
+                active.data = Set(merged);
+                active.updated_at = Set(now);
+                active.update(&transaction).await?;
+            } else {
+                settings::ActiveModel {
+                    id: Set(1),
+                    data: Set(current.to_json()),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(&transaction)
+                .await?;
+            }
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(material)
+    }
+
+    /// Replace a complete cluster CA pair and revoke every outstanding node
+    /// enrollment token in the same transaction.
+    ///
+    /// The caller must provide the fingerprint it independently observed before
+    /// starting recovery. This compare-and-swap guard prevents a stale browser
+    /// tab or automation run from replacing a newer trust root. Existing worker
+    /// certificates intentionally stop authenticating after this commits; every
+    /// worker must be re-enrolled against the returned root.
+    pub async fn rotate_cluster_ca_material(
+        &self,
+        expected_fingerprint: &str,
+        replacement_cert_pem: String,
+        replacement_key_encrypted: String,
+    ) -> Result<ClusterCaRotationResult, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_sqlite() {
+            query
+        } else {
+            query.lock_exclusive()
+        };
+        let model = query
+            .one(&transaction)
+            .await?
+            .ok_or(ConfigServiceError::ClusterCaNotInitialized)?;
+        let mut current = AppSettings::from_json(model.data.clone());
+        let current_cert = current
+            .multi_node
+            .cluster_ca_cert_pem
+            .as_deref()
+            .ok_or(ConfigServiceError::ClusterCaNotInitialized)?;
+        if current.multi_node.cluster_ca_key_encrypted.is_none() {
+            return Err(ConfigServiceError::InvalidConfiguration {
+                details: "cluster CA certificate exists but its encrypted private key is missing"
+                    .to_string(),
+            });
+        }
+
+        let previous_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(current_cert)
+            .map_err(|error| ConfigServiceError::InvalidConfiguration {
+                details: format!("active cluster CA certificate is invalid: {error}"),
+            })?;
+        if !previous_fingerprint.eq_ignore_ascii_case(expected_fingerprint.trim()) {
+            return Err(ConfigServiceError::ClusterCaFingerprintMismatch);
+        }
+
+        current.multi_node.cluster_ca_cert_pem = Some(replacement_cert_pem);
+        current.multi_node.cluster_ca_key_encrypted = Some(replacement_key_encrypted);
+        let now = Utc::now();
+        let merged = current.to_json_merged(&model.data);
+        let mut active: settings::ActiveModel = model.into();
+        active.data = Set(merged);
+        active.updated_at = Set(now);
+        active.update(&transaction).await?;
+
+        let revoked = node_enrollment_tokens::Entity::update_many()
+            .col_expr(
+                node_enrollment_tokens::Column::RevokedAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(node_enrollment_tokens::Column::UpdatedAt, Expr::value(now))
+            .filter(node_enrollment_tokens::Column::RevokedAt.is_null())
+            .exec(&transaction)
+            .await?;
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(ClusterCaRotationResult {
+            previous_fingerprint,
+            revoked_enrollment_tokens: revoked.rows_affected,
+        })
     }
 
     /// Initialize default settings if they don't exist
@@ -1427,6 +1730,162 @@ mod tests {
         }
     }
 
+    fn settings_row_with_cluster_ca(
+        cert_pem: Option<&str>,
+        encrypted_key: Option<&str>,
+    ) -> settings::Model {
+        let mut app_settings = AppSettings::default();
+        app_settings.multi_node.cluster_ca_cert_pem = cert_pem.map(ToString::to_string);
+        app_settings.multi_node.cluster_ca_key_encrypted = encrypted_key.map(ToString::to_string);
+        settings::Model {
+            id: 1,
+            data: app_settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_persists_first_complete_pair() {
+        let empty = settings_row_with_cluster_ca(None, None);
+        let persisted = settings_row_with_cluster_ca(Some("generated-cert"), Some("generated-key"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[empty], [persisted]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let material = service
+            .initialize_cluster_ca_material(
+                "generated-cert".to_string(),
+                "generated-key".to_string(),
+            )
+            .await
+            .expect("first complete cluster CA pair should be persisted");
+
+        assert_eq!(material.0, "generated-cert");
+        assert_eq!(material.1, "generated-key");
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_reuses_existing_pair() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[settings_row_with_cluster_ca(
+                Some("existing-cert"),
+                Some("existing-key"),
+            )]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let material = service
+            .initialize_cluster_ca_material("racing-cert".to_string(), "racing-key".to_string())
+            .await
+            .expect("existing cluster CA should win initialization race");
+
+        assert_eq!(material.0, "existing-cert");
+        assert_eq!(material.1, "existing-key");
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_rejects_partial_state() {
+        for row in [
+            settings_row_with_cluster_ca(Some("orphan-cert"), None),
+            settings_row_with_cluster_ca(None, Some("orphan-key")),
+        ] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection();
+            let service = ConfigService::new(test_config(), Arc::new(db));
+
+            let error = service
+                .initialize_cluster_ca_material(
+                    "generated-cert".to_string(),
+                    "generated-key".to_string(),
+                )
+                .await
+                .expect_err("partial CA state must require operator recovery");
+
+            assert!(matches!(
+                error,
+                ConfigServiceError::InvalidConfiguration { details }
+                    if details.contains("refusing automatic replacement")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_cluster_ca_material_replaces_pair_and_revokes_tokens() {
+        let existing = temps_core::node_pki::generate_cluster_ca()
+            .expect("test cluster CA generation should succeed");
+        let expected = temps_core::node_pki::ca_fingerprint_sha256(&existing.cert_pem)
+            .expect("test cluster CA fingerprint should succeed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                [settings_row_with_cluster_ca(
+                    Some(&existing.cert_pem),
+                    Some("existing-encrypted-key"),
+                )],
+                [settings_row_with_cluster_ca(
+                    Some("replacement-cert"),
+                    Some("replacement-encrypted-key"),
+                )],
+            ])
+            .append_exec_results([
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                },
+            ])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let result = service
+            .rotate_cluster_ca_material(
+                &expected,
+                "replacement-cert".to_string(),
+                "replacement-encrypted-key".to_string(),
+            )
+            .await
+            .expect("matching expected root should rotate atomically");
+
+        assert_eq!(result.previous_fingerprint, expected);
+        assert_eq!(result.revoked_enrollment_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn rotate_cluster_ca_material_rejects_stale_fingerprint() {
+        let existing = temps_core::node_pki::generate_cluster_ca()
+            .expect("test cluster CA generation should succeed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[settings_row_with_cluster_ca(
+                Some(&existing.cert_pem),
+                Some("existing-encrypted-key"),
+            )]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = service
+            .rotate_cluster_ca_material(
+                "stale-fingerprint",
+                "replacement-cert".to_string(),
+                "replacement-encrypted-key".to_string(),
+            )
+            .await
+            .expect_err("stale operator state must not replace the active root");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::ClusterCaFingerprintMismatch
+        ));
+    }
+
     fn timescale_policy_row(
         hypertable_name: &str,
         proc_name: &str,
@@ -1450,6 +1909,101 @@ mod tests {
 
     fn count_row(count: i64) -> BTreeMap<String, Value> {
         BTreeMap::from([("num_items".to_string(), Value::BigInt(Some(count)))])
+    }
+
+    fn network_config_row(
+        subnet_prefix_len: i32,
+        control_plane_compute_cidr: Option<&str>,
+    ) -> network_config::Model {
+        network_config::Model {
+            id: 1,
+            compute_pool_cidr: "10.240.0.0/16".to_string(),
+            subnet_prefix_len,
+            transport: "vxlan".to_string(),
+            vxlan_vni: 42,
+            vxlan_port: 4789,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: control_plane_compute_cidr.map(str::to_string),
+            control_plane_underlay_address: Some("10.200.4.1".to_string()),
+            control_plane_overlay_ready: control_plane_compute_cidr.is_some(),
+            control_plane_setup_generation: 1,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_counts_control_plane_and_worker_allocations() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[network_config_row(24, Some("10.240.0.0/24"))]])
+                .append_query_results([[count_row(2)]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let state = svc
+            .get_cluster_network_state()
+            .await
+            .expect("valid cluster network state should load");
+
+        assert_eq!(state.compute_pool_cidr, "10.240.0.0/16");
+        assert_eq!(state.subnet_prefix_len, 24);
+        assert_eq!(state.allocation_count, 3);
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_requires_the_singleton_row() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<network_config::Model>::new()])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("a missing singleton must be reported");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("singleton row is missing")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_rejects_an_invalid_prefix() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[network_config_row(300, None)]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("an out-of-range prefix must be rejected");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("outside the supported u8 range")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_propagates_database_errors() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "network configuration unavailable".to_string(),
+            )])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("database errors must remain typed");
+
+        assert!(matches!(error, ConfigServiceError::Database(_)));
     }
 
     #[test]
@@ -1915,5 +2469,70 @@ mod tests {
             "v2",
             "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidation_rejects_a_stale_in_flight_cache_publication() {
+        temps_core::tls::set_insecure_tls(false);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("new.example.com")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let stale_generation = svc.settings_cache.read().await.generation;
+
+        svc.invalidate_settings_cache().await;
+
+        let stale = AppSettings {
+            preview_domain: "old.example.com".to_string(),
+            insecure_tls: true,
+            ..AppSettings::default()
+        };
+        assert!(!svc.cache_settings_if_current(stale_generation, stale).await);
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "rejected stale settings must not mutate process-wide TLS behavior"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "new.example.com",
+            "a read started before invalidation must not republish stale settings"
+        );
+        temps_core::tls::set_insecure_tls(false);
+    }
+
+    #[tokio::test]
+    async fn invalidation_serializes_cache_and_tls_publication() {
+        temps_core::tls::set_insecure_tls(true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("strict.example.com")]])
+            .into_connection();
+        let svc = Arc::new(ConfigService::new(test_config(), Arc::new(db)));
+
+        // Hold the cache-publication lock while invalidation starts. The
+        // invalidator must not advance the generation or mutate TLS outside
+        // that lock; this is the check-to-publication interleaving that used to
+        // permit a stale insecure-TLS value to survive invalidation.
+        let cache_guard = svc.settings_cache.write().await;
+        let invalidation = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.invalidate_settings_cache().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !invalidation.is_finished(),
+            "invalidation must wait for the cache/TLS publication lock"
+        );
+        drop(cache_guard);
+
+        invalidation.await.expect("invalidation task");
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "invalidation must finish with the reloaded strict TLS setting"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "strict.example.com"
+        );
+        temps_core::tls::set_insecure_tls(false);
     }
 }

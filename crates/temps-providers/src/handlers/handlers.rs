@@ -27,9 +27,10 @@ use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::audit::{
-    ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberPromotedAudit,
-    ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
-    ExternalServiceDeletedAudit, ExternalServiceEnvironmentVariableRevealedAudit,
+    ContinuousArchiveSourceRepointedAudit, ExternalServiceClusterMemberAddedAudit,
+    ExternalServiceClusterMemberPromotedAudit, ExternalServiceClusterMemberRemovedAudit,
+    ExternalServiceCreatedAudit, ExternalServiceDeletedAudit,
+    ExternalServiceEnvironmentVariableRevealedAudit,
     ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceParameterRevealedAudit,
     ExternalServiceProjectLinkedAudit, ExternalServiceProjectUnlinkedAudit,
     ExternalServiceRuntimeCredentialsIssuedAudit, ExternalServiceStatusChangedAudit,
@@ -37,13 +38,13 @@ use super::audit::{
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
-    ClusterMemberHealthResponse, CreateExternalServiceRequest, EnvironmentVariableInfo,
-    ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
+    ClusterMemberHealthResponse, ContinuousArchiveSourceResponse, CreateExternalServiceRequest,
+    EnvironmentVariableInfo, ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
     ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    RetryClusterRequest, RuntimeCredentialsResponse, SensitiveValueResponse, ServiceHealthResponse,
-    ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
-    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
-    UpgradeExternalServiceRequest,
+    RepointContinuousArchiveSourceRequest, RetryClusterRequest, RuntimeCredentialsResponse,
+    SensitiveValueResponse, ServiceHealthResponse, ServiceHealthStatusBatchResponse,
+    ServiceHealthStatusEntryResponse, ServiceMemberInfo, ServiceParameter, ServiceTypeInfo,
+    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
 };
 use crate::services::EnvironmentVariableOptions;
 use temps_core::AuditContext;
@@ -271,6 +272,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/wal-health",
             get(get_postgres_wal_health),
+        )
+        .route(
+            "/external-services/{id}/continuous-archive-source",
+            post(repoint_continuous_archive_source),
         )
         .route(
             "/external-services/health-status-batch",
@@ -539,6 +544,7 @@ async fn get_service(
     post,
     path = "/external-services",
     tag = "External Services",
+    description = "Create a managed external service. The `parameters` object is service-type-specific. Read `get_service_type_parameters` for the chosen `service_type` immediately before creating the service and provide every field that schema marks as required. Set `project_id` to create and link the service in one approval-gated operation.",
     request_body = CreateExternalServiceRequest,
     responses(
         (status = 201, description = "Service created successfully", body = ExternalServiceInfo),
@@ -553,6 +559,24 @@ async fn create_service(
     Json(request): Json<CreateExternalServiceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesCreate);
+
+    if let Some(project_id) = request.project_id {
+        project_permission_guard!(
+            auth,
+            ExternalServicesWrite,
+            project_id,
+            app_state.project_access_checker
+        );
+        project_scope_guard!(auth, project_id);
+        let service_type: crate::externalsvc::ServiceType = request.service_type.clone().into();
+        app_state
+            .external_service_manager
+            .validate_service_link_target(project_id, &service_type.to_string())
+            .await
+            .map_err(service_link_problem)?;
+    }
+
+    let target_project_id = request.project_id;
 
     let service_config = crate::services::CreateExternalServiceRequest {
         name: request.name.clone(),
@@ -577,6 +601,50 @@ async fn create_service(
         .await
     {
         Ok(service) => {
+            if let Some(project_id) = target_project_id {
+                if let Err(link_error) = app_state
+                    .external_service_manager
+                    .link_service_to_project(service.id, project_id)
+                    .await
+                {
+                    return Err(rollback_unlinked_service(
+                        &app_state,
+                        service.id,
+                        format!("could not link it to project {project_id}: {link_error}"),
+                    )
+                    .await);
+                }
+
+                if let Err(network_error) = reconcile_application_network(
+                    app_state.application_network_reconciler.as_ref(),
+                    project_id,
+                )
+                .await
+                {
+                    let unlink_error = app_state
+                        .external_service_manager
+                        .unlink_service_from_project(service.id, project_id)
+                        .await
+                        .err();
+                    if let Some(unlink_error) = unlink_error {
+                        return Err(internal_server_error()
+                            .detail(format!(
+                                "Service {} was created and linked to project {}, but workspace network reconciliation failed ({network_error}) and the link could not be rolled back: {unlink_error}",
+                                service.id, project_id
+                            ))
+                            .build());
+                    }
+                    return Err(rollback_unlinked_service(
+                        &app_state,
+                        service.id,
+                        format!(
+                            "workspace network reconciliation for project {project_id} failed: {network_error}"
+                        ),
+                    )
+                    .await);
+                }
+            }
+
             // Create audit log with metadata
             let audit = ExternalServiceCreatedAudit {
                 context: AuditContext {
@@ -659,6 +727,44 @@ async fn create_service(
                     .build())
             }
         }
+    }
+}
+
+fn service_link_problem(error: crate::services::ExternalServiceError) -> Problem {
+    match error {
+        crate::services::ExternalServiceError::ProjectNotFound { .. }
+        | crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+            not_found().detail(error.to_string()).build()
+        }
+        crate::services::ExternalServiceError::DuplicateServiceType { .. } => {
+            conflict().detail(error.to_string()).build()
+        }
+        _ => internal_server_error()
+            .detail(format!("Failed to link service: {error}"))
+            .build(),
+    }
+}
+
+async fn rollback_unlinked_service(
+    app_state: &AppState,
+    service_id: i32,
+    reason: String,
+) -> Problem {
+    match app_state
+        .external_service_manager
+        .delete_service(service_id)
+        .await
+    {
+        Ok(()) => internal_server_error()
+            .detail(format!(
+                "Service creation was rolled back because {reason}"
+            ))
+            .build(),
+        Err(cleanup_error) => internal_server_error()
+            .detail(format!(
+                "Service {service_id} was created, but {reason}; automatic cleanup also failed: {cleanup_error}"
+            ))
+            .build(),
     }
 }
 
@@ -1391,6 +1497,147 @@ async fn get_postgres_wal_health(
     }
 }
 
+/// Repoint a service's continuous archive source
+///
+/// Deliberately, explicitly moves where a service's continuous, standing
+/// archiving process writes: Postgres/Timescale's WAL-G `archive_command`,
+/// or MariaDB's binlog shipper. Both need everything written under one S3
+/// prefix to stay restorable — data archived before this call lives under
+/// the *previous* source and will no longer be verifiable or replayable
+/// once archiving points at the new one.
+///
+/// This exists because a backup schedule that requests a different S3
+/// source than the one archiving is currently pinned to is refused, not
+/// silently honoured (see `ExternalServiceManager::repoint_continuous_archive_source`
+/// for the incident this prevents). Call this endpoint to deliberately move
+/// the pin instead — for example, to switch a service from an operator's
+/// own S3 source onto Temps Cloud's managed one.
+#[utoipa::path(
+    post,
+    path = "/external-services/{id}/continuous-archive-source",
+    operation_id = "repointContinuousArchiveSource",
+    tag = "External Services",
+    request_body = RepointContinuousArchiveSourceRequest,
+    responses(
+        (status = 200, description = "Continuous archive source repointed", body = ContinuousArchiveSourceResponse),
+        (status = 400, description = "Service type does not support continuous archiving, or the requested S3 source does not exist"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+    )
+)]
+async fn repoint_continuous_archive_source(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<RepointContinuousArchiveSourceRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+
+    // `assert_service_owned_by_caller` only proves the caller may manage
+    // `id` -- it says nothing about whether they may use
+    // `request.new_s3_source_id`. Unlike `external_services`, `s3_sources`
+    // carries no project scoping at all (see its entity definition), so
+    // every other endpoint that touches one (`list_s3_sources`,
+    // `create_s3_source`, `get_s3_source`, `update_s3_source` in
+    // `temps-backup`) gates on "instance admin, or no team-access checker is
+    // registered at all" instead. Without the same gate here, a Teams
+    // project admin with only `ExternalServicesWrite` on their own project
+    // could name the ID of an S3 source they were never granted and redirect
+    // this service's WAL straight into it.
+    if !auth.is_instance_admin()
+        && !(auth.project_id().is_none() && app_state.project_access_checker.is_none())
+    {
+        return Err(forbidden()
+            .title("Insufficient Permissions")
+            .detail("Only an administrator may repoint a continuous archive source")
+            .build());
+    }
+
+    let previous_s3_source_id = match app_state.external_service_manager.get_service(id).await {
+        Ok(service) => service.continuous_archive_s3_source_id,
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            return Err(not_found().detail("Service not found").build());
+        }
+        Err(e) => {
+            return Err(internal_server_error()
+                .detail(format!("Failed to load service: {}", e))
+                .build())
+        }
+    };
+
+    match app_state
+        .external_service_manager
+        .repoint_continuous_archive_source(id, request.new_s3_source_id)
+        .await
+    {
+        Ok(service) => {
+            let audit = ContinuousArchiveSourceRepointedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent.clone(),
+                },
+                service_id: service.id,
+                name: service.name.clone(),
+                previous_s3_source_id,
+                new_s3_source_id: request.new_s3_source_id,
+            };
+            if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+                error!("Failed to create audit log: {}", e);
+            }
+
+            let Some(pinned_at) = service.continuous_archive_pinned_at else {
+                return Err(internal_server_error()
+                    .detail("Repoint succeeded but the service has no pin timestamp")
+                    .build());
+            };
+            Ok((
+                StatusCode::OK,
+                Json(ContinuousArchiveSourceResponse {
+                    service_id: service.id,
+                    continuous_archive_s3_source_id: request.new_s3_source_id,
+                    continuous_archive_pinned_at: pinned_at.to_rfc3339(),
+                }),
+            ))
+        }
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            Err(not_found().detail("Service not found").build())
+        }
+        Err(e @ crate::services::ExternalServiceError::InvalidServiceType { .. }) => {
+            Err(bad_request().detail(e.to_string()).build())
+        }
+        Err(e @ crate::services::ExternalServiceError::ParameterValidationFailed { .. }) => {
+            Err(bad_request().detail(e.to_string()).build())
+        }
+        // Distinct from a plain 500: the DB persist failed after retries, so
+        // retrying this same request once the database is reachable is the
+        // correct recovery action. For Postgres/Timescale the container was
+        // already physically repointed (genuine desync); for MariaDB nothing
+        // moved (pin update is the entire repoint, so a retry is safe and
+        // idempotent). Either way the caller needs to know to retry, not just
+        // "something went wrong, investigate the logs" -- a client that only
+        // sees a generic 500 has no way to tell those two situations apart.
+        // `e.to_string()` surfaces the engine-accurate detail from the error.
+        Err(e @ crate::services::ExternalServiceError::ArchiveSourceDesynced { .. }) => {
+            Err(ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                .title("Archive Source Pin Desynchronized")
+                .detail(e.to_string())
+                .build())
+        }
+        Err(e) => Err(internal_server_error()
+            .detail(format!(
+                "Failed to repoint continuous archive source: {}",
+                e
+            ))
+            .build()),
+    }
+}
+
 /// Current health status for many services at once
 ///
 /// Powers the status dot on the Storage list page. Pass a comma-separated
@@ -2073,6 +2320,18 @@ async fn link_service_to_project(
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(service_id = id, project_id = request.project_id, error = %error, "failed to audit service link");
             }
+            reconcile_application_network(
+                app_state.application_network_reconciler.as_ref(),
+                request.project_id,
+            )
+            .await
+            .map_err(|error| {
+                internal_server_error()
+                    .detail(format!(
+                        "Service was linked, but application workspace network reconciliation failed closed: {error}"
+                    ))
+                    .build()
+            })?;
             Ok((StatusCode::CREATED, Json(info)))
         }
         Err(e) => match e {
@@ -2150,6 +2409,18 @@ async fn unlink_service_from_project(
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(service_id = id, project_id, error = %error, "failed to audit service unlink");
             }
+            reconcile_application_network(
+                app_state.application_network_reconciler.as_ref(),
+                project_id,
+            )
+            .await
+            .map_err(|error| {
+                internal_server_error()
+                    .detail(format!(
+                        "Service was unlinked and affected application workspaces were stopped because network revocation could not be confirmed: {error}"
+                    ))
+                    .build()
+            })?;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => match e {
@@ -2161,6 +2432,19 @@ async fn unlink_service_from_project(
                 .detail(format!("Failed to unlink service: {}", e))
                 .build()),
         },
+    }
+}
+
+async fn reconcile_application_network(
+    reconciler: Option<&Arc<dyn temps_core::ApplicationDataNetworkReconciler>>,
+    project_id: i32,
+) -> Result<(), String> {
+    match reconciler {
+        Some(reconciler) => reconciler
+            .project_topology_changed(project_id)
+            .await
+            .map_err(|error| error.to_string()),
+        None => Ok(()),
     }
 }
 
@@ -2990,6 +3274,7 @@ async fn update_service_resources(
         get_service_health_status,
         trigger_service_health_check,
         get_postgres_wal_health,
+        repoint_continuous_archive_source,
         list_service_health_statuses,
         get_cluster_health,
         get_service_runtime,
@@ -3032,6 +3317,8 @@ async fn update_service_resources(
         CreateExternalServiceRequest,
         UpdateExternalServiceRequest,
         UpgradeExternalServiceRequest,
+        RepointContinuousArchiveSourceRequest,
+        ContinuousArchiveSourceResponse,
         RetryClusterRequest,
         AddClusterMemberRequest,
         ServiceMemberInfo,
@@ -3104,7 +3391,7 @@ mod tests {
     use axum::response::IntoResponse;
     use sea_orm::MockDatabase;
     use std::sync::Mutex;
-    use temps_entities::external_services;
+    use temps_entities::{external_services, project_services};
 
     #[derive(Clone, Default)]
     struct RecordingAuditLogger {
@@ -3142,6 +3429,200 @@ mod tests {
             }
             Ok(self.allowed_project_ids.contains(&project_id))
         }
+    }
+
+    struct NarrowedServiceAccessChecker;
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for NarrowedServiceAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(matches!(project_id, 7 | 99))
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(vec![if project_id == 7 {
+                temps_auth::Permission::ExternalServicesWrite.to_string()
+            } else {
+                temps_auth::Permission::ExternalServicesRead.to_string()
+            }]))
+        }
+    }
+
+    struct RecordingNetworkReconciler {
+        project_ids: Mutex<Vec<i32>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ApplicationDataNetworkReconciler for RecordingNetworkReconciler {
+        async fn project_topology_changed(
+            &self,
+            project_id: i32,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.project_ids
+                .lock()
+                .expect("network reconciler mutex should not be poisoned")
+                .push(project_id);
+            if self.fail {
+                Err("application data network unavailable".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_topology_change_reconciles_application_data_network() {
+        let recorder = Arc::new(RecordingNetworkReconciler {
+            project_ids: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let reconciler: Arc<dyn temps_core::ApplicationDataNetworkReconciler> = recorder.clone();
+
+        reconcile_application_network(Some(&reconciler), 17)
+            .await
+            .expect("network reconciliation should succeed");
+
+        assert_eq!(
+            recorder
+                .project_ids
+                .lock()
+                .expect("network reconciler mutex should not be poisoned")
+                .as_slice(),
+            [17]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_topology_change_propagates_network_failure() {
+        let reconciler: Arc<dyn temps_core::ApplicationDataNetworkReconciler> =
+            Arc::new(RecordingNetworkReconciler {
+                project_ids: Mutex::new(Vec::new()),
+                fail: true,
+            });
+
+        let error = reconcile_application_network(Some(&reconciler), 17)
+            .await
+            .expect_err("network failure must fail the service-link request");
+
+        assert!(error.contains("application data network unavailable"));
+    }
+
+    #[test]
+    fn service_link_errors_keep_not_found_and_duplicate_types_actionable() {
+        let missing =
+            service_link_problem(crate::services::ExternalServiceError::ProjectNotFound { id: 17 });
+        assert_eq!(missing.into_response().status(), StatusCode::NOT_FOUND);
+
+        let duplicate = service_link_problem(
+            crate::services::ExternalServiceError::DuplicateServiceType {
+                project_id: 17,
+                service_type: "postgres".to_string(),
+            },
+        );
+        assert_eq!(duplicate.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn linking_service_requires_write_access_to_an_existing_service_project() {
+        let now = chrono::Utc::now();
+        let service = external_services::Model {
+            id: 17,
+            name: "tenant-database".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: Some("tenant-database".to_string()),
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: Some(1),
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        };
+        let linked_service = project_services::Model {
+            id: 1,
+            project_id: 99,
+            service_id: 17,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .append_query_results([vec![linked_service]])
+                .into_connection(),
+        );
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "service-link-authorization-test",
+        ));
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker client configuration should be available"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let network_reconciler = Arc::new(RecordingNetworkReconciler {
+            project_ids: Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let state = Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: Some(Arc::new(NarrowedServiceAccessChecker)),
+            application_network_reconciler: Some(network_reconciler.clone()),
+        });
+
+        let result = link_service_to_project(
+            State(state),
+            Path(17),
+            RequireAuth(test_auth_context_with_role(temps_auth::Role::User)),
+            Extension(test_request_metadata()),
+            Json(LinkServiceRequest { project_id: 7 }),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a service from a read-only project must not be linked"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(network_reconciler
+            .project_ids
+            .lock()
+            .expect("network reconciler mutex should not be poisoned")
+            .is_empty());
     }
 
     struct ListProjectAccessChecker {
@@ -3538,6 +4019,8 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
         let db = Arc::new(
             MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
@@ -3573,6 +4056,7 @@ mod tests {
             config_service: None,
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: None,
+            application_network_reconciler: None,
         });
 
         let response = reveal_service_parameter(

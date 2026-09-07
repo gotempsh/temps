@@ -872,7 +872,7 @@ export type AiStatusBreakdownResponse = {
 
 /**
  * One row in the AI-agent HTTP status breakdown: the request count for a
- * status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+ * status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
  */
 export type AiStatusBreakdownRow = {
     request_count: number;
@@ -896,6 +896,24 @@ export type AiSummaryPreferenceDto = {
      * `null` uses the selected model's default reasoning depth.
      */
     thinking_level?: string | null;
+};
+
+/**
+ * Runtime limits for workspace file transfer and browser previews.
+ *
+ * The HTTP layer additionally enforces absolute ceilings so a malformed or
+ * legacy settings row cannot turn a configurable limit into unbounded control
+ * plane memory use.
+ */
+export type AiWorkspaceFileLimitsSettings = {
+    max_download_size_mb?: number;
+    max_file_size_mb?: number;
+    max_files_per_upload?: number;
+    max_image_preview_size_mb?: number;
+    max_text_preview_kb?: number;
+    max_upload_size_mb?: number;
+    max_workspace_entries?: number;
+    max_workspace_size_mb?: number;
 };
 
 /**
@@ -1397,12 +1415,23 @@ export type AppSettings = {
     ai_chat_limits?: AiChatLimitsSettings;
     ai_config?: AiConfigSettings;
     /**
+     * Transfer and preview limits for files in persistent AI workspaces.
+     * These are runtime settings because operators have different control
+     * plane memory budgets and commonly work with very different asset sizes.
+     */
+    ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
      * hardware that already has its own per-host headroom).
      */
     build_limits?: BuildLimitsSettings;
+    /**
+     * Managed control-plane connection. Credentials are deliberately not
+     * stored here; they live in the owner-only cloud-link state file.
+     */
+    cloud?: CloudSettings;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
      * default — see `ClusterDnsSettings` for the incident background and
@@ -1574,10 +1603,18 @@ export type AppSettingsResponse = {
     ai_chat_limits: AiChatLimitsSettings;
     ai_config: AiConfigSettings;
     /**
+     * Persistent AI workspace file transfer and preview limits.
+     */
+    ai_workspace_file_limits: AiWorkspaceFileLimitsSettings;
+    /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
      */
     build_limits: BuildLimitsSettings;
+    /**
+     * Managed control-plane destination and explicit export consent flags.
+     */
+    cloud: CloudSettings;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
      * needed — `enabled` is a plain bool with no sensitive content. Passed
@@ -1696,6 +1733,150 @@ export type AppSettingsResponse = {
      * directly. Unenforced by default.
      */
     tenant_resource_ceilings: TenantResourceCeilings;
+};
+
+export type ApplicationPreviewLinkResponse = {
+    expires_at: number;
+    /**
+     * A short-lived authenticated URL. Its fragment carries the grant and
+     * never reaches the development server or referrer headers.
+     */
+    url: string;
+};
+
+export type ApplicationProjectDeploymentResponse = {
+    environment_id: number;
+    id: number;
+    project_id: number;
+    slug: string;
+    source_type: string;
+    state: string;
+};
+
+export type ApplicationProjectEnvironmentResponse = {
+    deployment_state?: string | null;
+    name: string;
+    sleeping: boolean;
+    slug: string;
+};
+
+export type ApplicationProjectResponse = {
+    automatic_deploy: boolean;
+    environments: Array<ApplicationProjectEnvironmentResponse>;
+    id: number;
+    is_primary: boolean;
+    is_private: boolean;
+    last_deployment_at?: string | null;
+    main_branch: string;
+    name: string;
+    repository?: string | null;
+    slug: string;
+};
+
+export type ApplicationResponse = {
+    created_at: string;
+    description?: string | null;
+    name: string;
+    projects: Array<ApplicationProjectResponse>;
+    public_id: string;
+    status: string;
+    updated_at: string;
+};
+
+export type ApplicationWorkspaceChangesResponse = {
+    branch?: string | null;
+    changes: Array<ApplicationWorkspaceFileResponse>;
+    changes_truncated: boolean;
+    clean: boolean;
+    files: Array<string>;
+    files_truncated: boolean;
+    head?: string | null;
+    /**
+     * Number of file paths discovered within the server-side safety cap.
+     */
+    listed_file_count: number;
+    /**
+     * Opaque position for the next bounded page, when another page exists.
+     */
+    next_cursor?: number | null;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceDiffResponse = {
+    diff: string;
+    path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceDirectoryEntryResponse = {
+    kind: string;
+    name: string;
+    path: string;
+    size_bytes: number;
+};
+
+export type ApplicationWorkspaceDirectoryResponse = {
+    entries: Array<ApplicationWorkspaceDirectoryEntryResponse>;
+    next_cursor?: number | null;
+    path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceFileContentResponse = {
+    binary: boolean;
+    content?: string | null;
+    /**
+     * Base64-encoded raster image bytes when this file has a verified,
+     * browser-safe image signature and is within the configured preview cap.
+     */
+    content_b64?: string | null;
+    media_type?: string | null;
+    path: string;
+    size_bytes: number;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceFileResponse = {
+    path: string;
+    staged: boolean;
+    status?: string | null;
+    unstaged: boolean;
+};
+
+export type ApplicationWorkspaceFileWrite = {
+    contents_b64: string;
+    mode?: number | null;
+    /**
+     * Project-relative path. Absolute paths and traversal are rejected.
+     */
+    path: string;
+};
+
+export type ApplicationWorkspaceResponse = {
+    cpu_limit: number;
+    cpu_usage_usec?: number | null;
+    data_network_service_count: number;
+    desired_state: string;
+    /**
+     * Docker bind-mounted workspaces report usage but cannot enforce a
+     * per-directory quota. Firecracker workspaces enforce this value.
+     */
+    disk_limit_enforced: boolean;
+    disk_limit_mb: number;
+    disk_used_bytes?: number | null;
+    idle_timeout_secs: number;
+    image?: string | null;
+    last_error?: string | null;
+    memory_limit_mb: number;
+    memory_used_bytes?: number | null;
+    open_preview_ports: Array<number>;
+    persistent_volume_healthy: boolean;
+    pids_limit: number;
+    pids_used?: number | null;
+    runtime: string;
+    sandbox_public_id?: string | null;
+    snapshot_id?: string | null;
+    state: string;
 };
 
 /**
@@ -2318,6 +2499,219 @@ export type BuildLimitsSettings = {
 };
 
 /**
+ * The quote.
+ */
+export type BulkActivationEstimateResponse = {
+    /**
+     * A job already running. Submitting would be refused with `409`, so the
+     * client can offer "watch the running job" instead of a button that fails.
+     */
+    active_batch_id?: string | null;
+    /**
+     * Whether a bulk activation could run at all right now.
+     *
+     * `false` is the normal state on an unlinked instance and must render as
+     * onboarding, not as an error.
+     */
+    configured: boolean;
+    eligible_projects: number;
+    estimated_bytes: number;
+    /**
+     * Totals over the **eligible** projects only — what confirming this quote
+     * would actually send.
+     */
+    estimated_spans: number;
+    plan_expires_at?: string | null;
+    /**
+     * Stable identity of the project set and windows, recorded on the job.
+     */
+    plan_hash?: string | null;
+    /**
+     * The handle to send back to `POST /bulk-jobs`.
+     *
+     * `None` when nothing is eligible: there is no bill to confirm, and
+     * handing back a token that would be refused on submit would be a dead
+     * end with no explanation attached.
+     */
+    plan_token?: string | null;
+    /**
+     * Every project considered, eligible or not, ascending by id.
+     */
+    projects: Array<BulkActivationProjectEstimateResponse>;
+    reason?: string | null;
+    setup_path?: string | null;
+    skipped_projects: number;
+    total_projects: number;
+    window_from: string;
+    window_to: string;
+};
+
+/**
+ * How much of the ETA this instance can honestly claim to know.
+ */
+export type BulkActivationEtaState = 'estimating' | 'known' | 'finished';
+
+/**
+ * One project's row inside a job.
+ */
+export type BulkActivationJobProjectResponse = {
+    bytes_shipped: number;
+    completed_at?: string | null;
+    estimated_bytes: number;
+    estimated_spans: number;
+    /**
+     * Why this project stopped, when `status` is `failed`. The switch is never
+     * rolled back, so this project is Cloud-primary with a recorded hole in
+     * its history — which is retryable, and must be visible to be retried.
+     */
+    last_error?: string | null;
+    /**
+     * `spans_shipped / estimated_spans`, clamped to 0–100. `None` when the
+     * estimate is zero or unknown — an empty window is not "0% done".
+     */
+    percent_complete?: number | null;
+    project_id: number;
+    setup_path?: string | null;
+    skip_detail?: string | null;
+    skip_reason?: string | null;
+    spans_shipped: number;
+    started_at?: string | null;
+    status: BulkJobProjectStatus;
+    window_from: string;
+    window_to: string;
+};
+
+/**
+ * A job, its projects, its progress and its ETA.
+ */
+export type BulkActivationJobResponse = {
+    /**
+     * The same reason as a sentence naming the fix and the page that applies
+     * it.
+     */
+    abort_detail?: string | null;
+    /**
+     * Machine-readable instance-wide abort reason, e.g. `not_linked`.
+     */
+    abort_reason?: string | null;
+    batch_id: string;
+    bytes_shipped: number;
+    /**
+     * Set as soon as a cancel is requested, before the worker honours it at
+     * the next chunk boundary — so the UI can stop offering Cancel twice.
+     */
+    cancel_requested: boolean;
+    cancel_requested_at?: string | null;
+    completed_at?: string | null;
+    created_at: string;
+    /**
+     * The project being switched or backfilled right now.
+     */
+    current_project_id?: number | null;
+    estimated_bytes: number;
+    estimated_spans: number;
+    /**
+     * Seconds remaining, or `null` when `eta_state` is not `known`.
+     */
+    eta_seconds?: number | null;
+    eta_state: BulkActivationEtaState;
+    /**
+     * The average this job has actually achieved since it started. Sent so the
+     * client can render a coarse rate instead of implying a precision the
+     * average does not have.
+     */
+    observed_spans_per_sec?: number | null;
+    percent_complete?: number | null;
+    plan_hash?: string | null;
+    projects: Array<BulkActivationJobProjectResponse>;
+    projects_done: number;
+    projects_failed: number;
+    projects_pending: number;
+    projects_skipped: number;
+    projects_total: number;
+    requested_by_user_id?: number | null;
+    spans_shipped: number;
+    started_at?: string | null;
+    status: BulkJobStatus;
+    trigger: BulkJobTrigger;
+};
+
+/**
+ * One project's line on the quote.
+ */
+export type BulkActivationProjectEstimateResponse = {
+    average_span_bytes: number;
+    /**
+     * Whether this project is part of the plan the token covers.
+     */
+    eligible: boolean;
+    /**
+     * `average_span_bytes * estimated_spans`, rounded up. Temps Cloud's own
+     * acknowledgement is authoritative; this is what this instance can know
+     * before sending.
+     */
+    estimated_bytes: number;
+    /**
+     * Exact count of local spans in the window. Zero for a skipped project —
+     * nothing was counted, because nothing would be sent.
+     */
+    estimated_spans: number;
+    fidelity: CloudTelemetryFidelity;
+    project_id: number;
+    /**
+     * How many spans were actually projected to derive the average.
+     */
+    sampled_spans: number;
+    /**
+     * Where the operator goes to unblock it, when anywhere.
+     */
+    setup_path?: string | null;
+    /**
+     * The same reason as a sentence, so no client has to map an enum to prose.
+     */
+    skip_detail?: string | null;
+    /**
+     * Machine-readable reason it is not, e.g. `fidelity_not_queryable`.
+     */
+    skip_reason?: string | null;
+    window_from: string;
+    window_to: string;
+};
+
+/**
+ * Where one project has got to inside a bulk job.
+ *
+ * `switching` and `backfilling` are separate on purpose: the switch is cheap,
+ * atomic and egresses nothing, while the backfill can run for hours and costs
+ * money. An operator watching a stuck job needs to know which of the two it is
+ * stuck in, and a project that failed after switching is *not* rolled back
+ * (ADR-042 §7) — so the two must be distinguishable after the fact too.
+ */
+export type BulkJobProjectStatus = 'pending' | 'switching' | 'backfilling' | 'done' | 'failed' | 'skipped';
+
+/**
+ * Lifecycle of a bulk job.
+ *
+ * The three terminal-with-a-problem states are deliberately distinct.
+ * `completed_with_failures` means the job ran to the end and some projects
+ * did not; `aborted` means an instance-wide condition stopped it and the
+ * untouched projects are still `pending`, ready to resume; `cancelled` means
+ * an operator asked it to stop. Collapsing any two of those would leave the
+ * Console unable to say what to do next.
+ */
+export type BulkJobStatus = 'pending' | 'running' | 'completed' | 'completed_with_failures' | 'aborted' | 'cancelled';
+
+/**
+ * Which entry point created the job (ADR-042 §1).
+ *
+ * The engine does not branch on this. It exists so an operator disputing an
+ * invoice, or reading an audit trail, can tell "this instance spent money
+ * because someone clicked a button" apart from "…because a purchase completed
+ * and the payment was the authorization".
+ */
+export type BulkJobTrigger = 'purchase' | 'operator';
+
+/**
  * Response body for cancel endpoints.
  */
 export type CancelBackupResponse = {
@@ -2430,6 +2824,24 @@ export type ChangeProjectSourceRequest = {
     source_type: SourceType;
 };
 
+export type ChatAttachmentReference = {
+    id: string;
+    name: string;
+};
+
+export type ChatAttachmentResponse = {
+    id: string;
+    is_image: boolean;
+    mime_type: string;
+    name: string;
+    sandbox_path: string;
+    size_bytes: number;
+};
+
+export type ChatAttachmentUpload = {
+    file: Blob | File;
+};
+
 export type ChatCompletionChoice = {
     finish_reason?: string | null;
     index: number;
@@ -2481,12 +2893,6 @@ export type ChatMessage = {
 
 /**
  * What still has to be true before an AI chat can run a turn in this project.
- *
- * The three gates are independent and fail for different reasons with different
- * fixes, so they are reported separately rather than collapsed into one boolean:
- * an instance admin configures a provider (instance-wide), while the two toggles
- * are per-project. Collapsing them would leave the user with "AI unavailable"
- * and no idea which of three places to go.
  */
 export type ChatReadinessResponse = {
     /**
@@ -2494,15 +2900,6 @@ export type ChatReadinessResponse = {
      * Settings → AI Providers; instance-wide, not per project.
      */
     ai_configured: boolean;
-    /**
-     * The per-project read-only chat toggle is on (the default).
-     */
-    chat_enabled: boolean;
-    /**
-     * The per-project write-actions opt-in is on. Required for any flow where
-     * the assistant *proposes* changes; irrelevant for read-only questions.
-     */
-    write_actions_enabled: boolean;
 };
 
 /**
@@ -2666,10 +3063,267 @@ export type CliLoginRequest = {
     username: string;
 };
 
+export type CloudAiCapability = {
+    configured: boolean;
+    model?: string | null;
+    reason?: string | null;
+    setup_path: string;
+};
+
+/**
+ * Per-project destination for analytics and metrics writes (ADR-043 §1).
+ */
+export type CloudAnalyticsWriteMode = 'local' | 'cloud';
+
+export type CloudBackfillStatusResponse = {
+    /**
+     * Whether a backfill would be accepted right now. False means the project
+     * is still at `metered` fidelity.
+     */
+    backfill_available: boolean;
+    /**
+     * The exact command an operator should run. Always present, in every
+     * state, so the capability is discoverable from the Console even though
+     * the Console deliberately cannot trigger it.
+     */
+    command: string;
+    completed_at?: string | null;
+    /**
+     * Current per-project egress fidelity. A `metered` project cannot be
+     * backfilled at all — the CLI refuses — so the client must be able to
+     * render "not set up" rather than "not started".
+     */
+    fidelity: CloudTelemetryFidelity;
+    /**
+     * Reason the last run stopped, when `status` is `failed`. Verbatim, but
+     * length-bounded: it originates as raw driver/server text and is readable
+     * by every project member with `OtelRead`, not only whoever ran the
+     * command.
+     */
+    last_error?: string | null;
+    /**
+     * `spans_processed / spans_total`, clamped to 0–100. `None` when the total
+     * is unknown or zero — an empty window is not "0% done".
+     */
+    percent_complete?: number | null;
+    project_id: number;
+    /**
+     * Where to go to raise fidelity, when `backfill_available` is false.
+     */
+    setup_path?: string | null;
+    spans_processed: number;
+    spans_total: number;
+    started_at?: string | null;
+    /**
+     * `not_started` when no backfill has ever run for this project.
+     */
+    status: CloudTelemetryBackfillStatus;
+    /**
+     * Bumped on every progress write. A `running` status whose `updated_at` is
+     * far in the past is a stalled run, and the client should say so instead
+     * of showing a spinner forever.
+     */
+    updated_at?: string | null;
+    window_from?: string | null;
+    window_to?: string | null;
+};
+
+export type CloudCapability = {
+    configured: boolean;
+    reason?: string | null;
+    setup_path: string;
+};
+
+export type CloudFeatureSwitchesRequest = {
+    backups_enabled: boolean;
+    notifications_enabled: boolean;
+    telemetry_enabled: boolean;
+};
+
 /**
  * Cloud provider detected from node metadata
  */
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'hetzner' | 'digitalocean' | 'other';
+
+/**
+ * Non-secret managed control-plane settings stored with application settings.
+ *
+ * `PartialEq` but deliberately **not** `Eq`: `telemetry_bulk_anomaly_factor` is
+ * a float, and the total-equality contract `Eq` promises is one `f32` cannot
+ * keep. Nothing compares two `CloudSettings` for equality outside this module's
+ * own tests, so the weaker bound costs nothing.
+ */
+export type CloudSettings = {
+    /**
+     * HTTPS origin used for enrollment and telemetry mirroring.
+     */
+    backend_url?: string;
+    /**
+     * Explicit consent to export completed backup objects.
+     */
+    backups_enabled?: boolean;
+    /**
+     * Explicit consent to send notifications through managed providers.
+     */
+    notifications_enabled?: boolean;
+    /**
+     * ADR-042 §6.3: how far a project's shipped bytes may exceed its pre-send
+     * estimate before the bulk activation stops that project.
+     *
+     * `None` — the default — resolves to
+     * [`DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`]. The guard exists because
+     * an estimate that is wrong by an order of magnitude means a bug, and *a
+     * bug that costs money should stop* rather than run away with a customer's
+     * egress spend on a path that has no human confirm behind it.
+     *
+     * An operator setting on the singleton `settings` row rather than an
+     * environment variable, per CLAUDE.md: the right multiple depends on how
+     * heterogeneous that instance's spans actually are, which only the operator
+     * running it can know, and they must be able to widen it — or narrow it —
+     * without restarting the binary mid-activation.
+     *
+     * Below `1.0` every project would pause on its first chunk, and above
+     * [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`] the guard stops being a
+     * tuning knob and becomes an off switch. The settings write path rejects
+     * values outside that range, and the effective value is clamped on read
+     * besides; see [`CloudSettings::effective_bulk_anomaly_factor`].
+     *
+     * The schema bounds below are documentation for a client; they are not
+     * what enforces this. The server validates the range on write.
+     */
+    telemetry_bulk_anomaly_factor?: number | null;
+    /**
+     * ADR-042 §3: optional throttle, in spans per second, on a **bulk Cloud
+     * telemetry activation** backfill.
+     *
+     * `None` — the default — is unthrottled, which is what "activate now"
+     * means and is right for an instance that is idle or being cut over
+     * deliberately. An operator running an activation against a live instance
+     * can set a ceiling so the backfill stops competing with their own read IO
+     * and with the Cloud ingest allowance.
+     *
+     * An operator setting on the singleton `settings` row rather than an
+     * environment variable, per CLAUDE.md, so it can be changed **while a job
+     * is running** — which is exactly when an operator discovers they need it,
+     * and exactly when restarting the binary would mean stopping an activation
+     * they have already paid for. The worker re-reads it each time it picks up
+     * a project, so a change takes effect at the next project boundary rather
+     * than at the next restart.
+     *
+     * Only the bulk worker reads this. The live Cloud-primary write path is a
+     * primary path and is never throttled; the offline
+     * `temps backfill cloud-telemetry` tool keeps its own
+     * `--rate-limit-spans-per-sec` flag, because it runs in a different
+     * process with the server stopped.
+     */
+    telemetry_bulk_rate_limit_spans_per_sec?: number | null;
+    /**
+     * Explicit consent to mirror locally stored telemetry.
+     */
+    telemetry_enabled?: boolean;
+    /**
+     * ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
+     * backs Cloud-primary telemetry writes.
+     *
+     * An operator setting on the singleton `settings` row rather than an
+     * environment variable, per CLAUDE.md, so it can be raised at runtime by
+     * the operator watching a queue fill up — which is exactly when they need
+     * to change it and exactly when restarting the binary is the worst
+     * available option.
+     *
+     * Expressed in **bytes and not rows**: the reference deployment is
+     * 3 vCPU / 4 GB, and a row count says nothing about disk on a table whose
+     * rows are serialized spans of wildly varying size. When the queue reaches
+     * this size the instance stops accepting new spans for Cloud-primary
+     * projects and records a gap window with a start, an end and a count —
+     * see [`DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES`] for how the default is
+     * sized and what it buys.
+     */
+    telemetry_outbox_max_bytes?: number;
+};
+
+export type CloudStatus = {
+    account_email?: string | null;
+    backend_url: string;
+    backups_enabled: boolean;
+    health: string;
+    health_message: string;
+    instance_id?: string | null;
+    managed_backup_setup: ManagedBackupSetup;
+    notifications_enabled: boolean;
+    spooled_spans: number;
+    status: string;
+    status_message: string;
+    telemetry_enabled: boolean;
+};
+
+/**
+ * Lifecycle of the most recent backfill run for a project.
+ */
+export type CloudTelemetryBackfillStatus = 'not_started' | 'running' | 'completed' | 'failed';
+
+/**
+ * Per-project fidelity tier for the optional Temps Cloud telemetry mirror.
+ */
+export type CloudTelemetryFidelity = 'metered' | 'queryable';
+
+/**
+ * Per-project destination for span writes.
+ */
+export type CloudTelemetryWriteMode = 'local' | 'cloud';
+
+/**
+ * Instance-wide aggregate for the Cloud settings page.
+ */
+export type CloudTelemetryWriteStatusResponse = {
+    /**
+     * Whether the console should offer decommission guidance. True only when
+     * `local_span_store_required` is false — the ADR is explicit that the
+     * advice must not appear before then.
+     */
+    can_decommission_local_span_store: boolean;
+    cloud_primary_projects: number;
+    /**
+     * Whether Cloud-primary writes can be used at all on this instance.
+     */
+    configured: boolean;
+    /**
+     * Rows that exhausted their retries. Never swept automatically; an
+     * operator has to see them.
+     */
+    dead_lettered_rows: number;
+    gap_windows: Array<TelemetryGapWindowResponse>;
+    local_history_until?: string | null;
+    local_mode_projects: number;
+    local_span_store_reason?: string | null;
+    /**
+     * The derived decommission signal. `true` means the operator gets **zero**
+     * resource win from removing their local span store, whatever the write
+     * modes say.
+     */
+    local_span_store_required: boolean;
+    /**
+     * Age of the oldest unshipped span, in seconds. `None` when the queue is
+     * empty — different from zero, and it must not render as zero.
+     */
+    oldest_unshipped_age_secs?: number | null;
+    queue_bytes: number;
+    /**
+     * Spans queued for Cloud across all projects.
+     */
+    queue_depth: number;
+    /**
+     * The operator-set ceiling, so the depth above is readable against
+     * something rather than being a number with no scale.
+     */
+    queue_max_bytes: number;
+    reason?: string | null;
+    setup_path?: string | null;
+    /**
+     * Set while Cloud-primary writes are falling back to local storage.
+     */
+    write_suspension?: string | null;
+};
 
 /**
  * Configuration for a Cloudflare Email Sending notification provider.
@@ -2844,6 +3498,18 @@ export type ClusterMemberRequest = {
      * Service-type-specific role (e.g., "monitor", "primary", "replica")
      */
     role: string;
+};
+
+/**
+ * Read-only cluster network state. Pool changes are performed on the control
+ * plane through `temps network setup-multi-node`, which enforces that no
+ * existing node allocation can be stranded by an in-place edit.
+ */
+export type ClusterNetworkSettings = {
+    allocation_count: number;
+    compute_pool_cidr: string;
+    locked: boolean;
+    subnet_prefix_len: number;
 };
 
 export type CmdBody = {
@@ -3643,26 +4309,59 @@ export type ContextLogsResponse = {
     target_index: number;
 };
 
+export type ContinuousArchiveSourceResponse = {
+    continuous_archive_pinned_at: string;
+    continuous_archive_s3_source_id: number;
+    service_id: number;
+};
+
+export type ControlApplicationWorkspaceRequest = {
+    /**
+     * restart, pause, resume, rebuild, snapshot, or restore
+     */
+    action: string;
+    label?: string | null;
+    snapshot_id?: string | null;
+};
+
 export type ConversationDetailResponse = ConversationResponse & {
     /**
      * Turns oldest-first. The `system` seed message is omitted (internal).
      */
     messages: Array<MessageResponse>;
+    page: ConversationMessagePageResponse;
     pending_permission?: null | PermissionRequest;
 };
 
+export type ConversationListScope = 'all' | 'global';
+
+export type ConversationListStatus = 'active' | 'archived';
+
+export type ConversationMessagePageResponse = {
+    has_more: boolean;
+    next_before?: string | null;
+};
+
 export type ConversationResponse = {
+    active_turn_id?: string | null;
     ai_model: string;
     ai_permission_mode: string;
     ai_provider: string;
     ai_thinking_level?: string | null;
+    application_id?: number | null;
     context_id: string;
     context_type: string;
     created_at: string;
     last_activity_at: string;
+    project_id?: number | null;
     public_id: string;
     status: string;
     title?: string | null;
+    turn_started_at?: string | null;
+    /**
+     * Server-authoritative lifecycle for the current/most recent turn.
+     */
+    turn_status: string;
 };
 
 /**
@@ -3849,6 +4548,42 @@ export type CreateApiKeyResponse = {
     role_type: string;
 };
 
+export type CreateApplicationConversationRequest = {
+    /**
+     * A registered development harness (for example `claude_cli`).
+     * Application threads never inherit an API-gateway provider.
+     */
+    ai_provider?: string | null;
+};
+
+export type CreateApplicationPreviewLinkRequest = {
+    /**
+     * Optional same-origin path to open after the preview grant is exchanged.
+     */
+    path?: string | null;
+    /**
+     * The development server port detected or selected in the sandbox.
+     */
+    port: number;
+};
+
+export type CreateApplicationProjectRequest = {
+    exposed_port?: number | null;
+    name: string;
+    /**
+     * Deployment preset for the project. Defaults to `autopack`, which
+     * detects the application runtime from the workspace source.
+     */
+    preset?: string | null;
+};
+
+export type CreateApplicationRequest = {
+    description?: string | null;
+    name: string;
+    project_ids?: Array<number>;
+    starter_project?: null | CreateApplicationProjectRequest;
+};
+
 export type CreateBackupScheduleRequest = {
     backup_type: string;
     description?: string | null;
@@ -3900,6 +4635,19 @@ export type CreateBitbucketRequest = {
      * Display name for this provider.
      */
     name: string;
+};
+
+/**
+ * Body for `POST /bulk-jobs`.
+ *
+ * Deliberately one field. The plan is inside the token, so there is no project
+ * list here to disagree with the one that was quoted.
+ */
+export type CreateBulkActivationJobRequest = {
+    /**
+     * The `plan_token` from a `POST /bulk-jobs/estimate` response.
+     */
+    plan_token: string;
 };
 
 export type CreateCloudflareProviderRequest = {
@@ -4194,6 +4942,17 @@ export type CreateGiteaPatRequest = {
      * Personal access token issued by the Gitea instance.
      */
     token: string;
+};
+
+export type CreateGlobalConversationRequest = {
+    ai_model?: string | null;
+    ai_permission_mode?: string | null;
+    /**
+     * A registered development harness. Global operator chats run inside a
+     * persistent Temps-managed sandbox rather than on the host filesystem.
+     */
+    ai_provider?: string | null;
+    ai_thinking_level?: string | null;
 };
 
 export type CreateIncidentRequest = {
@@ -4813,6 +5572,12 @@ export type CreateTeamRequest = {
     slug: string;
 };
 
+export type CreateThreadArtifactRequest = {
+    kind: string;
+    payload: unknown;
+    title?: string | null;
+};
+
 export type CreateUserRequest = {
     email?: string | null;
     must_change_password?: boolean;
@@ -5175,6 +5940,14 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeployApplicationProjectRequest = {
+    /**
+     * Target environment. Omit to use production, then the project's oldest
+     * active environment as a fallback.
+     */
+    environment_id?: number | null;
 };
 
 export type DeployFromImageRequest = {
@@ -7012,6 +7785,10 @@ export type EnrichVisitorResponse = {
     visitor_id: string;
 };
 
+export type EnrollCloudRequest = {
+    enrollment_code: string;
+};
+
 export type EnrollmentTokenInfo = {
     bound_node_name?: string | null;
     created_at: string;
@@ -7493,6 +8270,35 @@ export type ErrorTimeSeriesQuery = {
      */
     environment_id?: number | null;
     start_time: string;
+};
+
+/**
+ * What to quote.
+ *
+ * Exactly one of `all_eligible_projects` and a non-empty `project_ids` must be
+ * given. Defaulting an omitted scope to "everything" would make a typo cost
+ * money; defaulting it to "nothing" would make the endpoint silently useless.
+ */
+export type EstimateBulkActivationRequest = {
+    /**
+     * Quote every project that still writes its spans to this instance.
+     */
+    all_eligible_projects?: boolean;
+    /**
+     * Quote exactly these projects. Projects that are already Cloud-primary
+     * are accepted here — re-shipping a window is the retry path — but are
+     * never picked up by `all_eligible_projects`.
+     */
+    project_ids?: Array<number> | null;
+    /**
+     * Start of the window to ship. Defaults to the oldest span local retention
+     * can still be holding.
+     */
+    window_from?: string | null;
+    /**
+     * End of the window to ship. Defaults to now.
+     */
+    window_to?: string | null;
 };
 
 /**
@@ -8146,6 +8952,30 @@ export type ExternalImageResponse = {
     tag?: string | null;
 };
 
+export type ExternalServiceBackupCapabilityResponse = {
+    /**
+     * Concrete artifact Cloud would mirror, such as `walg_repository`,
+     * `redis_walg_stream`, or `object_set`.
+     */
+    artifact: string;
+    /**
+     * Whether this running service can produce the physical WAL-G repository
+     * required by Temps Cloud. Logical dump fallback is intentionally not
+     * considered compatible.
+     */
+    cloud_backup_compatible: boolean;
+    engine: string;
+    reason?: string | null;
+    recommended_image?: string | null;
+    remediation?: string | null;
+    /**
+     * False when Docker or the target container was unavailable, meaning the
+     * endpoint intentionally did not guess whether required tools exist.
+     */
+    verified: boolean;
+    wal_g_installed: boolean;
+};
+
 /**
  * Response type for external service backup
  */
@@ -8187,6 +9017,20 @@ export type ExternalServiceDetails = {
 
 export type ExternalServiceInfo = {
     connection_info?: string | null;
+    /**
+     * When `continuous_archive_s3_source_id` was last set. Null alongside
+     * a non-null source id means it was set by the original provisioning
+     * flow rather than an explicit repoint.
+     */
+    continuous_archive_pinned_at?: string | null;
+    /**
+     * S3 source ID that this service's continuous archiving (Postgres/
+     * Timescale WAL-G `archive_command`, or MariaDB's binlog shipper)
+     * currently writes to. Null for service types with no continuous
+     * archiving concept, or a Postgres/MariaDB service that has never had
+     * one provisioned. Change it with `repoint_continuous_archive_source`.
+     */
+    continuous_archive_s3_source_id?: number | null;
     created_at: string;
     /**
      * Error message from failed initialization.
@@ -8243,6 +9087,33 @@ export type ExternalServiceSummary = {
  * stamping it on each row keeps the status fields unambiguous.
  */
 export type FacetBackendKind = 'clickhouse' | 'timescaledb';
+
+/**
+ * Whether a facet registered now would actually cover anything
+ * (Feature Discoverability: "not built" and "not set up" need different UI).
+ */
+export type FacetCapability = {
+    /**
+     * False when the facet would populate for no project at all.
+     */
+    configured: boolean;
+    /**
+     * Why, when `configured` is false. Always populated in that case.
+     */
+    reason?: string | null;
+    /**
+     * Where the operator goes to change it.
+     */
+    setup_path?: string | null;
+    /**
+     * Projects whose spans this facet will **not** cover, because they are
+     * Cloud-primary and store no spans on this instance. Non-empty alongside
+     * `configured: true` is a real and useful state: the facet works for the
+     * other projects, and the operator must be told which ones it misses
+     * rather than discovering it from an empty filter.
+     */
+    uncovered_project_ids: Array<number>;
+};
 
 /**
  * Public representation of a registered span attribute facet.
@@ -8547,7 +9418,7 @@ export type GatewayStatus = {
      */
     health: string;
     /**
-     * Host port that the container's :8080 is published on.
+     * Host port that the ingress relay's :8080 is published on.
      */
     host_port?: number | null;
     /**
@@ -8568,7 +9439,8 @@ export type GatewayStatus = {
      */
     last_exit_code?: number | null;
     /**
-     * Network the container is attached to (should be `temps-sandbox-net`).
+     * Trusted control network the gateway starts on. It is additionally attached
+     * to each per-sandbox isolated network during reconciliation.
      */
     network?: string | null;
     /**
@@ -9225,12 +10097,16 @@ export type GlobalConversationResponse = {
     context_type: string;
     created_at: string;
     last_activity_at: string;
-    project_id: number;
+    project_id?: number | null;
     project_name?: string | null;
     project_slug?: string | null;
     public_id: string;
     status: string;
     title?: string | null;
+    /**
+     * Server-authoritative lifecycle for the current/most recent turn.
+     */
+    turn_status: string;
 };
 
 export type GlobalEventStatsResponse = {
@@ -9623,6 +10499,17 @@ export type ImageRuntimeConfig = {
     command?: Array<string> | null;
     healthCheckPath?: string | null;
     imageRef: string;
+};
+
+export type ImportApplicationWorkspaceGitRequest = {
+    depth?: number | null;
+    /**
+     * Opaque user-owned connection reference. The credential value remains
+     * server-side and is restricted to the provider's configured origin.
+     */
+    git_connection_id?: number | null;
+    revision?: string | null;
+    url: string;
 };
 
 /**
@@ -10472,6 +11359,10 @@ export type LineContext = {
     before: Array<ContextLine>;
 };
 
+export type LinkApplicationProjectRequest = {
+    project_id: number;
+};
+
 export type LinkServiceRequest = {
     project_id: number;
 };
@@ -10642,6 +11533,22 @@ export type ListOrdersResponse = {
 export type ListPresetsResponse = {
     presets: Array<PresetResponse>;
     total: number;
+};
+
+/**
+ * Domains discoverable on a provider's side for the "import existing
+ * domain" picker.
+ *
+ * `supported: false` means this provider type has no domain-listing API at
+ * all (SMTP) — the UI must fall back to manual domain entry rather than
+ * treat it as an error to retry. `error` is set when `supported` is `true`
+ * but the live fetch still failed (network, revoked credentials); the same
+ * manual-entry fallback applies, but it's worth surfacing as a warning.
+ */
+export type ListProviderDomainsResponse = {
+    domains: Array<ProviderDomainIdentityResponse>;
+    error?: string | null;
+    supported: boolean;
 };
 
 /**
@@ -10897,6 +11804,17 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
+export type ManagedBackupSetup = {
+    action: ManagedBackupSetupAction;
+    message: string;
+    ready: boolean;
+    status: ManagedBackupSetupStatus;
+};
+
+export type ManagedBackupSetupAction = 'none' | 'retry' | 'renew_subscription';
+
+export type ManagedBackupSetupStatus = 'disabled' | 'ready' | 'needs_setup' | 'subscription_required' | 'unavailable';
+
 /**
  * Managed domain response
  */
@@ -11016,8 +11934,17 @@ export type MessagePart = {
 };
 
 export type MessageResponse = {
+    /**
+     * Files copied into the persistent workspace for this user turn.
+     */
+    attachments?: Array<ChatAttachmentResponse> | null;
     content: string;
     created_at: string;
+    /**
+     * Stable opaque cursor for this stored message. Clients must treat this as
+     * an uninterpreted token and send it back through the `before` query.
+     */
+    cursor: string;
     /**
      * Ordered render segments (text / tool, in the order they occurred) so a
      * reloaded chat shows the same interleaving as the live stream. Absent for
@@ -11342,8 +12269,8 @@ export type MintEnrollmentTokenRequest = {
 
 export type MintEnrollmentTokenResponse = {
     /**
-     * SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-     * worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+     * SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+     * CA when needed, so every newly minted token carries a trust pin.
      */
     ca_fingerprint?: string | null;
     expires_at: string;
@@ -11380,6 +12307,18 @@ export type MiscResult = {
 
 export type MkdirBody = {
     path: string;
+};
+
+export type ModelCapability = {
+    default_thinking_mode_id?: string | null;
+    id: string;
+    name: string;
+    thinking_modes: Array<SelectOption>;
+    /**
+     * Optional reasoning modes valid when function tools are attached. `None`
+     * inherits `thinking_modes`; `Some` is a model-specific restriction.
+     */
+    tool_thinking_modes?: Array<SelectOption> | null;
 };
 
 export type ModelInfo = {
@@ -11597,9 +12536,10 @@ export type MultiNodeSettings = {
      */
     private_address?: string | null;
     /**
-     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
-     * (default), the control plane ignores join-time CSRs and nodes keep
-     * serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations
+     * default to `true`. Existing serialized settings that predate this field
+     * deserialize it as `false`, providing an explicit migration window rather
+     * than unexpectedly disconnecting legacy workers. When `true`, the CP signs
      * node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
      * cluster client cert. Observe-then-enforce: flip this on only once all
      * workers have re-enrolled with certs.
@@ -11616,6 +12556,7 @@ export type MultiNodeSettingsMasked = {
      * verify it out of band; the CA private key is never exposed).
      */
     cluster_ca_fingerprint?: string | null;
+    cluster_network?: null | ClusterNetworkSettings;
     has_join_token: boolean;
     /**
      * Whether the deprecated shared join token is still accepted.
@@ -11706,6 +12647,16 @@ export type NetworkConfiguration = {
  */
 export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
+};
+
+/**
+ * Cluster-wide pool which every node must use. This is intentionally sent
+ * alongside the local allocation so operators and agents can detect stale or
+ * independently configured nodes before routes are changed.
+ */
+export type NetworkPoolEntry = {
+    compute_pool_cidr: string;
+    subnet_prefix_len: number;
 };
 
 /**
@@ -13020,6 +13971,7 @@ export type PeerListResponse = {
      * and newer version skew degrades to the safe default of `false`.
      */
     cluster_dns_enabled: boolean;
+    network: NetworkPoolEntry;
     /**
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
@@ -13664,6 +14616,10 @@ export type PresetResponse = {
     slug: string;
 };
 
+export type PreviewGatewayLogsResponse = {
+    lines: Array<string>;
+};
+
 /**
  * Workspace preview gateway settings.
  *
@@ -13819,6 +14775,74 @@ export type ProjectAccessResponse = {
     role: TeamRole;
     team_id: number;
     updated_at: string;
+};
+
+/**
+ * A project's Cloud telemetry configuration, in every state.
+ */
+export type ProjectCloudTelemetryResponse = {
+    /**
+     * ADR-043 §1: the independent analytics write mode (metrics under Phase
+     * C1). Orthogonal to `write_mode` — a project may be Cloud-primary for
+     * spans and local for analytics, or vice versa.
+     */
+    analytics_write_mode: CloudAnalyticsWriteMode;
+    attribute_allowlist: Array<string>;
+    /**
+     * Whether `write_mode = cloud` could be set right now.
+     *
+     * `false` is the normal state on an unlinked instance and must render as
+     * onboarding, not as an error.
+     */
+    cloud_write_mode_available: boolean;
+    /**
+     * Spans this instance accepted for this project and gave up on delivering.
+     *
+     * The instance-wide card only shows a count; this route is already scoped
+     * to one project, so it can say *why* without exposing another tenant's
+     * failures.
+     */
+    dead_lettered_spans: number;
+    effective_reason?: null | TelemetryWriteIntervalReason;
+    effective_reason_message?: string | null;
+    /**
+     * Where this project's spans are going right now, which differs from
+     * `write_mode` during a quota or credential fallback.
+     */
+    effective_write_mode: CloudTelemetryWriteMode;
+    fidelity: CloudTelemetryFidelity;
+    /**
+     * Gap windows in the last 30 days.
+     */
+    gap_windows: Array<TelemetryGapWindowResponse>;
+    /**
+     * The write-mode ledger, newest first.
+     */
+    intervals: Array<TelemetryWriteIntervalResponse>;
+    last_dead_letter_at?: string | null;
+    /**
+     * The reason the most recent give-up gave, if there is one.
+     *
+     * Delivery metadata only — this instance's own bounded error string. It is
+     * never the span payload, and this field must not become a place one
+     * appears.
+     */
+    last_dead_letter_error?: string | null;
+    project_id: number;
+    /**
+     * Spans queued for Cloud for this project and not yet acknowledged.
+     */
+    queued_spans: number;
+    /**
+     * The single most relevant missing prerequisite, when
+     * `cloud_write_mode_available` is false.
+     */
+    reason?: string | null;
+    setup_path?: string | null;
+    /**
+     * The operator's declared intent.
+     */
+    write_mode: CloudTelemetryWriteMode;
 };
 
 /**
@@ -14521,6 +15545,11 @@ export type ProviderCatalogDto = {
      * that as "Use provider default".
      */
     default_model?: string | null;
+    default_permission_mode_id: string;
+    /**
+     * Explicit default used when a new harness thread is created.
+     */
+    default_runtime_model_id?: string | null;
     /**
      * Explains why `host_authenticated` is false (not installed vs.
      * installed-but-not-authenticated), or `None` when it's true.
@@ -14536,14 +15565,11 @@ export type ProviderCatalogDto = {
      * True when the CLI is installed AND authenticated on **this host** —
      * the machine running the Temps server process. This is a completely
      * different signal from `credential_saved`: that field is about a
-     * credential seeded into a *sandboxed autofixer container*, while this
-     * one is what actually gates whether the AI Gateway can route requests
-     * to this provider (ADR-037's `AgentCliAiService` uses only the host's
-     * ambient CLI session — ordering `claude setup-token`/`codex login` on
-     * this machine — and never reads the sandbox credential at all). A
-     * provider can show `credential_saved: true` and `host_authenticated:
-     * false` at the same time; only the latter means chat/gateway routing
-     * will actually work.
+     * credential available to the server-side, turn-scoped workspace relay.
+     * Persistent workspace chat never inherits the host's ambient CLI
+     * session. A provider can show
+     * `credential_saved: true` and `host_authenticated: false` at the same
+     * time.
      */
     host_authenticated: boolean;
     /**
@@ -14583,11 +15609,30 @@ export type ProviderCatalogDto = {
     models_refreshed_at?: string | null;
     name: string;
     /**
+     * Provider-native permission modes available to sandboxed harness turns.
+     */
+    permission_modes: Array<SelectOption>;
+    /**
+     * Full normalized runtime capabilities used by application chat. Unlike
+     * `models`, this preserves resolved display names and reasoning choices.
+     */
+    runtime_models: Array<ModelCapability>;
+    /**
      * True when this provider's CLI supports enforcing a turn cap. False
      * for Codex/OpenCode, which run to completion — the UI labels their
      * max-turns inputs accordingly.
      */
     supports_max_turns: boolean;
+    /**
+     * Actionable explanation when `workspace_ready` is false.
+     */
+    workspace_readiness_hint?: string | null;
+    /**
+     * True only when this provider can execute inside a persistent Temps
+     * workspace with a saved credential and a secure turn-scoped relay.
+     * This is the authoritative signal for workspace harness pickers.
+     */
+    workspace_ready: boolean;
 };
 
 export type ProviderCatalogResponse = {
@@ -14640,6 +15685,20 @@ export type ProviderDescriptor = {
 export type ProviderDetailResponse = {
     key: ProviderKeyResponse;
     models: Array<ProviderModelResponse>;
+};
+
+/**
+ * A single domain identity already registered on the provider's side,
+ * offered for import.
+ */
+export type ProviderDomainIdentityResponse = {
+    domain: string;
+    provider_identity_id: string;
+    /**
+     * The provider's current verification status for this domain
+     * ("verified", "pending", "failed", "not_started", "temporary_failure")
+     */
+    status: string;
 };
 
 export type ProviderKeyResponse = {
@@ -15372,6 +16431,10 @@ export type RegisterNodeResponse = {
     cert_pem?: string | null;
     id: number;
     message: string;
+    /**
+     * Whether this node must serve mTLS and reject plaintext agent traffic.
+     */
+    mtls_required: boolean;
     name: string;
     status: string;
 };
@@ -15492,6 +16555,20 @@ export type RenewalAttemptResponse = {
      * `"http-01"` | `"dns-01"`.
      */
     verification_method: string;
+};
+
+/**
+ * Deliberately, explicitly move where a service's continuous archiving
+ * process (Postgres/Timescale WAL-G, MariaDB's binlog shipper) points. See
+ * `ExternalServiceManager::repoint_continuous_archive_source` for why this is a
+ * dedicated, guarded operation rather than something a schedule change
+ * does implicitly.
+ */
+export type RepointContinuousArchiveSourceRequest = {
+    /**
+     * The S3 source continuous archiving should point at from now on.
+     */
+    new_s3_source_id: number;
 };
 
 export type RepositoryComposeServicesResponse = {
@@ -16152,6 +17229,25 @@ export type RootfsVmEntry = {
     sandbox_name: string;
 };
 
+export type RotateClusterCaRequest = {
+    /**
+     * Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+     */
+    confirmation: string;
+    /**
+     * Fingerprint observed through a trusted operator channel immediately
+     * before rotation. The request fails if the active root changed.
+     */
+    expected_fingerprint: string;
+};
+
+export type RotateClusterCaResponse = {
+    message: string;
+    new_fingerprint: string;
+    previous_fingerprint: string;
+    revoked_enrollment_tokens: number;
+};
+
 export type RouteRefreshResponse = {
     /**
      * Human-readable message
@@ -16275,6 +17371,12 @@ export type S3SourceResponse = {
     force_path_style?: boolean | null;
     id: number;
     is_default: boolean;
+    /**
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
+     */
+    managed_by_cloud: boolean;
     name: string;
     region: string;
     updated_at: number;
@@ -16852,6 +17954,12 @@ export type SecurityHeadersSettings = {
     x_xss_protection?: string;
 };
 
+export type SelectOption = {
+    description?: string | null;
+    id: string;
+    name: string;
+};
+
 /**
  * A single update attempt. Persisted to `<data_dir>/self-update.json` so the
  * result survives the restart it causes.
@@ -17024,6 +18132,21 @@ export type SendFailureReportRequest = {
     report_text: string;
 };
 
+/**
+ * Acknowledgement that a durable, server-owned turn has started. Live token,
+ * tool, permission, error, and completion events are delivered exclusively by
+ * the conversation WebSocket.
+ */
+export type SendMessageAcceptedResponse = {
+    status: string;
+    turn_id: string;
+    /**
+     * Server timestamp used by every observer to render one continuous
+     * elapsed-time counter across refreshes and reconnects.
+     */
+    turn_started_at: string;
+};
+
 export type SendMessageRequest = {
     /**
      * Optional next-turn model. The provider harness remains pinned, but its
@@ -17038,6 +18161,10 @@ export type SendMessageRequest = {
      * Optional next-turn thinking level.
      */
     ai_thinking_level?: string | null;
+    /**
+     * Opaque references returned by the conversation attachment endpoint.
+     */
+    attachments?: Array<ChatAttachmentReference>;
     content: string;
     /**
      * Optional, client-supplied description of the page/entity the user is
@@ -17046,6 +18173,11 @@ export type SendMessageRequest = {
      * side; oversized values are ignored rather than rejected.
      */
     page_context?: string | null;
+    /**
+     * Client-generated opaque idempotency key for this turn. Retries with the
+     * same id never create a second user message or harness execution.
+     */
+    turn_id?: string | null;
 };
 
 export type SensitiveConfigValueResponse = {
@@ -19254,6 +20386,39 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * A gap window as the client renders it.
+ */
+export type TelemetryGapWindowResponse = {
+    dropped_bytes: number;
+    dropped_spans: number;
+    ended_at: string;
+    /**
+     * The sentence shown to the operator. Sent by the server so the client
+     * never has to map an enum to prose and never renders a bare enum name.
+     */
+    message: string;
+    project_id: number;
+    reason: TelemetryWriteIntervalReason;
+    started_at: string;
+};
+
+/**
+ * Why an interval opened.
+ */
+export type TelemetryWriteIntervalReason = 'operator' | 'cloud_disconnected' | 'quota_exhausted' | 'credential_rejected' | 'queue_overflow_spill' | 'cloud_recovered';
+
+/**
+ * One entry of the write-mode ledger.
+ */
+export type TelemetryWriteIntervalResponse = {
+    effective_from: string;
+    effective_to?: string | null;
+    message: string;
+    mode: CloudTelemetryWriteMode;
+    reason: TelemetryWriteIntervalReason;
+};
+
+/**
  * Where a template is presented in the project creation flow.
  */
 export type TemplateKind = 'starter' | 'service';
@@ -19478,6 +20643,17 @@ export type TestProviderKeyResponse = {
 export type TestProviderResponse = {
     message?: string | null;
     success: boolean;
+};
+
+export type ThreadArtifactResponse = {
+    created_at: string;
+    kind: string;
+    payload: unknown;
+    public_id: string;
+    schema_version: number;
+    status: string;
+    title?: string | null;
+    updated_at: string;
 };
 
 /**
@@ -20403,6 +21579,15 @@ export type UpdateApiKeyRequest = {
     permissions?: Array<string> | null;
 };
 
+export type UpdateApplicationWorkspaceRequest = {
+    cpu_limit?: number | null;
+    disk_limit_mb?: number | null;
+    idle_timeout_secs?: number | null;
+    memory_limit_mb?: number | null;
+    pids_limit?: number | null;
+    runtime?: string | null;
+};
+
 export type UpdateAutomaticDeployRequest = {
     automatic_deploy: boolean;
 };
@@ -21086,8 +22271,31 @@ export type UpdateOidcProviderRequest = {
     trust_idp_email?: boolean | null;
 };
 
+export type UpdatePermissionModeRequest = {
+    /**
+     * Provider permission mode to persist. During a running turn only `Auto`
+     * (`full-access`) can be applied because provider CLI launch flags cannot
+     * be safely reduced after the process has started.
+     */
+    permission_mode: string;
+};
+
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
+};
+
+/**
+ * Body for changing a project's Cloud telemetry settings.
+ *
+ * Both fields are optional and independent: an operator raising fidelity and
+ * one flipping the write mode are two different acts, and forcing a client to
+ * send both would make each one able to clobber the other.
+ */
+export type UpdateProjectCloudTelemetryRequest = {
+    analytics_write_mode?: null | CloudAnalyticsWriteMode;
+    attribute_allowlist?: Array<string> | null;
+    fidelity?: null | CloudTelemetryFidelity;
+    write_mode?: null | CloudTelemetryWriteMode;
 };
 
 /**
@@ -22446,6 +23654,14 @@ export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'fail
  */
 export type WorkloadType = 'container' | 'function' | 'static-site' | 'server-side-app' | 'worker' | 'database' | 'message-queue' | 'cache' | 'cron-job' | 'other';
 
+export type WriteApplicationWorkspaceFilesRequest = {
+    files: Array<ApplicationWorkspaceFileWrite>;
+};
+
+export type WriteApplicationWorkspaceFilesResponse = {
+    written: number;
+};
+
 export type WriteFileBody = {
     /**
      * File contents, base64-encoded. Required — lets callers ship binary
@@ -22497,6 +23713,12 @@ export type S3SourceResponseWritable = {
     force_path_style?: boolean | null;
     id: number;
     is_default: boolean;
+    /**
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
+     */
+    managed_by_cloud: boolean;
     name: string;
     region: string;
     secret_key: string;
@@ -23272,10 +24494,670 @@ export type WebhookTriggerResponses = {
 
 export type WebhookTriggerResponse2 = WebhookTriggerResponses[keyof WebhookTriggerResponses];
 
+export type ListApplicationsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Number of applications or conversations per page (clamped to 1..=100).
+         */
+        page_size?: number;
+    };
+    url: '/ai/applications';
+};
+
+export type ListApplicationsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type ListApplicationsResponses = {
+    200: Array<ApplicationResponse>;
+};
+
+export type ListApplicationsResponse = ListApplicationsResponses[keyof ListApplicationsResponses];
+
+export type CreateApplicationData = {
+    body: CreateApplicationRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/applications';
+};
+
+export type CreateApplicationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+};
+
+export type CreateApplicationResponses = {
+    201: ApplicationResponse;
+};
+
+export type CreateApplicationResponse = CreateApplicationResponses[keyof CreateApplicationResponses];
+
+export type ArchiveApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type ArchiveApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type ArchiveApplicationResponses = {
+    204: void;
+};
+
+export type ArchiveApplicationResponse = ArchiveApplicationResponses[keyof ArchiveApplicationResponses];
+
+export type GetApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+    };
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type GetApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type GetApplicationResponse = GetApplicationResponses[keyof GetApplicationResponses];
+
+export type ListApplicationConversationsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Number of applications or conversations per page (clamped to 1..=100).
+         */
+        page_size?: number;
+    };
+    url: '/ai/applications/{application_public_id}/conversations';
+};
+
+export type ListApplicationConversationsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListApplicationConversationsResponses = {
+    200: Array<ConversationResponse>;
+};
+
+export type ListApplicationConversationsResponse = ListApplicationConversationsResponses[keyof ListApplicationConversationsResponses];
+
+export type CreateApplicationConversationData = {
+    body: CreateApplicationConversationRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations';
+};
+
+export type CreateApplicationConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateApplicationConversationResponses = {
+    201: ConversationResponse;
+};
+
+export type CreateApplicationConversationResponse = CreateApplicationConversationResponses[keyof CreateApplicationConversationResponses];
+
+export type ListThreadArtifactsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        conversation_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts';
+};
+
+export type ListThreadArtifactsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListThreadArtifactsResponses = {
+    200: Array<ThreadArtifactResponse>;
+};
+
+export type ListThreadArtifactsResponse = ListThreadArtifactsResponses[keyof ListThreadArtifactsResponses];
+
+export type CreateThreadArtifactData = {
+    body: CreateThreadArtifactRequest;
+    path: {
+        application_public_id: string;
+        conversation_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts';
+};
+
+export type CreateThreadArtifactErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateThreadArtifactResponses = {
+    201: ThreadArtifactResponse;
+};
+
+export type CreateThreadArtifactResponse = CreateThreadArtifactResponses[keyof CreateThreadArtifactResponses];
+
+export type CreateApplicationPreviewLinkData = {
+    body: CreateApplicationPreviewLinkRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/preview-link';
+};
+
+export type CreateApplicationPreviewLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type CreateApplicationPreviewLinkResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type CreateApplicationPreviewLinkResponse = CreateApplicationPreviewLinkResponses[keyof CreateApplicationPreviewLinkResponses];
+
+export type CreateApplicationProjectData = {
+    body: CreateApplicationProjectRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects';
+};
+
+export type CreateApplicationProjectErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateApplicationProjectResponses = {
+    201: ApplicationResponse;
+};
+
+export type CreateApplicationProjectResponse = CreateApplicationProjectResponses[keyof CreateApplicationProjectResponses];
+
+export type LinkApplicationProjectData = {
+    body: LinkApplicationProjectRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/link';
+};
+
+export type LinkApplicationProjectErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type LinkApplicationProjectResponses = {
+    200: ApplicationResponse;
+};
+
+export type LinkApplicationProjectResponse = LinkApplicationProjectResponses[keyof LinkApplicationProjectResponses];
+
+export type UnlinkApplicationProjectData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}';
+};
+
+export type UnlinkApplicationProjectErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type UnlinkApplicationProjectResponses = {
+    200: ApplicationResponse;
+};
+
+export type UnlinkApplicationProjectResponse = UnlinkApplicationProjectResponses[keyof UnlinkApplicationProjectResponses];
+
+export type DeployApplicationWorkspaceProjectData = {
+    body: DeployApplicationProjectRequest;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/deploy';
+};
+
+export type DeployApplicationWorkspaceProjectErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+};
+
+export type DeployApplicationWorkspaceProjectResponses = {
+    202: ApplicationProjectDeploymentResponse;
+};
+
+export type DeployApplicationWorkspaceProjectResponse = DeployApplicationWorkspaceProjectResponses[keyof DeployApplicationWorkspaceProjectResponses];
+
+export type SetApplicationPrimaryProjectData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/primary';
+};
+
+export type SetApplicationPrimaryProjectErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type SetApplicationPrimaryProjectResponses = {
+    200: ApplicationResponse;
+};
+
+export type SetApplicationPrimaryProjectResponse = SetApplicationPrimaryProjectResponses[keyof SetApplicationPrimaryProjectResponses];
+
+export type WriteApplicationWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/workspace/files';
+};
+
+export type WriteApplicationWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type WriteApplicationWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type WriteApplicationWorkspaceFilesResponse2 = WriteApplicationWorkspaceFilesResponses[keyof WriteApplicationWorkspaceFilesResponses];
+
+export type ImportApplicationWorkspaceGitData = {
+    body: ImportApplicationWorkspaceGitRequest;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/workspace/source';
+};
+
+export type ImportApplicationWorkspaceGitErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type ImportApplicationWorkspaceGitResponses = {
+    204: void;
+};
+
+export type ImportApplicationWorkspaceGitResponse = ImportApplicationWorkspaceGitResponses[keyof ImportApplicationWorkspaceGitResponses];
+
+export type RestoreApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/restore';
+};
+
+export type RestoreApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RestoreApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type RestoreApplicationResponse = RestoreApplicationResponses[keyof RestoreApplicationResponses];
+
+export type GetApplicationWorkspaceData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace';
+};
+
+export type GetApplicationWorkspaceErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type GetApplicationWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type GetApplicationWorkspaceResponse = GetApplicationWorkspaceResponses[keyof GetApplicationWorkspaceResponses];
+
+export type UpdateApplicationWorkspaceData = {
+    body: UpdateApplicationWorkspaceRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace';
+};
+
+export type UpdateApplicationWorkspaceErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type UpdateApplicationWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type UpdateApplicationWorkspaceResponse = UpdateApplicationWorkspaceResponses[keyof UpdateApplicationWorkspaceResponses];
+
+export type ControlApplicationWorkspaceData = {
+    body: ControlApplicationWorkspaceRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace/actions';
+};
+
+export type ControlApplicationWorkspaceErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type ControlApplicationWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type ControlApplicationWorkspaceResponse = ControlApplicationWorkspaceResponses[keyof ControlApplicationWorkspaceResponses];
+
+export type GetApplicationWorkspaceChangesData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Files per page (1-200, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/changes';
+};
+
+export type GetApplicationWorkspaceChangesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetApplicationWorkspaceChangesResponses = {
+    200: ApplicationWorkspaceChangesResponse;
+};
+
+export type GetApplicationWorkspaceChangesResponse = GetApplicationWorkspaceChangesResponses[keyof GetApplicationWorkspaceChangesResponses];
+
+export type GetApplicationWorkspaceDiffData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/diff';
+};
+
+export type GetApplicationWorkspaceDiffErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetApplicationWorkspaceDiffResponses = {
+    200: ApplicationWorkspaceDiffResponse;
+};
+
+export type GetApplicationWorkspaceDiffResponse = GetApplicationWorkspaceDiffResponses[keyof GetApplicationWorkspaceDiffResponses];
+
+export type GetApplicationWorkspaceDirectoryData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/directory';
+};
+
+export type GetApplicationWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetApplicationWorkspaceDirectoryResponse = GetApplicationWorkspaceDirectoryResponses[keyof GetApplicationWorkspaceDirectoryResponses];
+
+export type GetApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file';
+};
+
+export type GetApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetApplicationWorkspaceFileResponse = GetApplicationWorkspaceFileResponses[keyof GetApplicationWorkspaceFileResponses];
+
+export type DownloadApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file/download';
+};
+
+export type DownloadApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadApplicationWorkspaceFileResponses = {
+    200: Array<number>;
+};
+
+export type DownloadApplicationWorkspaceFileResponse = DownloadApplicationWorkspaceFileResponses[keyof DownloadApplicationWorkspaceFileResponses];
+
+export type UploadApplicationWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace/files';
+};
+
+export type UploadApplicationWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadApplicationWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Conversation lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Limit results to the global workspace, or return every readable context.
+         */
+        scope?: ConversationListScope;
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Number of conversations per page (clamped to 1..=100).
+         */
+        page_size?: number;
+    };
     url: '/ai/conversations';
 };
 
@@ -23289,6 +25171,347 @@ export type ListAllConversationsResponses = {
 };
 
 export type ListAllConversationsResponse = ListAllConversationsResponses[keyof ListAllConversationsResponses];
+
+export type CreateGlobalConversationData = {
+    body: CreateGlobalConversationRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/conversations';
+};
+
+export type CreateGlobalConversationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    409: unknown;
+    503: unknown;
+};
+
+export type CreateGlobalConversationResponses = {
+    201: ConversationResponse;
+};
+
+export type CreateGlobalConversationResponse = CreateGlobalConversationResponses[keyof CreateGlobalConversationResponses];
+
+export type GetUserConversationData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: {
+        /**
+         * Opaque next_before cursor returned by the previous page
+         */
+        before?: string;
+        /**
+         * Messages per page (default 50, maximum 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/conversations/{public_id}';
+};
+
+export type GetUserConversationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationResponses = {
+    200: ConversationDetailResponse;
+};
+
+export type GetUserConversationResponse = GetUserConversationResponses[keyof GetUserConversationResponses];
+
+export type RenameUserConversationData = {
+    body: RenameConversationRequest;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}';
+};
+
+export type RenameUserConversationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RenameUserConversationResponses = {
+    200: ConversationResponse;
+};
+
+export type RenameUserConversationResponse = RenameUserConversationResponses[keyof RenameUserConversationResponses];
+
+export type ArchiveUserConversationData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/archive';
+};
+
+export type ArchiveUserConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ArchiveUserConversationResponses = {
+    204: void;
+};
+
+export type ArchiveUserConversationResponse = ArchiveUserConversationResponses[keyof ArchiveUserConversationResponses];
+
+export type UploadUserConversationAttachmentData = {
+    body: ChatAttachmentUpload;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachments';
+};
+
+export type UploadUserConversationAttachmentErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+};
+
+export type UploadUserConversationAttachmentResponses = {
+    201: ChatAttachmentResponse;
+};
+
+export type UploadUserConversationAttachmentResponse = UploadUserConversationAttachmentResponses[keyof UploadUserConversationAttachmentResponses];
+
+export type GetUserConversationAttachmentData = {
+    body?: never;
+    path: {
+        public_id: string;
+        attachment_id: string;
+    };
+    query: {
+        name: string;
+    };
+    url: '/ai/conversations/{public_id}/attachments/{attachment_id}';
+};
+
+export type GetUserConversationAttachmentErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationAttachmentResponses = {
+    200: Array<number>;
+};
+
+export type GetUserConversationAttachmentResponse = GetUserConversationAttachmentResponses[keyof GetUserConversationAttachmentResponses];
+
+export type SendUserMessageData = {
+    body: SendMessageRequest;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/messages';
+};
+
+export type SendUserMessageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type SendUserMessageResponses = {
+    202: SendMessageAcceptedResponse;
+};
+
+export type SendUserMessageResponse = SendUserMessageResponses[keyof SendUserMessageResponses];
+
+export type ListUserPendingActionsData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/pending-actions';
+};
+
+export type ListUserPendingActionsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListUserPendingActionsResponses = {
+    200: Array<PendingActionResponse>;
+};
+
+export type ListUserPendingActionsResponse = ListUserPendingActionsResponses[keyof ListUserPendingActionsResponses];
+
+export type UpdateUserPermissionModeData = {
+    body: UpdatePermissionModeRequest;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/permission-mode';
+};
+
+export type UpdateUserPermissionModeErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type UpdateUserPermissionModeResponses = {
+    200: ConversationResponse;
+};
+
+export type UpdateUserPermissionModeResponse = UpdateUserPermissionModeResponses[keyof UpdateUserPermissionModeResponses];
+
+export type ResolveUserPermissionData = {
+    body: ResolvePermissionRequest;
+    path: {
+        public_id: string;
+        permission_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/permissions/{permission_id}/resolve';
+};
+
+export type ResolveUserPermissionErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    410: unknown;
+};
+
+export type ResolveUserPermissionResponses = {
+    204: void;
+};
+
+export type ResolveUserPermissionResponse = ResolveUserPermissionResponses[keyof ResolveUserPermissionResponses];
+
+export type RestoreUserConversationData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/restore';
+};
+
+export type RestoreUserConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RestoreUserConversationResponses = {
+    204: void;
+};
+
+export type RestoreUserConversationResponse = RestoreUserConversationResponses[keyof RestoreUserConversationResponses];
+
+export type StopUserTurnData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/stop';
+};
+
+export type StopUserTurnErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type StopUserTurnResponses = {
+    204: void;
+};
+
+export type StopUserTurnResponse = StopUserTurnResponses[keyof StopUserTurnResponses];
+
+export type GetUserPendingActionData = {
+    body?: never;
+    path: {
+        action_public_id: string;
+    };
+    query?: never;
+    url: '/ai/pending-actions/{action_public_id}';
+};
+
+export type GetUserPendingActionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserPendingActionResponses = {
+    200: PendingActionResponse;
+};
+
+export type GetUserPendingActionResponse = GetUserPendingActionResponses[keyof GetUserPendingActionResponses];
+
+export type ConfirmUserPendingActionData = {
+    body?: never;
+    path: {
+        action_public_id: string;
+    };
+    query?: never;
+    url: '/ai/pending-actions/{action_public_id}/confirm';
+};
+
+export type ConfirmUserPendingActionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type ConfirmUserPendingActionResponses = {
+    200: PendingActionResponse;
+};
+
+export type ConfirmUserPendingActionResponse = ConfirmUserPendingActionResponses[keyof ConfirmUserPendingActionResponses];
+
+export type RejectUserPendingActionData = {
+    body?: never;
+    path: {
+        action_public_id: string;
+    };
+    query?: never;
+    url: '/ai/pending-actions/{action_public_id}/reject';
+};
+
+export type RejectUserPendingActionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type RejectUserPendingActionResponses = {
+    200: PendingActionResponse;
+};
+
+export type RejectUserPendingActionResponse = RejectUserPendingActionResponses[keyof RejectUserPendingActionResponses];
 
 export type GetPricingData = {
     body?: never;
@@ -24224,6 +26447,221 @@ export type ListModelsResponses = {
 };
 
 export type ListModelsResponse = ListModelsResponses[keyof ListModelsResponses];
+
+export type GetGlobalAiWorkspaceData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace';
+};
+
+export type GetGlobalAiWorkspaceErrors = {
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type GetGlobalAiWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type GetGlobalAiWorkspaceResponse = GetGlobalAiWorkspaceResponses[keyof GetGlobalAiWorkspaceResponses];
+
+export type GetGlobalWorkspaceChangesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Files per page (1-200, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/changes';
+};
+
+export type GetGlobalWorkspaceChangesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceChangesResponses = {
+    200: ApplicationWorkspaceChangesResponse;
+};
+
+export type GetGlobalWorkspaceChangesResponse = GetGlobalWorkspaceChangesResponses[keyof GetGlobalWorkspaceChangesResponses];
+
+export type GetGlobalWorkspaceDiffData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/diff';
+};
+
+export type GetGlobalWorkspaceDiffErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceDiffResponses = {
+    200: ApplicationWorkspaceDiffResponse;
+};
+
+export type GetGlobalWorkspaceDiffResponse = GetGlobalWorkspaceDiffResponses[keyof GetGlobalWorkspaceDiffResponses];
+
+export type GetGlobalWorkspaceDirectoryData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/directory';
+};
+
+export type GetGlobalWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetGlobalWorkspaceDirectoryResponse = GetGlobalWorkspaceDirectoryResponses[keyof GetGlobalWorkspaceDirectoryResponses];
+
+export type GetGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file';
+};
+
+export type GetGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetGlobalWorkspaceFileResponse = GetGlobalWorkspaceFileResponses[keyof GetGlobalWorkspaceFileResponses];
+
+export type GetWorkspaceFileLimitsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/file-limits';
+};
+
+export type GetWorkspaceFileLimitsErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type GetWorkspaceFileLimitsResponses = {
+    200: AiWorkspaceFileLimitsSettings;
+};
+
+export type GetWorkspaceFileLimitsResponse = GetWorkspaceFileLimitsResponses[keyof GetWorkspaceFileLimitsResponses];
+
+export type DownloadGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file/download';
+};
+
+export type DownloadGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadGlobalWorkspaceFileResponses = {
+    200: Array<number>;
+};
+
+export type DownloadGlobalWorkspaceFileResponse = DownloadGlobalWorkspaceFileResponses[keyof DownloadGlobalWorkspaceFileResponses];
+
+export type UploadGlobalWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/files';
+};
+
+export type UploadGlobalWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadGlobalWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadGlobalWorkspaceFilesResponse = UploadGlobalWorkspaceFilesResponses[keyof UploadGlobalWorkspaceFilesResponses];
+
+export type CreateGlobalWorkspacePreviewLinkData = {
+    body: CreateApplicationPreviewLinkRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/preview-link';
+};
+
+export type CreateGlobalWorkspacePreviewLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponse = CreateGlobalWorkspacePreviewLinkResponses[keyof CreateGlobalWorkspacePreviewLinkResponses];
 
 export type GetAnalyticsActiveVisitorsData = {
     body?: never;
@@ -26598,6 +29036,41 @@ export type CleanupExpiredBackupsResponses = {
 
 export type CleanupExpiredBackupsResponse = CleanupExpiredBackupsResponses[keyof CleanupExpiredBackupsResponses];
 
+export type GetExternalServiceBackupCapabilityData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/capability';
+};
+
+export type GetExternalServiceBackupCapabilityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * External service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Capability could not be loaded
+     */
+    500: ProblemDetails;
+};
+
+export type GetExternalServiceBackupCapabilityError = GetExternalServiceBackupCapabilityErrors[keyof GetExternalServiceBackupCapabilityErrors];
+
+export type GetExternalServiceBackupCapabilityResponses = {
+    /**
+     * Cloud backup compatibility
+     */
+    200: ExternalServiceBackupCapabilityResponse;
+};
+
+export type GetExternalServiceBackupCapabilityResponse = GetExternalServiceBackupCapabilityResponses[keyof GetExternalServiceBackupCapabilityResponses];
+
 export type RunExternalServiceBackupData = {
     body: RunExternalServiceBackupRequest;
     path: {
@@ -28243,6 +30716,97 @@ export type BlobHeadResponses = {
     200: unknown;
 };
 
+export type DisconnectCloudData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud';
+};
+
+export type DisconnectCloudResponses = {
+    200: CloudStatus;
+};
+
+export type DisconnectCloudResponse = DisconnectCloudResponses[keyof DisconnectCloudResponses];
+
+export type GetCloudAiCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/ai/capability';
+};
+
+export type GetCloudAiCapabilityResponses = {
+    200: CloudAiCapability;
+};
+
+export type GetCloudAiCapabilityResponse = GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
+
+export type ReconcileCloudBackupSourceData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/backups/source/reconcile';
+};
+
+export type ReconcileCloudBackupSourceResponses = {
+    200: ManagedBackupSetup;
+};
+
+export type ReconcileCloudBackupSourceResponse = ReconcileCloudBackupSourceResponses[keyof ReconcileCloudBackupSourceResponses];
+
+export type GetCloudCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/capability';
+};
+
+export type GetCloudCapabilityResponses = {
+    200: CloudCapability;
+};
+
+export type GetCloudCapabilityResponse = GetCloudCapabilityResponses[keyof GetCloudCapabilityResponses];
+
+export type EnrollCloudData = {
+    body: EnrollCloudRequest;
+    path?: never;
+    query?: never;
+    url: '/cloud/enroll';
+};
+
+export type EnrollCloudResponses = {
+    200: CloudStatus;
+};
+
+export type EnrollCloudResponse = EnrollCloudResponses[keyof EnrollCloudResponses];
+
+export type UpdateCloudFeaturesData = {
+    body: CloudFeatureSwitchesRequest;
+    path?: never;
+    query?: never;
+    url: '/cloud/features';
+};
+
+export type UpdateCloudFeaturesResponses = {
+    200: CloudStatus;
+};
+
+export type UpdateCloudFeaturesResponse = UpdateCloudFeaturesResponses[keyof UpdateCloudFeaturesResponses];
+
+export type GetCloudStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/status';
+};
+
+export type GetCloudStatusResponses = {
+    200: CloudStatus;
+};
+
+export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
+
 export type ClusterDnsStatusData = {
     body?: never;
     path?: never;
@@ -29442,17 +32006,37 @@ export type FinalizeOrderData = {
 
 export type FinalizeOrderErrors = {
     /**
+     * Bad request - account email or ACME order is invalid
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Domain or DNS provider permission denied
+     */
+    403: unknown;
     /**
      * Domain or order not found
      */
     404: unknown;
     /**
+     * Certificate issued but DNS cleanup requires operator action
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Certificate issued but DNS provider cleanup failed
+     */
+    502: unknown;
+    /**
+     * Certificate issued but DNS provider service is unavailable
+     */
+    503: unknown;
 };
 
 export type FinalizeOrderResponses = {
@@ -29493,6 +32077,10 @@ export type SetupDnsChallengeErrors = {
      * Domain or DNS provider not found
      */
     404: unknown;
+    /**
+     * Ambiguous managed DNS zone
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -29662,13 +32250,25 @@ export type ProvisionDomainData = {
 
 export type ProvisionDomainErrors = {
     /**
+     * Bad request - account email or challenge is invalid
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
     /**
+     * Domain permission denied or a user account is required
+     */
+    403: unknown;
+    /**
      * Domain not found
      */
     404: unknown;
+    /**
+     * DNS cleanup-aware order must use the finalize endpoint
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -29990,7 +32590,18 @@ export type DeleteEmailDomainData = {
          */
         id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Also remove the domain identity on the provider's side (Scaleway/SES),
+         * not just the local Temps record. Defaults to `false`: the same domain
+         * may be shared with other tools against that provider account, so
+         * deleting it from Temps must not silently un-register it elsewhere
+         * unless explicitly requested. If the provider-side deletion fails
+         * (network error, revoked credentials), the local record is still
+         * deleted -- an unreachable provider never blocks removing it from Temps.
+         */
+        delete_from_provider?: boolean;
+    };
     url: '/email-domains/{id}';
 };
 
@@ -30008,7 +32619,7 @@ export type DeleteEmailDomainErrors = {
      */
     404: unknown;
     /**
-     * Internal server error
+     * Internal server error (includes provider-side cleanup failure; the local record is still deleted)
      */
     500: unknown;
 };
@@ -30354,7 +32965,7 @@ export type CreateEmailProviderData = {
 
 export type CreateEmailProviderErrors = {
     /**
-     * Invalid request
+     * Invalid request or validation error
      */
     400: unknown;
     /**
@@ -30366,9 +32977,17 @@ export type CreateEmailProviderErrors = {
      */
     403: unknown;
     /**
+     * Provider credentials are invalid — the provider API definitively rejected them
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Could not reach the provider API to verify credentials — the credentials may still be valid
+     */
+    502: unknown;
 };
 
 export type CreateEmailProviderResponses = {
@@ -30494,9 +33113,17 @@ export type UpdateEmailProviderErrors = {
      */
     409: unknown;
     /**
+     * New credentials are invalid — the provider API definitively rejected them
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Could not reach the provider API to verify new credentials
+     */
+    502: unknown;
 };
 
 export type UpdateEmailProviderResponses = {
@@ -30507,6 +33134,46 @@ export type UpdateEmailProviderResponses = {
 };
 
 export type UpdateEmailProviderResponse = UpdateEmailProviderResponses[keyof UpdateEmailProviderResponses];
+
+export type ListDiscoverableDomainsData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}/discoverable-domains';
+};
+
+export type ListDiscoverableDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDiscoverableDomainsResponses = {
+    /**
+     * Discoverable domains (see `supported`/`error` for fallback state)
+     */
+    200: ListProviderDomainsResponse;
+};
+
+export type ListDiscoverableDomainsResponse = ListDiscoverableDomainsResponses[keyof ListDiscoverableDomainsResponses];
 
 export type TestProviderData = {
     body: TestEmailRequest;
@@ -31564,6 +34231,42 @@ export type GetClusterHealthResponses = {
 };
 
 export type GetClusterHealthResponse = GetClusterHealthResponses[keyof GetClusterHealthResponses];
+
+export type RepointContinuousArchiveSourceData = {
+    body: RepointContinuousArchiveSourceRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/continuous-archive-source';
+};
+
+export type RepointContinuousArchiveSourceErrors = {
+    /**
+     * Service type does not support continuous archiving, or the requested S3 source does not exist
+     */
+    400: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RepointContinuousArchiveSourceResponses = {
+    /**
+     * Continuous archive source repointed
+     */
+    200: ContinuousArchiveSourceResponse;
+};
+
+export type RepointContinuousArchiveSourceResponse = RepointContinuousArchiveSourceResponses[keyof RepointContinuousArchiveSourceResponses];
 
 export type RevealServiceEnvironmentVariablesData = {
     body?: never;
@@ -38640,6 +41343,364 @@ export type UpdateAlertResponses = {
 
 export type UpdateAlertResponse = UpdateAlertResponses[keyof UpdateAlertResponses];
 
+export type GetCloudBackfillStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/backfill/{project_id}';
+};
+
+export type GetCloudBackfillStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCloudBackfillStatusError = GetCloudBackfillStatusErrors[keyof GetCloudBackfillStatusErrors];
+
+export type GetCloudBackfillStatusResponses = {
+    /**
+     * Backfill status
+     */
+    200: CloudBackfillStatusResponse;
+};
+
+export type GetCloudBackfillStatusResponse = GetCloudBackfillStatusResponses[keyof GetCloudBackfillStatusResponses];
+
+export type CreateBulkActivationJobData = {
+    body: CreateBulkActivationJobRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs';
+};
+
+export type CreateBulkActivationJobErrors = {
+    /**
+     * The plan token is invalid, altered or expired
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * An activation is already running; the response carries its batch_id
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateBulkActivationJobError = CreateBulkActivationJobErrors[keyof CreateBulkActivationJobErrors];
+
+export type CreateBulkActivationJobResponses = {
+    /**
+     * The activation was queued
+     */
+    202: BulkActivationJobResponse;
+};
+
+export type CreateBulkActivationJobResponse = CreateBulkActivationJobResponses[keyof CreateBulkActivationJobResponses];
+
+export type GetCurrentBulkActivationJobData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/current';
+};
+
+export type GetCurrentBulkActivationJobErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCurrentBulkActivationJobError = GetCurrentBulkActivationJobErrors[keyof GetCurrentBulkActivationJobErrors];
+
+export type GetCurrentBulkActivationJobResponses = {
+    /**
+     * The active activation job, or null when none is running
+     */
+    200: null | BulkActivationJobResponse;
+};
+
+export type GetCurrentBulkActivationJobResponse = GetCurrentBulkActivationJobResponses[keyof GetCurrentBulkActivationJobResponses];
+
+export type EstimateBulkActivationData = {
+    body: EstimateBulkActivationRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/estimate';
+};
+
+export type EstimateBulkActivationErrors = {
+    /**
+     * Neither or both scopes given, or an invalid window
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Temps Cloud is not ready for telemetry
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type EstimateBulkActivationError = EstimateBulkActivationErrors[keyof EstimateBulkActivationErrors];
+
+export type EstimateBulkActivationResponses = {
+    /**
+     * Per-project and total estimate, plus a plan token
+     */
+    200: BulkActivationEstimateResponse;
+};
+
+export type EstimateBulkActivationResponse = EstimateBulkActivationResponses[keyof EstimateBulkActivationResponses];
+
+export type GetBulkActivationJobData = {
+    body?: never;
+    path: {
+        /**
+         * Activation job id (UUID)
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/{batch_id}';
+};
+
+export type GetBulkActivationJobErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No such activation job
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetBulkActivationJobError = GetBulkActivationJobErrors[keyof GetBulkActivationJobErrors];
+
+export type GetBulkActivationJobResponses = {
+    /**
+     * The activation job
+     */
+    200: BulkActivationJobResponse;
+};
+
+export type GetBulkActivationJobResponse = GetBulkActivationJobResponses[keyof GetBulkActivationJobResponses];
+
+export type CancelBulkActivationJobData = {
+    body?: never;
+    path: {
+        /**
+         * Activation job id (UUID)
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel';
+};
+
+export type CancelBulkActivationJobErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No such activation job
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CancelBulkActivationJobError = CancelBulkActivationJobErrors[keyof CancelBulkActivationJobErrors];
+
+export type CancelBulkActivationJobResponses = {
+    /**
+     * The cancellation was recorded, or the job had already stopped
+     */
+    200: BulkActivationJobResponse;
+};
+
+export type CancelBulkActivationJobResponse = CancelBulkActivationJobResponses[keyof CancelBulkActivationJobResponses];
+
+export type GetProjectCloudTelemetryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/projects/{project_id}';
+};
+
+export type GetProjectCloudTelemetryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectCloudTelemetryError = GetProjectCloudTelemetryErrors[keyof GetProjectCloudTelemetryErrors];
+
+export type GetProjectCloudTelemetryResponses = {
+    /**
+     * Project Cloud telemetry settings
+     */
+    200: ProjectCloudTelemetryResponse;
+};
+
+export type GetProjectCloudTelemetryResponse = GetProjectCloudTelemetryResponses[keyof GetProjectCloudTelemetryResponses];
+
+export type UpdateProjectCloudTelemetryData = {
+    body: UpdateProjectCloudTelemetryRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/projects/{project_id}';
+};
+
+export type UpdateProjectCloudTelemetryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * A prerequisite is missing
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateProjectCloudTelemetryError = UpdateProjectCloudTelemetryErrors[keyof UpdateProjectCloudTelemetryErrors];
+
+export type UpdateProjectCloudTelemetryResponses = {
+    /**
+     * Updated settings
+     */
+    200: ProjectCloudTelemetryResponse;
+};
+
+export type UpdateProjectCloudTelemetryResponse = UpdateProjectCloudTelemetryResponses[keyof UpdateProjectCloudTelemetryResponses];
+
+export type GetCloudTelemetryStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/status';
+};
+
+export type GetCloudTelemetryStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCloudTelemetryStatusError = GetCloudTelemetryStatusErrors[keyof GetCloudTelemetryStatusErrors];
+
+export type GetCloudTelemetryStatusResponses = {
+    /**
+     * Instance Cloud telemetry write status
+     */
+    200: CloudTelemetryWriteStatusResponse;
+};
+
+export type GetCloudTelemetryStatusResponse = GetCloudTelemetryStatusResponses[keyof GetCloudTelemetryStatusResponses];
+
 export type ListDashboardsData = {
     body?: never;
     path?: never;
@@ -40911,8 +43972,17 @@ export type GetPreviewGatewayLogsData = {
     url: '/preview-gateway/logs';
 };
 
+export type GetPreviewGatewayLogsErrors = {
+    /**
+     * Docker log request failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetPreviewGatewayLogsError = GetPreviewGatewayLogsErrors[keyof GetPreviewGatewayLogsErrors];
+
 export type GetPreviewGatewayLogsResponses = {
-    200: LogsResponse;
+    200: PreviewGatewayLogsResponse;
 };
 
 export type GetPreviewGatewayLogsResponse = GetPreviewGatewayLogsResponses[keyof GetPreviewGatewayLogsResponses];
@@ -40923,6 +43993,15 @@ export type RestartPreviewGatewayData = {
     query?: never;
     url: '/preview-gateway/restart';
 };
+
+export type RestartPreviewGatewayErrors = {
+    /**
+     * Gateway restart failed
+     */
+    500: ProblemDetails;
+};
+
+export type RestartPreviewGatewayError = RestartPreviewGatewayErrors[keyof RestartPreviewGatewayErrors];
 
 export type RestartPreviewGatewayResponses = {
     /**
@@ -40953,6 +44032,15 @@ export type PatchPreviewGatewaySettingsData = {
     url: '/preview-gateway/settings';
 };
 
+export type PatchPreviewGatewaySettingsErrors = {
+    /**
+     * Settings update failed
+     */
+    500: ProblemDetails;
+};
+
+export type PatchPreviewGatewaySettingsError = PatchPreviewGatewaySettingsErrors[keyof PatchPreviewGatewaySettingsErrors];
+
 export type PatchPreviewGatewaySettingsResponses = {
     200: PreviewGatewaySettingsResponse;
 };
@@ -40966,6 +44054,15 @@ export type GetPreviewGatewayStatusData = {
     url: '/preview-gateway/status';
 };
 
+export type GetPreviewGatewayStatusErrors = {
+    /**
+     * Docker status request failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetPreviewGatewayStatusError = GetPreviewGatewayStatusErrors[keyof GetPreviewGatewayStatusErrors];
+
 export type GetPreviewGatewayStatusResponses = {
     200: GatewayStatus;
 };
@@ -40978,6 +44075,15 @@ export type UpgradePreviewGatewayData = {
     query?: never;
     url: '/preview-gateway/upgrade';
 };
+
+export type UpgradePreviewGatewayErrors = {
+    /**
+     * Gateway upgrade failed
+     */
+    500: ProblemDetails;
+};
+
+export type UpgradePreviewGatewayError = UpgradePreviewGatewayErrors[keyof UpgradePreviewGatewayErrors];
 
 export type UpgradePreviewGatewayResponses = {
     /**
@@ -42443,11 +45549,21 @@ export type GetConversationData = {
         project_id: number;
         public_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Opaque next_before cursor returned by the previous page
+         */
+        before?: string;
+        /**
+         * Messages per page (default 50, maximum 100)
+         */
+        limit?: number;
+    };
     url: '/projects/{project_id}/ai/conversations/{public_id}';
 };
 
 export type GetConversationErrors = {
+    400: unknown;
     401: unknown;
     403: unknown;
     404: unknown;
@@ -42504,7 +45620,7 @@ export type ArchiveConversationResponses = {
 
 export type ArchiveConversationResponse = ArchiveConversationResponses[keyof ArchiveConversationResponses];
 
-export type SendMessageData = {
+export type SendProjectAiMessageData = {
     body: SendMessageRequest;
     path: {
         project_id: number;
@@ -42514,18 +45630,21 @@ export type SendMessageData = {
     url: '/projects/{project_id}/ai/conversations/{public_id}/messages';
 };
 
-export type SendMessageErrors = {
+export type SendProjectAiMessageErrors = {
     401: unknown;
     403: unknown;
     404: unknown;
+    409: unknown;
 };
 
-export type SendMessageResponses = {
+export type SendProjectAiMessageResponses = {
     /**
-     * SSE stream of assistant text deltas
+     * Turn accepted; output follows on the conversation WebSocket
      */
-    200: unknown;
+    202: SendMessageAcceptedResponse;
 };
+
+export type SendProjectAiMessageResponse = SendProjectAiMessageResponses[keyof SendProjectAiMessageResponses];
 
 export type ListPendingActionsData = {
     body?: never;
@@ -42551,6 +45670,30 @@ export type ListPendingActionsResponses = {
 };
 
 export type ListPendingActionsResponse = ListPendingActionsResponses[keyof ListPendingActionsResponses];
+
+export type UpdatePermissionModeData = {
+    body: UpdatePermissionModeRequest;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/permission-mode';
+};
+
+export type UpdatePermissionModeErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type UpdatePermissionModeResponses = {
+    200: ConversationResponse;
+};
+
+export type UpdatePermissionModeResponse = UpdatePermissionModeResponses[keyof UpdatePermissionModeResponses];
 
 export type ResolvePermissionData = {
     body: ResolvePermissionRequest;
@@ -42604,6 +45747,28 @@ export type ResolvePermissionResponses = {
 };
 
 export type ResolvePermissionResponse = ResolvePermissionResponses[keyof ResolvePermissionResponses];
+
+export type StopTurnData = {
+    body?: never;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/stop';
+};
+
+export type StopTurnErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type StopTurnResponses = {
+    204: void;
+};
+
+export type StopTurnResponse = StopTurnResponses[keyof StopTurnResponses];
 
 export type GetPendingActionData = {
     body?: never;
@@ -53337,7 +56502,20 @@ export type SaveAgentTokenResponse2 = SaveAgentTokenResponses[keyof SaveAgentTok
 export type ListAiProvidersData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Return only static/cached catalog metadata. This path deliberately
+         * skips the settings-row read as well as CLI probes and is used for chat
+         * first paint; an authenticated refresh follows in the background.
+         */
+        catalog_only?: boolean;
+        /**
+         * Run account-aware model discovery before returning. Normal catalog
+         * reads intentionally use cached/bootstrap models so chat first paint is
+         * not held hostage by provider CLIs that can take 10-15 seconds.
+         */
+        refresh_models?: boolean;
+    };
     url: '/settings/ai-providers';
 };
 
@@ -53440,6 +56618,49 @@ export type SaveAiProviderCredentialResponses = {
 };
 
 export type SaveAiProviderCredentialResponse = SaveAiProviderCredentialResponses[keyof SaveAiProviderCredentialResponses];
+
+export type RotateClusterCaData = {
+    body: RotateClusterCaRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-ca/rotate';
+};
+
+export type RotateClusterCaErrors = {
+    /**
+     * Invalid confirmation or CA state
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Expected fingerprint is stale
+     */
+    409: unknown;
+    /**
+     * Fresh MFA verification required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RotateClusterCaResponses = {
+    /**
+     * Cluster CA rotated
+     */
+    200: RotateClusterCaResponse;
+};
+
+export type RotateClusterCaResponse2 = RotateClusterCaResponses[keyof RotateClusterCaResponses];
 
 export type GetDiskStatusData = {
     body?: never;

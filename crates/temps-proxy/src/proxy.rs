@@ -29,7 +29,7 @@ use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_gateway_peer, preview_peer_group_key, verify_argon2,
+    preview_cookie_needs_refresh, preview_gateway_peer, preview_request_group_key, verify_argon2,
     PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
 };
 use crate::service::cert_host_cache::CertHostCache;
@@ -4155,6 +4155,17 @@ impl ProxyHttp for LoadBalancer {
                                     .insert_header("X-Temps-Preview-Token", &secret)?;
                             }
                         }
+                        // The gateway strips its bearer token once, at the TCP
+                        // connection boundary. Non-upgrade HTTP traffic must
+                        // therefore close after this request so neither side
+                        // can place another token-bearing request on the same
+                        // authenticated connection. WebSocket upgrades are a
+                        // single HTTP request followed by non-HTTP frames.
+                        if !ctx.is_websocket {
+                            session
+                                .req_header_mut()
+                                .insert_header("Connection", "close")?;
+                        }
                         // Fall through — upstream_peer will route to the gateway.
                     }
                     PreviewAuthOutcome::LoginRequired { host } => {
@@ -5658,10 +5669,10 @@ impl ProxyHttp for LoadBalancer {
         // traffic path.
         //
         // Every preview target shares this same physical peer address, so
-        // `group_key` MUST be set per-target — otherwise Pingora's
+        // `group_key` MUST be set per request — otherwise Pingora's
         // connection pool considers all sandboxes' requests interchangeable
         // and can hand a connection opened for one sandbox back out to
-        // serve a different sandbox's request (see `preview_peer_group_key`
+        // serve another token-bearing request (see `preview_request_group_key`
         // doc comment for the full mechanism).
         if let Some(host) = &ctx.preview_route {
             let preview_io_timeout = if is_websocket {
@@ -5671,11 +5682,15 @@ impl ProxyHttp for LoadBalancer {
             };
             let gateway_peer = preview_gateway_peer();
             let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
-            peer.group_key = preview_peer_group_key(host);
+            peer.group_key = preview_request_group_key(host, &ctx.request_id);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(preview_io_timeout);
             peer.options.write_timeout = Some(preview_io_timeout);
-            peer.options.idle_timeout = Some(preview_io_timeout);
+            peer.options.idle_timeout = Some(if is_websocket {
+                preview_io_timeout
+            } else {
+                std::time::Duration::from_millis(1)
+            });
             ctx.upstream_host = Some(gateway_peer);
             return Ok(peer);
         }

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ACTIVATION_SECTION_ANCHOR } from '@/components/observe/CloudTelemetryActivationSection'
+import { CloudTelemetryWriteStatusCard } from '@/components/observe/CloudTelemetryWriteStatusCard'
+import { JOB_STATUS_LABELS } from '@/lib/cloud-telemetry-activation'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -35,11 +38,13 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  getCurrentBulkActivationJobOptions,
   getIngestErrorsOptions,
   getPipelineHistoryOptions,
   getPipelineStatsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
+  BulkActivationJobResponse,
   IngestErrorSummary,
   PipelineHistoryResponse,
 } from '@/api/client/types.gen'
@@ -59,8 +64,9 @@ import {
   Activity,
   ChevronDown,
   CheckCircle2,
+  Rocket,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { type MouseEvent, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
 
 // ---------------------------------------------------------------------------
@@ -536,6 +542,55 @@ function SignalSection({
   )
 }
 
+// ---------------------------------------------------------------------------
+// Bulk activation pointer
+// ---------------------------------------------------------------------------
+
+function scrollToActivation(event: MouseEvent<HTMLAnchorElement>) {
+  const target = document.getElementById(ACTIVATION_SECTION_ANCHOR)
+  if (!target) return
+  event.preventDefault()
+  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+/**
+ * A pointer to the activation running further down this page (ADR-042 §11).
+ *
+ * The section itself is always rendered; this exists because on a long page an
+ * operator who came here to find out why spans stopped arriving locally should
+ * not have to scroll past four charts to discover that an activation is moving
+ * them to Cloud right now.
+ */
+function ActivationJumpLink({
+  job,
+}: {
+  job: BulkActivationJobResponse | null | undefined
+}) {
+  if (!job) return null
+  return (
+    <Alert>
+      <Rocket className="h-4 w-4" />
+      <AlertTitle>
+        A Cloud telemetry activation is in progress —{' '}
+        {JOB_STATUS_LABELS[job.status].toLowerCase()}
+      </AlertTitle>
+      <AlertDescription>
+        {job.projects_done} of {job.projects_total} project
+        {job.projects_total === 1 ? '' : 's'} switched so far. Spans for those
+        projects are no longer counted in the throughput figures below.{' '}
+        <a
+          href={`#${ACTIVATION_SECTION_ANCHOR}`}
+          onClick={scrollToActivation}
+          className="inline-flex items-center gap-1 font-medium underline underline-offset-2"
+        >
+          Jump to the activation
+          <ArrowRight className="h-3 w-3" />
+        </a>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
 export function OtelPipelineStatusPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
 
@@ -579,6 +634,15 @@ export function OtelPipelineStatusPage() {
     refetchInterval: 60_000,
   })
 
+  // Shares its cache entry with the activation section below, so this costs no
+  // extra request. `retry: false` because the endpoint is instance-admin only
+  // and a refused read simply means no pointer, not a broken page.
+  const { data: activationJob } = useQuery({
+    ...getCurrentBulkActivationJobOptions(),
+    refetchInterval: 30_000,
+    retry: false,
+  })
+
   const stats = data?.stats
   const errorEntries = ingestErrors?.errors ?? []
   const showDate = RANGES_SHOWING_DATE.includes(range)
@@ -615,6 +679,14 @@ export function OtelPipelineStatusPage() {
           every {sampleIntervalSeconds}&nbsp;s and can trigger alarms.
         </p>
       </div>
+
+      <ActivationJumpLink job={activationJob} />
+
+      {/* Where spans are written, and whether the local span store is still
+          needed. Sits above the throughput charts because "these spans are not
+          stored on this instance at all" changes how every number below is
+          read. */}
+      <CloudTelemetryWriteStatusCard />
 
       {/* Trend over time — the cumulative counters below can't distinguish a
           past incident that recovered from an ongoing bleed. */}

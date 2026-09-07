@@ -113,6 +113,47 @@ pub async fn link_index_by_name(handle: &Handle, name: &str) -> crate::Result<Op
     }
 }
 
+/// Read a link's configured MTU by interface name.
+pub async fn link_mtu_by_name(handle: &Handle, name: &str) -> crate::Result<Option<u32>> {
+    use netlink_packet_route::link::LinkAttribute;
+
+    let mut links = handle.link().get().match_name(name).execute();
+    match links.try_next().await {
+        Ok(Some(msg)) => Ok(msg.attributes.iter().find_map(|attr| match attr {
+            LinkAttribute::Mtu(mtu) => Some(*mtu),
+            _ => None,
+        })),
+        Ok(None) => Ok(None),
+        Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ENODEV => Ok(None),
+        Err(e) => Err(NetworkError::Netlink {
+            op: "get_link_mtu",
+            link: name.into(),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Look up a link's name by interface index. Returns `Ok(None)` when the
+/// link does not exist.
+pub async fn link_name_by_index(handle: &Handle, index: u32) -> crate::Result<Option<String>> {
+    use netlink_packet_route::link::LinkAttribute;
+
+    let mut links = handle.link().get().match_index(index).execute();
+    match links.try_next().await {
+        Ok(Some(msg)) => Ok(msg.attributes.iter().find_map(|attr| match attr {
+            LinkAttribute::IfName(name) => Some(name.clone()),
+            _ => None,
+        })),
+        Ok(None) => Ok(None),
+        Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ENODEV => Ok(None),
+        Err(e) => Err(NetworkError::Netlink {
+            op: "get_link_by_index",
+            link: format!("index {}", index),
+            reason: e.to_string(),
+        }),
+    }
+}
+
 /// Ensure an address is assigned to a link. Idempotent — if the address is
 /// already there, this is a no-op.
 async fn ensure_addr(

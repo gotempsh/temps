@@ -226,6 +226,36 @@ jobs:
             --skip-geolite2-download \
             --output-format json
 
+      # The preview gateway is a separate release image. Build this checkout's
+      # source so the browser suite exercises protocol/security changes from
+      # the PR instead of silently testing the last published gateway digest.
+      - name: Build preview gateway from current source
+        run: |
+          set -euo pipefail
+          docker build --tag temps-preview-gateway:dev crates/temps-preview-gateway
+          test "$(docker image inspect temps-preview-gateway:dev \
+            --format '{{ index .Config.Labels "sh.temps.preview-gateway-security-protocol" }}')" = \
+            "strip-token-v1"
+
+      - name: Configure current preview gateway image
+        run: |
+          set -euo pipefail
+          DB_CONTAINER="${{ job.services.timescaledb.id }}"
+          docker exec "$DB_CONTAINER" psql -U temps -d temps -v ON_ERROR_STOP=1 -c \
+            "UPDATE settings
+             SET data = jsonb_set(
+               data::jsonb,
+               '{preview_gateway}',
+               COALESCE(data::jsonb -> 'preview_gateway', '{}'::jsonb)
+                 || '{\"image\":\"temps-preview-gateway:dev\",\"auto_upgrade\":true}'::jsonb,
+               true
+             )::json,
+             updated_at = now()
+             WHERE id = 1"
+          CONFIGURED_IMAGE=$(docker exec "$DB_CONTAINER" psql -U temps -d temps -tAc \
+            "SELECT data -> 'preview_gateway' ->> 'image' FROM settings WHERE id = 1")
+          test "$CONFIGURED_IMAGE" = "temps-preview-gateway:dev"
+
       - name: Prepare temps runtime files
         run: |
           # Sync encryption key to working directory (temps serve reads from cwd)

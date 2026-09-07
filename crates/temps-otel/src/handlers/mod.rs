@@ -4,6 +4,12 @@
 //! HTTP handlers for OTLP ingest and query endpoints.
 
 pub mod audit;
+pub mod cloud_backfill_handler;
+/// The operator path onto the bulk Cloud-telemetry activation engine
+/// (ADR-042 §9).
+pub mod cloud_bulk_activation_handler;
+/// Per-project telemetry write mode and the instance aggregate (ADR-041 §9).
+pub mod cloud_telemetry_handler;
 pub mod dashboard_handler;
 pub mod facet_handler;
 pub mod ingest_handler;
@@ -53,6 +59,17 @@ pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 ///   GET /otel/pipeline-stats
 ///   GET /otel/ingest-errors
 ///   GET /otel/pipeline-history
+///   GET /otel/cloud-telemetry/backfill/{project_id}
+///   GET /otel/cloud-telemetry/status
+///   GET   /otel/cloud-telemetry/projects/{project_id}
+///   PATCH /otel/cloud-telemetry/projects/{project_id}
+///
+/// Bulk Cloud telemetry activation (ADR-042 §9, instance administrator):
+///   POST /otel/cloud-telemetry/bulk-jobs/estimate
+///   POST /otel/cloud-telemetry/bulk-jobs
+///   GET  /otel/cloud-telemetry/bulk-jobs/current
+///   GET  /otel/cloud-telemetry/bulk-jobs/{batch_id}
+///   POST /otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel
 pub fn configure_routes() -> Router<OtelAppState> {
     // OTLP ingest endpoints are split into their own sub-router so
     // `DefaultBodyLimit` applies only to them, not to the query/dashboard
@@ -111,6 +128,53 @@ pub fn configure_routes() -> Router<OtelAppState> {
         )
         .route("/otel/health/{project_id}", get(query_handler::get_health))
         .route("/otel/quota/{project_id}", get(query_handler::get_quota))
+        // ADR-040 §1: read-only status of the out-of-process Cloud telemetry
+        // backfill, so the Console can show a run the CLI is driving.
+        .route(
+            "/otel/cloud-telemetry/backfill/{project_id}",
+            get(cloud_backfill_handler::get_cloud_backfill_status),
+        )
+        // ADR-041 §9: the per-project write-mode control and the instance
+        // aggregate. Both answer on an unlinked instance — the control must
+        // onboard rather than disappear, which is impossible if the endpoint
+        // 404s when Cloud is not set up.
+        //
+        // The static `/status` path is registered before the parameterised
+        // `/projects/{project_id}` for readability only; matchit prefers static
+        // segments regardless.
+        .route(
+            "/otel/cloud-telemetry/status",
+            get(cloud_telemetry_handler::get_cloud_telemetry_status),
+        )
+        .route(
+            "/otel/cloud-telemetry/projects/{project_id}",
+            get(cloud_telemetry_handler::get_project_cloud_telemetry)
+                .patch(cloud_telemetry_handler::update_project_cloud_telemetry),
+        )
+        // ADR-042 §9: the operator path onto the bulk activation engine.
+        // `/estimate` and `/current` are registered before the parameterised
+        // `{batch_id}` for readability only; matchit prefers static segments
+        // regardless, so neither can be captured as a job id.
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/estimate",
+            post(cloud_bulk_activation_handler::estimate_bulk_activation),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/current",
+            get(cloud_bulk_activation_handler::get_current_bulk_activation_job),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs",
+            post(cloud_bulk_activation_handler::create_bulk_activation_job),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/{batch_id}",
+            get(cloud_bulk_activation_handler::get_bulk_activation_job),
+        )
+        .route(
+            "/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel",
+            post(cloud_bulk_activation_handler::cancel_bulk_activation_job),
+        )
         .route(
             "/otel/has-traces/{project_id}",
             get(query_handler::has_traces),

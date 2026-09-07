@@ -119,7 +119,7 @@ function PresetGroup({
             <p className="font-medium">Point-in-time recovery not available</p>
             <p className="text-xs">
               This image does not include WAL-G. Backups will be basic snapshots
-              — you won’t be able to restore to a specific timestamp.
+              — you won&apos;t be able to restore to a specific timestamp.
               {pitrManagedImage && (
                 <>
                   {' '}
@@ -184,16 +184,21 @@ export function useServiceTypePreset(serviceType: string | null): PresetState {
 }
 
 // -----------------------------------------------------------------------------
-// MariaDB preset — official MariaDB LTS image + custom.
+// MariaDB preset — managed WAL-G image + custom.
 // -----------------------------------------------------------------------------
 
-const MARIADB_MANAGED_IMAGE = 'mariadb:lts'
+// Pinned to the digest printed by .github/workflows/mariadb-walg-image.yml's
+// first run on main (11.4.12-walg-v3.0.8) -- validate_immutable_mariadb_image
+// in mariadb.rs requires a real repository@sha256:<digest> reference for any
+// non-default MariaDB image, so a mutable tag here is rejected at creation.
+const MARIADB_MANAGED_IMAGE =
+  'ghcr.io/gotempsh/mariadb-walg@sha256:fa4c9247f82c47ace7c1aa9b77010870f4905bbae57c4f0aa24ae6ba3b6cdbf3'
 
 const MARIADB_OPTIONS: PresetOption[] = [
   {
     id: 'managed',
-    title: 'MariaDB LTS',
-    subtitle: 'Official image',
+    title: 'MariaDB 11.4',
+    subtitle: 'Managed + WAL-G',
     value: MARIADB_MANAGED_IMAGE,
   },
   {

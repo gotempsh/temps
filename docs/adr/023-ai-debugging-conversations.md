@@ -181,18 +181,19 @@ provider's `authorize` enforces context-level access):
 - `GET /{id}` → full message history.
 - `POST /{id}/messages` `{content}` → **SSE stream** of the assistant reply
   (`text/event-stream`, mirroring `handlers/gateway.rs` / `log_handler.rs` SSE), then
-  persisted. Gated: `ai.is_available()` + the per-project opt-in (§5) → 409/empty if off.
+  persisted. Gated by provider availability, the authenticated user's permissions,
+  and project membership.
 - `POST /{id}/archive`, `DELETE /{id}` (audit-logged).
 
 ### 5. User control + OSS/EE boundary
 
 Per ADR-022 and the pricing-honesty stance:
 
-- **Off until configured + opted in.** Capability gate `ai.is_available()` (a
-  provider key exists); feature gate a per-project toggle (`projects.ai_debug_chat_enabled`,
-  tri-state like `ai_alert_summaries_enabled`); spend is governed by `ai_gateway_config`
-  and surfaced per-conversation via the `tokens/cost` columns. It's the user's key,
-  cost, and scope.
+- **Off until configured.** Capability gate `ai.is_available()` requires a provider
+  key. Access then inherits the authenticated user's permissions and project
+  membership. The harness permission mode controls tool execution; destructive
+  platform operations always require explicit approval. Spend is governed by
+  `ai_gateway_config` and surfaced per conversation via the `tokens/cost` columns.
 - **OSS** = the conversation system + the deployment-failure debugging chat
   (explain, Q&A, with the user's own key). This is the adoption hook; gating it
   behind EE would repel.
@@ -240,8 +241,8 @@ Per ADR-022 and the pricing-honesty stance:
 - **New crate + 2 tables + streaming + UI** is a multi-layer feature; phase it.
 
 ### Neutral
-- No behaviour change when no key is configured or the toggle is off — the chat UI
-  simply doesn't offer itself.
+- No behaviour change when no key is configured — the chat UI offers an onboarding
+  path instead of attempting a turn.
 
 ## Phased plan
 
@@ -249,22 +250,20 @@ Per ADR-022 and the pricing-honesty stance:
    (`ai_conversations`/`ai_messages`); `chat_stream` in `temps-ai` + gateway;
    `temps-ai-chat` crate (service + provider trait); the deployment context
    provider (seed = `diagnose_failure` + job logs); the 4 endpoints (SSE send);
-   `projects.ai_debug_chat_enabled` toggle; `<DebugChat>` on `DeploymentDetails`.
+   `<DebugChat>` on `DeploymentDetails`.
 2. **P2 — generalize:** alert + error-group providers (no schema change); the chat
    component mounted on those pages; conversation list/archive UI.
 3. **P3 — autonomy + EE:** "open a fix PR" hand-off to the Autofixer (OSS);
    EE `Feature::AiSre` proactive cross-signal investigator providers.
 
 ## Open questions
-1. **Toggle exposure**: ship `ai_debug_chat_enabled` settable via the project API +
-   a settings switch in P1, or SQL-only until P2? (Recommend P1 — it's the control surface.)
-2. **History truncation policy**: fixed sliding window of last N turns + always the
+1. **History truncation policy**: fixed sliding window of last N turns + always the
    seed, or token-budget-based? Summarize older turns into the seed?
-3. **Auto-start vs lazy**: create the deployment chat eagerly on failure (so a
+2. **Auto-start vs lazy**: create the deployment chat eagerly on failure (so a
    notification can deep-link) or lazily on first open? (Recommend lazy + a "Debug
    with AI" entry point; eager later if we deep-link from alerts.)
-4. **Drop the dormant `workspace_*` tables** in the same migration, or leave them?
-5. **Default model** for chat — reuse `ai_gateway_config.allowed_models[0]` (ADR-022)
+3. **Drop the dormant `workspace_*` tables** in the same migration, or leave them?
+4. **Default model** for chat — reuse `ai_gateway_config.allowed_models[0]` (ADR-022)
    or a dedicated chat model setting?
 
 ## References

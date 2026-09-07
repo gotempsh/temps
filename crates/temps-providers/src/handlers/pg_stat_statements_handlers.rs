@@ -558,6 +558,7 @@ mod tests {
             config_service: None,
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: None,
+            application_network_reconciler: None,
         })
     }
 

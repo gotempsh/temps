@@ -3,12 +3,16 @@
 
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod ai_application_projects;
+pub mod ai_application_workspaces;
+pub mod ai_applications;
 pub mod ai_conversations;
 pub mod ai_gateway_config;
 pub mod ai_messages;
 pub mod ai_pending_actions;
 pub mod ai_provider_keys;
 pub mod ai_provider_models;
+pub mod ai_thread_artifacts;
 pub mod ai_usage_logs;
 pub mod alarms;
 pub mod analytics_ingest_keys;
@@ -33,6 +37,15 @@ pub mod backup_schedules;
 pub mod backups;
 pub mod challenge_sessions;
 pub mod cli_login_sessions;
+pub mod cloud_analytics_write_mode;
+pub mod cloud_backup_mirror_cursors;
+pub mod cloud_backup_mirror_states;
+pub mod cloud_telemetry_backfills;
+pub mod cloud_telemetry_bulk_job_projects;
+pub mod cloud_telemetry_bulk_jobs;
+pub mod cloud_telemetry_fidelity;
+pub mod cloud_telemetry_outbox;
+pub mod cloud_telemetry_write_mode;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;
@@ -89,6 +102,7 @@ pub mod postgres_major_upgrades;
 pub mod preset;
 pub mod project_custom_domains;
 pub mod project_services;
+pub mod project_telemetry_write_intervals;
 pub mod projects;
 pub mod proxy_logs;
 pub mod renewal_attempts;
@@ -132,6 +146,7 @@ pub mod session_replay_events;
 pub mod session_replay_ingest_batches;
 pub mod session_replay_sessions;
 pub mod settings;
+pub mod telemetry_gap_windows;
 pub mod visitor;
 
 // Error tracking entities

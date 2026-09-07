@@ -16,7 +16,10 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use temps_cloud::CloudService;
+use temps_cloud_protocol::{ManagedNotificationRequest, ManagedNotificationSeverity};
 use temps_core::notifications::{
     EmailMessage, NotificationData, NotificationError as CoreNotificationError,
     NotificationService as CoreNotificationService,
@@ -599,6 +602,256 @@ pub trait NotificationProvider: Send + Sync {
     async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()>;
     async fn send(&self, notification: &Notification) -> Result<()>;
     async fn health_check(&self) -> Result<bool>;
+}
+
+const CLOUD_TITLE_MAX_CHARS: usize = 200;
+const CLOUD_MESSAGE_MAX_CHARS: usize = 4_000;
+const CLOUD_METADATA_VALUE_MAX_CHARS: usize = 256;
+const CLOUD_METADATA_MAX_ENTRIES: usize = 3;
+const CLOUD_METADATA_ALLOWLIST: &[&str] = &["environment", "event_kind", "resource_type"];
+
+#[derive(Debug, thiserror::Error)]
+enum CloudNotificationError {
+    #[error("Could not create a private identifier for the managed notification")]
+    Pseudonymization,
+    #[error("The managed notification provider could not accept the notification")]
+    Delivery,
+}
+
+#[async_trait]
+trait ManagedNotificationSender: Send + Sync {
+    fn notifications_enabled(&self) -> bool;
+    fn notifications_available(&self) -> bool;
+    fn pseudonymize_notification_id(
+        &self,
+        notification_id: &str,
+    ) -> std::result::Result<String, CloudNotificationError>;
+    async fn send_managed_notification(
+        &self,
+        request: &ManagedNotificationRequest,
+    ) -> std::result::Result<(), CloudNotificationError>;
+}
+
+#[async_trait]
+impl ManagedNotificationSender for CloudService {
+    fn notifications_enabled(&self) -> bool {
+        self.link().notifications_enabled()
+    }
+
+    fn notifications_available(&self) -> bool {
+        self.link().notifications_available()
+    }
+
+    fn pseudonymize_notification_id(
+        &self,
+        notification_id: &str,
+    ) -> std::result::Result<String, CloudNotificationError> {
+        self.link()
+            .pseudonymize_notification_id(notification_id)
+            .map_err(|_| CloudNotificationError::Pseudonymization)
+    }
+
+    async fn send_managed_notification(
+        &self,
+        request: &ManagedNotificationRequest,
+    ) -> std::result::Result<(), CloudNotificationError> {
+        self.send_notification(request)
+            .await
+            .map(|_| ())
+            .map_err(|_| CloudNotificationError::Delivery)
+    }
+}
+
+/// The only managed provider exposed by OSS. Cloud owns all concrete sinks.
+pub struct TempsCloudProvider {
+    cloud: Arc<dyn ManagedNotificationSender>,
+}
+
+fn bound_cloud_text(value: &str, max_chars: usize) -> String {
+    let redacted = redact_sensitive_text(value.trim());
+    if redacted.chars().count() <= max_chars {
+        return redacted;
+    }
+
+    let mut bounded: String = redacted.chars().take(max_chars.saturating_sub(1)).collect();
+    bounded.push('…');
+    bounded
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    let value = redact_url_credentials(value);
+    let value = redact_secret_prefixes(&value);
+    redact_key_value_secrets(&value)
+}
+
+fn redact_url_credentials(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(scheme_index) = remaining.find("://") {
+        let credential_start = scheme_index + 3;
+        let tail = &remaining[credential_start..];
+        let boundary = tail
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '/' | '?' | '#')
+            })
+            .unwrap_or(tail.len());
+        let Some(at_index) = tail[..boundary].find('@') else {
+            output.push_str(&remaining[..credential_start]);
+            remaining = tail;
+            continue;
+        };
+        output.push_str(&remaining[..credential_start]);
+        output.push_str("[redacted]@");
+        remaining = &tail[at_index + 1..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_secret_prefixes(value: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "bearer ", "sk-ant-", "sk-", "ghp_", "gho_", "glpat-", "xoxb-", "xoxp-",
+    ];
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let earliest = PREFIXES
+            .iter()
+            .filter_map(|prefix| {
+                lowercase[cursor..]
+                    .find(prefix)
+                    .map(|index| (cursor + index, prefix.len()))
+            })
+            .min_by_key(|(start, _)| *start);
+        let Some((start, prefix_len)) = earliest else {
+            output.push_str(&value[cursor..]);
+            break;
+        };
+        output.push_str(&value[cursor..start]);
+        output.push_str("[redacted]");
+        let token_start = start + prefix_len;
+        let end = value[token_start..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'' | '&')
+            })
+            .map_or(value.len(), |offset| token_start + offset);
+        cursor = end.max(token_start);
+    }
+    output
+}
+
+fn redact_key_value_secrets(value: &str) -> String {
+    const KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "authorization",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+    ];
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let candidate = KEYS
+            .iter()
+            .filter_map(|key| {
+                lowercase[cursor..]
+                    .find(key)
+                    .map(|offset| (cursor + offset, *key))
+            })
+            .filter_map(|(start, key)| {
+                let before_is_boundary = start == 0
+                    || value[..start].chars().next_back().is_some_and(|character| {
+                        !character.is_ascii_alphanumeric() && character != '_'
+                    });
+                let mut separator = start + key.len();
+                while value[separator..]
+                    .starts_with(|character: char| character.is_ascii_whitespace())
+                {
+                    separator += value[separator..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
+                }
+                let has_separator = value[separator..].starts_with(['=', ':']);
+                (before_is_boundary && has_separator).then_some((start, separator + 1))
+            })
+            .min_by_key(|(start, _)| *start);
+        let Some((start, mut value_start)) = candidate else {
+            output.push_str(&value[cursor..]);
+            break;
+        };
+        while value[value_start..].starts_with(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '"' | '\'')
+        }) {
+            value_start += value[value_start..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+        }
+        let value_end = value[value_start..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'' | '&')
+            })
+            .map_or(value.len(), |offset| value_start + offset);
+        output.push_str(&value[cursor..value_start]);
+        output.push_str("[redacted]");
+        cursor = value_end.max(start + 1);
+    }
+    output
+}
+
+fn cloud_metadata(notification: &Notification) -> BTreeMap<String, String> {
+    notification
+        .metadata
+        .iter()
+        .filter(|(key, _)| CLOUD_METADATA_ALLOWLIST.contains(&key.as_str()))
+        .take(CLOUD_METADATA_MAX_ENTRIES)
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                bound_cloud_text(value, CLOUD_METADATA_VALUE_MAX_CHARS),
+            )
+        })
+        .collect()
+}
+
+#[async_trait]
+impl NotificationProvider for TempsCloudProvider {
+    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let severity = match notification.effective_severity() {
+            NotificationSeverity::Debug => ManagedNotificationSeverity::Debug,
+            NotificationSeverity::Info => ManagedNotificationSeverity::Info,
+            NotificationSeverity::Warning => ManagedNotificationSeverity::Warning,
+            NotificationSeverity::Error => ManagedNotificationSeverity::Error,
+            NotificationSeverity::Critical => ManagedNotificationSeverity::Critical,
+            NotificationSeverity::Emergency => ManagedNotificationSeverity::Emergency,
+        };
+        let source_notification_id = self.cloud.pseudonymize_notification_id(&notification.id)?;
+        self.cloud
+            .send_managed_notification(&ManagedNotificationRequest {
+                source_notification_id,
+                title: bound_cloud_text(&notification.title, CLOUD_TITLE_MAX_CHARS),
+                message: bound_cloud_text(&notification.message, CLOUD_MESSAGE_MAX_CHARS),
+                severity,
+                metadata: cloud_metadata(notification),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        Ok(self.cloud.notifications_available())
+    }
 }
 
 impl EmailProvider {
@@ -1433,6 +1686,7 @@ impl NotificationProvider for WebhookProvider {
 pub struct NotificationService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    cloud: Option<Arc<dyn ManagedNotificationSender>>,
     routing_service: NotificationRoutingService,
 }
 
@@ -1445,6 +1699,20 @@ impl NotificationService {
             routing_service: NotificationRoutingService::new(db.clone()),
             db,
             encryption_service,
+            cloud: None,
+        }
+    }
+
+    pub fn new_with_cloud(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        cloud: Arc<CloudService>,
+    ) -> Self {
+        Self {
+            routing_service: NotificationRoutingService::new(db.clone()),
+            db,
+            encryption_service,
+            cloud: Some(cloud),
         }
     }
 
@@ -1473,6 +1741,15 @@ impl NotificationService {
                     error!("Failed to load provider {}: {}", db_provider.name, e);
                 }
             }
+        }
+        if let Some(cloud) = self
+            .cloud
+            .as_ref()
+            .filter(|cloud| cloud.notifications_enabled())
+        {
+            providers.push(Box::new(TempsCloudProvider {
+                cloud: cloud.clone(),
+            }));
         }
         Ok(providers)
     }
@@ -1660,6 +1937,13 @@ impl NotificationService {
     }
 
     pub async fn is_configured(&self) -> Result<bool> {
+        if self
+            .cloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.notifications_enabled())
+        {
+            return Ok(true);
+        }
         self.routing_service
             .has_routable_provider()
             .await
@@ -1668,6 +1952,7 @@ impl NotificationService {
 
     pub async fn list_providers(&self) -> Result<Vec<notification_providers::Model>> {
         let providers = notification_providers::Entity::find()
+            .filter(notification_providers::Column::ProviderType.ne("cloud"))
             .all(self.db.as_ref())
             .await?;
         Ok(providers)
@@ -1679,6 +1964,7 @@ impl NotificationService {
         page_size: u64,
     ) -> Result<Vec<notification_providers::Model>> {
         let providers = notification_providers::Entity::find()
+            .filter(notification_providers::Column::ProviderType.ne("cloud"))
             .paginate(self.db.as_ref(), page_size)
             .fetch_page(page - 1)
             .await?;
@@ -2079,8 +2365,15 @@ impl NotificationService {
 
         if let Some(provider) = provider {
             let notification_provider = self.load_provider(&provider).await?;
-            // Let the error propagate instead of swallowing it
-            notification_provider.health_check().await
+            let notification = Notification::new(
+                "Temps test notification",
+                "This is a test alert from your Temps notification settings. No action is required.",
+            );
+            // A provider test must exercise delivery, not only configuration.
+            // Otherwise the UI can report success while credentials, routing,
+            // or the remote destination are unable to accept a message.
+            notification_provider.send(&notification).await?;
+            Ok(true)
         } else {
             Err(anyhow::anyhow!(
                 "Notification provider with ID {} not found",
@@ -2479,6 +2772,7 @@ impl NotificationPreferencesService {
 mod tests {
     use super::*;
     use sea_orm::MockDatabase;
+    use std::sync::Mutex;
     use temps_database::test_utils::TestDatabase;
 
     macro_rules! test_database_or_skip {
@@ -2514,6 +2808,237 @@ mod tests {
             .collect(),
             bypass_throttling: false,
         }
+    }
+
+    struct MockManagedNotificationSender {
+        enabled: bool,
+        available: bool,
+        fail_delivery: bool,
+        pseudonym_inputs: Mutex<Vec<String>>,
+        requests: Mutex<Vec<ManagedNotificationRequest>>,
+    }
+
+    impl MockManagedNotificationSender {
+        fn new(enabled: bool, available: bool) -> Self {
+            Self {
+                enabled,
+                available,
+                fail_delivery: false,
+                pseudonym_inputs: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail_delivery: true,
+                ..Self::new(true, true)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ManagedNotificationSender for MockManagedNotificationSender {
+        fn notifications_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn notifications_available(&self) -> bool {
+            self.available
+        }
+
+        fn pseudonymize_notification_id(
+            &self,
+            notification_id: &str,
+        ) -> std::result::Result<String, CloudNotificationError> {
+            if !self.available {
+                return Err(CloudNotificationError::Pseudonymization);
+            }
+            self.pseudonym_inputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(notification_id.to_string());
+            Ok("8f1d1f5408e49b72e91fe5f10f6c11075b0fd7806ab9c2f49625a4ec638c2ea9".to_string())
+        }
+
+        async fn send_managed_notification(
+            &self,
+            request: &ManagedNotificationRequest,
+        ) -> std::result::Result<(), CloudNotificationError> {
+            if self.fail_delivery {
+                return Err(CloudNotificationError::Delivery);
+            }
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            Ok(())
+        }
+    }
+
+    fn service_with_managed_sender(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        cloud: Arc<dyn ManagedNotificationSender>,
+    ) -> NotificationService {
+        NotificationService {
+            routing_service: NotificationRoutingService::new(db.clone()),
+            db,
+            encryption_service,
+            cloud: Some(cloud),
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_requires_explicit_opt_in_and_never_duplicates_legacy_rows() {
+        for (enabled, available, expected_count) in
+            [(false, false, 0), (true, false, 1), (true, true, 1)]
+        {
+            let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+                "managed-notification-provider-test",
+            ));
+            let db = Arc::new(
+                MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([Vec::<notification_routes::Model>::new()])
+                    .into_connection(),
+            );
+            let cloud = Arc::new(MockManagedNotificationSender::new(enabled, available));
+            let service = service_with_managed_sender(db.clone(), encryption, cloud);
+
+            let providers = service
+                .get_enabled_providers(&create_test_notification())
+                .await
+                .unwrap();
+            assert_eq!(providers.len(), expected_count);
+
+            drop(providers);
+            drop(service);
+            let log = Arc::try_unwrap(db)
+                .expect("notification service released the mock database")
+                .into_transaction_log();
+            assert_eq!(log.len(), 1, "provider discovery must be read-only");
+            let sql = &log[0].statements()[0].sql;
+            assert!(sql.starts_with("SELECT"));
+            assert!(sql.contains("notification_routes"));
+            assert!(!sql.contains("INSERT"));
+            assert!(!sql.contains("UPDATE"));
+        }
+    }
+
+    #[tokio::test]
+    async fn opted_in_but_unavailable_cloud_provider_is_attempted_and_fails_visibly() {
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "unavailable-cloud-provider-test",
+        ));
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<notification_routes::Model>::new()])
+                .into_connection(),
+        );
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, false));
+        let service = service_with_managed_sender(db, encryption, cloud);
+
+        let providers = service
+            .get_enabled_providers(&create_test_notification())
+            .await
+            .unwrap();
+        assert_eq!(providers.len(), 1, "opted-in Cloud must not disappear");
+        let error = providers[0]
+            .send(&create_test_notification())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Could not create a private identifier for the managed notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_redacts_bounds_and_allowlists_payload() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification.id = "local-notification-id".to_string();
+        notification.title = format!("password=hunter2 {}", "T".repeat(CLOUD_TITLE_MAX_CHARS));
+        notification.message = format!(
+            "Bearer upstream-token database=https://user:pass@example.test/db {}",
+            "M".repeat(CLOUD_MESSAGE_MAX_CHARS)
+        );
+        notification.metadata = [
+            (
+                "environment".to_string(),
+                "token=metadata-secret".to_string(),
+            ),
+            ("event_kind".to_string(), "deployment_failed".to_string()),
+            ("resource_type".to_string(), "service".repeat(100)),
+            ("project_id".to_string(), "private-project".to_string()),
+            ("api_key".to_string(), "must-not-leave".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        provider.send(&notification).await.unwrap();
+
+        let pseudonym_inputs = cloud
+            .pseudonym_inputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(pseudonym_inputs.as_slice(), ["local-notification-id"]);
+        drop(pseudonym_inputs);
+        let requests = cloud
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_ne!(request.source_notification_id, notification.id);
+        assert_eq!(request.source_notification_id.len(), 64);
+        assert!(request.title.chars().count() <= CLOUD_TITLE_MAX_CHARS);
+        assert!(request.message.chars().count() <= CLOUD_MESSAGE_MAX_CHARS);
+        assert!(request.title.contains("[redacted]"));
+        assert!(request.message.contains("[redacted]"));
+        let serialized = serde_json::to_string(request).unwrap();
+        for secret in [
+            "hunter2",
+            "upstream-token",
+            "user:pass",
+            "metadata-secret",
+            "private-project",
+            "must-not-leave",
+            "local-notification-id",
+        ] {
+            assert!(!serialized.contains(secret), "payload leaked {secret}");
+        }
+        assert_eq!(request.metadata.len(), CLOUD_METADATA_MAX_ENTRIES);
+        assert!(request.metadata.contains_key("environment"));
+        assert!(request.metadata.contains_key("event_kind"));
+        assert!(request.metadata.contains_key("resource_type"));
+        assert!(request
+            .metadata
+            .values()
+            .all(|value| value.chars().count() <= CLOUD_METADATA_VALUE_MAX_CHARS));
+    }
+
+    #[tokio::test]
+    async fn cloud_send_failure_exposes_no_upstream_or_internal_detail() {
+        let cloud = Arc::new(MockManagedNotificationSender::failing());
+        let provider = TempsCloudProvider { cloud };
+
+        let error = provider
+            .send(&create_test_notification())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "The managed notification provider could not accept the notification"
+        );
+        assert!(!error.contains("http"));
+        assert!(!error.contains("token"));
     }
 
     #[test]

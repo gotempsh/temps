@@ -24,6 +24,7 @@
 //! - Parse fails on startup → same as read fail. Old corrupt snapshots
 //!   never block startup.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -77,9 +78,10 @@ impl ZoneStore {
         match std::fs::read(&self.snapshot_path) {
             Ok(bytes) => match serde_json::from_slice::<Snapshot>(&bytes) {
                 Ok(snap) => {
+                    let records = deduplicate_records(snap.records);
                     let new_inner = Inner {
                         generation: snap.generation,
-                        records: snap.records,
+                        records,
                     };
                     let mut guard = self.inner.write().expect("zone-store rwlock poisoned");
                     *guard = Arc::new(new_inner);
@@ -119,7 +121,7 @@ impl ZoneStore {
     pub fn replace(&self, generation: i64, records: Vec<ZoneRecord>) -> i64 {
         let new_inner = Arc::new(Inner {
             generation,
-            records,
+            records: deduplicate_records(records),
         });
         {
             let mut guard = self.inner.write().expect("zone-store rwlock poisoned");
@@ -145,6 +147,7 @@ impl ZoneStore {
             .cloned()
             .collect();
         new_records.extend(upserts);
+        let new_records = deduplicate_records(new_records);
 
         *guard = Arc::new(Inner {
             generation: new_generation,
@@ -212,6 +215,34 @@ impl ZoneSnapshot {
 
 fn normalise(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Collapse records that produce the same DNS resource record. Row IDs and
+/// generations are registry bookkeeping and must never cause repeated wire
+/// answers. This also repairs snapshots written by older agents that merged
+/// delete+insert endpoint replacements without receiving deletion tombstones.
+/// The last occurrence wins so a newly inserted row replaces stale bookkeeping
+/// from an earlier generation.
+fn deduplicate_records(records: Vec<ZoneRecord>) -> Vec<ZoneRecord> {
+    let mut seen = HashSet::with_capacity(records.len());
+    let mut deduplicated: Vec<ZoneRecord> = records
+        .into_iter()
+        .rev()
+        .filter(|record| {
+            let target = record
+                .target_ip
+                .as_deref()
+                .map(|value| value.trim_end_matches('.').to_ascii_lowercase());
+            seen.insert((
+                normalise(&record.fqdn),
+                record.record_type.to_ascii_uppercase(),
+                target,
+                record.target_port,
+            ))
+        })
+        .collect();
+    deduplicated.reverse();
+    deduplicated
 }
 
 fn write_atomic(path: &Path, snap: &Snapshot) -> Result<(), ResolverError> {
@@ -295,6 +326,38 @@ mod tests {
     }
 
     #[test]
+    fn replace_collapses_semantic_duplicates_with_different_row_ids() {
+        let dir = tempdir().unwrap();
+        let store = ZoneStore::new(dir.path().join("zone.json"));
+        let mut duplicate = rec(2, "PG.TEMPS.LOCAL.", "172.20.255.2", 8);
+        duplicate.owner_id = 99;
+
+        store.replace(
+            8,
+            vec![rec(1, "pg.temps.local", "172.20.255.2", 7), duplicate],
+        );
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.records().len(), 1);
+        assert_eq!(snapshot.lookup("pg.temps.local").count(), 1);
+        assert_eq!(snapshot.records()[0].id, 2);
+    }
+
+    #[test]
+    fn apply_diff_does_not_accumulate_reinserted_semantic_duplicates() {
+        let dir = tempdir().unwrap();
+        let store = ZoneStore::new(dir.path().join("zone.json"));
+        store.replace(7, vec![rec(1, "pg.temps.local", "172.20.255.2", 7)]);
+
+        store.apply_diff(8, vec![rec(200, "pg.temps.local", "172.20.255.2", 8)], &[]);
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.records().len(), 1);
+        assert_eq!(snapshot.lookup("pg.temps.local").count(), 1);
+        assert_eq!(snapshot.records()[0].id, 200);
+    }
+
+    #[test]
     fn apply_diff_upserts_and_removes() {
         let dir = tempdir().unwrap();
         let store = ZoneStore::new(dir.path().join("zone.json"));
@@ -352,5 +415,24 @@ mod tests {
         let store = ZoneStore::new(path);
         store.load_from_disk();
         assert_eq!(store.generation(), 0);
+    }
+
+    #[test]
+    fn load_from_disk_repairs_duplicate_records_from_older_agents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("zone.json");
+        let snapshot = Snapshot {
+            generation: 165,
+            records: (1..=165)
+                .map(|id| rec(id, "pg.temps.local", "172.20.255.2", id))
+                .collect(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let store = ZoneStore::new(path);
+        store.load_from_disk();
+
+        assert_eq!(store.generation(), 165);
+        assert_eq!(store.snapshot().records().len(), 1);
     }
 }

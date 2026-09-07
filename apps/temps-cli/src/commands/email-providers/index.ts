@@ -10,10 +10,12 @@ import {
   getEmailProvider as getEmailSmtpProvider,
   deleteEmailProvider as deleteEmailSmtpProvider,
   testProvider as testEmailProvider,
+  listDiscoverableDomains as listDiscoverableDomainsSdk,
 } from '../../api/sdk.gen.js'
 import type {
   EmailProviderResponse,
   EmailProviderTypeRoute,
+  ProviderDomainIdentityResponse,
   ScalewayCredentialsRequest,
   SesCredentialsRequest,
 } from '../../api/types.gen.js'
@@ -56,6 +58,11 @@ interface TestOptions {
   id: string
   from?: string
   fromName?: string
+}
+
+interface DiscoverableDomainsOptions {
+  id: string
+  json?: boolean
 }
 
 // --- Credential resolution ---
@@ -160,6 +167,14 @@ export function registerEmailProvidersCommands(program: Command): void {
     .option('--from <email>', 'Sender email address (must be verified)')
     .option('--from-name <name>', 'Sender display name')
     .action(testProviderAction)
+
+  emailProviders
+    .command('discoverable-domains')
+    .alias('discover-domains')
+    .description('List domain identities already registered on the provider\'s side, for importing')
+    .requiredOption('--id <id>', 'Provider ID')
+    .option('--json', 'Output in JSON format')
+    .action(discoverableDomainsAction)
 }
 
 async function listProvidersAction(options: { json?: boolean }): Promise<void> {
@@ -454,4 +469,60 @@ async function testProviderAction(options: TestOptions): Promise<void> {
 
   success('Test email sent successfully!')
   info('Check your inbox for the test message')
+}
+
+async function discoverableDomainsAction(options: DiscoverableDomainsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid provider ID')
+    return
+  }
+
+  const result = await withSpinner('Listing domains from provider...', async () => {
+    const { data, error } = await listDiscoverableDomainsSdk({ client, path: { id } })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error) ?? `Failed to list domains for provider ${options.id}`)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Discoverable Domains`)
+
+  if (!result.supported) {
+    info('This provider type does not support listing registered domains.')
+    info('Use: temps email-domains import --provider-id <id> --domain <domain> to import one by name.')
+    newline()
+    return
+  }
+
+  if (result.error) {
+    warning(`Could not fetch domains from the provider: ${result.error}`)
+    info('Use: temps email-domains import --provider-id <id> --domain <domain> to import one by name.')
+    newline()
+    return
+  }
+
+  if (result.domains.length === 0) {
+    info('No domains registered with this provider')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<ProviderDomainIdentityResponse>[] = [
+    { header: 'Domain', key: 'domain', color: (v) => colors.bold(v) },
+    { header: 'Status', key: 'status', color: (v) => statusBadge(v === 'verified' ? 'active' : 'inactive') },
+    { header: 'Identity ID', key: 'provider_identity_id', color: (v) => colors.muted(v) },
+  ]
+
+  printTable(result.domains, columns, { style: 'minimal' })
+  newline()
 }

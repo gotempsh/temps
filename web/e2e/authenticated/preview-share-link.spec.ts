@@ -2,6 +2,44 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test } from '../fixtures'
+import type { Page } from '@playwright/test'
+
+async function navigateToNewPreviewRoute(
+  page: Page,
+  url: string,
+  bridgePostCount: () => number
+) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await page.goto(url)
+      return
+    } catch (error) {
+      const networkChanged =
+        error instanceof Error && error.message.includes('ERR_NETWORK_CHANGED')
+
+      if (!networkChanged) {
+        throw error
+      }
+
+      // Chromium can invalidate its network context while the newly-created
+      // wildcard preview route becomes available. If the one-time grant was
+      // already submitted, do not submit it twice; the assertions below will
+      // wait for and validate the completed navigation.
+      if (bridgePostCount() > 0) {
+        return
+      }
+
+      if (attempt === 2) {
+        throw new Error(
+          'The newly-created preview route remained unavailable after 3 navigation attempts',
+          { cause: error }
+        )
+      }
+
+      await page.waitForTimeout(250 * 2 ** attempt)
+    }
+  }
+}
 
 test.describe('sandbox preview share links', () => {
   test('requires an authenticated control-plane session', async ({
@@ -57,7 +95,7 @@ test.describe('sandbox preview share links', () => {
             cmd: [
               'node',
               '-e',
-              'require("http").createServer((req,res)=>res.end("preview-share-ok:"+req.url)).listen(3000,"0.0.0.0")',
+              'require("http").createServer((req,res)=>res.end("preview-share-ok:"+req.url+":preview-token="+(req.headers["x-temps-preview-token"]??"absent"))).listen(3000,"0.0.0.0")',
             ],
           },
         }
@@ -113,7 +151,11 @@ test.describe('sandbox preview share links', () => {
         }
       })
 
-      await page.goto(shareUrl.toString())
+      await navigateToNewPreviewRoute(
+        page,
+        shareUrl.toString(),
+        () => bridgePosts
+      )
       await page.waitForURL(/\/browser-proof\?ok=1$/)
 
       expect(bridgePosts).toBe(1)
@@ -131,7 +173,17 @@ test.describe('sandbox preview share links', () => {
       expect(previewCookie).toBeDefined()
       expect(previewCookie?.httpOnly).toBe(true)
       await expect(page.locator('body')).toHaveText(
-        'preview-share-ok:/browser-proof?ok=1'
+        'preview-share-ok:/browser-proof?ok=1:preview-token=absent'
+      )
+
+      // A second request to the same preview target used to reuse Pingora's
+      // authenticated upstream connection. The gateway only consumes its
+      // internal token at the TCP boundary, so the second request leaked that
+      // token to tenant code. Exercise the same browser/target twice to prove
+      // every HTTP request now receives a fresh gateway connection.
+      await page.goto(new URL('/second-proof?ok=2', page.url()).toString())
+      await expect(page.locator('body')).toHaveText(
+        'preview-share-ok:/second-proof?ok=2:preview-token=absent'
       )
     } finally {
       const destroyed = await page.request.post(
