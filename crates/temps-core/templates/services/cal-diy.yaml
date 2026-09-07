@@ -3,12 +3,15 @@
 
 # Cal.diy is Cal.com's MIT-licensed, self-hosted community edition. Upstream
 # recommends it for personal/non-production use, not customer-facing booking
-# infrastructure -- see https://github.com/calcom/cal.diy. Image is published
-# under the project's pre-rename name, docker.io/calendso/calendso, pinned to
-# the v6.2.0 release (the latest cal.diy git tag at the time this was added).
-# calendso/calendso does not publish a real multi-arch manifest under one
-# tag/digest -- amd64 and arm64 are separate, separately-versioned tags
-# (v6.2.0 vs v6.2.0-arm) -- hence the separate image_arm64 pin below.
+# infrastructure -- see https://github.com/calcom/cal.diy. The same
+# release-docker.yaml CI build pushes this image to several Docker Hub
+# namespaces (calcom/cal.com, calcom/cal.diy, calendso/calendso); only
+# calcom/cal.com and calendso/calendso actually have published tags
+# (calcom/cal.diy has none as of this writing) -- pinned here to v6.2.0,
+# the latest cal.diy git tag at the time this was added. It does not publish
+# a real multi-arch manifest under one tag/digest -- amd64 and arm64 are
+# separate, separately-versioned tags (v6.2.0 vs v6.2.0-arm) -- hence the
+# separate image_arm64 pin below.
 slug: cal-diy
 name: Cal.diy
 version: 6.2.0
@@ -18,8 +21,8 @@ git:
   url: https://github.com/calcom/cal.diy.git
   ref: v6.2.0
 preset: dockerfile
-image: docker.io/calendso/calendso@sha256:ace3bb1219fb7306585ab9f4d94d41af7ee064c343db0498173436bbe857bd49
-image_arm64: docker.io/calendso/calendso@sha256:4b0fa72eec13bd3ddb608a6d13f05bf0ebc136e73832abfe1a8ec145db9e4651
+image: docker.io/calcom/cal.com@sha256:ace3bb1219fb7306585ab9f4d94d41af7ee064c343db0498173436bbe857bd49
+image_arm64: docker.io/calcom/cal.com@sha256:4b0fa72eec13bd3ddb608a6d13f05bf0ebc136e73832abfe1a8ec145db9e4651
 resources:
   cpu_request: 500000
   cpu_limit: 1000000
