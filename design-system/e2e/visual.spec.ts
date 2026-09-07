@@ -84,16 +84,27 @@ function masks(page: Page) {
  * Top-level blocks only: the Settings demo inside one of them renders its own
  * `<section id>` children, which are not library components.
  */
-const BLOCKS = [
-  'status', 'num', 'page-state', 'kbd', 'echo', 'chart', 'ledger', 'detail',
+const BLOCKS: readonly string[] = [
+  'status', 'num', 'page-state', 'button-busy', 'kbd', 'echo', 'chart', 'ledger', 'inspector', 'detail',
   'picker', 'settings', 'mark', 'breakdown', 'callout', 'strip', 'trace', 'logs',
   // The blocks files (src/sections/blocks/), mounted here and in /guide.
   'form-field', 'form-validation', 'form-datetime', 'form-range-schedule', 'form-disabled',
   'notify-table', 'notify-toast', 'notify-attention',
   'viz-choice', 'viz-series', 'viz-legend', 'viz-a11y',
+  // DataVizBlocks2, then GenUiBlocks, in the order the page mounts them. Their
+  // `DATAVIZ2_TOC` / `GENUI_TOC` exports are the source of truth and the page's
+  // rail spreads them; they cannot be imported here, because the module graph
+  // behind them reaches a JSON asset that Node will not load without an import
+  // attribute. The `toEqual([...BLOCKS])` assertion above is what keeps this
+  // copy honest: add a block there and this run goes red until it is added here.
+  'viz-band', 'viz-compare', 'viz-stacked', 'viz-heatmap', 'viz-ladder', 'viz-cohort',
+  'viz-paths', 'viz-session', 'viz-usage', 'viz-gauge', 'viz-state', 'viz-delta',
+  'viz-window', 'viz-topology',
+  'genui-ledger', 'genui-provenance', 'genui-proposal', 'genui-streaming',
+  'genui-question', 'genui-wrong',
   'content-error', 'content-time', 'content-fmt',
   'tokens-table', 'motion-tiers', 'icons-vocabulary',
-] as const
+]
 
 test.describe('op-components blocks', () => {
   test('the library still has exactly the blocks we shoot', async ({ page }) => {
@@ -147,6 +158,9 @@ const RECORDS: ReadonlyArray<{ label: string; path: string }> = [
   { label: 'issue-i_4821', path: v1('issue:i_4821') },
   { label: 'node-hetzner-3', path: v1('node:hetzner-3') },
   { label: 'settings-hub', path: v1('settings') },
+  // The logs screen, on the chrome-free console route: query bar, histogram,
+  // level toggles and the line list in one shot.
+  { label: 'console-logs', path: '/console?p=logs' },
 ]
 
 for (const { label, path } of RECORDS) {

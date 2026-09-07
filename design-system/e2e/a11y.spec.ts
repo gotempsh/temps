@@ -43,6 +43,8 @@ const PAGES: ReadonlyArray<{ label: string; path: string }> = [
   { label: '/v1?p=db:acme-pg', path: v1('db:acme-pg') },
   { label: '/v1?p=errors', path: v1('errors') },
   { label: '/v1?p=issue:i_4821', path: v1('issue:i_4821') },
+  { label: '/v1?p=logs', path: v1('logs') },
+  { label: '/v1?p=log:log_03x9w6', path: v1('log:log_03x9w6') },
   { label: '/v1?p=settings', path: v1('settings') },
   { label: '/v1?p=settings:cluster', path: v1('settings:cluster') },
   { label: '/status?project=acme-storefront', path: '/status?project=acme-storefront' },

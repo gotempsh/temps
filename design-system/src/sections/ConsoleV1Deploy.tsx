@@ -80,7 +80,7 @@ const PIPELINE_FAILED: Stage[] = [
 
 const PIPELINE_BUILDING: Stage[] = [
   { phase: 'build', name: 'download repository', state: 'ok', duration: '3s', result: 'develop@b7c9d21 · 1,206 files · 38 MB', lines: [L('20:29:00', 'info', 'git', 'clone github.com/acme/api-gateway --depth 1 --branch develop'), L('20:29:03', 'info', 'git', 'checked out b7c9d21')] },
-  { phase: 'build', name: 'build container image', state: 'idle', duration: '48s', result: 'next build · 31 of 48 routes', lines: [
+  { phase: 'build', name: 'build container image', state: 'running', duration: '48s', result: 'next build · 31 of 48 routes', lines: [
     L('20:29:03', 'info', 'docker', 'FROM oven/bun:1.2-slim AS deps'), L('20:29:04', 'info', 'bun', 'bun install --frozen-lockfile'), L('20:29:44', 'info', 'bun', '412 packages installed [40.1s]'), L('20:29:44', 'info', 'next', 'next build'),
     L('20:29:47', 'warn', 'next', 'src/legacy/stripe.ts: import.meta.env is undefined at build time'), L('20:29:51', 'info', 'next', '  compiling 31/48 routes'),
   ] },
@@ -112,7 +112,7 @@ const RUNTIME: LogLine[] = [
 ]
 
 const WORD: Record<Status_, string> = { live: 'live', superseded: 'superseded', failed: 'failed', building: 'building', cancelled: 'cancelled' }
-const WORD_STATE: Record<Status_, State> = { live: 'ok', superseded: 'idle', failed: 'error', building: 'idle', cancelled: 'idle' }
+const WORD_STATE: Record<Status_, State> = { live: 'ok', superseded: 'idle', failed: 'error', building: 'running', cancelled: 'idle' }
 
 // ── Screen ────────────────────────────────────────────────────────────
 type Tab = 'overview' | 'build log' | 'runtime log' | 'checks'
@@ -125,7 +125,7 @@ export function DeploymentScreen({ tag, dense, notify, go }: { tag: string; dens
   const [live, setLive] = useState(d.status === 'building' || d.status === 'live')
   const [elapsed, setElapsed] = useState(51)
   useEffect(() => { if (d.status !== 'building') return; const id = window.setInterval(() => setElapsed((e) => e + 1), 1000); return () => window.clearInterval(id) }, [d.status])
-  const running = d.stages.findIndex((s) => s.state === 'idle' && s.lines)
+  const running = d.stages.findIndex((s) => s.state === 'running')
   const done = d.stages.filter((s) => s.state === 'ok').length
 
   const status = d.status === 'live'
@@ -137,7 +137,7 @@ export function DeploymentScreen({ tag, dense, notify, go }: { tag: string; dens
       : d.status === 'failed'
         ? <StatusLine state="error">Failed at <Phrase onClick={() => setTab('build log')}>{d.fault?.step}</Phrase> after {d.took}: {d.fault?.quote.split(' · ')[1]} Nothing changed in {d.env}.</StatusLine>
         : d.status === 'building'
-          ? <StatusLine state="idle">Building: step {running + 1} of {d.stages.length}, {d.stages[running]?.name}. {fmt(elapsed)} so far, usually {d.usual} end to end.</StatusLine>
+          ? <StatusLine state="running">Building: step {running + 1} of {d.stages.length}, {d.stages[running]?.name}. {fmt(elapsed)} so far, usually {d.usual} end to end.</StatusLine>
           : <StatusLine state="ok">Nothing to do: cancelled by {d.author} before the build started. Nothing changed in {d.env}.</StatusLine>
 
   const facts: KV[] = [
@@ -245,7 +245,7 @@ export function DeploymentScreen({ tag, dense, notify, go }: { tag: string; dens
 
       {tab === 'runtime log' && (
         d.status === 'live' || d.status === 'superseded'
-          ? <Section title="Runtime log" meta={live ? 'both replicas · live · newest at the bottom' : 'both replicas · paused'} action={<button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => setLive((l) => !l)}>{live ? 'pause' : 'resume'}</button>}>
+          ? <Section title="Runtime log" meta={live ? 'both replicas · live · newest at the bottom' : 'both replicas · paused'} action={<span className="flex items-center gap-3 text-xs"><button type="button" className="text-muted-foreground hover:text-foreground" onClick={() => go(`logs:deploy:${d.tag}`)}>open in Logs</button><button type="button" className="text-muted-foreground hover:text-foreground" onClick={() => setLive((l) => !l)}>{live ? 'pause' : 'resume'}</button></span>}>
               <LogLines lines={RUNTIME} live={live && d.status === 'live'} height={520} search />
             </Section>
           : <Section title="Runtime log" meta="nothing ran"><p className="border bg-background px-3 py-3 text-xs text-muted-foreground">{d.status === 'building' ? 'Containers start after the image is built; the log begins then.' : 'This deployment never started a container, so there is no runtime log.'}</p></Section>

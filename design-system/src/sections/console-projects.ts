@@ -6,6 +6,7 @@ const svg = (body: string) => `data:image/svg+xml;utf8,${encodeURIComponent(`<sv
 export const PROJECT_ICONS: Record<string, string> = {
   'api-gateway': svg('<rect width="32" height="32" fill="#0f4c81"/><path d="M8 22 16 8l8 14z" fill="#fff"/>'),
   'acme-storefront': svg('<rect width="32" height="32" fill="#e4572e"/><circle cx="16" cy="16" r="7" fill="#fff"/>'),
+  'billing-worker': svg('<rect width="32" height="32" fill="#5b4b8a"/><path d="M9 12h14M9 17h14M9 22h8" stroke="#fff" stroke-width="3"/>'),
   'acme-crm': svg('<rect width="32" height="32" fill="#2a9d8f"/><rect x="8" y="8" width="16" height="16" fill="#fff"/>'),
   'docs': svg('<rect width="32" height="32" fill="#f4f1de"/><path d="M9 7h11l5 5v13H9z" fill="#3d405b"/>'),
 }

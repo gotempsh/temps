@@ -2,15 +2,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useSearchParams } from 'react-router'
 import { ArrowUpRight, ExternalLink, Inbox, Moon, Plus, Server, Square, Terminal as TerminalIcon, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { LogViewer, type LogLine } from '@/components/ui/log-viewer'
 import {
-  Callout, ChartFooter, Columns, Detail, EchoDialog, Histogram, KeyValue, Ledger, Lede, Metric, MetricGrid, Num, PageState, PageTitle, Phrase, RangePicker, Section, Segmented, Status, StatusLine, TimeChart, Waterfall, type Pct,
+  Callout, ChartFooter, Columns, Detail, EchoDialog, Histogram, KeyValue, Ledger, Lede, LogLines, Metric, MetricGrid, Num, PageState, PageTitle, Phrase, RangePicker, Section, Segmented, Status, StatusLine, TimeChart, Waterfall, type Pct,
   type LedgerRow, type Range, type State, type TimeRange, type Span as VizSpan,
 } from '@/components/op'
 import { fmtNum, fmtPct } from '@/components/op'
 import { matches } from './ConsoleV1Admin'
+/* The Logs screen owns the line fixtures and this file owns the span fixtures,
+   and each screen has to show the other's — a trace that lists different lines
+   from the ones Logs shows for the same trace id is a design that lies. Both
+   sides are exported as hoisted function declarations and called in render, so
+   the pair of imports has no module-initialisation order to get wrong. */
+import { traceLogLines } from './ConsoleV1Logs'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -24,7 +31,7 @@ import { cn } from '@/lib/utils'
    ──────────────────────────────────────────────────────────────────────── */
 
 export type Notify = (level: 'ok' | 'warn' | 'err', msg: string, detail?: string) => void
-export type Plan = { id: string; label: string; retention: string; retentionDays: number; sampled: boolean; ingest: string | null }
+export type Plan = { id: string; label: string; retention: string; retentionDays: number; sampled: boolean; ingest: string | null; ingestGb: number | null; ingestUsedGb: number }
 const RANGES: readonly Range[] = [{ label: '1h', days: 0.05 }, { label: '24h', days: 1 }, { label: '7d', days: 7 }, { label: '30d', days: 30 }, { label: '90d', days: 90 }]
 
 function gated(notify: Notify, plan: Plan) {
@@ -40,7 +47,10 @@ const SANDBOXES: Sandbox[] = [
   { id: 'sbx_c1d4', name: 'docs-refresh', status: 'sleeping', lifecycle: 'persistent', runtime: 'python 3.12', image: 'temps/sandbox:python312', vcpus: 1, memory: 2048, disk_size_mb: 4096, region: 'local', backend: 'docker', cwd: '/workspace/docs', source_repo_url: 'github.com/acme/docs', agent_run_id: null, preview_url_template: 'https://sbx-c1d4-8000.preview.acme.sh', preview_password_hint: null, createdAt: '3d ago', timeout: 3600, cpu_pct: 0, mem_pct: 0, disk_pct: 31 },
   { id: 'sbx_e77b', name: 'billing-repro', status: 'failed', lifecycle: 'ephemeral', runtime: 'node 22', image: 'temps/sandbox:node22-playwright', vcpus: 2, memory: 4096, disk_size_mb: 8192, region: 'local', backend: 'docker', cwd: '/workspace/billing-worker', source_repo_url: 'github.com/acme/billing-worker', agent_run_id: 419, preview_url_template: '', preview_password_hint: null, createdAt: '41m ago', timeout: 1800, cpu_pct: 0, mem_pct: 0, disk_pct: 0 },
 ]
-const SBX_STATE: Record<Sandbox['status'], State> = { running: 'ok', starting: 'warn', sleeping: 'idle', stopped: 'idle', failed: 'error' }
+// `running` here is the sandbox's own word for "up and serving", which is a
+// verdict and so is `ok`. The op state called `running` is work in flight —
+// that is `starting`, and its glyph pulses until the sandbox is up.
+const SBX_STATE: Record<Sandbox['status'], State> = { running: 'ok', starting: 'running', sleeping: 'idle', stopped: 'idle', failed: 'error' }
 const SBX_STATUS = { docker_available: true, firecracker_available: false, image_name: 'temps/sandbox:node22', image_ready: true }
 
 const SBX_EVENTS = [
@@ -327,16 +337,45 @@ const SPANS: Span[] = [
   { span_id: 's8', parent_span_id: 's1', name: 'email.send order_confirmation', service: 'api-gateway', kind: 'CLIENT', start: 396, duration_ms: 4, status_code: 'UNSET', status_message: '', attributes: { 'peer.service': 'temps-email', 'email.template': 'order_confirmation' }, events: [] },
 ]
 
+/** The flat OTLP span list as the tree `Waterfall` draws it. */
+function traceTree(): VizSpan[] {
+  const node = (sp: Span): VizSpan => ({ id: sp.span_id, name: sp.name, service: sp.service, start_ms: sp.start, duration_ms: sp.duration_ms, state: sp.status_code === 'ERROR' ? 'error' : sp.status_code === 'OK' ? 'ok' : 'idle', children: SPANS.filter((c) => c.parent_span_id === sp.span_id).map(node) })
+  return SPANS.filter((sp) => !sp.parent_span_id).map(node)
+}
+
+/**
+ * The checkout trace, for any screen that has to draw it. The Logs record and
+ * its Inspector show the waterfall of the trace a line belongs to inline, and
+ * a second copy of these spans is a second story: one of them would drift.
+ * A function, not a const, so the mutual import with `ConsoleV1Logs` is bound
+ * by hoisting rather than by evaluation order.
+ */
+export function checkoutTrace(): { trace_id: string; root: string; service: string; environment: string; total_ms: number; span_count: number; spans: VizSpan[] } {
+  const t = TRACES[0]
+  return { trace_id: t.trace_id, root: t.root_span_name, service: t.service_name, environment: t.deployment_environment, total_ms: SPANS[0].duration_ms, span_count: SPANS.length, spans: traceTree() }
+}
+
 export function TraceScreen({ id, go }: { id: string; go: (v: string) => void; dense?: boolean }) {
   const t = TRACES.find((x) => x.trace_id === id) ?? TRACES[0]
   const [sel, setSel] = useState<string>('s5')
+  const [params, setParams] = useSearchParams()
   const total = SPANS[0].duration_ms
   const span = SPANS.find((s) => s.span_id === sel)!
-  // The flat OTLP span list as the tree `Waterfall` draws; selection is the row's own focusable control, so `Tab` reaches it.
-  const tree = useMemo(() => {
-    const node = (sp: Span): VizSpan => ({ id: sp.span_id, name: sp.name, service: sp.service, start_ms: sp.start, duration_ms: sp.duration_ms, state: sp.status_code === 'ERROR' ? 'error' : sp.status_code === 'OK' ? 'ok' : 'idle', children: SPANS.filter((c) => c.parent_span_id === sp.span_id).map(node) })
-    return SPANS.filter((sp) => !sp.parent_span_id).map(node)
-  }, [])
+  // Selection is the row's own focusable control, so `Tab` reaches it.
+  const tree = useMemo(() => traceTree(), [])
+  /* The lines Logs holds for this trace, drawn from the Logs fixtures rather than
+     from a copy: the two screens cannot disagree about what this request said. */
+  const lines = useMemo(() => traceLogLines(t.trace_id), [t.trace_id])
+  /* "open in Logs" is the Logs URL contract, written the way Logs writes it:
+     `?p=logs&q=trace:<id>` — one `trace:` token in the query, which the query bar
+     then shows as a removable chip the reader can widen from. */
+  const openInLogs = () => {
+    const p = new URLSearchParams(params)
+    p.set('p', 'logs')
+    p.set('q', `trace:${t.trace_id}`)
+    p.delete('lv')
+    setParams(p)
+  }
   const errSpan = SPANS.find((s) => s.status_code === 'ERROR' && s.parent_span_id)!
   const stripe = SPANS.find((s) => s.name.includes('stripe'))!
   return (
@@ -369,6 +408,16 @@ export function TraceScreen({ id, go }: { id: string; go: (v: string) => void; d
         <div>
           <Section title="Spans" meta={`${SPANS.length} · ${total}ms`}>
             <Waterfall spans={tree} total_ms={total} selected={sel} onSelect={(sp) => setSel(sp.id)} />
+          </Section>
+          {/* Correlation runs both ways: the Logs record draws this waterfall, and this
+              record draws the lines. Neither screen sends the reader away to find out. */}
+          <Section title="Logs" meta={`lines carrying ${t.trace_id.slice(0, 8)}`}
+            action={<button type="button" onClick={openInLogs} className="text-xs text-muted-foreground hover:text-foreground">open in Logs</button>}>
+            {lines.length > 0
+              ? <LogLines lines={lines} height={220} />
+              : <p className="text-xs text-muted-foreground">
+                No line carries this trace id · the SDK stamps one on every line it writes once tracing is on, and then this section is the request&apos;s own log. <Phrase onClick={() => go('settings:store')}>Turn tracing on in Settings › Store</Phrase>.
+              </p>}
           </Section>
         </div>
         <div>

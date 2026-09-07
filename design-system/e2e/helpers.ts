@@ -92,6 +92,11 @@ export const V5_VIEWS = [
   'deploy:dep_92b',
   'errors',
   'issue:i_4821',
+  'logs',
+  // A real id out of ConsoleV1Logs' own fixtures (`LINES`), not an invented
+  // one: `LogRecord` falls back to `LINES[0]` for an unknown id, so a made-up
+  // id would sweep a page that is not the one it names.
+  'log:log_03x9w6',
   'analytics',
   'event:signup',
   'uptime',
