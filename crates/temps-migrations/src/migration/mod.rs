@@ -228,6 +228,7 @@ mod m20260903_000002_harden_application_workspaces;
 mod m20260903_000003_application_workspace_quarantine;
 mod m20260903_000004_repair_application_primary_projects;
 mod m20260904_000001_reset_ambiguous_managed_status_monitors;
+mod m20260907_000001_add_mfa_pending_origin_to_sessions;
 
 pub struct Migrator;
 
@@ -491,6 +492,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260831_000002_add_managed_status_monitors::Migration),
             Box::new(m20260903_000001_add_service_project_identity::Migration),
             Box::new(m20260904_000001_reset_ambiguous_managed_status_monitors::Migration),
+            // Keep the canonical main-branch migration before feature-branch
+            // migrations so existing main upgrade history remains a stable prefix.
+            Box::new(m20260907_000001_add_mfa_pending_origin_to_sessions::Migration),
             Box::new(m20260831_000001_ai_first_applications::Migration),
             Box::new(m20260901_000001_persist_ai_turn_state::Migration),
             Box::new(m20260901_000002_user_owned_ai_conversations::Migration),
