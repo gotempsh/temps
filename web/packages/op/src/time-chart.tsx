@@ -14,6 +14,7 @@ import {
 } from 'recharts'
 import { cn } from './lib/cn'
 import { fmtAbsolute, fmtNum } from './fmt'
+import { Strip } from './datetime'
 
 /**
  * Every Temps time axis carries three things:
@@ -331,7 +332,8 @@ export function TimeChart({ data, series, markers = [], thresholds = [], hot, on
  * which plan keeps that range.
  */
 export type Range = { label: string; days: number }
-const fmtStamp = (iso: string) => fmtAbsolute(iso)
+/** The applied window on the strip button: short enough for a 7-cell strip, and always beside the zone in the panel below. */
+const fmtWindow = (iso: string) => fmtAbsolute(iso)
 /**
  * Quick ranges as one strip; with `custom`, a last button opens two
  * datetime fields under the strip. Once applied the button reads the window
@@ -345,8 +347,8 @@ export function RangePicker({ ranges, value, onChange, retentionDays, retentionL
   retentionDays: number
   retentionLabel: string
   onGated: (r: Range) => void
-  /** Enables the custom window. `from`/`to` are ISO local stamps (datetime-local). */
-  custom?: { from: string; to: string; onChange: (from: string, to: string) => void }
+  /** Enables the custom window. `from`/`to` are ISO local stamps (datetime-local); `zone` names the clock they are read in, because a time with no zone beside it is a guess. */
+  custom?: { from: string; to: string; zone: string; onChange: (from: string, to: string) => void }
   className?: string
 }) {
   const wrap = useRef<HTMLDivElement>(null)
@@ -362,34 +364,26 @@ export function RangePicker({ ranges, value, onChange, retentionDays, retentionL
   const isCustom = value === 'custom'
   return (
     <div ref={wrap} className={cn('relative max-w-full', className)}>
-    <div className="op-scroll-x flex max-w-full border text-[11px]">
-      {ranges.map((r, i) => {
+    {/* The same Strip a date field's presets and a schedule's weekdays use, so gating is written once (datetime.tsx). */}
+    <Strip
+      items={ranges.map((r) => {
         const gated = r.days > retentionDays
-        return (
-          <button
-            key={r.label}
-            type="button"
-            aria-pressed={value === r.label}
-            title={gated ? `beyond ${retentionLabel} retention` : undefined}
-            onClick={() => (gated ? onGated(r) : onChange(r.label))}
-            className={cn('h-7 shrink-0 px-2', i > 0 && 'border-l', value === r.label ? 'bg-foreground text-background' : gated ? 'text-muted-foreground line-through decoration-[var(--op-rule-soft)] hover:bg-muted' : 'hover:bg-muted')}
-          >
-            {r.label}
-          </button>
-        )
+        return { label: r.label, pressed: value === r.label, gated, title: gated ? `beyond ${retentionLabel} retention` : undefined, onClick: () => (gated ? onGated(r) : onChange(r.label)) }
       })}
-      {custom && (
+      after={custom && (
         <button type="button" aria-pressed={isCustom} aria-expanded={open} onClick={() => setOpen((o) => !o)} className={cn('h-7 shrink-0 border-l px-2 font-mono', isCustom ? 'bg-foreground text-background' : 'hover:bg-muted')}>
-          {isCustom && custom.from && custom.to ? `${fmtStamp(custom.from)} → ${fmtStamp(custom.to)}` : 'custom'}
+          {isCustom && custom.from && custom.to ? `${fmtWindow(custom.from)} → ${fmtWindow(custom.to)}` : 'custom'}
         </button>
       )}
-    </div>
+    />
     {custom && open && (
       <form role="dialog" aria-label="Custom range" className="absolute right-0 top-full z-30 mt-1 grid w-[min(22rem,calc(100vw-2rem))] gap-2 border bg-background p-3 text-xs shadow-[3px_3px_0_0_var(--foreground)]"
         onSubmit={(e) => { e.preventDefault(); if (draft.from && draft.to && draft.from < draft.to) { custom.onChange(draft.from, draft.to); onChange('custom'); setOpen(false) } }}>
-        <label className="grid gap-1"><span className="op-label">from</span><input type="datetime-local" required value={draft.from} onChange={(e) => setDraft({ ...draft, from: e.target.value })} className="h-8 border bg-background px-2 font-mono text-xs" /></label>
-        <label className="grid gap-1"><span className="op-label">to</span><input type="datetime-local" required value={draft.to} onChange={(e) => setDraft({ ...draft, to: e.target.value })} className="h-8 border bg-background px-2 font-mono text-xs" /></label>
-        <p className="font-mono text-[10px] text-muted-foreground">{draft.from && draft.to && draft.from >= draft.to ? '× "to" must be after "from"' : `retention ${retentionLabel} · times are local`}</p>
+        {/* The same native inputs the date fields use, under the same ink skin: typed entry first, the browser's picker as the accelerator. */}
+        <label className="grid gap-1"><span className="op-label">from</span><input type="datetime-local" required value={draft.from} onChange={(e) => setDraft({ ...draft, from: e.target.value })} className="h-8 border bg-background px-2 font-mono text-xs tabular-nums" /></label>
+        <label className="grid gap-1"><span className="op-label">to</span><input type="datetime-local" required value={draft.to} onChange={(e) => setDraft({ ...draft, to: e.target.value })} className="h-8 border bg-background px-2 font-mono text-xs tabular-nums" /></label>
+        {/* A time with no zone beside it is a time the reader has to guess at. */}
+        <p className="font-mono text-[10px] text-muted-foreground">{draft.from && draft.to && draft.from >= draft.to ? '× "to" must be after "from"' : `retention ${retentionLabel} · times are ${custom.zone}`}</p>
         <div className="flex justify-end gap-2"><button type="button" onClick={() => setOpen(false)} className="h-7 px-2 hover:bg-muted">cancel</button><button type="submit" className="op-primary h-7 border px-3">apply</button></div>
       </form>
     )}

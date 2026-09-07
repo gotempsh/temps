@@ -151,6 +151,36 @@ export function fmtAbsolute(date: Date | string | number | null | undefined, o: 
   }).format(d)
 }
 
+/**
+ * A wall clock written ISO-ordered: `2026-09-06 20:33`. This is the form
+ * every date/time *input* reads and writes (forms.md §Dates, times and
+ * ranges) — it sorts, it never reads as another day somewhere else, and
+ * `09/06/26` is two different dates depending on who is looking at it.
+ *
+ * It takes the stamp verbatim and converts nothing: the value is already a
+ * wall clock in `zone`, and a formatter that helpfully shifts it is how a
+ * point-in-time restore lands on the wrong second. `zone` is appended as the
+ * fact that says which clock it is.
+ *
+ * ```ts
+ * fmtStamp('2026-09-06T20:33')                                    // "2026-09-06 20:33"
+ * fmtStamp('2026-09-06T20:33:41', { precision: 'second', zone: 'UTC' })
+ *                                                                 // "2026-09-06 20:33:41 UTC"
+ * fmtStamp('2026-12-06', { precision: 'day' })                     // "2026-12-06"
+ * ```
+ */
+export function fmtStamp(value: Date | string | null | undefined, o: { zone?: string; precision?: 'day' | 'minute' | 'second' } = {}): string {
+  if (value === null || value === undefined || value === '') return EMPTY
+  const p = (n: number) => String(n).padStart(2, '0')
+  const raw = value instanceof Date
+    ? `${value.getFullYear()}-${p(value.getMonth() + 1)}-${p(value.getDate())}T${p(value.getHours())}:${p(value.getMinutes())}:${p(value.getSeconds())}`
+    : value.trim()
+  const [date, clock = ''] = raw.split('T')
+  const time = clock.slice(0, o.precision === 'second' ? 8 : 5)
+  const body = o.precision === 'day' || !time ? date : `${date} ${time}`
+  return o.zone ? `${body} ${o.zone}` : body
+}
+
 const MINUTE = 60_000
 const HOUR = 3_600_000
 const DAY = 86_400_000

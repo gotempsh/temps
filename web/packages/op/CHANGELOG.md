@@ -2,6 +2,50 @@
 
 ## 0.1.2
 
+- Date, time, range, duration and schedule fields (`datetime.tsx`), so a form
+  can ask for a moment without inventing a control (see
+  `design-system/docs/forms.md` §"Dates, times and ranges").
+
+  - `DateTimeField`, `DateField`, `TimeField` compose `Field` around a real
+    `datetime-local` / `date` / `time` input: typed entry first, the browser's
+    picker as the accelerator, ↑/↓ stepping the focused segment. `precision:
+    'second'` adds `step=1` for the one second-precise operation (point-in-time
+    restore). `zone` is a mono fact beside the control and becomes a `Picker`
+    when `onZoneChange` is passed — a control never guesses which clock it is
+    on. `min`/`max` state the window in the hint once and fault on blur;
+    `presets` fill the absolute field, which stays the truth about what they
+    wrote. `never` makes "no expiry" an option word, so an empty date can never
+    mean forever.
+
+  - `DateTimeRangeField` is two of them on one row (stacked below sm) with
+    `quick` windows, `to > from` validated on blur of "to", and ranges past
+    `retentionDays` struck through with the plan word rather than hidden.
+
+  - `DurationField` is a number plus a unit `Picker` (`s` `min` `h` `d`) over a
+    millisecond value, so `30d` is never free text to be parsed; the preview
+    under it is `fmtDuration`.
+
+  - `ScheduleField` is `HH:MM` plus its zone plus optional weekday toggles, and
+    it prints the next three runs underneath — a schedule nobody can read back
+    is a cron expression with extra steps. `cron` stays available as the
+    advanced entry beside the simple one, never instead of it.
+
+  - `Strip` is the one anchor strip these and `RangePicker` share, so a preset,
+    a quick range and a weekday are the same control and the gating (struck
+    through, still pressable, calls `onGated`) cannot drift between them.
+    `RangePicker` renders through it and is otherwise unchanged, except that
+    `custom` now takes a required `zone` and names it under the two inputs.
+
+  - `op.css` gains a block for the native controls under the ink skin: mono,
+    tabular, square, muted calendar glyph (inverted in dark), the focused
+    segment marked in ink rather than the UA's selection blue.
+
+- `fmtStamp` in `fmt.ts`: a wall clock written ISO-ordered
+  (`2026-09-06 20:33`, `… :41` at second precision, `zone` appended). It
+  converts nothing — the value is already a wall clock in that zone, and a
+  formatter that helpfully shifts it is how a restore lands on the wrong
+  second.
+
 - `TimeChart` tells series apart by pattern, not by hue, and draws its own
   legend (audit item 31; see `design-system/docs/data-viz.md`).
 

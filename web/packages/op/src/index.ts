@@ -9,7 +9,7 @@
 export { Kbd, MOD, IS_MAC } from './kbd'
 export { Status, StatusLine, AttentionHost, Phrase, worst, GLYPH, GLYPH_CLASS, STATE_RANK, type State, type StatusItem } from './status'
 export { Num, Metric, MetricGrid } from './num'
-export { fmtNum, fmtPct, fmtBytes, fmtDuration, fmtRelative, fmtAbsolute, fmtCount, EMPTY, type Locale } from './fmt'
+export { fmtNum, fmtPct, fmtBytes, fmtDuration, fmtRelative, fmtAbsolute, fmtStamp, fmtCount, EMPTY, type Locale } from './fmt'
 export { PageState, type PageStateProps } from './page-state'
 export { EchoDialog } from './echo-dialog'
 export { Ledger, Detail, Settings, Field, Segmented, PageTitle, Pager, ActionBar, SectionTitle, Section,
@@ -25,4 +25,6 @@ export { Drop } from './drop'
 export { ShellSlotsProvider, useShellSlots, type ShellSlots } from './shell-slots'
 export { Breakdown, GeoMap, Sparkline, StatusStrip, ScoreRing, CalendarHeatmap, Funnel, Flow, Waterfall, StackTrace, LogLines, Stages, Histogram, quantile, Live,
   type BreakdownRow, type GeoRow, type StatusBucket, type ActivityDay, type FunnelStep, type FlowRow, type Span, type Frame, type LogLine, type Stage, type HistBucket, type Pct } from './viz'
+export { DateTimeField, DateField, TimeField, DateTimeRangeField, DurationField, ScheduleField, Strip, nextRuns, toStamp,
+  type TemporalKind, type Precision, type Preset, type Quick, type NeverOption, type StripItem, type DurationUnit, type Weekday, type DateTimeFieldProps } from './datetime'
 export { ProjectMark } from './project-mark'

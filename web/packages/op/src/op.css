@@ -629,3 +629,64 @@
 /* Streaming caret for tool input / agent text under ink: a 1ch ink block that blinks. */
 .operator.ink .op-caret::after { content: '▍'; margin-left: 1px; animation: op-blink 1s steps(1) infinite; }
 @keyframes op-blink { 50% { opacity: 0; } }
+
+/* ────────────────────────────────────────────────────────────────────────
+   Native date and time inputs under the ink skin (forms.md §Dates, times
+   and ranges; the controls are in `datetime.tsx`).
+
+   The rule is typed entry first: these stay real `date` / `time` /
+   `datetime-local` inputs, so the reader can type a stamp out of a log,
+   step the focused segment with ↑/↓ and still reach the browser's own
+   picker as an accelerator. All this block does is stop them looking like
+   a foreign control: mono, tabular, square, ink.
+
+   The calendar button is a UA glyph, so it can only be toned with `filter`
+   and `opacity` — it is muted at rest, full ink on hover, and inverted in
+   dark, where the glyph ships black on our near-black paper.
+   ──────────────────────────────────────────────────────────────────────── */
+.operator.ink input[type='date'],
+.operator.ink input[type='time'],
+.operator.ink input[type='datetime-local'] {
+  border-radius: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color-scheme: light;
+}
+.dark .operator.ink input[type='date'],
+.dark .operator.ink input[type='time'],
+.dark .operator.ink input[type='datetime-local'] { color-scheme: dark; }
+.operator.ink input[type='date']::-webkit-calendar-picker-indicator,
+.operator.ink input[type='time']::-webkit-calendar-picker-indicator,
+.operator.ink input[type='datetime-local']::-webkit-calendar-picker-indicator {
+  opacity: 0.5;
+  cursor: pointer;
+  padding: 0;
+  margin-inline-start: 0.25rem;
+  transition: opacity var(--op-duration-fast) var(--op-ease);
+}
+.operator.ink input[type='date']:hover::-webkit-calendar-picker-indicator,
+.operator.ink input[type='time']:hover::-webkit-calendar-picker-indicator,
+.operator.ink input[type='datetime-local']:hover::-webkit-calendar-picker-indicator { opacity: 1; }
+.dark .operator.ink input[type='date']::-webkit-calendar-picker-indicator,
+.dark .operator.ink input[type='time']::-webkit-calendar-picker-indicator,
+.dark .operator.ink input[type='datetime-local']::-webkit-calendar-picker-indicator { filter: invert(1); }
+/* The focused segment is the thing ↑/↓ steps, so it is marked in ink rather
+   than in the UA's selection blue — the one hue that would survive here. */
+.operator.ink input[type='date']::-webkit-datetime-edit,
+.operator.ink input[type='time']::-webkit-datetime-edit,
+.operator.ink input[type='datetime-local']::-webkit-datetime-edit { padding: 0; }
+.operator.ink input::-webkit-datetime-edit-year-field:focus,
+.operator.ink input::-webkit-datetime-edit-month-field:focus,
+.operator.ink input::-webkit-datetime-edit-day-field:focus,
+.operator.ink input::-webkit-datetime-edit-hour-field:focus,
+.operator.ink input::-webkit-datetime-edit-minute-field:focus,
+.operator.ink input::-webkit-datetime-edit-second-field:focus {
+  background: var(--foreground);
+  color: var(--background);
+  outline: none;
+}
+/* A duration is a number and a unit Picker beside it, so the spinner is a
+   second control for the same value in a smaller hit area. */
+.operator.ink input[type='number'] { border-radius: 0; font-variant-numeric: tabular-nums; }
+.operator.ink input[type='number']::-webkit-outer-spin-button,
+.operator.ink input[type='number']::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
