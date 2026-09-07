@@ -158,7 +158,7 @@ jobs:
       # dependency graph, which can fail independently of this repository's
       # Cargo.lock (for example, when an upstream build-only crate is broken).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
         with:
           tool: cargo-audit@0.22.2
           fallback: none

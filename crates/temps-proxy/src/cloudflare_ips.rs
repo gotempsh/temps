@@ -22,6 +22,8 @@
 //! records the edge IP (today's behavior) rather than anything spoofable.
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use ipnetwork::IpNetwork;
 use once_cell::sync::Lazy;
 use std::net::IpAddr;
@@ -66,6 +68,13 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// list stale for a full day.
 const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Defensive ceiling on the Cloudflare IP-range response body. This endpoint
+/// is hardcoded (not request-triggered) and the real response is ~20 CIDRs —
+/// 1 MiB is generous headroom, not a tight fit. Enforced against actual
+/// bytes read via a streaming count, not `Content-Length` alone, since that
+/// header can be absent or lied about.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Process-wide trust store, following the `crawler_detector` global pattern.
 /// Seeded with the builtin ranges; the refresher starts lazily on first
@@ -173,20 +182,49 @@ async fn refresh_once(
     client: &reqwest::Client,
     ranges: &ArcSwap<Vec<IpNetwork>>,
 ) -> Result<usize, String> {
-    let body = client
+    let response = client
         .get(CLOUDFLARE_IPS_URL)
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("bad status: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("body read failed: {e}"))?;
+        .map_err(|e| format!("bad status: {e}"))?;
+    let body_bytes = read_body_capped(
+        response.bytes_stream(),
+        MAX_RESPONSE_BYTES,
+        CLOUDFLARE_IPS_URL,
+    )
+    .await?;
+    let body = String::from_utf8(body_bytes)
+        .map_err(|e| format!("body from {CLOUDFLARE_IPS_URL} was not valid UTF-8: {e}"))?;
     let parsed = parse_cloudflare_ips_response(&body)?;
     let count = parsed.len();
     ranges.store(Arc::new(parsed));
     Ok(count)
+}
+
+/// Buffer a byte stream up to `cap` bytes, erroring rather than truncating
+/// once the cumulative size exceeds it. Enforced against actual bytes
+/// received (not `Content-Length`, which can be absent or lied about) so a
+/// misbehaving or malicious endpoint can't force unbounded buffering.
+/// Extracted as a pure function over a generic stream so it is testable
+/// without a real HTTP round trip.
+async fn read_body_capped<E: std::fmt::Display>(
+    mut stream: impl Stream<Item = Result<Bytes, E>> + Unpin,
+    cap: usize,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("body stream from {url} failed: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        if buf.len() > cap {
+            return Err(format!(
+                "body from {url} exceeded {cap}-byte cap — refusing to buffer further"
+            ));
+        }
+    }
+    Ok(buf)
 }
 
 /// Parse the `/client/v4/ips` JSON body into networks. Errors (rather than
@@ -331,5 +369,39 @@ mod tests {
             r#"{"success": true, "result": {"ipv4_cidrs": ["bogus"], "ipv6_cidrs": ["2400:cb00::/32"]}}"#
         )
         .is_err());
+    }
+
+    // --- Response size cap tests ---
+
+    /// A response body under the cap is buffered in full.
+    #[tokio::test]
+    async fn read_body_capped_accepts_body_under_cap() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from_static(b"{\"success\":true}"))];
+        let stream = futures::stream::iter(chunks);
+        let result = read_body_capped(stream, MAX_RESPONSE_BYTES, "https://example.test").await;
+        assert_eq!(result.unwrap(), b"{\"success\":true}".to_vec());
+    }
+
+    /// A response whose cumulative size crosses the cap must be rejected
+    /// outright — never silently truncated — so a misbehaving or malicious
+    /// endpoint can't force unbounded buffering, and callers keep the last
+    /// known-good trust set instead of installing a partial one.
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversized_body_without_oom() {
+        let cap = 1024usize;
+        // Split an over-cap body across several chunks, as a real streamed
+        // HTTP response would arrive, to prove the running-total check (not
+        // just a single-chunk length check) is what triggers the rejection.
+        let oversized_chunk = Bytes::from(vec![b'a'; cap]);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(oversized_chunk.clone()),
+            Ok(oversized_chunk.clone()),
+            Ok(Bytes::from_static(b"tail")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let result = read_body_capped(stream, cap, "https://example.test").await;
+        assert!(result.is_err(), "oversized body must be rejected");
+        assert!(result.unwrap_err().contains("exceeded"));
     }
 }

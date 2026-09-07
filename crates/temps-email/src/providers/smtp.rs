@@ -22,8 +22,8 @@ use tracing::{debug, error};
 use utoipa::ToSchema;
 
 use super::traits::{
-    DomainIdentity, DomainIdentityDetails, EmailProvider, EmailProviderType, SendEmailRequest,
-    SendEmailResponse, VerificationStatus,
+    DomainIdentity, DomainIdentityDetails, EmailProvider, EmailProviderType,
+    ProviderDomainIdentity, SendEmailRequest, SendEmailResponse, VerificationStatus,
 };
 use crate::errors::EmailError;
 
@@ -355,6 +355,15 @@ impl EmailProvider for SmtpProvider {
 
     fn provider_type(&self) -> EmailProviderType {
         EmailProviderType::Smtp
+    }
+
+    /// SMTP has no domain-management API to list registered domains
+    /// against — see the trait doc comment for how callers must handle this.
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+        Err(EmailError::UnsupportedOperation {
+            provider_type: "smtp".to_string(),
+            operation: "listing registered domains".to_string(),
+        })
     }
 }
 

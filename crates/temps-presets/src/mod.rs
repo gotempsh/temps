@@ -20,6 +20,7 @@ mod nixpacks_preset;
 mod preset_config;
 mod python_preset;
 mod react_app;
+pub mod registry_prefix;
 mod rsbuild;
 mod rust_preset;
 mod vite;

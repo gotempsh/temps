@@ -793,6 +793,36 @@ mod tests {
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
+    /// Parses a raw `curl -w "%{http_code}"` output and reports whether it
+    /// represents a successful (2xx) response. A container that answers with
+    /// 201/204/206 is not "down" -- only an exact-match on `"200"` would
+    /// wrongly keep polling in those cases. Redirects (3xx) and error codes
+    /// still count as not-ready, so the poll keeps waiting for them.
+    fn curl_status_indicates_success(raw_status: &str) -> bool {
+        raw_status
+            .trim()
+            .parse::<u16>()
+            .is_ok_and(|code| (200..300).contains(&code))
+    }
+
+    #[test]
+    fn curl_status_indicates_success_accepts_full_2xx_range() {
+        assert!(curl_status_indicates_success("200"));
+        assert!(curl_status_indicates_success("201"));
+        assert!(curl_status_indicates_success("204"));
+        assert!(curl_status_indicates_success("299"));
+    }
+
+    #[test]
+    fn curl_status_indicates_success_rejects_non_2xx_and_malformed_output() {
+        assert!(!curl_status_indicates_success("101"));
+        assert!(!curl_status_indicates_success("301"));
+        assert!(!curl_status_indicates_success("404"));
+        assert!(!curl_status_indicates_success("500"));
+        assert!(!curl_status_indicates_success(""));
+        assert!(!curl_status_indicates_success("curl: (7) Failed to connect"));
+    }
+
     /// Integration test that builds and runs a real Next.js Docker image
     /// This test requires Docker to be running and may take several minutes.
     /// It uses the fixture at tests/fixtures/nextjs-hello-world
@@ -1004,9 +1034,9 @@ mod tests {
 
             if let Ok(output) = curl_result {
                 let status = String::from_utf8_lossy(&output.stdout);
-                if status == "200" {
+                if curl_status_indicates_success(&status) {
                     is_healthy = true;
-                    println!("HTTP health check passed with status 200");
+                    println!("HTTP health check passed with status {status}");
                     break;
                 }
             }

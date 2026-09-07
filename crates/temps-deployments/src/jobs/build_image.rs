@@ -297,6 +297,10 @@ pub struct BuildImageJob {
     log_service: Option<Arc<LogService>>,
     preset: Option<StoredPreset>,
     preset_config: Option<StoredPresetConfig>,
+    /// Operator-configured prefix (`AppSettings::registry_mirror_prefix`)
+    /// applied to implicit Docker Hub base images in the generated
+    /// Dockerfile. `None` (the default) leaves every `FROM` line untouched.
+    registry_mirror_prefix: Option<String>,
 }
 
 impl std::fmt::Debug for BuildImageJob {
@@ -328,6 +332,7 @@ impl BuildImageJob {
             log_service: None,
             preset: None,
             preset_config: None,
+            registry_mirror_prefix: None,
         }
     }
 
@@ -368,6 +373,11 @@ impl BuildImageJob {
 
     pub fn with_preset_config(mut self, preset_config: Option<StoredPresetConfig>) -> Self {
         self.preset_config = preset_config;
+        self
+    }
+
+    pub fn with_registry_mirror_prefix(mut self, registry_mirror_prefix: Option<String>) -> Self {
+        self.registry_mirror_prefix = registry_mirror_prefix;
         self
     }
 
@@ -656,7 +666,7 @@ impl BuildImageJob {
 
         // Generate Dockerfile content with build args and .temps.yaml overrides
         // Use build_context_dir as both root and local path so preset detection works correctly
-        let dockerfile_with_args = preset
+        let mut dockerfile_with_args = preset
             .dockerfile(temps_presets::DockerfileConfig {
                 root_local_path: build_context_dir,
                 local_path: build_context_dir,
@@ -668,6 +678,21 @@ impl BuildImageJob {
                 use_buildkit: true, // Enable BuildKit for faster builds and caching
             })
             .await;
+
+        // Route implicit Docker Hub base images (`FROM node:22-slim`) through
+        // the operator's configured registry mirror/prefix, if any. Only
+        // applies to preset-generated Dockerfiles -- an existing Dockerfile
+        // in the repo never reaches this function at all (see
+        // `ensure_dockerfile`'s early return above), so a user's own FROM
+        // lines are never rewritten out from under them.
+        if let Some(prefix) = self
+            .registry_mirror_prefix
+            .as_deref()
+            .filter(|p| !p.is_empty())
+        {
+            dockerfile_with_args.content =
+                temps_presets::apply_registry_prefix(&dockerfile_with_args.content, prefix);
+        }
 
         // Write the Dockerfile
         write_no_follow(
@@ -1148,6 +1173,10 @@ impl BuildImageJob {
         build_host_platform: &str,
         error: &temps_deployer::BuilderError,
     ) -> String {
+        if let Some(message) = Self::describe_registry_rate_limit(platform, error) {
+            return message;
+        }
+
         let Some(platform) = platform else {
             return format!("Failed to build image: {}", error);
         };
@@ -1177,6 +1206,52 @@ impl BuildImageJob {
         } else {
             format!("Failed to build image for {}: {}", platform, error)
         }
+    }
+
+    /// Recognise a Docker Hub anonymous-pull rate limit and explain the fix.
+    ///
+    /// Autopack's generated Dockerfiles always reference unqualified base
+    /// images (`FROM node:22-slim`, `FROM debian:bookworm-slim`), so the
+    /// daemon resolves every one of them against `docker.io` with no
+    /// credentials attached — Temps has no registry auth or mirror
+    /// configuration of its own. Docker Hub throttles anonymous pulls per
+    /// source IP, and that limit is shared across every build this host (or,
+    /// on multi-node clusters, every node behind the same WAN IP) runs. The
+    /// daemon reports this as a generic pull failure buried in build output;
+    /// without translation it reads like a broken Dockerfile or a transient
+    /// network blip and sends people looking in the wrong place.
+    ///
+    /// Returns `None` for any other failure so the caller falls through to
+    /// its existing handling.
+    fn describe_registry_rate_limit(
+        platform: Option<&str>,
+        error: &temps_deployer::BuilderError,
+    ) -> Option<String> {
+        let text = error.to_string().to_lowercase();
+        let looks_like_rate_limit = text.contains("toomanyrequests")
+            || text.contains("pull rate limit")
+            || text.contains("429 too many requests")
+            || (text.contains("failed to authorize") && text.contains("429"));
+
+        if !looks_like_rate_limit {
+            return None;
+        }
+
+        let scope = match platform {
+            Some(platform) => format!(" for {}", platform),
+            None => String::new(),
+        };
+
+        Some(format!(
+            "Failed to build image{scope}: Docker Hub rate-limited an anonymous image pull ({error}). \
+             This build host pulls base images from docker.io without authentication, and Docker \
+             Hub throttles anonymous pulls by source IP — the limit is shared across every build \
+             this host runs, and across every node behind the same WAN IP on a multi-node cluster. \
+             Configure a registry mirror on this host's Docker daemon (the `registry-mirrors` option \
+             in /etc/docker/daemon.json) and restart Docker — see \
+             https://temps.sh/docs/configure-a-docker-registry-mirror for the steps, including how \
+             to also raise the pull ceiling with an authenticated pull-through cache."
+        ))
     }
 }
 
@@ -1350,6 +1425,7 @@ pub struct BuildImageJobBuilder {
     log_service: Option<Arc<LogService>>,
     preset: Option<StoredPreset>,
     preset_config: Option<StoredPresetConfig>,
+    registry_mirror_prefix: Option<String>,
 }
 
 impl BuildImageJobBuilder {
@@ -1363,6 +1439,7 @@ impl BuildImageJobBuilder {
             log_service: None,
             preset: None,
             preset_config: None,
+            registry_mirror_prefix: None,
         }
     }
 
@@ -1431,6 +1508,11 @@ impl BuildImageJobBuilder {
         self
     }
 
+    pub fn registry_mirror_prefix(mut self, registry_mirror_prefix: Option<String>) -> Self {
+        self.registry_mirror_prefix = registry_mirror_prefix;
+        self
+    }
+
     pub fn build(
         self,
         image_builder: Arc<dyn ImageBuilder>,
@@ -1456,6 +1538,7 @@ impl BuildImageJobBuilder {
             job = job.with_preset(preset);
         }
         job = job.with_preset_config(self.preset_config);
+        job = job.with_registry_mirror_prefix(self.registry_mirror_prefix);
 
         Ok(job)
     }
@@ -1984,6 +2067,54 @@ mod tests {
             cross_on_remote_daemon.contains("--install amd64"),
             "the command must name the architecture to install: {}",
             cross_on_remote_daemon
+        );
+    }
+
+    /// A Docker Hub anonymous-pull rate limit must be named explicitly, with
+    /// the registry-mirror fix, instead of surfacing as an opaque pull
+    /// failure that reads like a broken Dockerfile.
+    #[test]
+    fn test_describe_build_failure_names_docker_hub_rate_limit() {
+        let host = "linux/amd64";
+        let rate_limited = BuilderError::BuildFailed(
+            "failed to resolve source metadata for docker.io/library/node:22-slim: \
+             toomanyrequests: You have reached your pull rate limit"
+                .into(),
+        );
+
+        let msg = BuildImageJob::describe_build_failure(Some(host), host, &rate_limited);
+        assert!(msg.contains("Docker Hub rate-limited"), "got: {}", msg);
+        assert!(msg.contains("registry-mirrors"), "got: {}", msg);
+        assert!(msg.contains("daemon.json"), "got: {}", msg);
+        assert!(!msg.contains("binfmt"), "not a QEMU problem: {}", msg);
+
+        // Also recognised with no platform requested (single-arch path).
+        let plain = BuildImageJob::describe_build_failure(None, host, &rate_limited);
+        assert!(plain.contains("Docker Hub rate-limited"), "got: {}", plain);
+
+        // An authorize failure that happens to 429 is the same underlying
+        // problem, just surfaced by BuildKit's resolver instead of the
+        // classic builder.
+        let buildkit_phrasing = BuilderError::BuildFailed(
+            "failed to authorize: failed to fetch anonymous token: unexpected status \
+             from GET request to https://auth.docker.io/token: 429 Too Many Requests"
+                .into(),
+        );
+        let buildkit_msg =
+            BuildImageJob::describe_build_failure(Some(host), host, &buildkit_phrasing);
+        assert!(
+            buildkit_msg.contains("Docker Hub rate-limited"),
+            "got: {}",
+            buildkit_msg
+        );
+
+        // An unrelated failure must not be misdiagnosed as a rate limit.
+        let unrelated = BuilderError::BuildFailed("npm ERR! missing script: build".into());
+        let unrelated_msg = BuildImageJob::describe_build_failure(Some(host), host, &unrelated);
+        assert!(
+            !unrelated_msg.contains("Docker Hub rate-limited"),
+            "got: {}",
+            unrelated_msg
         );
     }
 

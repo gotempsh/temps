@@ -1188,13 +1188,26 @@ impl WorkflowExecutionService {
 
                 let image_tag = format!("{}:latest", deployment.slug);
 
+                // Route implicit Docker Hub base images through the
+                // operator's configured registry mirror/prefix, if any.
+                // Falls back to unconfigured (no rewriting) rather than
+                // failing the build if settings can't be read -- the
+                // existing anonymous-pull behavior is always a safe default.
+                let registry_mirror_prefix = self
+                    .config_service
+                    .get_settings()
+                    .await
+                    .ok()
+                    .and_then(|settings| settings.registry_mirror_prefix);
+
                 let mut builder = BuildImageJobBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .download_job_id(download_job_id)
                     .image_tag(image_tag)
                     .dockerfile_path(dockerfile_path.to_string())
                     .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone());
+                    .log_service(self.log_service.clone())
+                    .registry_mirror_prefix(registry_mirror_prefix);
 
                 builder = builder
                     .preset(project.preset)

