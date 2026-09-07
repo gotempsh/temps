@@ -2968,6 +2968,30 @@ fn is_pinned_sha256_image_reference(image: &str) -> bool {
     })
 }
 
+/// Best-effort choice between `image` and `image_arm64` for the architecture
+/// this process is running on. Project creation happens before deployment
+/// scheduling, so the eventual target node's architecture isn't known yet --
+/// this assumes a homogeneous fleet (the console host's own architecture),
+/// which matches the documented single/few-node self-hosted reference
+/// deployment. A heterogeneous multi-node fleet with mixed architectures is
+/// not resolved correctly by this heuristic.
+fn select_template_image_for_arch<'a>(
+    template: &'a temps_core::templates::ProjectTemplate,
+    default_image: &'a str,
+    host_arch: &str,
+) -> &'a str {
+    if host_arch == "aarch64" {
+        if let Some(arm_image) = template
+            .image_arm64
+            .as_deref()
+            .filter(|image| !image.is_empty())
+        {
+            return arm_image;
+        }
+    }
+    default_image
+}
+
 fn resolve_image_template_runtime(
     template: &temps_core::templates::ProjectTemplate,
     request: &super::templates::CreateProjectFromTemplateRequest,
@@ -2979,7 +3003,13 @@ fn resolve_image_template_runtime(
         return Ok(None);
     };
 
-    let image_ref = request.image.as_deref().unwrap_or(template_image).trim();
+    let image_ref = request
+        .image
+        .as_deref()
+        .unwrap_or_else(|| {
+            select_template_image_for_arch(template, template_image, std::env::consts::ARCH)
+        })
+        .trim();
     if image_ref.is_empty() {
         return Err(TemplateRuntimeOverrideError::InvalidImage {
             reason: "the image reference cannot be empty".to_string(),
@@ -3884,8 +3914,9 @@ mod tests {
         parse_owner_repo_from_git_url, production_environment_variable_names,
         project_created_from_template_telemetry_event, require_git_settings_permissions,
         require_template_creation_permissions, resolve_image_template_runtime,
-        service_template_changes, validate_template_service_selection, DropPresetCandidate,
-        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        select_template_image_for_arch, service_template_changes,
+        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
+        TemplateRuntimeOverrideError, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -4109,6 +4140,46 @@ mod tests {
             serde_json::json!(["start"])
         );
         assert_eq!(stored["imageRuntime"]["healthCheckPath"], "/realms/master");
+    }
+
+    #[test]
+    fn arch_selection_prefers_image_arm64_only_on_arm64_hosts() {
+        let template = temps_core::templates::bundled_template_by_slug("cal-diy")
+            .expect("Cal.diy should be bundled");
+        let default_image = template.image.as_deref().expect("Cal.diy image");
+        let arm_image = template
+            .image_arm64
+            .as_deref()
+            .expect("Cal.diy image_arm64");
+        assert_ne!(
+            default_image, arm_image,
+            "fixture should exercise two distinct pinned images"
+        );
+
+        assert_eq!(
+            select_template_image_for_arch(&template, default_image, "aarch64"),
+            arm_image
+        );
+        assert_eq!(
+            select_template_image_for_arch(&template, default_image, "x86_64"),
+            default_image
+        );
+    }
+
+    #[test]
+    fn arch_selection_falls_back_to_default_image_without_an_arm64_pin() {
+        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be bundled");
+        assert!(
+            template.image_arm64.is_none(),
+            "fixture should exercise a template with no arm64 override (its image is already multi-arch)"
+        );
+        let default_image = template.image.as_deref().expect("Keycloak image");
+
+        assert_eq!(
+            select_template_image_for_arch(&template, default_image, "aarch64"),
+            default_image
+        );
     }
 
     #[test]

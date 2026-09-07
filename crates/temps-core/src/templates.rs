@@ -189,6 +189,16 @@ pub struct ProjectTemplate {
     /// absent, the template builds from source.
     #[serde(default)]
     pub image: Option<String>,
+    /// arm64/aarch64 variant of `image`, used instead of it when the deploy
+    /// host is arm64. Populate this when the upstream registry does not
+    /// publish a real multi-arch manifest under one tag/digest (some
+    /// self-hosted projects ship amd64 and arm64 as entirely separate,
+    /// separately-tagged images instead of one manifest list) -- `image`
+    /// alone would then only ever resolve to one architecture regardless of
+    /// where it is deployed. Must be an immutable `@sha256:` digest, same as
+    /// `image`, when `kind` is `service`.
+    #[serde(default)]
+    pub image_arm64: Option<String>,
     /// Optional command passed to the container image. This is needed for
     /// production images whose default command is intentionally a development
     /// mode (for example Keycloak).
@@ -774,6 +784,16 @@ impl TemplateService {
             {
                 errors.push(
                     "Service templates must use an immutable sha256 image digest".to_string(),
+                );
+            }
+            if template
+                .image_arm64
+                .as_deref()
+                .is_some_and(|image| !image.trim().is_empty() && !is_pinned_image_reference(image))
+            {
+                errors.push(
+                    "Service template image_arm64 must use an immutable sha256 image digest"
+                        .to_string(),
                 );
             }
             if template
@@ -1397,6 +1417,7 @@ templates:
                 preset: "nextjs".to_string(),
                 preset_config: None,
                 image: None,
+                image_arm64: None,
                 command: None,
                 resources: None,
                 exposed_port: None,

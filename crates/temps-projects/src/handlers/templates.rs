@@ -55,6 +55,10 @@ pub struct TemplateResponse {
     /// Prebuilt Docker image reference. When set, the one-click deploy pulls and
     /// runs this image directly (no build); when absent it builds from `git`.
     pub image: Option<String>,
+    /// arm64 variant of `image`, used instead of it when the deploy host is
+    /// arm64. Present only when the upstream image does not publish a real
+    /// multi-arch manifest under `image`'s tag/digest.
+    pub image_arm64: Option<String>,
     /// Optional command passed to the image entrypoint.
     pub command: Option<Vec<String>>,
     /// Curated CPU/memory profile applied when the project is created.
@@ -125,6 +129,7 @@ impl From<ProjectTemplate> for TemplateResponse {
                 .collect(),
             is_featured: template.is_featured,
             image: template.image,
+            image_arm64: template.image_arm64,
             command: template.command,
             resources: template.resources,
             exposed_port: template.exposed_port,
@@ -308,6 +313,7 @@ mod tests {
             preset_config: None,
             resources: None,
             image: None,
+            image_arm64: None,
             command: None,
             exposed_port: None,
             health_check_path: None,
