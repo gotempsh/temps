@@ -1190,6 +1190,37 @@ mod tests {
         Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
     }
 
+    #[cfg(unix)]
+    fn sleeping_process(root: &Path, name: &str, version: &str) -> (ExternalPluginProcess, u32) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn fixture process");
+        let pid = child.id().expect("fixture process ID");
+        (
+            ExternalPluginProcess {
+                manifest: PluginManifest::builder(name, version).build(),
+                binary_path: root.join(format!("{name}-{version}")),
+                sha256: "00".repeat(32),
+                socket_path: root.join(format!("{name}-{version}.sock")),
+                auth_secret: "fixture-auth".to_string(),
+                pid_file_path: root.join(format!("{name}-{version}.pid")),
+                child,
+                has_ui: false,
+                channel: None,
+                openapi_schema: None,
+            },
+            pid,
+        )
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks whether this PID is visible; it does
+        // not signal or otherwise modify the process.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
     #[tokio::test]
     async fn test_manager_creation() {
         let config = ExternalPluginConfig::new(
@@ -1347,6 +1378,73 @@ mod tests {
             !marker.exists(),
             "identity rejection must happen before the launch secret is written"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_promote_candidate_swaps_then_stops_previous_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let manager = ExternalPluginManager::new(config, mock_db());
+        let (old, old_pid) = sleeping_process(temp.path(), "example", "1.0.0");
+        let (candidate, candidate_pid) = sleeping_process(temp.path(), "example", "2.0.0");
+        manager
+            .plugins
+            .write()
+            .await
+            .insert("example".to_string(), old);
+
+        let manifest = manager
+            .promote_candidate(PendingPlugin {
+                expected_name: "example".to_string(),
+                process: candidate,
+            })
+            .await;
+
+        assert_eq!(manifest.version, "2.0.0");
+        assert!(
+            !process_is_alive(old_pid),
+            "previous process must be reaped"
+        );
+        assert!(
+            process_is_alive(candidate_pid),
+            "candidate must remain active"
+        );
+        assert_eq!(manager.manifests().await[0].version, "2.0.0");
+
+        manager.shutdown_all().await;
+        assert!(
+            !process_is_alive(candidate_pid),
+            "active process must be reaped"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_discard_candidate_stops_process_without_activating_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let manager = ExternalPluginManager::new(config, mock_db());
+        let (candidate, candidate_pid) = sleeping_process(temp.path(), "example", "2.0.0");
+
+        manager
+            .discard_candidate(PendingPlugin {
+                expected_name: "example".to_string(),
+                process: candidate,
+            })
+            .await;
+
+        assert!(
+            !process_is_alive(candidate_pid),
+            "discarded process must be reaped"
+        );
+        assert!(manager.manifests().await.is_empty());
     }
 
     #[tokio::test]
