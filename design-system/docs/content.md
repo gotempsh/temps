@@ -199,6 +199,8 @@ These are `src/fmt.ts`. Use the function; do not hand-roll the string.
   `0.5–2 cores`.
 - Write a version, a commit and a digest short and mono: `9bc61c0`,
   `sha256:9e21c7`, `v0.1.2`.
+- Entering one of these is `forms.md` §"Dates, times and ranges": typed first,
+  ISO-ordered through `fmtStamp`, the zone always beside the control.
 
 ## 7. Punctuation
 

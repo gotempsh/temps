@@ -7,11 +7,11 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
-  ChartFooter, Detail, EchoDialog, Ledger, Lede, Metric, MetricGrid, Num, PageState, Phrase, Section, Segmented, KeyValue, Status, StatusLine, TimeChart, Columns, SecretValue, ProjectMark,
+  Callout, ChartFooter, DateTimeField, Detail, EchoDialog, Ledger, Lede, Metric, MetricGrid, Num, PageState, Phrase, Section, Segmented, KeyValue, Status, StatusLine, TimeChart, Columns, SecretValue, ProjectMark,
   StatusStrip, LogLines, Histogram, quantile,
   type KV, type LedgerRow, type State, type StatusBucket, type LogLine, type Pct, type HistBucket,
 } from '@/components/op'
-import { EMPTY, fmtNum, fmtPct } from '@/components/op'
+import { EMPTY, fmtNum, fmtPct, fmtStamp } from '@/components/op'
 import type { Notify } from './ConsoleV1Observe'
 import { PROJECT_ICONS } from './console-projects'
 import { agoNum, sizeNum } from './ConsoleV1'
@@ -73,6 +73,15 @@ const HIST: HistBucket[] = [[1, 820], [5, 4100], [20, 2200], [100, 900], [500, 3
 
 // ── Screen ───────────────────────────────────────────────────────────
 const TABS = ['overview', 'backups', 'metrics', 'logs', 'queries', 'data'] as const
+
+/* The point-in-time window, as the two bounds the restore field refuses outside
+   of. Fixed rather than computed from `new Date()`: the mockup is screenshot
+   every run, and a window that slides overnight is a baseline that fails by
+   Tuesday. The instance's clock is UTC; the operator's own zone is beside it. */
+const PITR_FLOOR = '2026-08-30T20:33:00'
+const PITR_CEIL = '2026-09-06T20:33:00'
+const PITR_LAST_BACKUP = '2026-09-06T18:33:00'
+const ZONES = ['UTC', 'Europe/Madrid', 'America/New_York']
 type Tab = (typeof TABS)[number]
 export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const db = DBS.find((d) => d.id === id) ?? DBS[0]
@@ -87,6 +96,8 @@ export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: b
   const [dataView, setDataView] = useState<'tree' | 'sql'>('tree')
   const [statement, setStatement] = useState('')
   const [ran, setRan] = useState<string | null>(null)
+  const [pit, setPit] = useState(PITR_LAST_BACKUP)
+  const [zone, setZone] = useState('UTC')
   const m = metrics.find((x) => x.key === metric) ?? metrics[0]
   const last = (d: MetricDef) => d.series[d.series.length - 1]
   const noBackup = db.backups.length === 0
@@ -234,14 +245,45 @@ export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: b
       )}
 
       {tab === 'backups' && (
-        <Ledger status={null} dense={dense}
-          columns={[{ label: 'backup', key: 'id' }, 'status', { label: 'size', key: 'size', numeric: true }, 'source', { label: 'taken', key: 'at' }, '']}
-          grid="minmax(6rem,1fr) minmax(12rem,2fr) minmax(70px,max-content) minmax(8rem,1fr) minmax(70px,max-content) minmax(60px,max-content)"
-          rows={backupRows} total={db.backups.length} filter={q} onFilter={setQ} placeholder="filter backups"
-          state={noBackup ? <PageState state="empty" title="No backups yet" reason="Restores, point-in-time recovery and upgrades all start from a backup. Take one now, or schedule nightly backups from an S3 source." next={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'backup started', `${db.name} → r2-backups`)}><HardDrive /> back up now</Button>} /> : undefined}
-          hint={db.pitr ? 'point-in-time recovery: restore to any second in the last 7 days from the backups tab' : 'point-in-time recovery is off for this engine'}
-          action={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'backup started', `${db.name} → r2-backups`)}><HardDrive /> back up now</Button>}
-          footer={<span>nightly at 02:00 · keeps 14 · to r2-backups</span>} />
+        <div className="space-y-6">
+          {/* Restore is a form, not a verb on a row: the operator has a second in
+              mind (the one in the failing log line) and has to be able to type it. */}
+          <Section title="Restore to a point in time" meta={db.pitr ? 'WAL replayed onto a new volume' : `${db.engine} ${db.version} · not available`}>
+            {db.pitr ? (
+              <div className="@container space-y-4 border bg-background p-4">
+                <DateTimeField
+                  id="pitr-at" label={`restore ${db.name} to`} precision="second"
+                  value={pit} onChange={setPit} min={PITR_FLOOR} max={PITR_CEIL}
+                  zone={zone} onZoneChange={setZone} zones={ZONES}
+                  hint="any second in the last 7 days"
+                  presets={[{ label: 'now', value: PITR_CEIL }, { label: '−1h', value: '2026-09-06T19:33:00' }, { label: 'last backup', value: PITR_LAST_BACKUP }]} />
+                <div className="flex flex-wrap items-center gap-3 text-xs">
+                  <EchoDialog
+                    trigger={<Button size="sm" className="op-primary h-7 text-xs"><RefreshCw /> restore</Button>}
+                    title={`Restore ${db.name} to ${fmtStamp(pit, { precision: 'second', zone })}`}
+                    description={`${db.backups[0].id} is restored onto a new volume and WAL is replayed to that second. ${db.name} is unavailable while it runs; the current volume is kept until you delete it.`}
+                    confirmWord={db.name}
+                    steps={['stop container', 'restore ' + db.backups[0].id, 'replay WAL', 'start on the new volume']}
+                    onDone={() => notify('ok', `${db.name} restored`, fmtStamp(pit, { precision: 'second', zone }))} />
+                  <span className="text-muted-foreground">writes after that second are not in the restored volume</span>
+                </div>
+              </div>
+            ) : (
+              <Callout state="idle" title={`${db.engine} ${db.version} has no write-ahead log to replay`}
+                action={<Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => notify('ok', 'restore from b_12', 'in place, or as a new service')}>restore from a backup</Button>}>
+                With it, a restore could land on any second in the last 7 days instead of on the last nightly dump. Until then the newest backup is the earliest point {db.name} can be brought back to.
+              </Callout>
+            )}
+          </Section>
+          <Ledger status={null} dense={dense}
+            columns={[{ label: 'backup', key: 'id' }, 'status', { label: 'size', key: 'size', numeric: true }, 'source', { label: 'taken', key: 'at' }, '']}
+            grid="minmax(6rem,1fr) minmax(12rem,2fr) minmax(70px,max-content) minmax(8rem,1fr) minmax(70px,max-content) minmax(60px,max-content)"
+            rows={backupRows} total={db.backups.length} filter={q} onFilter={setQ} placeholder="filter backups"
+            state={noBackup ? <PageState state="empty" title="No backups yet" reason="Restores, point-in-time recovery and upgrades all start from a backup. Take one now, or schedule nightly backups from an S3 source." next={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'backup started', `${db.name} → r2-backups`)}><HardDrive /> back up now</Button>} /> : undefined}
+            hint="newest first"
+            action={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'backup started', `${db.name} → r2-backups`)}><HardDrive /> back up now</Button>}
+            footer={<span>nightly at 02:00 · keeps 14 · to r2-backups</span>} />
+        </div>
       )}
 
       {tab === 'metrics' && (

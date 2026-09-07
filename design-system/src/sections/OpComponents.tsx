@@ -93,6 +93,8 @@ const TOC = [
   ['logs', 'LogLines · Stages · Histogram'],
   ['form-field', 'Field · hint, error, optional'],
   ['form-validation', 'FormErrors · validation and save'],
+  ['form-datetime', 'Dates and times'],
+  ['form-range-schedule', 'Ranges, schedules, durations'],
   ['form-disabled', 'Disabled and unavailable'],
   ['notify-table', 'Which surface says it'],
   ['notify-toast', 'Toasts'],

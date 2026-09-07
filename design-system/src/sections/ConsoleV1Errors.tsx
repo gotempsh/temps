@@ -120,7 +120,7 @@ export function ErrorsScreen({ dense, plan, notify, go }: { dense: boolean; plan
         <PageState state="error" title="Error store unreachable" message="connection refused: clickhouse://127.0.0.1:9000 (timeout 3s)" resource="clickhouse · events-ch" onRetry={retry} retrying={phase === 'retrying'} />
       )}
       hint="regressed and new first, then by events · × unresolved · ◐ handled · ● resolved · ○ ignored"
-      action={<><RangePicker ranges={RANGES} value={range} onChange={setRange} retentionDays={plan.retentionDays} retentionLabel={plan.retention} onGated={(r) => notify('warn', `${r.label} is beyond this plan's retention`, `currently ${plan.retention}`)} custom={{ from: win.from, to: win.to, onChange: (from, to) => setWin({ from, to }) }} /><Segmented options={FILTERS} value={filter} onChange={setFilter} className="h-7 [&>button]:h-7" /></>}
+      action={<><RangePicker ranges={RANGES} value={range} onChange={setRange} retentionDays={plan.retentionDays} retentionLabel={plan.retention} onGated={(r) => notify('warn', `${r.label} is beyond this plan's retention`, `currently ${plan.retention}`)} custom={{ from: win.from, to: win.to, zone: 'UTC', onChange: (from, to) => setWin({ from, to }) }} /><Segmented options={FILTERS} value={filter} onChange={setFilter} className="h-7 [&>button]:h-7" /></>}
       footer={<span>an issue is one stack trace across releases; events are its occurrences · sampled at 100% on this plan</span>}
     />
   )

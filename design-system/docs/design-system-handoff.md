@@ -487,15 +487,51 @@ the summary is a way in, not a second copy of the truth. Validation timing,
 disabled controls, long submits, destructive submits and secrets are all in
 `docs/forms.md`; `/guide#forms` and `/op-components#form-field` show them live.
 
+### DateTimeField, DateField, TimeField, DateTimeRangeField, DurationField, ScheduleField
+
+`datetime.tsx`, the moment-in-time half of `Field`. All of them compose `Field`
+and all of them are typed entry first: a real `date` / `time` /
+`datetime-local` input under the ink skin, so a stamp copied out of a log can be
+pasted, `↑`/`↓` step the focused segment, and the browser's own picker is the
+accelerator rather than the only door. The value is an ISO local stamp
+(`2026-09-06T20:33`), written back ISO-ordered by `fmtStamp`.
+
+`DateTimeField` takes `zone` — rendered as a mono fact beside the control, or as
+a `Picker` in the same `Field` when `onZoneChange` is passed, because a control
+that guesses the clock restores to the wrong second. `precision: 'second'` adds
+`step=1` for the one second-precise operation. `min`/`max` state the window in
+the hint once and fault on blur with the state word and the fact. `presets`
+(`now`, `−1h`, `last backup`) are a `Strip` that fills the absolute field, which
+stays the truth about what they wrote. `never` makes "no expiry" an option word,
+so an empty date never means forever. `DateField` and `TimeField` are the same
+control at day and time-of-day precision.
+
+`DateTimeRangeField` is two of them on one row (stacked below sm) with `quick`
+windows, `to > from` validated on blur of "to", and windows past `retentionDays`
+struck through with the plan word and routed to `onGated` — the same gating
+`RangePicker` does, through the same `Strip`.
+
+`DurationField` is a number plus a unit `Picker` (`s` `min` `h` `d`) over a
+millisecond value, previewed with `fmtDuration`: `30d`, `30 days`, `720h` and
+`30` are four spellings of one value and three of them are a parser bug.
+
+`ScheduleField` is `HH:MM` plus its zone plus optional weekday toggles, and it
+prints the next three runs underneath (`nextRuns`) so a schedule is verifiable
+before it is saved. `cron` is an advanced entry behind a text button, never the
+only way in. The rules are `docs/forms.md` §"Dates, times and ranges";
+`/guide#forms` and `/op-components#form-datetime` show them live.
+
 ### fmt (`fmt.ts`)
 
 `fmtNum`, `fmtPct`, `fmtBytes`, `fmtDuration`, `fmtRelative`, `fmtAbsolute`,
-`fmtCount` and `EMPTY`: pure functions, no React, no state, one locale argument,
+`fmtStamp`, `fmtCount` and `EMPTY`: pure functions, no React, no state, one locale argument,
 holding the number, date and duration rules of `docs/content.md` in one place.
 Locale grouping through `Intl` (never a hand-rolled separator), decimal bytes by
 default and binary on request (`MiB`, where the kernel counts), percentages at
 one decimal, durations in at most two units, time relative under 24 hours and
-absolute after, plurals through `Intl.PluralRules` (never `+ 's'`), nothing as
+absolute after, `fmtStamp` for the ISO-ordered wall clock a date input reads and
+writes (converting nothing, because the value is already in the zone named
+beside it), plurals through `Intl.PluralRules` (never `+ 's'`), nothing as
 an en dash and zero as `0` — different facts. `Num`, `Pager`, `Breakdown`,
 `Funnel`, `Flow`, `Histogram` and `TimeChart` / `RangePicker` format through
 them, and so do the sandbox screens: `toFixed` and `toLocaleString` in a screen
@@ -711,7 +747,11 @@ one row via a container query (`@md:`) on the section body, so it stacks when
 the section is narrow regardless of viewport. The side index and the two-column
 layout are also container-queried (`@3xl:`), so Settings works inside a 360px
 box as well as on a page. Metric tiles show the state glyph before the baseline
-for every non-ok state, so a `sampled` tile is visibly sampled.
+for every non-ok state, so a `sampled` tile is visibly sampled. A section that
+asks for a moment or a length uses the `datetime.tsx` fields rather than an
+`Input` with the unit in the hint: API key expiry is a `DateField` with "never"
+as an option word, retention is a `DurationField`, and a backup window is a
+`ScheduleField` that prints its next three runs.
 
 ### Record page checklist (enforced)
 
@@ -1561,6 +1601,8 @@ design-system/
       echo-dialog.tsx  templates.tsx  time-chart.tsx  picker.tsx
       fmt.ts    the formatters content.md's number rules live in
       form.tsx  FormErrors, the multi-field submit summary
+      datetime.tsx  date, time, range, duration and schedule fields, and the
+                    Strip that RangePicker shares with them (forms.md)
     ../web/packages/op/tokens.json    the token layer as data (§4)
     ../web/packages/op/scripts/tokens.mjs  check / build, wired into bun run lint
     components/ui/                shadcn primitives + sparkline, log-viewer, empty-placeholder

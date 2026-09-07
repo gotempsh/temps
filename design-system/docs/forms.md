@@ -6,8 +6,10 @@ change is saved. Everything below follows from that.
 
 Companion to `brand-guidelines.md` §6 and `design-system-handoff.md` §6–§7.
 Components: `Field`, `FormErrors`, `Settings`, `Callout`, `EchoDialog`,
-`SecretValue`, `Picker`. Examples are from the mockups (`/v1?p=settings`,
-`/v1?p=email`, `/v1?p=env`).
+`SecretValue`, `Picker`, and for a moment in time `DateTimeField`, `DateField`,
+`TimeField`, `DateTimeRangeField`, `DurationField`, `ScheduleField`. Examples
+are from the mockups (`/v1?p=settings`, `/v1?p=email`, `/v1?p=env`,
+`/v1?p=databases`).
 
 ## Field anatomy
 
@@ -40,6 +42,66 @@ Components: `Field`, `FormErrors`, `Settings`, `Callout`, `EchoDialog`,
 - Keep the inline message when the summary shows. The summary is a way in, not a second copy of the truth.
 - Never raise the summary (`.op-raise`) and never box it. A fault is a Callout; the left rule is the alert.
 - Quote the other system verbatim in `Callout.quote` when the fault came from one: the provider's 403, the DNS answer, the build's last line.
+
+## Dates, times and ranges
+
+Components: `DateTimeField`, `DateField`, `TimeField`, `DateTimeRangeField`,
+`DurationField`, `ScheduleField` (`web/packages/op/src/datetime.tsx`), live at
+`/guide#forms` and `/op-components#form-datetime`.
+
+- Make every date and time a text input the reader can type into, with the
+  browser's own picker as the accelerator (`<input type="date|time|datetime-local">`
+  under the ink skin): an operator reading a stamp out of a log pastes it, and
+  a calendar grid has nowhere to paste. Type, `↑`/`↓` step the focused segment,
+  `⏎` commits.
+- Write every stamp ISO-ordered — `2026-09-06 20:33` (`fmtStamp`) — in the
+  value, the hint, the presets and the read-back: it sorts, it is mono, and
+  `09/06/26` is two different days depending on who is reading. Show seconds
+  only where the operation is second-precise, which today is point-in-time
+  restore. The one thing this does not control is the segment order *inside*
+  the native control, which every browser takes from the operator's own locale
+  — which is exactly why the stamp we write, in the hint, the error and the
+  read-back, is always the ISO one.
+- Put the zone beside the control, always, as a mono fact: `UTC` or the
+  operator's own zone name (`Europe/Madrid`), read from settings. A control
+  that guesses restores to the wrong second and says nothing. Changing it is a
+  `Picker` in the same `Field`, never a global toggle hidden on another page.
+- Offer the useful anchors as a strip beside the absolute field — `now`,
+  `−1h`, `−24h`, `last backup` — and let them *fill* the field. The absolute
+  field stays the truth: a preset the reader cannot see the result of is a
+  button that did something.
+- Write a range as two fields, `from` → `to`, with the quick windows on the
+  same strip a chart's `RangePicker` uses. Validate `to > from` on blur of
+  `to`; strike a window past the retention horizon through with the plan word
+  rather than hiding it, exactly as a chart does.
+- State the window in the hint, once: "any second in the last 7 days · from
+  2026-08-30 20:33 UTC". Refuse outside it with the state word and the fact
+  ("out of window · … is before …; pick a later stamp"). A control with no
+  bound says so: "no expiry" is an option word, never an empty date that
+  quietly means forever.
+- Enter a time of day as `HH:MM`, 24-hour, mono, with its zone — and render
+  the next three occurrences under it as facts ("next 2026-09-07 03:00 UTC ·
+  2026-09-08 · 2026-09-09"), so a schedule is verifiable before it is saved.
+  Cron is the advanced entry beside the simple one, never the only one:
+  `0 4 * * 0` is where a weekly backup quietly becomes a Sunday-only backup.
+- Enter a duration as a number and a unit `Picker` (`s`, `min`, `h`, `d`),
+  never as free text: `30d`, `30 days`, `720h` and `30` are four spellings of
+  one value and three of them are a parser bug. Display it with `fmtDuration`.
+- Say an expiry twice over, once each way: the absolute date and the distance
+  ("expires 2026-12-06 · in 91 days"). Future dates only, and "never" listed
+  as a choice rather than left as an empty field.
+- Read the value back after save through `fmtAbsolute` with the zone, relative
+  under a day per `content.md` §6, and with the id or deploy beside it when the
+  time refers to one.
+
+Two ways to get this wrong, both common:
+
+- A bare calendar icon as the only entry point. The reader has the stamp in
+  their clipboard — `2026-09-06T20:33:41Z`, copied out of the failing log line
+  — and the form makes them find it by clicking through months.
+- A time with no zone. `restore to 03:00` on a console whose operator is in
+  `Europe/Madrid`, a node in `UTC` and a backup labelled in the bucket's own
+  clock is three different moments, and the form never says which one it meant.
 
 ## Required and optional
 

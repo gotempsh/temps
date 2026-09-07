@@ -88,7 +88,7 @@ const BLOCKS = [
   'status', 'num', 'page-state', 'kbd', 'echo', 'chart', 'ledger', 'detail',
   'picker', 'settings', 'mark', 'breakdown', 'callout', 'strip', 'trace', 'logs',
   // The blocks files (src/sections/blocks/), mounted here and in /guide.
-  'form-field', 'form-validation', 'form-disabled',
+  'form-field', 'form-validation', 'form-datetime', 'form-range-schedule', 'form-disabled',
   'notify-table', 'notify-toast', 'notify-attention',
   'viz-choice', 'viz-series', 'viz-legend', 'viz-a11y',
   'content-error', 'content-time', 'content-fmt',

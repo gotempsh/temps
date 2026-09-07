@@ -66,6 +66,8 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - A toast and a Callout for the same event. A red dot with no count.
 - A disabled control with no reason beside it. A save button disabled because the form is invalid.
 - Validation on every keystroke, before the field has ever been left.
+- A calendar as the only way to enter a date. A time with no zone beside it.
+- An empty date that means forever. Free-text durations (`30d` in a text box). `MM/DD/YY`.
 - "Success", "Done" or "Error" as the whole message.
 - A stored secret prefilled into an input. A banner that pushes the page down.
 - Pie charts, donuts, treemaps, stacked areas. A truncated y axis on bars.
@@ -158,6 +160,17 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Route destructive submits through `EchoDialog`; ask for the typed echo, and use red, only when the loss is irreversible.
 - Never prefill a stored secret. `SecretValue` shows it is set, with reveal and copy; replacing says what breaks.
 - `⏎` submits a single-field form only. `esc` closes what is open and discards nothing.
+
+### Dates and times
+
+- Enter every date and time by typing, in a native `date` / `time` / `datetime-local` under the ink skin; the picker is the accelerator.
+- Write every stamp ISO-ordered through `fmtStamp`: `2026-09-06 20:33`. Seconds only where the operation is second-precise.
+- Put the zone beside the control as a mono fact, always. Change it with a `Picker` in the same `Field`.
+- Fill the absolute field from the preset strip (`now`, `−1h`, `last backup`); the field stays the truth.
+- Write a range as `from` → `to`, validate `to > from` on blur of `to`, and strike gated windows through with the plan word.
+- State the window once in the hint and refuse outside it with the state word and the fact.
+- Show a schedule's next three runs under the field; cron is the advanced entry beside the simple one, never the only one.
+- Enter a duration as a number plus a unit `Picker` (`s` `min` `h` `d`) and display it with `fmtDuration`.
 
 ## Notifications
 

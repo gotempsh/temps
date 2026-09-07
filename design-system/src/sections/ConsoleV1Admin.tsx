@@ -7,8 +7,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import {
-  Callout, Columns, Detail, EchoDialog, Field, GitProviderLogo, KeyValue, Ledger, Lede, Metric, MetricGrid, Num, PageState, Phrase, Picker, Section, Segmented, Settings, Status, StatusLine,
-  type LedgerRow, type State, type StatusItem } from '@/components/op'
+  Callout, Columns, Detail, DurationField, EchoDialog, Field, GitProviderLogo, KeyValue, Ledger, Lede, Metric, MetricGrid, Num, PageState, Phrase, Picker, ScheduleField, Section, Segmented, Settings, Status, StatusLine,
+  type LedgerRow, type State, type StatusItem, type Weekday } from '@/components/op'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -71,6 +71,13 @@ const BACKUPS = [
 const BK_STATE: Record<string, State> = { running: 'warn', completed: 'ok', failed: 'error', pending: 'idle', cancelled: 'idle' }
 const BK_TABS = ['schedules', 'backups', 'sources'] as const
 
+/* The instance's clock and a fixed today, so the "next three runs" a schedule
+   prints are the same three every run. A demo whose occurrences move overnight
+   is a baseline that fails by Tuesday. */
+const ZONE = 'UTC'
+const TODAY = new Date(2026, 8, 6, 20, 33, 0)
+const DAY = 86_400_000
+
 /** Case-insensitive filter over several fields; every ledger filter in the console uses this so "API" finds api-gateway. */
 export function matches(q: string, ...fields: (string | undefined | null)[]) { const n = q.trim().toLowerCase(); return !n || fields.some((f) => (f ?? '').toLowerCase().includes(n)) }
 /** "212 GB" → 212, "1.2 TB" → 1228.8: sizes sort as numbers. */
@@ -82,6 +89,8 @@ export function BackupsScreen({ dense, plan, notify, go }: { dense: boolean; pla
   const [tab, setTab] = useState<(typeof BK_TABS)[number]>('schedules')
   const [q, setQ] = useState('')
   const [backups, setBackups] = useState(BACKUPS)
+  const [adding, setAdding] = useState(false)
+  const [draft, setDraft] = useState<{ name: string; time: string; days: Weekday[]; cron: string; keep: number }>({ name: '', time: '02:00', days: [], cron: '0 2 * * *', keep: 30 * DAY })
   const [sources, setSources] = useState(SOURCES)
   const failed = backups.find((b) => b.state === 'failed')
   const overdue = SCHEDULES.find((s) => s.state === 'warn')
@@ -144,14 +153,35 @@ export function BackupsScreen({ dense, plan, notify, go }: { dense: boolean; pla
     <Detail title="Backups" meta={`${SCHEDULES.filter((s) => s.enabled).length} schedules · ${sources.length} sources · point-in-time recovery ${plan.pitr}`} status={status} tabs={BK_TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
       actions={<>
         {tab === 'schedules' && <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => notify('ok', 'nightly-all started', 'events-ch first, then the rest')}><Play /> run nightly-all now</Button>}
-        {tab === 'schedules' && <Button size="sm" className="op-primary h-8 text-xs" onClick={() => notify('ok', 'new schedule')}><Plus /> new schedule</Button>}
+        {tab === 'schedules' && <Button size="sm" className="op-primary h-8 text-xs" onClick={() => setAdding((a) => !a)}><Plus /> new schedule</Button>}
         {tab === 'backups' && <Button size="sm" className="op-primary h-8 text-xs" onClick={() => notify('ok', 'backup started', 'acme-pg → hetzner-fsn1')}><Play /> back up now</Button>}
         {tab === 'sources' && <Button size="sm" className="op-primary h-8 text-xs" onClick={() => notify('ok', 'add source')}><Plus /> add source</Button>}
       </>}>
       {tab === 'schedules' && (
+        <div className="space-y-6">
+        {/* A schedule nobody can read back is a cron expression with extra steps:
+            the next three runs are printed under the field, before it is saved. */}
+        {adding && (
+          <Section title="New schedule" meta="runs against every service unless a target is named">
+            <div className="@container space-y-4 border bg-background p-4">
+              <Field label="name" hint="how it is named in the ledger, the bell and the bucket"><Input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} className="h-8 font-mono text-xs" placeholder="nightly-all" /></Field>
+              <ScheduleField
+                id="sched-time" label="runs at" time={draft.time} onTimeChange={(t) => setDraft({ ...draft, time: t })}
+                zone={ZONE} now={TODAY} days={draft.days} onDaysChange={(d) => setDraft({ ...draft, days: d })}
+                cron={draft.cron} onCronChange={(c) => setDraft({ ...draft, cron: c })}
+                hint="no day selected means every day" />
+              <DurationField label="keeps backups for" units={['d']} min={DAY} max={365 * DAY} value={draft.keep} onChange={(v) => setDraft({ ...draft, keep: v })} hint="older ones are deleted on the next run" />
+              <div className="flex flex-wrap items-center gap-3 text-xs">
+                <Button size="sm" className="op-primary h-7 text-xs" onClick={() => { setAdding(false); notify('ok', `${draft.name || 'schedule'} created`, `${draft.time} ${ZONE}`) }}>create schedule</Button>
+                <button type="button" className="underline underline-offset-4 hover:text-foreground" onClick={() => setAdding(false)}>cancel</button>
+              </div>
+            </div>
+          </Section>
+        )}
         <Ledger status={null} columns={[{ label: 'schedule', key: 'name' }, 'status', 'targets', 'runs', { label: 'next run', key: 'next' }, { label: 'keeps', key: 'retention', numeric: true }, 'source']} grid="1fr 1.8fr 1.5fr minmax(80px,max-content) minmax(80px,max-content) minmax(55px,max-content) minmax(80px,max-content)"
           rows={scheduleRows} total={SCHEDULES.length} filter={q} onFilter={setQ} placeholder="filter schedules" hint="needs attention first" dense={dense}
           footer={<>{scheduleRows.length} of {SCHEDULES.length} · a schedule with all services on also picks up services created later · retention is per schedule, PITR is per plan ({plan.pitr})</>} />
+        </div>
       )}
       {tab === 'backups' && (
         <div className="space-y-6">

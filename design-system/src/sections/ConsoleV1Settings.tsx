@@ -6,7 +6,7 @@ import { ArrowUpCircle, Bell, Database, Gauge, Globe, Hammer, Hourglass, Key, Ke
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
-  Callout, EchoDialog, Field, Ledger, PageTitle, Phrase, Picker, SecretValue, Section, Settings, Status, StatusLine, GLYPH, GLYPH_CLASS,
+  Callout, DateField, DurationField, EchoDialog, ScheduleField, Field, Ledger, PageTitle, Phrase, Picker, SecretValue, Section, Settings, Status, StatusLine, GLYPH, GLYPH_CLASS,
   type LedgerRow, type State,
 } from '@/components/op'
 import { Toggle } from './ConsoleV1Admin'
@@ -23,6 +23,15 @@ import { NodesLedger, ClusterPage } from './ConsoleV1Nodes'
  * it takes effect: now · next request · restart. The hub shows each page's
  * current value so nobody opens a page to find out whether it is set.
  */
+
+/* The instance's clock, and a fixed today. Fixed rather than `new Date()`
+   because these screens are screenshot every run: an expiry that drifts
+   overnight is a baseline that fails by Tuesday. */
+export const ZONE = 'UTC'
+export const ZONES = ['UTC', 'Europe/Madrid', 'America/New_York']
+const TODAY = new Date(2026, 8, 6, 20, 33, 0)
+const DAY = 86_400_000
+const TOMORROW = '2026-09-07'
 
 type Effect = 'now' | 'next request' | 'restart'
 const EFFECT: Record<Effect, State> = { now: 'ok', 'next request': 'idle', restart: 'warn' }
@@ -49,7 +58,7 @@ export const SETTINGS_GROUPS: { group: string; why: string; pages: Page[] }[] = 
   ] },
   { group: 'data', why: 'where telemetry goes and how long it stays', pages: [
     { slug: 'store', icon: Database, title: 'Store', group: 'data', value: 'TimescaleDB · scrape 15s · 12 services' },
-    { slug: 'retention', icon: Hourglass, title: 'Retention', group: 'data', value: 'raw 7d · hourly 90d · daily 2y · logs 14d' },
+    { slug: 'retention', icon: Hourglass, title: 'Retention', group: 'data', value: 'raw 7d · hourly 90d · daily 730d · logs 14d' },
     { slug: 'alerts', icon: Bell, title: 'Alerts', group: 'data', value: 'email + slack · disk at 80% · 2 rules' },
   ] },
   { group: 'fleet', why: 'the machines and code this instance runs', pages: [
@@ -128,6 +137,12 @@ export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense:
   const page = ALL.find((p) => p.slug === slug) ?? ALL[0]
   const [dirty, setDirty] = useState(false)
   const [q, setQ] = useState('')
+  const [newKey, setNewKey] = useState(false)
+  const [keyName, setKeyName] = useState('')
+  const [keyExpiry, setKeyExpiry] = useState('2026-12-06')
+  const [keyNever, setKeyNever] = useState(false)
+  const [window, setWindow] = useState('04:00')
+  const [keep, setKeep] = useState({ raw: 7 * DAY, hourly: 90 * DAY, daily: 730 * DAY, proxy: 14 * DAY, spans: 14 * DAY, app: 14 * DAY })
   const touch = () => setDirty(true)
   const save = () => { setDirty(false); notify('ok', `${page.title} saved`) }
   // The trail is the shell's job; the meta places the page (group · what it is about), and is never a link.
@@ -150,7 +165,24 @@ export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense:
   if (slug === 'keys') {
     const K = [['ci-deploy', 'tk_HJfH…', 'deploy, projects:read', 'ci-bot', '4m ago', '6d', 'warn'], ['cli-maya', 'tk_5heD…', 'all', 'maya', '1h ago', '82d', 'ok'], ['status-reader', 'tk_P2nm…', 'monitors:read', 'jules', '3d ago', 'never', 'ok'], ['old-import', 'tk_EVvj…', 'imports', 'sam', '41d ago', 'expired', 'idle']]
     const rows: LedgerRow[] = K.filter((k) => k[0].toLowerCase().includes(q.trim().toLowerCase())).map((k) => ({ id: k[0], state: k[6] as State, onOpen: () => notify('ok', `open key ${k[0]}`, 'scopes, last uses, rotate'), mobile: <><span className="block font-mono">{k[0]}</span><span className="block text-[11px] text-muted-foreground">{k[2]} · expires {k[5]}</span></>, cells: [<span className="font-mono">{k[0]}</span>, <span className="font-mono text-muted-foreground">{k[1]}</span>, <span className="truncate text-muted-foreground">{k[2]}</span>, <span>{k[3]}</span>, <span className="text-muted-foreground">{k[4]}</span>, k[6] === 'ok' ? <span>{k[5]}</span> : <Status state={k[6] as State} label={k[5]} />] }))
-    return <Ledger title="API keys" meta={meta} dense={dense} status={<StatusLine state="warn"><Phrase onClick={() => notify('ok', 'rotate ci-deploy', 'new secret shown once; old one valid 24h')}>ci-deploy</Phrase> expires in 6 days. CI deploys stop when it does; rotate it now and the old key keeps working for 24h.</StatusLine>} columns={['key', 'prefix', 'scopes', 'owner', 'last used', 'expires']} grid="minmax(8rem,1fr) minmax(6rem,max-content) minmax(10rem,1.5fr) minmax(5rem,max-content) minmax(70px,max-content) minmax(60px,max-content)" rows={rows} total={K.length} filter={q} onFilter={setQ} placeholder="filter keys" hint="◐ expires within 7d · ○ expired" action={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'new key', 'name · scopes · expiry; the secret is shown once')}>new key</Button>} footer={<span>a key acts as its owner, narrowed to its scopes · secrets are shown once, at creation</span>} />
+    // "new key" is a form, not a toast: the expiry is a date the operator has to
+    // choose, and "never" is one of the choices rather than an empty field.
+    const form = newKey && (
+      <Section title="New API key" meta="the secret is shown once, at creation">
+        <div className="@container space-y-4 border bg-background p-4">
+          <Field label="name" hint="what it is for, so a stale key can be recognised a year from now"><Input value={keyName} onChange={(e) => setKeyName(e.target.value)} className="h-8 font-mono text-xs" placeholder="ci-deploy" /></Field>
+          <DateField id="key-expiry" label="expires" zone={ZONE} value={keyExpiry} onChange={setKeyExpiry} min={TOMORROW} now={TODAY}
+            hint="requests with it are refused from midnight in this zone"
+            never={{ label: 'no expiry', on: keyNever, onChange: setKeyNever }} />
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <Button size="sm" className="op-primary h-7 text-xs" onClick={() => { setNewKey(false); notify('ok', `${keyName || 'key'} created`, keyNever ? 'no expiry' : `expires ${keyExpiry}`) }}>create key</Button>
+            <button type="button" className="underline underline-offset-4 hover:text-foreground" onClick={() => setNewKey(false)}>cancel</button>
+            {keyNever && <span className="text-muted-foreground">a key with no expiry has to be revoked by hand</span>}
+          </div>
+        </div>
+      </Section>
+    )
+    return <div className="space-y-6">{form}<Ledger title="API keys" meta={meta} dense={dense} status={<StatusLine state="warn"><Phrase onClick={() => notify('ok', 'rotate ci-deploy', 'new secret shown once; old one valid 24h')}>ci-deploy</Phrase> expires in 6 days. CI deploys stop when it does; rotate it now and the old key keeps working for 24h.</StatusLine>} columns={['key', 'prefix', 'scopes', 'owner', 'last used', 'expires']} grid="minmax(8rem,1fr) minmax(6rem,max-content) minmax(10rem,1.5fr) minmax(5rem,max-content) minmax(70px,max-content) minmax(60px,max-content)" rows={rows} total={K.length} filter={q} onFilter={setQ} placeholder="filter keys" hint="◐ expires within 7d · ○ expired" action={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => setNewKey((n) => !n)}>new key</Button>} footer={<span>a key acts as its owner, narrowed to its scopes · secrets are shown once, at creation</span>} /></div>
   }
   if (slug === 'routes') {
     const R = [['legacy.acme.sh', 'http://10.0.3.9:8080', 'no', 'warn', 'no certificate · served over http'], ['grafana.acme.sh', 'http://10.0.3.4:3000', 'yes', 'ok', ''], ['s3.acme.sh', 'http://10.0.3.7:9000', 'yes', 'ok', 'websocket on']]
@@ -190,7 +222,7 @@ export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense:
         { title: 'self-update', body: <>
           <Field label="self-update" help={eff('now', 'downloads the release and restarts at the window')}><Toggle checked onChange={touch} /></Field>
           <Field label="channel" help={eff('now', 'stable · beta gets releases two weeks earlier')}><Picker value="stable" onChange={touch} options={[{ value: 'stable', label: 'stable' }, { value: 'beta', label: 'beta' }]} className="h-8 text-xs" width="200px" /></Field>
-          <Field label="restart window" help={eff('now', 'local time on the node')}><Input defaultValue="04:00" onChange={touch} className="h-8 w-24 font-mono text-xs" /></Field>
+          <ScheduleField label="restart window" hint={eff('now')} time={window} onTimeChange={(t) => { setWindow(t); touch() }} zone={ZONE} now={TODAY} count={1} />
         </> },
       ],
       danger: <div className="flex flex-wrap items-center justify-between gap-3 text-xs"><div><p className="font-medium">Update now</p><p className="text-[11px] text-muted-foreground">Nothing newer than v0.1.0 on stable. Switch to beta to see v0.2.0-beta.3.</p></div><Button size="sm" variant="outline" className="h-8 text-xs" disabled>update now</Button></div>,
@@ -275,17 +307,19 @@ export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense:
       danger: <p className="text-xs text-muted-foreground">Nothing destructive here. Deleting data is on <Phrase onClick={() => go('settings:retention')}>Retention</Phrase>, on purpose.</p>,
     },
     retention: {
-      status: <StatusLine state="ok">Raw metrics 7 days, hourly 90 days, daily 2 years; logs and spans 14 days. Shortening a value deletes older rows on the next hourly pass.</StatusLine>,
+      status: <StatusLine state="ok">Raw metrics 7 days, hourly 90 days, daily 730 days; logs and spans 14 days. Shortening a value deletes older rows on the next hourly pass.</StatusLine>,
       sections: [
+        // A retention is a length, so it is a number and a unit, never a free-text
+        // "30d" that has to be parsed and can be typed four ways.
         { title: 'metrics', body: <>
-          <Field label="raw" help={eff('now', 'days · 1.9 GB now')}><Input defaultValue="7" onChange={touch} className="h-8 w-24 font-mono text-xs" /></Field>
-          <Field label="hourly" help={eff('now', 'days · 0.4 GB')}><Input defaultValue="90" onChange={touch} className="h-8 w-24 font-mono text-xs" /></Field>
-          <Field label="daily" help={eff('now', 'years · 0.1 GB')}><Input defaultValue="2" onChange={touch} className="h-8 w-24 font-mono text-xs" /></Field>
+          <DurationField label="raw" hint={eff('now', '1.9 GB now')} units={['h', 'd']} min={DAY} max={365 * DAY} value={keep.raw} onChange={(v) => { setKeep({ ...keep, raw: v }); touch() }} />
+          <DurationField label="hourly" hint={eff('now', '0.4 GB')} units={['d']} min={DAY} max={730 * DAY} value={keep.hourly} onChange={(v) => { setKeep({ ...keep, hourly: v }); touch() }} />
+          <DurationField label="daily" hint={eff('now', '0.1 GB')} units={['d']} min={30 * DAY} max={3650 * DAY} value={keep.daily} onChange={(v) => { setKeep({ ...keep, daily: v }); touch() }} />
         </> },
         { title: 'logs and traces', body: <>
-          <Field label="proxy logs" help={eff('now', 'days · 0.5 GB')}><Input defaultValue="14" onChange={touch} className="h-8 w-24 font-mono text-xs" /></Field>
-          <Field label="spans" help={eff('now', 'days · 0.2 GB')}><Input defaultValue="14" onChange={touch} className="h-8 w-24 font-mono text-xs" /></Field>
-          <Field label="application logs" help={eff('now', 'days')}><Input defaultValue="14" onChange={touch} className="h-8 w-24 font-mono text-xs" /></Field>
+          <DurationField label="proxy logs" hint={eff('now', '0.5 GB')} units={['h', 'd']} min={DAY} max={365 * DAY} value={keep.proxy} onChange={(v) => { setKeep({ ...keep, proxy: v }); touch() }} />
+          <DurationField label="spans" hint={eff('now', '0.2 GB')} units={['h', 'd']} min={DAY} max={365 * DAY} value={keep.spans} onChange={(v) => { setKeep({ ...keep, spans: v }); touch() }} />
+          <DurationField label="application logs" hint={eff('now')} units={['h', 'd']} min={DAY} max={365 * DAY} value={keep.app} onChange={(v) => { setKeep({ ...keep, app: v }); touch() }} />
         </> },
       ],
       danger: <div className="text-xs"><p className="font-medium">Saving a shorter value deletes data.</p><p className="mt-1 text-[11px] text-muted-foreground">The save bar asks you to type "delete" when any value got shorter, and says how many days of which signal go away.</p></div>,

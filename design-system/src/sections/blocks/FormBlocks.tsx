@@ -3,7 +3,10 @@
 
 import { useState } from 'react'
 import { Block, Demo, Rule } from '@/components/op-doc'
-import { Callout, Field, FormErrors, Kbd, SecretValue, StatusLine, type FieldError } from '@/components/op'
+import {
+  Callout, DateField, DateTimeField, DateTimeRangeField, DurationField, Field, FormErrors, Kbd, ScheduleField, SecretValue, StatusLine,
+  type FieldError, type Weekday,
+} from '@/components/op'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Toggle } from '../ConsoleV1Admin'
@@ -146,6 +149,79 @@ function DisabledPair() {
   )
 }
 
+// ── dates, times, ranges ───────────────────────────────────────────────
+
+/* A fixed clock, not `new Date()`: these blocks are screenshot every run, and a
+   demo whose "next three runs" move overnight is a baseline that fails by
+   Tuesday. The instance's zone is UTC and its operator is in Europe/Madrid. */
+const NOW = new Date(2026, 8, 6, 20, 33, 0)
+const ZONES = ['UTC', 'Europe/Madrid', 'America/New_York']
+/** The 7-day PITR window acme-pg keeps, as the two bounds the field refuses outside of. */
+const PITR_FLOOR = '2026-08-30T20:33:00'
+const PITR_CEIL = '2026-09-06T20:33:00'
+
+function PointInTime() {
+  const [at, setAt] = useState('2026-09-06T19:04:00')
+  const [zone, setZone] = useState('UTC')
+  const [window, setWindow] = useState('09:00')
+  const [expires, setExpires] = useState('2026-12-06')
+  const [never, setNever] = useState(false)
+  return (
+    <div className="@container space-y-4 border p-4">
+      <DateTimeField
+        id="demo-pitr" label="restore acme-pg to" precision="second" zone={zone} onZoneChange={setZone} zones={ZONES}
+        value={at} onChange={setAt} min={PITR_FLOOR} max={PITR_CEIL}
+        hint="any second in the last 7 days · WAL is replayed to it"
+        presets={[
+          { label: 'now', value: PITR_CEIL },
+          { label: '−1h', value: '2026-09-06T19:33:00' },
+          { label: 'last backup', value: '2026-09-06T18:33:00' },
+        ]}
+      />
+      <DateField
+        id="demo-expiry" label="ci-deploy expires" zone={zone} value={expires} onChange={setExpires} min="2026-09-07" now={NOW}
+        hint="CI deploys stop when it does"
+        never={{ label: 'no expiry', on: never, onChange: setNever }}
+      />
+      <ScheduleField
+        id="demo-window" label="restart window" time={window} onTimeChange={setWindow} zone={zone} now={NOW} count={1}
+        hint="self-update restarts inside this window"
+      />
+    </div>
+  )
+}
+
+function RangeAndSchedule() {
+  const [win, setWin] = useState({ from: '2026-09-05T20:33:00', to: '2026-09-06T20:33:00' })
+  const [gate, setGate] = useState<string | null>(null)
+  const [time, setTime] = useState('02:00')
+  const [days, setDays] = useState<Weekday[]>([1, 2, 3, 4, 5])
+  const [cron, setCron] = useState('0 2 * * 1-5')
+  const [keep, setKeep] = useState(30 * 86_400_000)
+  const [timeout, setTimeout_] = useState(90 * 60_000)
+  return (
+    <div className="@container space-y-4 border p-4">
+      <DateTimeRangeField
+        id="demo-range" label="proxy logs" zone="UTC" now={NOW}
+        from={win.from} to={win.to} onChange={(from, to) => setWin({ from, to })}
+        min="2026-08-07T20:33:00" max="2026-09-06T20:33:00"
+        quick={[{ label: '1h', hours: 1 }, { label: '24h', hours: 24 }, { label: '7d', hours: 168 }, { label: '30d', hours: 720 }, { label: '90d', hours: 2160 }]}
+        retentionDays={30} retentionLabel="30d" onGated={(q) => setGate(`${q.label} is beyond 30d retention on Starter · Team keeps 90d`)}
+        hint="the window the log ledger reads"
+      />
+      {gate && <Callout state="idle" title="90d is beyond this plan's retention">Starter keeps 30 days of proxy logs. Team keeps 90. Nothing older than 2026-08-07 20:33 UTC exists to read.</Callout>}
+      <ScheduleField
+        id="demo-schedule" label="nightly-all runs at" time={time} onTimeChange={setTime} zone="UTC" now={NOW}
+        days={days} onDaysChange={setDays} cron={cron} onCronChange={setCron}
+        hint="every service plus the control plane"
+      />
+      <DurationField id="demo-keep" label="keeps backups for" value={keep} onChange={setKeep} units={['h', 'd']} min={86_400_000} max={365 * 86_400_000} hint="older ones are deleted on the next nightly pass" />
+      {/* 90 minutes is where the read-back earns its line: the number and the unit do not say `1h 30m` on their own. */}
+      <DurationField id="demo-timeout" label="build timeout" value={timeout} onChange={setTimeout_} units={['min', 'h']} min={60_000} max={6 * 3_600_000} hint="a build still running at this point is killed" />
+    </div>
+  )
+}
+
 // ── the section ────────────────────────────────────────────────────────
 
 export function FormBlocks() {
@@ -198,6 +274,45 @@ export function FormBlocks() {
         </>}>
         <Demo label="live · blur to validate, save to submit">
           <LiveForm />
+        </Demo>
+      </Block>
+
+      <Block id="form-datetime" title="Dates and times" api={`<DateTimeField
+  label="restore acme-pg to"
+  value={at} onChange={setAt}
+  zone={zone} onZoneChange={setZone}
+  precision="second"
+  min={floor} max={ceil}
+  presets={[{ label: 'now', value: ceil }]} />
+
+<DateField never={{ label: 'no expiry', on, onChange }} />`}
+        rule={<>
+          <p>Typed entry first: a real <code>datetime-local</code> under the ink skin, so a stamp copied out of the failing log line can be pasted, <code>↑</code>/<code>↓</code> step the focused segment, and the browser's picker is the accelerator rather than the only door.</p>
+          <p>The zone sits beside the control as a fact, always — a <code>Picker</code> in the same <code>Field</code> when it can be changed. Three clocks are in play on any restore (the operator's, the node's, the bucket's) and a control that guesses picks the wrong second silently.</p>
+          <p>The window is stated once in the hint and refused outside it on blur, with the state word and the fact. Presets fill the absolute field; the field stays the truth about what they wrote. "no expiry" is an option word, never an empty date.</p>
+          <Rule state="ok">Type 2026-08-20 into the restore field and leave it: out of window, with both bounds named.</Rule>
+          <Rule state="error">A calendar icon as the only entry, or <code>09/06/26</code> with no zone beside it.</Rule>
+        </>}>
+        <Demo label="live · type, blur, press a preset">
+          <PointInTime />
+        </Demo>
+      </Block>
+
+      <Block id="form-range-schedule" title="Ranges, schedules and durations" api={`<DateTimeRangeField from to onChange zone
+  quick={[{ label: '7d', hours: 168 }]}
+  retentionDays={30} retentionLabel="30d" onGated />
+
+<ScheduleField time zone days onDaysChange cron />
+<DurationField value={ms} onChange units={['h','d']} />`}
+        rule={<>
+          <p>A range is two fields, <code>from</code> → <code>to</code>, on the strip a chart's <code>RangePicker</code> already uses. <code>to &gt; from</code> is checked on blur of "to"; a window past the retention horizon is struck through with the plan word and says what keeps it, never hidden.</p>
+          <p>A schedule prints its next three runs underneath, so it is verifiable before it is saved — <code>0 4 * * 0</code> is where a weekly backup quietly becomes a Sunday-only backup. Cron stays available beside the simple entry, never instead of it.</p>
+          <p>A duration is a number and a unit <code>Picker</code>: <code>30d</code>, <code>30 days</code>, <code>720h</code> and <code>30</code> are four spellings of one value and three of them are a parser bug. The preview under it is <code>fmtDuration</code>.</p>
+          <Rule state="ok">Press 90d: it is struck through and explains which plan keeps it.</Rule>
+          <Rule state="error">A free-text "30d" box, or a schedule that shows only the cron string.</Rule>
+        </>}>
+        <Demo label="live · press 90d, toggle a weekday, change the unit">
+          <RangeAndSchedule />
         </Demo>
       </Block>
 
