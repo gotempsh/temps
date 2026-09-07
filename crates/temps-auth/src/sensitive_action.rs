@@ -432,6 +432,7 @@ mod tests {
             expires_at: Utc::now() + Duration::days(1),
             mfa_pending: false,
             step_up_expires_at,
+            mfa_pending_origin: None,
         }
     }
 

@@ -277,7 +277,19 @@ impl AuthService {
     }
 
     // Creates temporary session for MFA verification
-    pub async fn create_mfa_session(&self, user_id: i32) -> Result<String, AuthError> {
+    //
+    // `origin` records which login method created this pending challenge
+    // (e.g. `"password"`, `"oidc"`, `"saml"`) so a later caller can tell an
+    // SSO-originated challenge apart from a password-originated one -- see
+    // `mfa_session_origin`'s doc comment for why that distinction matters.
+    // Callers should use short, self-consistent values; they don't need to
+    // match any other string convention (e.g. audit-log `login_method`
+    // values) verbatim.
+    pub async fn create_mfa_session(
+        &self,
+        user_id: i32,
+        origin: &str,
+    ) -> Result<String, AuthError> {
         let session_token = self.generate_session_token();
         let expires_at = Utc::now() + Duration::minutes(5); // Short expiration for MFA sessions
 
@@ -288,12 +300,42 @@ impl AuthService {
             // Mark this as a pending MFA challenge so it can never be replayed
             // as a real session cookie -- `verify_session` rejects such rows.
             mfa_pending: Set(true),
+            mfa_pending_origin: Set(Some(origin.to_string())),
             ..Default::default()
         };
 
         new_session.insert(self.db.as_ref()).await?;
 
         Ok(session_token)
+    }
+
+    /// Look up the login method that created a still-pending MFA challenge,
+    /// without consuming it.
+    ///
+    /// Used by SSO enforcement (temps-ee-sso) so `POST /auth/verify-mfa` can
+    /// let an SSO-originated pending challenge (`"oidc"`/`"saml"`) through
+    /// even while enforcement is blocking password/magic-link/reset logins,
+    /// instead of permanently stranding an MFA+SSO account on the "Two-factor
+    /// authentication" screen.
+    ///
+    /// Applies the exact same filters `verify_mfa_challenge` uses (token
+    /// match, not expired, `mfa_pending = true`), so this never reports an
+    /// origin for a row `verify_mfa_challenge` would itself reject. Every
+    /// "not currently a valid pending MFA session" case -- unknown token,
+    /// expired, already consumed, or a fully authenticated session token --
+    /// collapses to `None`; callers don't need to distinguish them.
+    pub async fn mfa_session_origin(
+        &self,
+        session_token: &str,
+    ) -> Result<Option<String>, AuthError> {
+        let session = temps_entities::sessions::Entity::find()
+            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
+            .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+            .one(self.db.as_ref())
+            .await?;
+
+        Ok(session.and_then(|s| s.mfa_pending_origin))
     }
 
     // Verifies the MFA code
@@ -1476,7 +1518,10 @@ mod tests {
         let user = create_test_user(&db.db, "mfabypass@example.com", "password").await;
 
         // Token handed to the client as the `mfa_session` cookie.
-        let mfa_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let mfa_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
 
         // The attack: replay it on the normal session path.
         let result = auth_service.verify_session(&mfa_token).await;
@@ -1528,7 +1573,10 @@ mod tests {
         };
         let user = create_test_user(&db.db, "activecount@example.com", "password").await;
 
-        auth_service.create_mfa_session(user.id).await.unwrap();
+        auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
         assert_eq!(
             auth_service.count_active_sessions(user.id).await.unwrap(),
             0,
@@ -2137,7 +2185,10 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "mfa@example.com", "password").await;
 
-        let mfa_session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let mfa_session_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
 
         assert!(!mfa_session_token.is_empty());
 
@@ -2157,13 +2208,114 @@ mod tests {
         assert!(time_diff < 2); // Allow 2 seconds of variance
     }
 
+    /// Regression coverage for the SSO+MFA lockout fix: `create_mfa_session`
+    /// must persist the given origin, and `mfa_session_origin` must read it
+    /// back exactly -- this is the mechanism temps-ee-sso's enforcement
+    /// middleware relies on to tell an SSO-originated pending challenge
+    /// apart from a password-originated one. Runs it against a real
+    /// (Dockerized) database so the new `mfa_pending_origin` column is
+    /// proven to round-trip, not just compile against the entity model.
+    #[tokio::test]
+    async fn test_create_mfa_session_persists_origin_and_mfa_session_origin_reads_it_back() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "mfa-origin@example.com", "password").await;
+
+        let oidc_token = auth_service
+            .create_mfa_session(user.id, "oidc")
+            .await
+            .unwrap();
+        let saml_token = auth_service
+            .create_mfa_session(user.id, "saml")
+            .await
+            .unwrap();
+        let password_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            auth_service.mfa_session_origin(&oidc_token).await.unwrap(),
+            Some("oidc".to_string())
+        );
+        assert_eq!(
+            auth_service.mfa_session_origin(&saml_token).await.unwrap(),
+            Some("saml".to_string())
+        );
+        assert_eq!(
+            auth_service
+                .mfa_session_origin(&password_token)
+                .await
+                .unwrap(),
+            Some("password".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mfa_session_origin_returns_none_for_unknown_token() {
+        let (_db, auth_service, _) = setup_test_env().await;
+
+        let origin = auth_service
+            .mfa_session_origin("does-not-exist")
+            .await
+            .unwrap();
+
+        assert_eq!(origin, None);
+    }
+
+    #[tokio::test]
+    async fn test_mfa_session_origin_returns_none_for_expired_session() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "mfa-origin-expired@example.com", "password").await;
+
+        let token = "expired_mfa_origin_session";
+        let session = sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set(token.to_string()),
+            expires_at: Set(Utc::now() - Duration::minutes(1)),
+            mfa_pending: Set(true),
+            mfa_pending_origin: Set(Some("oidc".to_string())),
+            ..Default::default()
+        };
+        session.insert(db.db.as_ref()).await.unwrap();
+
+        let origin = auth_service.mfa_session_origin(token).await.unwrap();
+
+        assert_eq!(
+            origin, None,
+            "an expired pending session must not report an origin"
+        );
+    }
+
+    /// A fully authenticated (non-pending) session token must never report
+    /// an origin either -- `mfa_session_origin` filters on `mfa_pending =
+    /// true` exactly like `verify_mfa_challenge`, so a real session token
+    /// can never be mistaken for a pending SSO challenge by the enforcement
+    /// middleware.
+    #[tokio::test]
+    async fn test_mfa_session_origin_returns_none_for_real_session() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "mfa-origin-real@example.com", "password").await;
+
+        let real_token = auth_service.create_session(user.id).await.unwrap();
+
+        let origin = auth_service.mfa_session_origin(&real_token).await.unwrap();
+
+        assert_eq!(
+            origin, None,
+            "a fully authenticated session must not report a pending-MFA origin"
+        );
+    }
+
     #[tokio::test]
     async fn test_verify_mfa_challenge_without_secret() {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "mfa@example.com", "password").await;
 
         // Create MFA session
-        let mfa_session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let mfa_session_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
 
         // Try to verify without MFA secret set
         let result = auth_service
@@ -2200,7 +2352,10 @@ mod tests {
         };
         let user =
             create_test_user_with_mfa(&db.db, "wrong-code@example.com", "password", true).await;
-        let session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let session_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
         let current_code = current_totp_code("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
         let wrong_code = if current_code == "000000" {
             "000001"
@@ -2271,6 +2426,7 @@ mod tests {
             expires_at: now + Duration::minutes(5),
             mfa_pending: true,
             step_up_expires_at: None,
+            mfa_pending_origin: Some("password".to_string()),
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![session]])
