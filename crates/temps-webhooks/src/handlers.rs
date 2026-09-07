@@ -443,6 +443,7 @@ async fn update_webhook(
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Verify webhook belongs to project
+    let mut existing_subscribes_to_backup_events = false;
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
         if existing.project_id != project_id {
             return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
@@ -450,6 +451,13 @@ async fn update_webhook(
                 .detail("Webhook does not belong to this project")
                 .build());
         }
+        let existing_events: Vec<String> =
+            serde_json::from_str(&existing.events).unwrap_or_default();
+        let existing_events: Vec<WebhookEventType> = existing_events
+            .iter()
+            .filter_map(|s| WebhookEventType::from_str(s))
+            .collect();
+        existing_subscribes_to_backup_events = subscribes_to_backup_events(&existing_events);
     }
 
     // Parse event types if provided
@@ -458,10 +466,15 @@ async fn update_webhook(
             .filter_map(|s| WebhookEventType::from_str(s))
             .collect()
     });
-    if let Some(events) = &events {
-        if subscribes_to_backup_events(events) {
-            permission_check!(auth, Permission::BackupsRead);
-        }
+    // Gated on the webhook's events before *and* after this update, not just
+    // whether this call happens to touch `events`: a caller who omits
+    // `events` (e.g. only changing `url`) would otherwise be able to
+    // repoint an already backup-subscribed webhook at a URL of their
+    // choosing without ever holding `BackupsRead`.
+    let new_subscribes_to_backup_events =
+        events.as_deref().is_some_and(subscribes_to_backup_events);
+    if existing_subscribes_to_backup_events || new_subscribes_to_backup_events {
+        permission_check!(auth, Permission::BackupsRead);
     }
 
     let request = UpdateWebhookRequest {
