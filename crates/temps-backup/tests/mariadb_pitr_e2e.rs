@@ -970,10 +970,24 @@ struct E2eEnv {
 /// Boot the whole fixture. Returns `None` (graceful skip) whenever any piece of
 /// infrastructure is unavailable — never panics on missing infrastructure, only
 /// on real assertion failures once a flow is running.
-async fn setup_e2e_env(name_prefix: &str) -> Option<E2eEnv> {
+///
+/// `use_walg_image` selects the source container: `true` boots the pinned
+/// WAL-G-enabled image (required by any flow that exercises
+/// `MariadbPhysicalEngine` directly, like base-backup/retention testing),
+/// `false` boots a plain `mariadb:lts` image (for flows that deliberately
+/// test the no-WAL-G dump-engine fallback). Passing `true` for a flow that
+/// never calls the physical engine works too, but pointlessly pulls and pins
+/// the larger image.
+async fn setup_e2e_env(name_prefix: &str, use_walg_image: bool) -> Option<E2eEnv> {
     init_tracing();
 
     let docker = connect_docker().await?;
+    if use_walg_image {
+        if let Err(error) = ensure_pitr_network(&docker).await {
+            eprintln!("Could not create PITR Docker network, skipping: {error}");
+            return None;
+        }
+    }
 
     let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
@@ -984,7 +998,7 @@ async fn setup_e2e_env(name_prefix: &str) -> Option<E2eEnv> {
     };
     let pool = test_db.connection_arc();
 
-    let (minio_port, _minio_container_name, minio_guard) = boot_minio(&docker).await?;
+    let (minio_port, minio_container_name, minio_guard) = boot_minio(&docker).await?;
     let s3_client = build_s3_client(minio_port)?;
     if let Err(e) = s3_client.create_bucket().bucket(BUCKET).send().await {
         eprintln!("Could not create MinIO bucket, skipping: {e}");
@@ -992,8 +1006,12 @@ async fn setup_e2e_env(name_prefix: &str) -> Option<E2eEnv> {
     }
 
     let service_name = format!("{name_prefix}{}", uuid::Uuid::new_v4().simple());
-    let (container_name, mariadb_port, mariadb_guard) =
-        boot_default_mariadb_source(&docker, &service_name).await?;
+    let (container_name, mariadb_port, mariadb_guard) = if use_walg_image {
+        let (launch_image, _immutable_image) = resolve_mariadb_image(&docker).await.ok()?;
+        boot_mariadb_source(&docker, &service_name, &minio_container_name, &launch_image).await?
+    } else {
+        boot_default_mariadb_source(&docker, &service_name).await?
+    };
     eprintln!("Booted MariaDB source container {container_name} on host port {mariadb_port}");
 
     Some(E2eEnv {
@@ -1154,6 +1172,43 @@ async fn fetch_binlog_manifest(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Read `binlog_file` out of one specific backup's `metadata.json`, keyed by
+/// its own UUID — the exact key `mariadb_physical::run` writes it under
+/// (`{repository_key}/{backup_uuid}.metadata.json`). Needed because a WAL-G
+/// repository's `location` is shared by every backup of the service, so it
+/// alone cannot identify which backup's metadata to read.
+async fn walg_base_binlog_file(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    base_location: &str,
+    backup_uuid: &str,
+) -> anyhow::Result<Option<String>> {
+    let repository_key = base_location
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("base location '{base_location}' is not in bucket '{bucket}'")
+        })?;
+    let metadata_key = format!("{repository_key}/{backup_uuid}.metadata.json");
+    let obj = s3_client
+        .get_object()
+        .bucket(bucket)
+        .key(&metadata_key)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("get base metadata s3://{bucket}/{metadata_key}: {e}"))?;
+    let bytes = obj.body.collect().await?.into_bytes();
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let pitr = metadata
+        .get("pitr")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let file = metadata
+        .get("binlog_file")
+        .and_then(|v| v.as_str())
+        .filter(|f| !f.is_empty());
+    Ok(if pitr { file.map(str::to_string) } else { None })
+}
+
 /// Mirror of the provider's `pub(crate)` `MariaDbService::binlog_is_strictly_older`
 /// ordering rule: same basename, same zero-padded suffix width, lexicographically
 /// smaller. Anything it cannot order with certainty answers `false` (= keep).
@@ -1214,7 +1269,7 @@ async fn mariadb_pitr_full_chain_e2e_binlog_retention_prune() {
 }
 
 async fn mariadb_binlog_retention_prune_inner() {
-    let Some(env) = setup_e2e_env("prune").await else {
+    let Some(env) = setup_e2e_env("prune", true).await else {
         return;
     };
     run_binlog_retention_flow(&env)
@@ -1266,7 +1321,7 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
     );
 
     // ── Base #1: the first retained base backup ─────────────────────────────
-    let (base1_location, _base1_backup) = run_engine_backup(
+    let (base1_location, base1_backup) = run_engine_backup(
         &env.pool,
         &engine,
         "mariadb_physical",
@@ -1277,8 +1332,8 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
     )
     .await?;
     assert!(
-        base1_location.ends_with("base.mbstream.gz"),
-        "base #1 must be a physical base, got {base1_location}"
+        base1_location.trim_end_matches('/').ends_with("/walg"),
+        "base #1 must be a WAL-G physical repository, got {base1_location}"
     );
 
     let mariadb_svc = MariaDbService::new(service_name.to_string(), Arc::new(env.docker.clone()));
@@ -1305,7 +1360,7 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
     }
 
     // ── Base #2, later in the timeline: its anchor is a LATER segment ───────
-    let (base2_location, _base2_backup) = run_engine_backup(
+    let (base2_location, base2_backup) = run_engine_backup(
         &env.pool,
         &engine,
         "mariadb_physical",
@@ -1316,8 +1371,8 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
     )
     .await?;
     assert!(
-        base2_location.ends_with("base.mbstream.gz"),
-        "base #2 must be a physical base, got {base2_location}"
+        base2_location.trim_end_matches('/').ends_with("/walg"),
+        "base #2 must be a WAL-G physical repository, got {base2_location}"
     );
 
     // ── Ship more segments AFTER base #2 so the prune has both a "delete"
@@ -1341,20 +1396,38 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
     eprintln!("Total binlog segments shipped: {shipped_total}");
 
     // ── Anchors ─────────────────────────────────────────────────────────────
-    let anchor1 = mariadb_svc
-        .base_binlog_anchor(&env.s3_client, BUCKET, &base1_location)
-        .await
-        .map_err(|e| anyhow::anyhow!("base_binlog_anchor(base #1): {e}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("base #1 must expose a PITR binlog anchor; got None (pitr disabled?)")
-        })?;
-    let anchor2 = mariadb_svc
-        .base_binlog_anchor(&env.s3_client, BUCKET, &base2_location)
-        .await
-        .map_err(|e| anyhow::anyhow!("base_binlog_anchor(base #2): {e}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("base #2 must expose a PITR binlog anchor; got None (pitr disabled?)")
-        })?;
+    // NOTE: `MariaDbService::base_binlog_anchor` is not used here. It resolves
+    // a base's metadata.json purely from the base *location* string, which
+    // works for the legacy single-object mbstream format but not for a WAL-G
+    // repository: every backup of this service shares the same repository
+    // location (`base1_location == base2_location`), so a location-only
+    // lookup cannot tell base #1's metadata from base #2's. This is a
+    // pre-existing gap in that helper (and in the `is_physical_base_location`
+    // check it uses), tracked separately from this test — fetch each base's
+    // own metadata.json directly here, keyed by the backup's own UUID (the
+    // exact key `mariadb_physical` writes it under).
+    let anchor1 = walg_base_binlog_file(
+        &env.s3_client,
+        BUCKET,
+        &base1_location,
+        &base1_backup.backup_id,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("base_binlog_anchor(base #1): {e}"))?
+    .ok_or_else(|| {
+        anyhow::anyhow!("base #1 must expose a PITR binlog anchor; got None (pitr disabled?)")
+    })?;
+    let anchor2 = walg_base_binlog_file(
+        &env.s3_client,
+        BUCKET,
+        &base2_location,
+        &base2_backup.backup_id,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("base_binlog_anchor(base #2): {e}"))?
+    .ok_or_else(|| {
+        anyhow::anyhow!("base #2 must expose a PITR binlog anchor; got None (pitr disabled?)")
+    })?;
     eprintln!("DIAG anchors: base#1={anchor1} base#2={anchor2}");
     assert!(
         expect_strictly_older(&anchor1, &anchor2),
@@ -1590,7 +1663,7 @@ async fn mariadb_pitr_full_chain_e2e_logical_dump_restore_keeps_target_credentia
 }
 
 async fn mariadb_logical_dump_restore_inner() {
-    let Some(env) = setup_e2e_env("dump").await else {
+    let Some(env) = setup_e2e_env("dump", false).await else {
         return;
     };
     run_logical_dump_restore_flow(&env)

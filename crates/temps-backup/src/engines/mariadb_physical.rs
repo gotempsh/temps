@@ -26,19 +26,25 @@
 //! 3. `docker exec wal-g backup-push` inside the running container. WAL-G runs
 //!    `mariadb-backup --stream=mbstream` and uploads the stream directly to S3.
 //!    No database-sized host file is created.
-//! 4. Parse the binlog position from the bounded WAL-G/mariadb-backup output.
+//! 4. Query `SHOW BINLOG STATUS` directly against the live server for the
+//!    binlog position at backup time — NOT by parsing `mariadb-backup`'s own
+//!    stderr, which WAL-G's `WALG_STREAM_CREATE_COMMAND` never forwards into
+//!    its own captured output.
 //! 5. Write `metadata.json` with the coordinates and exact backup identity.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
+use bollard::container::LogOutput;
+use bollard::exec::StartExecResults;
+use futures::StreamExt;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use super::dispatch::service_container_name;
-use super::mariadb_exec::parse_binlog_position;
+use super::mariadb_exec::BinlogCoord;
 use super::postgres_walg::run_walg_exec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
@@ -220,7 +226,12 @@ impl BackupEngine for MariadbPhysicalEngine {
         // Binlog coordinates anchor PITR replay. Absence means binary logging
         // is off on the source — the base is still a valid full backup, but
         // PITR will not be possible until binlog archiving is enabled.
-        let coord = parse_binlog_position(&format!("{}\n{}", exec.stdout, exec.stderr));
+        let coord = query_binlog_status(&deps.docker, &container_name, &root_password)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(backup_id, error = %e, "mariadb: could not query binlog status");
+                None
+            });
         match &coord {
             Some(c) => info!(
                 backup_id,
@@ -231,8 +242,8 @@ impl BackupEngine for MariadbPhysicalEngine {
             ),
             None => warn!(
                 backup_id,
-                "MariadbPhysicalEngine: no binlog position in mariadb-backup output \
-                 (binary logging disabled on source?) — PITR will be unavailable for this base",
+                "MariadbPhysicalEngine: no binlog position on the source \
+                 (binary logging disabled?) — PITR will be unavailable for this base",
             ),
         }
 
@@ -353,6 +364,84 @@ fn build_walg_env(
     ));
     env.extend(v2_common::walg_identity_env(backup_uuid));
     env
+}
+
+/// Query the binlog coordinates at (approximately) base-backup time, by
+/// running `SHOW BINLOG STATUS` and `SELECT @@global.gtid_binlog_pos`
+/// directly against the live server.
+///
+/// The credential goes through the exec `env` (`MYSQL_PWD`), never the `cmd`
+/// argv, so it never leaks via `ps`/`/proc/<pid>/cmdline` — same convention
+/// as every other exec in this module. Returns `Ok(None)` (not an error) when
+/// binary logging is off on the source: the base backup is still valid, PITR
+/// just is not possible until archiving is enabled.
+async fn query_binlog_status(
+    docker: &bollard::Docker,
+    container_name: &str,
+    root_password: &str,
+) -> Result<Option<BinlogCoord>, BackupError> {
+    let mysql_pwd = format!("MYSQL_PWD={root_password}");
+    let exec = docker
+        .create_exec(
+            container_name,
+            bollard::exec::CreateExecOptions {
+                cmd: Some(vec![
+                    "mariadb",
+                    "-N",
+                    "-B",
+                    "--user=root",
+                    "--host=127.0.0.1",
+                    "-e",
+                    "SHOW BINLOG STATUS; SELECT @@global.gtid_binlog_pos",
+                ]),
+                env: Some(vec![mysql_pwd.as_str()]),
+                attach_stdout: Some(true),
+                attach_stderr: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| BackupError::Failed {
+            reason: format!("create exec for binlog status on {container_name}: {e}"),
+        })?;
+    let start = docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|e| BackupError::Failed {
+            reason: format!("start exec for binlog status on {container_name}: {e}"),
+        })?;
+    let mut output = String::new();
+    if let StartExecResults::Attached {
+        output: mut stream, ..
+    } = start
+    {
+        while let Some(Ok(msg)) = stream.next().await {
+            if let LogOutput::StdOut { message } = msg {
+                output.push_str(&String::from_utf8_lossy(&message));
+            }
+        }
+    }
+
+    // Line 1 (batch/tab-separated, no header thanks to -N -B):
+    //   <file>\t<position>\t<binlog_do_db>\t<binlog_ignore_db>
+    // Line 2: the gtid_binlog_pos value, or empty when GTID is unused.
+    let mut lines = output.lines();
+    let Some(status_line) = lines.next() else {
+        return Ok(None);
+    };
+    let mut fields = status_line.split('\t');
+    let (Some(file), Some(position)) = (fields.next(), fields.next()) else {
+        return Ok(None);
+    };
+    if file.is_empty() || position.is_empty() {
+        return Ok(None);
+    }
+    let gtid = lines.next().unwrap_or_default().trim().to_string();
+    Ok(Some(BinlogCoord {
+        file: file.to_string(),
+        position: position.to_string(),
+        gtid,
+    }))
 }
 
 async fn list_total_s3_size(
