@@ -779,3 +779,23 @@
 .operator.ink .bg-foreground, .operator.ink [cmdk-item][data-selected='true'], .operator.ink [role='tab'][aria-selected='true'] {
   --muted-foreground: color-mix(in oklch, var(--background) 78%, var(--foreground));
 }
+
+/* ── Scrollbars ────────────────────────────────────────────────────────
+   Square, thin, ink at 30% on a transparent track; 55% under the pointer.
+   The document scrollbar follows when the skin owns the page. Never a
+   rounded platform pill on a square system, never a coloured track. */
+.operator.ink, .operator.ink *, html:has(> body > .operator.ink), html:has(> body > #root > .operator.ink) {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--foreground) 30%, transparent) transparent;
+}
+.operator.ink ::-webkit-scrollbar, html:has(.operator.ink)::-webkit-scrollbar { width: 8px; height: 8px; }
+.operator.ink ::-webkit-scrollbar-track, html:has(.operator.ink)::-webkit-scrollbar-track { background: transparent; }
+.operator.ink ::-webkit-scrollbar-thumb, html:has(.operator.ink)::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--foreground) 30%, transparent);
+  border-radius: 0;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.operator.ink ::-webkit-scrollbar-thumb:hover, html:has(.operator.ink)::-webkit-scrollbar-thumb:hover { background-color: color-mix(in oklch, var(--foreground) 55%, transparent); }
+.operator.ink ::-webkit-scrollbar-corner { background: transparent; }
+/* Sideways strips (.op-scroll-x) already hide their bar above: the clipped edge is the affordance. */

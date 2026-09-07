@@ -276,6 +276,16 @@ Frozen decisions. Do not reopen without a written reason:
 - Motion is 100ms, transform / shadow / colour only. No entrance animation.
 - Charts are linear lines, ink on paper, no fills, no animation.
 
+### Scrollbars
+
+The platform scrollbar is a rounded grey pill; the system is square ink. The
+skin therefore draws every scrollbar: 8px, square, ink at 30% on a transparent
+track, 55% under the pointer, and the document scrollbar follows when the skin
+owns the page. Sideways strips (`.op-scroll-x`: tabs, action bars) scroll with
+no bar at all; the clipped last item is the affordance. A scroll region is
+still a focusable region with a visible focus ring (axe requires it), the bar
+is not the only sign that it scrolls.
+
 ## 5. Status vocabulary
 
 `src/components/op/status.tsx`. Six states, one glyph each, one colour each.

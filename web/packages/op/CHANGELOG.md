@@ -2,6 +2,9 @@
 
 ## 0.1.2
 
+- Scrollbars belong to the skin: thin, square, ink at 30% on a transparent
+  track (55% under the pointer), the document scrollbar included when the
+  skin owns the page; sideways strips (`.op-scroll-x`) show no bar.
 - A hover, a selection or a focused row lifts the whole row: `--muted-foreground`
   goes to 80% ink under the fill, and to 78% paper under an ink-filled selection
   (the palette's current item, a filled tab). Utilities read the variable, so
