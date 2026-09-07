@@ -18,6 +18,7 @@ import {
   listServiceProjects,
   updateService,
   upgradeService,
+  repointContinuousArchiveSource,
   importExternalService,
   linkServiceToProject,
   unlinkServiceFromProject,
@@ -181,6 +182,11 @@ interface UpgradeOptions {
   version?: string
 }
 
+interface RepointContinuousArchiveSourceOptions {
+  id: string
+  s3Source: string
+}
+
 interface ImportOptions {
   type?: string
   name?: string
@@ -315,6 +321,18 @@ export function registerServicesCommands(program: Command): void {
     .requiredOption('--id <id>', 'Service ID')
     .option('-v, --version <version>', 'Docker image to upgrade to (e.g., postgres:18-alpine)')
     .action(upgradeServiceAction)
+
+  services
+    .command('repoint-continuous-archive-source')
+    .description(
+      "Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog " +
+        'shipper) to a different S3 source. Data archived before this call stays under the ' +
+        'previous source and will no longer be verifiable or replayable once archiving points ' +
+        'at the new one.',
+    )
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--s3-source <id>', 'S3 source ID to point continuous archiving at')
+    .action(repointContinuousArchiveSourceAction)
 
   services
     .command('import')
@@ -1067,6 +1085,42 @@ async function upgradeServiceAction(options: UpgradeOptions): Promise<void> {
 
   success('Service upgrade initiated')
   info(`Run: temps services show --id ${options.id} to check the status`)
+}
+
+async function repointContinuousArchiveSourceAction(options: RepointContinuousArchiveSourceOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID')
+    return
+  }
+
+  const newS3SourceId = parseInt(options.s3Source, 10)
+  if (isNaN(newS3SourceId)) {
+    warning('Invalid S3 source ID')
+    return
+  }
+
+  const result = await withSpinner('Repointing continuous archive source...', async () => {
+    const { data, error } = await repointContinuousArchiveSource({
+      client,
+      path: { id },
+      body: { new_s3_source_id: newS3SourceId },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  success('Continuous archive source repointed')
+  if (result) {
+    keyValue('Service ID', String(result.service_id))
+    keyValue('S3 source', String(result.continuous_archive_s3_source_id))
+    keyValue('Pinned at', result.continuous_archive_pinned_at)
+  }
 }
 
 async function importServiceAction(options: ImportOptions): Promise<void> {

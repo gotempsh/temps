@@ -34,7 +34,8 @@ import {
   Sparkles,
 } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { type FieldErrors, useForm } from 'react-hook-form'
+import { toast } from 'sonner'
 import * as z from 'zod'
 
 interface JsonSchemaProperty {
@@ -368,6 +369,38 @@ export function JsonSchemaForm({
     await onSubmit(cleanedValues)
   }
 
+  // React Hook Form's own `handleSubmit` silently drops the submission when
+  // validation fails and does nothing else -- no toast, no console warning.
+  // That's invisible for a field that isn't rendered at all (hidden or
+  // preset-owned, e.g. a Docker image the preset fills in only after this
+  // validation already ran and rejected it), which previously made a broken
+  // schema/preset combination look identical to a truly unresponsive button.
+  // Surface *something* every time submission is blocked, so this class of
+  // bug is diagnosable instead of silent.
+  const onInvalid = (errors: FieldErrors<FormValues>) => {
+    const fieldNames = Object.keys(errors)
+    if (fieldNames.length === 0) return
+
+    const hiddenFailures = fieldNames.filter((name) =>
+      effectiveHiddenFields.includes(name)
+    )
+
+    if (hiddenFailures.length > 0) {
+      // The field can't be fixed by the user -- it isn't on screen -- so this
+      // is a form/schema bug, not a validation message to act on.
+      toast.error('Unable to create service', {
+        description: `Internal form error: ${hiddenFailures
+          .map(humanizeLabel)
+          .join(', ')} failed validation but ${
+          hiddenFailures.length === 1 ? "isn't" : "aren't"
+        } shown on this form. Please report this as a bug.`,
+      })
+      return
+    }
+
+    toast.error('Check the highlighted fields before creating this service')
+  }
+
   const isPairedField = (fieldName: string, nextFieldName?: string) => {
     if (!nextFieldName) return false
     return pairedFields.some(
@@ -607,7 +640,10 @@ export function JsonSchemaForm({
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
+      <form
+        onSubmit={form.handleSubmit(handleSubmit, onInvalid)}
+        className="space-y-6"
+      >
         {useGrouping ? (
           <>
             {nonAdvancedGroups.map((group) => {

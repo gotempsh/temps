@@ -919,6 +919,7 @@ export function ServiceDetail() {
             <WalHealthPanel
               serviceId={parseInt(id!)}
               serviceType={service.service.service_type}
+              onUpgrade={() => setIsUpgradeDialogOpen(true)}
             />
           ) : null}
 

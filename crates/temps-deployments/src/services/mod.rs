@@ -5,6 +5,9 @@
 pub mod services;
 pub use services::*;
 
+pub mod container_operations;
+pub use container_operations::*;
+
 pub mod types;
 pub use types::*;
 

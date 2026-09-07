@@ -14,10 +14,10 @@
 //!
 //! ## Two endpoints
 //!
-//! - `GET /internal/nodes/{node_id}/dns/changes?since=N` — long-poll style
-//!   diff. Returns records with `generation > N`. If `N == 0` (or the diff
-//!   exceeds an internal threshold), returns `full_snapshot: true` + the
-//!   entire zone.
+//! - `GET /internal/nodes/{node_id}/dns/changes?since=N` — returns an empty
+//!   response when the node is current, otherwise `full_snapshot: true` plus
+//!   the entire authoritative zone. Endpoint replacement deletes old row IDs,
+//!   so incremental changes are unsafe until durable deletion tombstones exist.
 //! - `POST /internal/nodes/{node_id}/dns/ack` — agent reports the highest
 //!   generation it has applied. Updates `node_dns_state` so ops can detect
 //!   drift.

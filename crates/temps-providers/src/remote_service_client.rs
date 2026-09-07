@@ -165,6 +165,53 @@ impl RemoteServiceClient {
         })
     }
 
+    /// Create a client that presents the control-plane identity and trusts
+    /// only the cluster CA. This is required for agents enrolled with mTLS;
+    /// using the process-wide public root store cannot authenticate either
+    /// side of that private trust domain.
+    pub fn new_mtls(
+        agent_url: String,
+        token: String,
+        node_name: String,
+        identity_pem: &str,
+        cluster_ca_pem: &str,
+    ) -> Result<Self, ExternalServiceError> {
+        let identity = reqwest::Identity::from_pem(identity_pem.as_bytes()).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to parse control-plane mTLS identity for node {}: {}",
+                    node_name, e
+                ),
+            }
+        })?;
+        let cluster_ca =
+            reqwest::Certificate::from_pem(cluster_ca_pem.as_bytes()).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to parse cluster CA certificate for node {}: {}",
+                        node_name, e
+                    ),
+                }
+            })?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .use_rustls_tls()
+            .identity(identity)
+            .add_root_certificate(cluster_ca)
+            .tls_built_in_root_certs(false)
+            .build()
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to create mTLS client for node {}: {}", node_name, e),
+            })?;
+
+        Ok(Self {
+            agent_url,
+            token,
+            node_name,
+            client,
+        })
+    }
+
     /// Create and start a service container on the remote node.
     pub async fn create_service(
         &self,
@@ -590,6 +637,55 @@ mod tests {
         truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
         assert!(error.is_char_boundary(error.len()));
         assert!(error.len() <= MAX_HEALTH_ERROR_BYTES + '…'.len_utf8());
+    }
+
+    #[test]
+    fn mtls_client_rejects_invalid_control_plane_identity() {
+        let error = RemoteServiceClient::new_mtls(
+            "https://worker.internal:3100".to_string(),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+            "not-a-pem-identity",
+            "not-reached",
+        )
+        .err()
+        .expect("invalid identity must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("Failed to parse control-plane mTLS identity for node worker-1"));
+    }
+
+    #[test]
+    fn mtls_client_rejects_invalid_cluster_ca() {
+        let ca = temps_core::node_pki::generate_cluster_ca().expect("generate test CA");
+        let csr = temps_core::node_pki::generate_node_keypair_csr(
+            "temps-control-plane",
+            &["temps-control-plane".to_string()],
+        )
+        .expect("generate control-plane identity");
+        let signed = temps_core::node_pki::sign_node_csr(
+            &ca.cert_pem,
+            &ca.key_pem,
+            &csr.csr_pem,
+            &["temps-control-plane".to_string()],
+        )
+        .expect("sign control-plane identity");
+        let identity_pem = format!("{}{}", signed.cert_pem, csr.key_pem);
+
+        let error = RemoteServiceClient::new_mtls(
+            "https://worker.internal:3100".to_string(),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+            &identity_pem,
+            "not-a-pem-certificate",
+        )
+        .err()
+        .expect("invalid cluster CA must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("Failed to parse cluster CA certificate for node worker-1"));
     }
 
     #[test]

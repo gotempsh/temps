@@ -27,6 +27,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { CloudTelemetryBackfillCard } from './CloudTelemetryBackfillCard'
 import { MonitoringCard } from './MonitoringCard'
 import {
   Form,
@@ -271,6 +272,11 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
 
       {/* Monitoring — what deployments report about themselves */}
       <MonitoringCard project={project} refetch={refetch} />
+
+      {/* ADR-040 — where this project's telemetry history stands with Temps
+          Cloud. Always rendered: the backfill is a deliberate CLI action, so
+          this card is the only place it is discoverable from the Console. */}
+      <CloudTelemetryBackfillCard project={project} />
 
       {/* Cross-Project Trace Sharing Card */}
       <Card className="bg-background text-foreground">

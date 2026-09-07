@@ -40,6 +40,7 @@ pub enum SensitiveAction {
         user_id: i32,
     },
     UpdateAccountEmail,
+    RotateClusterCa,
     RestoreExternalService {
         service_id: i32,
     },
@@ -94,6 +95,7 @@ impl SensitiveAction {
             Self::DeleteOidcRoleMapping { .. } => "delete_oidc_role_mapping",
             Self::AssignRole { .. } => "assign_role",
             Self::UpdateAccountEmail => "update_account_email",
+            Self::RotateClusterCa => "rotate_cluster_ca",
             Self::RestoreExternalService { .. } => "restore_external_service",
             Self::DeleteBackup { .. } => "delete_backup",
             Self::RollbackPgUpgrade { .. } => "rollback_pg_upgrade",
@@ -170,6 +172,10 @@ mod tests {
     #[test]
     fn action_identifiers_are_stable_and_resource_independent() {
         assert_eq!(SensitiveAction::CreateApiKey.as_str(), "create_api_key");
+        assert_eq!(
+            SensitiveAction::RotateClusterCa.as_str(),
+            "rotate_cluster_ca"
+        );
         assert_eq!(
             SensitiveAction::RotateApiKey { api_key_id: 13 }.as_str(),
             "rotate_api_key"

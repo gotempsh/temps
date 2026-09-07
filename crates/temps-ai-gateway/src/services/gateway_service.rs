@@ -41,6 +41,7 @@ pub struct ByokOverride {
 pub struct GatewayService {
     provider_key_service: Arc<ProviderKeyService>,
     providers: HashMap<&'static str, Box<dyn AiProvider>>,
+    cloud_link: Option<Arc<temps_cloud_client::CloudLink>>,
 }
 
 impl GatewayService {
@@ -54,7 +55,25 @@ impl GatewayService {
         Self {
             provider_key_service,
             providers,
+            cloud_link: None,
         }
+    }
+
+    pub fn with_cloud_link(
+        mut self,
+        cloud_link: Option<Arc<temps_cloud_client::CloudLink>>,
+    ) -> Self {
+        self.cloud_link = cloud_link;
+        self
+    }
+
+    pub async fn managed_model(&self) -> Option<String> {
+        let link = self.cloud_link.as_ref()?;
+        let capability = link.managed_ai_capability().await.ok()?;
+        capability
+            .configured
+            .then_some(capability.managed_model?)
+            .filter(|model| !model.is_empty())
     }
 
     /// Models advertised by the adapter for one configured provider key.
@@ -317,6 +336,9 @@ impl GatewayService {
         request: &ChatCompletionRequest,
         byok: &ByokOverride,
     ) -> Result<(ChatCompletionResponse, CredentialType), AiGatewayError> {
+        if request.model == "temps-cloud" {
+            return self.cloud_chat_completion(request).await;
+        }
         let (provider, api_key, base_url, cred_type) =
             self.resolve_provider_and_key(&request.model, byok).await?;
 
@@ -339,6 +361,37 @@ impl GatewayService {
         ),
         AiGatewayError,
     > {
+        if request.model == "temps-cloud" {
+            let (response, credential) = self.cloud_chat_completion(request).await?;
+            let choice = response.choices.first().cloned();
+            let first = serde_json::json!({
+                "id": response.id,
+                "object": "chat.completion.chunk",
+                "created": response.created,
+                "model": response.model,
+                "choices": choice.into_iter().map(|choice| serde_json::json!({
+                    "index": choice.index,
+                    "delta": {
+                        "role": choice.message.role,
+                        "content": choice.message.content,
+                        "tool_calls": choice.message.tool_calls,
+                    },
+                    "finish_reason": choice.finish_reason,
+                })).collect::<Vec<_>>(),
+                "usage": response.usage,
+            });
+            let payload = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&first).map_err(|error| {
+                    AiGatewayError::TranslationError {
+                        provider: "temps-cloud".into(),
+                        reason: error.to_string(),
+                    }
+                })?
+            );
+            let stream = tokio_stream::iter(vec![Ok(Bytes::from(payload))]);
+            return Ok((Box::pin(stream), credential));
+        }
         let (provider, api_key, base_url, cred_type) =
             self.resolve_provider_and_key(&request.model, byok).await?;
 
@@ -347,6 +400,45 @@ impl GatewayService {
             .await?;
 
         Ok((stream, cred_type))
+    }
+
+    async fn cloud_chat_completion(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<(ChatCompletionResponse, CredentialType), AiGatewayError> {
+        let link =
+            self.cloud_link
+                .as_ref()
+                .ok_or_else(|| AiGatewayError::ProviderNotConfigured {
+                    provider: "temps-cloud".into(),
+                })?;
+        let mut body =
+            serde_json::to_value(request).map_err(|error| AiGatewayError::TranslationError {
+                provider: "temps-cloud".into(),
+                reason: format!("could not encode managed request: {error}"),
+            })?;
+        if let Some(object) = body.as_object_mut() {
+            object.insert("stream".into(), false.into());
+        }
+        let response = link
+            .managed_ai_chat(&temps_cloud_protocol::ManagedAiChatRequest {
+                request_id: uuid::Uuid::new_v4(),
+                requested_at: chrono::Utc::now(),
+                body,
+            })
+            .await
+            .map_err(|error| AiGatewayError::UpstreamError {
+                model: "temps-cloud".into(),
+                status: 502,
+                message: error.to_string(),
+            })?;
+        let completion = serde_json::from_value(response.body).map_err(|error| {
+            AiGatewayError::TranslationError {
+                provider: "temps-cloud".into(),
+                reason: format!("Cloud returned an invalid OpenAI completion: {error}"),
+            }
+        })?;
+        Ok((completion, CredentialType::System))
     }
 
     /// Execute an embeddings request
@@ -457,7 +549,220 @@ impl GatewayService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::StatusCode, routing::post, Json, Router};
+    use futures_util::StreamExt;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_cloud_client::{BackendUrl, CloudLink};
+    use temps_cloud_protocol::{EnrollResponse, ManagedAiChatRequest};
     use temps_core::url_validation::validate_external_url;
+    use temps_core::EncryptionService;
+
+    async fn enroll_stub() -> Json<EnrollResponse> {
+        Json(EnrollResponse {
+            tenant_id: uuid::Uuid::new_v4(),
+            account_email: Some("operator@example.com".into()),
+            instance_token: "instance-token".into(),
+            capabilities: Vec::new(),
+        })
+    }
+
+    async fn cloud_chat_stub(Json(request): Json<ManagedAiChatRequest>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "request_id": request.request_id,
+            "settled_credits": 1,
+            "provider": "test-provider",
+            "model": "test-model",
+            "body": {
+                "id": "managed-completion",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Cloud is healthy."},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11}
+            }
+        }))
+    }
+
+    async fn cloud_chat_unavailable_stub() -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"detail": "temporary managed inference outage"})),
+        )
+    }
+
+    async fn cloud_chat_malformed_stub(
+        Json(request): Json<ManagedAiChatRequest>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "request_id": request.request_id,
+            "settled_credits": 0,
+            "provider": "test-provider",
+            "model": "test-model",
+            "body": {"unexpected": "not an OpenAI completion"}
+        }))
+    }
+
+    async fn managed_gateway_with_route(
+        route: axum::routing::MethodRouter,
+    ) -> Option<(GatewayService, tempfile::TempDir)> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping managed AI gateway test");
+                return None;
+            }
+            Err(error) => panic!("bind managed AI Cloud stub: {error}"),
+        };
+        let address = listener.local_addr().expect("Cloud stub address");
+        let app = Router::new()
+            .route("/v1/enroll", post(enroll_stub))
+            .route("/v1/ai/chat/completions", route);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve Cloud stub");
+        });
+        let temp = tempfile::tempdir().expect("temporary Cloud state");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        link.configure(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback Cloud URL"),
+        )
+        .expect("configure Cloud link");
+        link.enroll("TEST-CODE")
+            .await
+            .expect("enroll test instance");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let encryption = Arc::new(
+            EncryptionService::new("01234567890123456789012345678901").expect("test encryption"),
+        );
+        let provider_keys = Arc::new(ProviderKeyService::new(db, encryption));
+        Some((
+            GatewayService::new(provider_keys).with_cloud_link(Some(link)),
+            temp,
+        ))
+    }
+
+    fn managed_chat_request(stream: bool) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "temps-cloud".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("Is Cloud healthy?".into())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream,
+            temperature: None,
+            max_tokens: Some(32),
+            top_p: None,
+            stop: None,
+            n: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            user: None,
+            extra: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_cloud_completion_uses_the_linked_instance_path() {
+        let Some((gateway, _state_dir)) = managed_gateway_with_route(post(cloud_chat_stub)).await
+        else {
+            return;
+        };
+
+        let (response, credential) = gateway
+            .chat_completion(&managed_chat_request(false), &ByokOverride::default())
+            .await
+            .expect("managed completion");
+        assert_eq!(credential, CredentialType::System);
+        assert_eq!(response.id, "managed-completion");
+        assert_eq!(response.model, "test-model");
+    }
+
+    #[tokio::test]
+    async fn test_managed_cloud_stream_emits_openai_chunk_and_done_sentinel() {
+        let Some((gateway, _state_dir)) = managed_gateway_with_route(post(cloud_chat_stub)).await
+        else {
+            return;
+        };
+
+        let (mut stream, credential) = gateway
+            .chat_completion_stream(&managed_chat_request(true), &ByokOverride::default())
+            .await
+            .expect("managed stream");
+        let mut payload = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            payload.extend_from_slice(&chunk.expect("valid SSE chunk"));
+        }
+        let payload = String::from_utf8(payload).expect("SSE is UTF-8");
+
+        assert_eq!(credential, CredentialType::System);
+        assert!(payload.starts_with("data: {"));
+        assert!(payload.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(payload.contains("Cloud is healthy."));
+        assert!(payload.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn test_managed_cloud_upstream_outage_returns_contextual_gateway_error() {
+        let Some((gateway, _state_dir)) =
+            managed_gateway_with_route(post(cloud_chat_unavailable_stub)).await
+        else {
+            return;
+        };
+
+        let error = gateway
+            .chat_completion(&managed_chat_request(false), &ByokOverride::default())
+            .await
+            .expect_err("persistent Cloud outage must not produce a completion");
+
+        match error {
+            AiGatewayError::UpstreamError {
+                model,
+                status,
+                message,
+            } => {
+                assert_eq!(model, "temps-cloud");
+                assert_eq!(status, 502);
+                assert!(message.contains("503") || message.contains("unavailable"));
+            }
+            other => panic!("expected contextual upstream error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_managed_cloud_malformed_completion_is_rejected_without_panicking() {
+        let Some((gateway, _state_dir)) =
+            managed_gateway_with_route(post(cloud_chat_malformed_stub)).await
+        else {
+            return;
+        };
+
+        let error = gateway
+            .chat_completion(&managed_chat_request(false), &ByokOverride::default())
+            .await
+            .expect_err("malformed Cloud response must be rejected");
+
+        match error {
+            AiGatewayError::TranslationError { provider, reason } => {
+                assert_eq!(provider, "temps-cloud");
+                assert!(reason.contains("invalid OpenAI completion"));
+            }
+            other => panic!("expected translation error, got {other:?}"),
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Fix #3 — SSRF guard: validate_external_url rejects every dangerous URL

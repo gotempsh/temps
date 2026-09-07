@@ -58,6 +58,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
+import { AiAssistantGate } from './AiAssistantGate'
 import {
   conversationListNeedsRefresh,
   createProjectChat,
@@ -211,11 +212,13 @@ export function AiAssistantDock() {
           on mobile instead of leaving an empty band below it. */}
       <div className="sticky top-0 h-dvh w-full">
         {isOpen && (
-          <DockBody
-            key={openSeq}
-            initialContext={initialContext}
-            onClose={close}
-          />
+          <AiAssistantGate onClose={close}>
+            <DockBody
+              key={openSeq}
+              initialContext={initialContext}
+              onClose={close}
+            />
+          </AiAssistantGate>
         )}
       </div>
     </aside>

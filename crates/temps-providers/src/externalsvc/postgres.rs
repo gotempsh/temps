@@ -1947,6 +1947,10 @@ impl PostgresService {
             "PGHOST=localhost".to_string(),
             format!("PGPORT={}", POSTGRES_INTERNAL_PORT),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials
@@ -2510,6 +2514,10 @@ impl PostgresService {
             "PGHOST=localhost".to_string(),
             format!("PGPORT={}", POSTGRES_INTERNAL_PORT),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if let Some(resolved_endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, container_name)
@@ -3499,26 +3507,7 @@ impl ExternalService for PostgresService {
             return Ok(());
         }
 
-        let postgres_config = self.get_postgres_config(service_config)?;
-        let container_name = self.get_live_container_name(&postgres_config);
-
-        let mut walg_env: Vec<String> = vec![
-            format!("WALG_S3_PREFIX={}", walg_prefix),
-            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
-            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
-            format!("AWS_REGION={}", s3_credentials.region),
-        ];
-        if let Some(resolved_endpoint) = s3_credentials
-            .resolve_endpoint_for_container(&self.docker, &container_name)
-            .await
-        {
-            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
-        }
-        if s3_credentials.force_path_style {
-            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
-        }
-
-        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config)
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
             .await
     }
 
@@ -4256,6 +4245,63 @@ impl ExternalService for PostgresService {
             .await?;
             Ok(None)
         }
+    }
+}
+
+impl PostgresService {
+    /// Point continuous WAL-G archiving at `s3_credentials`/`walg_prefix`
+    /// unconditionally — the container-recreating dance
+    /// `enable_continuous_archiving` normally skips once `walg.env` already
+    /// exists on the volume, because that check is presence-only and can't
+    /// tell "already active, no need to redo this" apart from "active, but
+    /// pointed at a source we no longer want".
+    ///
+    /// Only the explicit, operator-initiated WAL archive source repoint
+    /// (`ExternalServiceManager::repoint_continuous_archive_source`) should call
+    /// this — it accepts the brief archiving outage a container recreate
+    /// causes, in exchange for actually moving where WAL segments land, not
+    /// just updating a database record that no longer matches reality.
+    pub async fn force_reenable_continuous_archiving(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &super::S3Credentials,
+        walg_prefix: &str,
+    ) -> Result<()> {
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+            .await
+    }
+
+    async fn write_wal_archiving_config(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &super::S3Credentials,
+        walg_prefix: &str,
+    ) -> Result<()> {
+        let postgres_config = self.get_postgres_config(service_config)?;
+        let container_name = self.get_live_container_name(&postgres_config);
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+        ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config)
+            .await
     }
 }
 
@@ -6354,6 +6400,7 @@ mod tests {
         let s3_creds = crate::externalsvc::S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "us-east-1".into(),
             endpoint: None,
             bucket_name: "b".into(),
@@ -6367,10 +6414,15 @@ mod tests {
             bucket_path: "".into(),
             access_key_id: "enc".into(),
             secret_key: "enc".into(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".into(),
             endpoint: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             backing_service_id: None,
@@ -6420,6 +6472,8 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
         // Build a MockDatabase for the `pool` slot — restore_pitr for
         // Postgres doesn't touch it in the legacy-reject path.

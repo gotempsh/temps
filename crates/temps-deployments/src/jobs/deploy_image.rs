@@ -1072,6 +1072,17 @@ impl DeployImageJob {
         &self.target
     }
 
+    /// Record a newly-created container and the deployer that owns it before
+    /// any subsequent fallible operation. Cleanup must never guess which
+    /// Docker daemon owns a container created on a worker node.
+    fn track_container(&self, container_id: String, deployer: Arc<dyn ContainerDeployer>) {
+        // Insert ownership first. This prevents cleanup from observing a
+        // container ID without the node-aware deployer needed to remove it.
+        lock_deployment_state(&self.replica_deployers, "replica_deployers")
+            .insert(container_id.clone(), deployer);
+        lock_deployment_state(&self.container_ids, "container_ids").push(container_id);
+    }
+
     async fn stop_background_log_stream(
         &self,
         context: &WorkflowContext,
@@ -1130,6 +1141,8 @@ impl DeployImageJob {
                     Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
                         self.log(context, format!("✅ Container {} is absent", container_id))
                             .await?;
+                        lock_deployment_state(&self.replica_deployers, "replica_deployers")
+                            .remove(container_id);
                     }
                     Err(error) => {
                         cleanup_errors.push(format!("container {container_id}: {error}"));
@@ -1144,6 +1157,17 @@ impl DeployImageJob {
                     }
                 }
             }
+
+            // Snapshot ownership before locking the ID list. `track_container`
+            // acquires these locks in the opposite phase (ownership, then IDs),
+            // so nesting them here could deadlock a concurrent cancellation.
+            let remaining_container_ids =
+                lock_deployment_state(&self.replica_deployers, "replica_deployers")
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>();
+            lock_deployment_state(&self.container_ids, "container_ids")
+                .retain(|container_id| remaining_container_ids.contains(container_id));
         }
 
         if !cleanup_errors.is_empty() {
@@ -1930,15 +1954,9 @@ impl DeployImageJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
             })?;
 
-        // CRITICAL: Store container_id immediately for cleanup on failure/cancellation
-        {
-            let mut container_ids = lock_deployment_state(&self.container_ids, "container_ids");
-            container_ids.push(deploy_result.container_id.clone());
-        }
-        {
-            let mut deployers = lock_deployment_state(&self.replica_deployers, "replica_deployers");
-            deployers.insert(deploy_result.container_id.clone(), deployer.clone());
-        }
+        // Store both the ID and its owning deployer before status checks,
+        // startup log streaming, health checks, or any other fallible work.
+        self.track_container(deploy_result.container_id.clone(), deployer.clone());
 
         // A rolling-upgrade cluster may still have an older agent that ignores
         // PortMapping.host_ip. Inspect what Docker actually published before
@@ -2073,6 +2091,7 @@ impl DeployImageJob {
         let log_id = self.log_id.clone();
         let log_service = self.log_service.clone();
         let context_for_logs = context.clone();
+        let deployer_for_logs = deployer.clone();
 
         let log_task = tokio::spawn(async move {
             // Helper macro to write logs in the background task
@@ -2092,29 +2111,22 @@ impl DeployImageJob {
                 "📋 Streaming container logs for 15s...".to_string()
             );
 
-            // Connect to Docker
-            let docker = match bollard::Docker::connect_with_local_defaults() {
-                Ok(d) => d,
+            // Ask the selected deployer for logs. For worker assignments this
+            // streams through the worker agent instead of opening the control
+            // plane's local Docker socket.
+            let mut log_stream = match deployer_for_logs
+                .stream_container_logs(&container_id_for_logs)
+                .await
+            {
+                Ok(stream) => stream,
                 Err(e) => {
                     write_log!(
                         LogLevel::Warning,
-                        format!("⚠️  Cannot stream logs - Docker connection failed: {}", e)
+                        format!("⚠️  Cannot stream logs from the container's node: {}", e)
                     );
                     return;
                 }
             };
-
-            // Configure log options
-            let log_options = bollard::query_parameters::LogsOptions {
-                stdout: true,
-                stderr: true,
-                follow: true,
-                timestamps: false,
-                ..Default::default()
-            };
-
-            // Stream logs with timeout
-            let mut log_stream = docker.logs(&container_id_for_logs, Some(log_options));
             let mut line_count = 0;
             let max_lines = 100;
             let timeout = tokio::time::sleep(std::time::Duration::from_secs(15));
@@ -2129,8 +2141,8 @@ impl DeployImageJob {
                     }
                     log_result = log_stream.next() => {
                         match log_result {
-                            Some(Ok(log_output)) => {
-                                let clean_msg = log_output.to_string().trim().to_string();
+                            Some(log_output) => {
+                                let clean_msg = log_output.trim().to_string();
                                 if !clean_msg.is_empty() {
                                     write_log!(LogLevel::Info,
                                         format!("🐳 {}", clean_msg));
@@ -2142,11 +2154,6 @@ impl DeployImageJob {
                                         break;
                                     }
                                 }
-                            }
-                            Some(Err(e)) => {
-                                write_log!(LogLevel::Warning,
-                                    format!("⚠️  Log stream error: {}", e));
-                                break;
                             }
                             None => {
                                 write_log!(LogLevel::Info,

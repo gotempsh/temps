@@ -27,9 +27,10 @@ use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::audit::{
-    ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberPromotedAudit,
-    ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
-    ExternalServiceDeletedAudit, ExternalServiceEnvironmentVariableRevealedAudit,
+    ContinuousArchiveSourceRepointedAudit, ExternalServiceClusterMemberAddedAudit,
+    ExternalServiceClusterMemberPromotedAudit, ExternalServiceClusterMemberRemovedAudit,
+    ExternalServiceCreatedAudit, ExternalServiceDeletedAudit,
+    ExternalServiceEnvironmentVariableRevealedAudit,
     ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceParameterRevealedAudit,
     ExternalServiceProjectLinkedAudit, ExternalServiceProjectUnlinkedAudit,
     ExternalServiceRuntimeCredentialsIssuedAudit, ExternalServiceStatusChangedAudit,
@@ -37,13 +38,13 @@ use super::audit::{
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
-    ClusterMemberHealthResponse, CreateExternalServiceRequest, EnvironmentVariableInfo,
-    ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
+    ClusterMemberHealthResponse, ContinuousArchiveSourceResponse, CreateExternalServiceRequest,
+    EnvironmentVariableInfo, ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
     ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    RetryClusterRequest, RuntimeCredentialsResponse, SensitiveValueResponse, ServiceHealthResponse,
-    ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
-    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
-    UpgradeExternalServiceRequest,
+    RepointContinuousArchiveSourceRequest, RetryClusterRequest, RuntimeCredentialsResponse,
+    SensitiveValueResponse, ServiceHealthResponse, ServiceHealthStatusBatchResponse,
+    ServiceHealthStatusEntryResponse, ServiceMemberInfo, ServiceParameter, ServiceTypeInfo,
+    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
 };
 use crate::services::EnvironmentVariableOptions;
 use temps_core::AuditContext;
@@ -271,6 +272,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/wal-health",
             get(get_postgres_wal_health),
+        )
+        .route(
+            "/external-services/{id}/continuous-archive-source",
+            post(repoint_continuous_archive_source),
         )
         .route(
             "/external-services/health-status-batch",
@@ -1387,6 +1392,147 @@ async fn get_postgres_wal_health(
         }
         Err(e) => Err(internal_server_error()
             .detail(format!("Failed to load WAL health: {}", e))
+            .build()),
+    }
+}
+
+/// Repoint a service's continuous archive source
+///
+/// Deliberately, explicitly moves where a service's continuous, standing
+/// archiving process writes: Postgres/Timescale's WAL-G `archive_command`,
+/// or MariaDB's binlog shipper. Both need everything written under one S3
+/// prefix to stay restorable — data archived before this call lives under
+/// the *previous* source and will no longer be verifiable or replayable
+/// once archiving points at the new one.
+///
+/// This exists because a backup schedule that requests a different S3
+/// source than the one archiving is currently pinned to is refused, not
+/// silently honoured (see `ExternalServiceManager::repoint_continuous_archive_source`
+/// for the incident this prevents). Call this endpoint to deliberately move
+/// the pin instead — for example, to switch a service from an operator's
+/// own S3 source onto Temps Cloud's managed one.
+#[utoipa::path(
+    post,
+    path = "/external-services/{id}/continuous-archive-source",
+    operation_id = "repointContinuousArchiveSource",
+    tag = "External Services",
+    request_body = RepointContinuousArchiveSourceRequest,
+    responses(
+        (status = 200, description = "Continuous archive source repointed", body = ContinuousArchiveSourceResponse),
+        (status = 400, description = "Service type does not support continuous archiving, or the requested S3 source does not exist"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+    )
+)]
+async fn repoint_continuous_archive_source(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<RepointContinuousArchiveSourceRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+
+    // `assert_service_owned_by_caller` only proves the caller may manage
+    // `id` -- it says nothing about whether they may use
+    // `request.new_s3_source_id`. Unlike `external_services`, `s3_sources`
+    // carries no project scoping at all (see its entity definition), so
+    // every other endpoint that touches one (`list_s3_sources`,
+    // `create_s3_source`, `get_s3_source`, `update_s3_source` in
+    // `temps-backup`) gates on "instance admin, or no team-access checker is
+    // registered at all" instead. Without the same gate here, a Teams
+    // project admin with only `ExternalServicesWrite` on their own project
+    // could name the ID of an S3 source they were never granted and redirect
+    // this service's WAL straight into it.
+    if !auth.is_instance_admin()
+        && !(auth.project_id().is_none() && app_state.project_access_checker.is_none())
+    {
+        return Err(forbidden()
+            .title("Insufficient Permissions")
+            .detail("Only an administrator may repoint a continuous archive source")
+            .build());
+    }
+
+    let previous_s3_source_id = match app_state.external_service_manager.get_service(id).await {
+        Ok(service) => service.continuous_archive_s3_source_id,
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            return Err(not_found().detail("Service not found").build());
+        }
+        Err(e) => {
+            return Err(internal_server_error()
+                .detail(format!("Failed to load service: {}", e))
+                .build())
+        }
+    };
+
+    match app_state
+        .external_service_manager
+        .repoint_continuous_archive_source(id, request.new_s3_source_id)
+        .await
+    {
+        Ok(service) => {
+            let audit = ContinuousArchiveSourceRepointedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent.clone(),
+                },
+                service_id: service.id,
+                name: service.name.clone(),
+                previous_s3_source_id,
+                new_s3_source_id: request.new_s3_source_id,
+            };
+            if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+                error!("Failed to create audit log: {}", e);
+            }
+
+            let Some(pinned_at) = service.continuous_archive_pinned_at else {
+                return Err(internal_server_error()
+                    .detail("Repoint succeeded but the service has no pin timestamp")
+                    .build());
+            };
+            Ok((
+                StatusCode::OK,
+                Json(ContinuousArchiveSourceResponse {
+                    service_id: service.id,
+                    continuous_archive_s3_source_id: request.new_s3_source_id,
+                    continuous_archive_pinned_at: pinned_at.to_rfc3339(),
+                }),
+            ))
+        }
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            Err(not_found().detail("Service not found").build())
+        }
+        Err(e @ crate::services::ExternalServiceError::InvalidServiceType { .. }) => {
+            Err(bad_request().detail(e.to_string()).build())
+        }
+        Err(e @ crate::services::ExternalServiceError::ParameterValidationFailed { .. }) => {
+            Err(bad_request().detail(e.to_string()).build())
+        }
+        // Distinct from a plain 500: the DB persist failed after retries, so
+        // retrying this same request once the database is reachable is the
+        // correct recovery action. For Postgres/Timescale the container was
+        // already physically repointed (genuine desync); for MariaDB nothing
+        // moved (pin update is the entire repoint, so a retry is safe and
+        // idempotent). Either way the caller needs to know to retry, not just
+        // "something went wrong, investigate the logs" -- a client that only
+        // sees a generic 500 has no way to tell those two situations apart.
+        // `e.to_string()` surfaces the engine-accurate detail from the error.
+        Err(e @ crate::services::ExternalServiceError::ArchiveSourceDesynced { .. }) => {
+            Err(ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                .title("Archive Source Pin Desynchronized")
+                .detail(e.to_string())
+                .build())
+        }
+        Err(e) => Err(internal_server_error()
+            .detail(format!(
+                "Failed to repoint continuous archive source: {}",
+                e
+            ))
             .build()),
     }
 }
@@ -2990,6 +3136,7 @@ async fn update_service_resources(
         get_service_health_status,
         trigger_service_health_check,
         get_postgres_wal_health,
+        repoint_continuous_archive_source,
         list_service_health_statuses,
         get_cluster_health,
         get_service_runtime,
@@ -3032,6 +3179,8 @@ async fn update_service_resources(
         CreateExternalServiceRequest,
         UpdateExternalServiceRequest,
         UpgradeExternalServiceRequest,
+        RepointContinuousArchiveSourceRequest,
+        ContinuousArchiveSourceResponse,
         RetryClusterRequest,
         AddClusterMemberRequest,
         ServiceMemberInfo,
@@ -3538,6 +3687,8 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
         let db = Arc::new(
             MockDatabase::new(sea_orm::DatabaseBackend::Postgres)

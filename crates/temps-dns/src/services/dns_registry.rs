@@ -37,8 +37,8 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
-    Statement, TransactionTrait,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Statement,
+    TransactionTrait,
 };
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -46,7 +46,7 @@ use std::sync::Arc;
 use temps_core::DBDateTime;
 use temps_entities::{node_dns_state, service_endpoints};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Allowed DNS record types in the internal zone.
 ///
@@ -303,8 +303,6 @@ pub struct ZoneSnapshot {
 /// returning a full snapshot instead. Picked to keep a single response
 /// well under typical body limits while still letting agents catch up
 /// from short outages without re-snapshotting.
-const SNAPSHOT_THRESHOLD: usize = 1_000;
-
 #[derive(Clone)]
 pub struct DnsRegistry {
     db: Arc<DatabaseConnection>,
@@ -570,16 +568,14 @@ impl DnsRegistry {
         Ok(out)
     }
 
-    /// Long-poll diff. Returns records with `generation > since` plus
-    /// (separately) the IDs of any records the agent should drop.
+    /// Return DNS changes since `since`.
     ///
-    /// Note: with the current "delete-old, insert-new" replace semantics,
-    /// removed records leave no row behind we can hand back as a tombstone.
-    /// Step 2 (the resolver crate) handles this by replacing the entire
-    /// zone whenever it observes a generation jump it can't account for —
-    /// for now we always return `removed_ids = []` and let the resolver
-    /// reconcile by name. If the diff is large or `since=0`, the response
-    /// is a full snapshot instead.
+    /// A changed generation is currently returned as an authoritative full
+    /// snapshot. Endpoint replacement is implemented as delete-old +
+    /// insert-new, and deleted rows leave no tombstone behind. Sending only
+    /// the new rows would therefore make workers retain the old row IDs and
+    /// eventually serve stale or duplicate answers. Full snapshots preserve
+    /// correctness until the registry has durable deletion tombstones.
     pub async fn get_changes_since(&self, since: i64) -> Result<ChangeSet, DnsRegistryError> {
         let current = current_generation(self.db.as_ref()).await?;
         if since <= 0 || current <= since {
@@ -602,32 +598,11 @@ impl DnsRegistry {
             });
         }
 
-        let records = service_endpoints::Entity::find()
-            .filter(service_endpoints::Column::Generation.gt(since))
-            .order_by_asc(service_endpoints::Column::Generation)
-            .order_by_asc(service_endpoints::Column::Id)
-            .limit((SNAPSHOT_THRESHOLD as u64) + 1)
-            .all(self.db.as_ref())
-            .await?;
-
-        if records.len() > SNAPSHOT_THRESHOLD {
-            warn!(
-                since,
-                current, "diff exceeds snapshot threshold; returning full zone instead"
-            );
-            let snap = self.get_full_zone().await?;
-            return Ok(ChangeSet {
-                generation: snap.generation,
-                full_snapshot: true,
-                records: snap.records,
-                removed_ids: vec![],
-            });
-        }
-
+        let snap = self.get_full_zone().await?;
         Ok(ChangeSet {
-            generation: current,
-            full_snapshot: false,
-            records,
+            generation: snap.generation,
+            full_snapshot: true,
+            records: snap.records,
             removed_ids: vec![],
         })
     }

@@ -10,27 +10,26 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import { CopyButton } from '@/components/ui/copy-button'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertTriangle, Globe } from 'lucide-react'
+import { buildMultiNodeSetupCommand } from '@/lib/cluster-network-command'
+import { AlertTriangle, Globe, LockKeyhole, Network } from 'lucide-react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 
 /**
  * Cluster DNS (ADR-024, experimental beta) toggle.
  *
- * Off by default — a past incident showed the injected resolver adding
- * 22-27s delays to outbound connections when it was slow to answer for
- * non-`*.temps.local` hostnames (glibc cycled through all three configured
- * nameservers at ~5s timeout x2 attempts each before falling through).
- * Operators who need `*.temps.local` service-to-service resolution inside
- * containers (e.g. reaching a managed Postgres cluster by hostname from a
- * single control-plane node, where no worker agent is running its own
- * resolver) must explicitly opt in here.
+ * Off by default. Operators who need `*.temps.local` service-to-service
+ * resolution inside containers must explicitly opt in here.
  */
 export function ClusterDnsCard() {
   const { data: settings, isLoading, error } = useSettings()
   const updateSettings = useUpdateSettings()
+  const clusterNetwork = settings?.multi_node.cluster_network
 
   if (isLoading) {
     return (
@@ -106,13 +105,11 @@ export function ClusterDnsCard() {
       <CardContent className="space-y-4">
         <Alert>
           <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>Known risk before enabling</AlertTitle>
+          <AlertTitle>Cluster-wide setting</AlertTitle>
           <AlertDescription>
-            A past incident showed 22-27s outbound connection delays when the
-            injected resolver was slow to answer for hostnames outside{' '}
-            <code>*.temps.local</code> — glibc retried all three configured
-            nameservers at ~5s timeout x2 attempts each. Only enable this if you
-            need <code>*.temps.local</code> resolution inside containers.
+            Incorrect DNS configuration can break service discovery across the
+            cluster. Verify node and application health before and after
+            changing it.
           </AlertDescription>
         </Alert>
 
@@ -133,7 +130,114 @@ export function ClusterDnsCard() {
             onCheckedChange={onCheckedChange}
           />
         </div>
+
+        <div className="rounded-lg border">
+          <div className="flex items-start gap-3 border-b p-4">
+            <Network className="mt-0.5 h-5 w-5 text-muted-foreground" />
+            <div className="space-y-1">
+              <p className="text-sm font-medium">Container network</p>
+              <p className="text-xs text-muted-foreground">
+                Temps assigns one subnet from this cluster-wide pool to each
+                control-plane or worker node.
+              </p>
+            </div>
+          </div>
+
+          {clusterNetwork ? (
+            <ClusterNetworkConfiguration
+              key={`${clusterNetwork.compute_pool_cidr}/${clusterNetwork.subnet_prefix_len}`}
+              computePoolCidr={clusterNetwork.compute_pool_cidr}
+              subnetPrefixLen={clusterNetwork.subnet_prefix_len}
+              allocationCount={clusterNetwork.allocation_count}
+              locked={clusterNetwork.locked}
+            />
+          ) : (
+            <p className="p-4 text-xs text-muted-foreground">
+              Cluster network state is unavailable. Run{' '}
+              <code>temps network status</code> on the control-plane host to
+              inspect it.
+            </p>
+          )}
+        </div>
       </CardContent>
     </Card>
+  )
+}
+
+interface ClusterNetworkConfigurationProps {
+  computePoolCidr: string
+  subnetPrefixLen: number
+  allocationCount: number
+  locked: boolean
+}
+
+function ClusterNetworkConfiguration({
+  computePoolCidr,
+  subnetPrefixLen,
+  allocationCount,
+  locked,
+}: ClusterNetworkConfigurationProps) {
+  const [poolCidr, setPoolCidr] = useState(computePoolCidr)
+  const [nodePrefix, setNodePrefix] = useState(String(subnetPrefixLen))
+  const setupCommand = buildMultiNodeSetupCommand(poolCidr, nodePrefix)
+
+  return (
+    <div className="space-y-4 p-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="space-y-2">
+          <Label htmlFor="cluster-compute-pool">Pool CIDR</Label>
+          <Input
+            id="cluster-compute-pool"
+            value={poolCidr}
+            disabled={locked}
+            onChange={(event) => setPoolCidr(event.target.value)}
+            spellCheck={false}
+            className="font-mono"
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="cluster-node-prefix">Per-node prefix</Label>
+          <Input
+            id="cluster-node-prefix"
+            value={nodePrefix}
+            disabled={locked}
+            onChange={(event) => setNodePrefix(event.target.value)}
+            inputMode="numeric"
+            className="font-mono"
+          />
+        </div>
+      </div>
+
+      {locked ? (
+        <div className="flex gap-2 rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
+          <LockKeyhole className="h-4 w-4 shrink-0" />
+          <p>
+            Locked after {allocationCount}{' '}
+            {allocationCount === 1
+              ? 'network allocation'
+              : 'network allocations'}
+            . Changing an active pool requires an explicit cluster network
+            migration so existing workloads are not stranded.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-xs text-muted-foreground">
+            No subnets have been allocated yet. Run this command on the
+            control-plane host to set the pool safely:
+          </p>
+          <div className="flex items-center gap-2 rounded-md bg-muted p-3">
+            <code className="min-w-0 flex-1 overflow-x-auto text-xs">
+              {setupCommand}
+            </code>
+            <CopyButton
+              minimal
+              value={setupCommand}
+              label="Copy network setup command"
+            />
+          </div>
+        </div>
+      )}
+    </div>
   )
 }

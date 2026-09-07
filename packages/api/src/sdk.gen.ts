@@ -131,6 +131,9 @@ import type {
   CancelBackupData,
   CancelBackupErrors,
   CancelBackupResponses,
+  CancelBulkActivationJobData,
+  CancelBulkActivationJobErrors,
+  CancelBulkActivationJobResponses,
   CancelData,
   CancelDeploymentData,
   CancelDeploymentErrors,
@@ -247,6 +250,9 @@ import type {
   CreateBitbucketProviderData,
   CreateBitbucketProviderErrors,
   CreateBitbucketProviderResponses,
+  CreateBulkActivationJobData,
+  CreateBulkActivationJobErrors,
+  CreateBulkActivationJobResponses,
   CreateCloudflareProviderData,
   CreateCloudflareProviderErrors,
   CreateCloudflareProviderResponses,
@@ -604,6 +610,8 @@ import type {
   DisableMfaData,
   DisableMfaErrors,
   DisableMfaResponses,
+  DisconnectCloudData,
+  DisconnectCloudResponses,
   DiscoverWorkloadsData,
   DiscoverWorkloadsErrors,
   DiscoverWorkloadsResponses,
@@ -631,6 +639,11 @@ import type {
   EnrichVisitorData,
   EnrichVisitorErrors,
   EnrichVisitorResponses,
+  EnrollCloudData,
+  EnrollCloudResponses,
+  EstimateBulkActivationData,
+  EstimateBulkActivationErrors,
+  EstimateBulkActivationResponses,
   ExecData,
   ExecDetachedData,
   ExecDetachedErrors,
@@ -793,6 +806,9 @@ import type {
   GetBucketedStatusData,
   GetBucketedStatusErrors,
   GetBucketedStatusResponses,
+  GetBulkActivationJobData,
+  GetBulkActivationJobErrors,
+  GetBulkActivationJobResponses,
   GetChallengeTokenData,
   GetChallengeTokenErrors,
   GetChallengeTokenResponses,
@@ -802,6 +818,18 @@ import type {
   GetCliStatusData,
   GetCliStatusErrors,
   GetCliStatusResponses,
+  GetCloudAiCapabilityData,
+  GetCloudAiCapabilityResponses,
+  GetCloudBackfillStatusData,
+  GetCloudBackfillStatusErrors,
+  GetCloudBackfillStatusResponses,
+  GetCloudCapabilityData,
+  GetCloudCapabilityResponses,
+  GetCloudStatusData,
+  GetCloudStatusResponses,
+  GetCloudTelemetryStatusData,
+  GetCloudTelemetryStatusErrors,
+  GetCloudTelemetryStatusResponses,
   GetClusterHealthData,
   GetClusterHealthErrors,
   GetClusterHealthResponses,
@@ -842,6 +870,9 @@ import type {
   GetCrossProjectTraceSiblingsData,
   GetCrossProjectTraceSiblingsErrors,
   GetCrossProjectTraceSiblingsResponses,
+  GetCurrentBulkActivationJobData,
+  GetCurrentBulkActivationJobErrors,
+  GetCurrentBulkActivationJobResponses,
   GetCurrentMonitorStatusData,
   GetCurrentMonitorStatusErrors,
   GetCurrentMonitorStatusResponses,
@@ -986,6 +1017,9 @@ import type {
   GetExternalImageData,
   GetExternalImageErrors,
   GetExternalImageResponses,
+  GetExternalServiceBackupCapabilityData,
+  GetExternalServiceBackupCapabilityErrors,
+  GetExternalServiceBackupCapabilityResponses,
   GetFailureReportPreviewData,
   GetFailureReportPreviewErrors,
   GetFailureReportPreviewResponses,
@@ -1146,10 +1180,12 @@ import type {
   GetPreferencesErrors,
   GetPreferencesResponses,
   GetPreviewGatewayLogsData,
+  GetPreviewGatewayLogsErrors,
   GetPreviewGatewayLogsResponses,
   GetPreviewGatewaySettingsData,
   GetPreviewGatewaySettingsResponses,
   GetPreviewGatewayStatusData,
+  GetPreviewGatewayStatusErrors,
   GetPreviewGatewayStatusResponses,
   GetPricingData,
   GetPricingErrors,
@@ -1163,6 +1199,9 @@ import type {
   GetProjectBySlugData,
   GetProjectBySlugErrors,
   GetProjectBySlugResponses,
+  GetProjectCloudTelemetryData,
+  GetProjectCloudTelemetryErrors,
+  GetProjectCloudTelemetryResponses,
   GetProjectData,
   GetProjectDeploymentsData,
   GetProjectDeploymentsErrors,
@@ -1486,6 +1525,9 @@ import type {
   HasTracesData,
   HasTracesErrors,
   HasTracesResponses,
+  ImportEmailDomainData,
+  ImportEmailDomainErrors,
+  ImportEmailDomainResponses,
   ImportExternalServiceData,
   ImportExternalServiceErrors,
   ImportExternalServiceResponses,
@@ -1960,6 +2002,7 @@ import type {
   PatchAdminGateErrors,
   PatchAdminGateResponses,
   PatchPreviewGatewaySettingsData,
+  PatchPreviewGatewaySettingsErrors,
   PatchPreviewGatewaySettingsResponses,
   PauseDeploymentData,
   PauseDeploymentErrors,
@@ -2033,6 +2076,8 @@ import type {
   RebuildSandboxImageData,
   RebuildSandboxImageErrors,
   RebuildSandboxImageResponses,
+  ReconcileCloudBackupSourceData,
+  ReconcileCloudBackupSourceResponses,
   RecordConsoleEventData,
   RecordConsoleEventErrors,
   RecordConsoleEventResponses,
@@ -2090,6 +2135,9 @@ import type {
   RenewDomainData,
   RenewDomainErrors,
   RenewDomainResponses,
+  RepointContinuousArchiveSourceData,
+  RepointContinuousArchiveSourceErrors,
+  RepointContinuousArchiveSourceResponses,
   RequestDiscoveredRouteCertData,
   RequestDiscoveredRouteCertErrors,
   RequestDiscoveredRouteCertResponses,
@@ -2115,6 +2163,7 @@ import type {
   RestartContainerErrors,
   RestartContainerResponses,
   RestartPreviewGatewayData,
+  RestartPreviewGatewayErrors,
   RestartPreviewGatewayResponses,
   RestartSandboxData,
   RestartSandboxErrors,
@@ -2232,6 +2281,9 @@ import type {
   RotateApiKeyData,
   RotateApiKeyErrors,
   RotateApiKeyResponses,
+  RotateClusterCaData,
+  RotateClusterCaErrors,
+  RotateClusterCaResponses,
   RotateDeploymentTokenData,
   RotateDeploymentTokenErrors,
   RotateDeploymentTokenResponses,
@@ -2457,6 +2509,8 @@ import type {
   UpdateBackupScheduleData,
   UpdateBackupScheduleErrors,
   UpdateBackupScheduleResponses,
+  UpdateCloudFeaturesData,
+  UpdateCloudFeaturesResponses,
   UpdateCloudflareProviderData,
   UpdateCloudflareProviderErrors,
   UpdateCloudflareProviderResponses,
@@ -2531,6 +2585,9 @@ import type {
   UpdatePreferencesData,
   UpdatePreferencesErrors,
   UpdatePreferencesResponses,
+  UpdateProjectCloudTelemetryData,
+  UpdateProjectCloudTelemetryErrors,
+  UpdateProjectCloudTelemetryResponses,
   UpdateProjectData,
   UpdateProjectDeploymentConfigData,
   UpdateProjectDeploymentConfigErrors,
@@ -2601,6 +2658,7 @@ import type {
   UpdateWebhookProviderResponses,
   UpdateWebhookResponses,
   UpgradePreviewGatewayData,
+  UpgradePreviewGatewayErrors,
   UpgradePreviewGatewayResponses,
   UpgradeProjectServiceTemplateData,
   UpgradeProjectServiceTemplateErrors,
@@ -4621,6 +4679,32 @@ export const cleanupExpiredBackups = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Report whether an existing service can produce a Cloud-restorable backup.
+ *
+ * This probes the running container instead of trusting its configured image
+ * name: operators can build their own WAL-G image, and an image label alone
+ * cannot prove that the binary is actually executable.
+ */
+export const getExternalServiceBackupCapability = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetExternalServiceBackupCapabilityData, ThrowOnError>,
+): RequestResult<
+  GetExternalServiceBackupCapabilityResponses,
+  GetExternalServiceBackupCapabilityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetExternalServiceBackupCapabilityResponses,
+    GetExternalServiceBackupCapabilityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/backups/external-services/{id}/capability",
+    ...options,
+  });
+
+/**
  * Run a backup for an external service manually.
  *
  * Enqueues the backup for asynchronous execution via the `BackupRunner`
@@ -5502,6 +5586,103 @@ export const blobHead = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/blob/{project_id}/{path}",
+    ...options,
+  });
+
+export const disconnectCloud = <ThrowOnError extends boolean = false>(
+  options?: Options<DisconnectCloudData, ThrowOnError>,
+): RequestResult<DisconnectCloudResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).delete<
+    DisconnectCloudResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud",
+    ...options,
+  });
+
+export const getCloudAiCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudAiCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudAiCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudAiCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/ai/capability",
+    ...options,
+  });
+
+export const reconcileCloudBackupSource = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<ReconcileCloudBackupSourceData, ThrowOnError>,
+): RequestResult<ReconcileCloudBackupSourceResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).post<
+    ReconcileCloudBackupSourceResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/backups/source/reconcile",
+    ...options,
+  });
+
+export const getCloudCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/capability",
+    ...options,
+  });
+
+export const enrollCloud = <ThrowOnError extends boolean = false>(
+  options: Options<EnrollCloudData, ThrowOnError>,
+): RequestResult<EnrollCloudResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).post<EnrollCloudResponses, unknown, ThrowOnError>({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/enroll",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateCloudFeatures = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateCloudFeaturesData, ThrowOnError>,
+): RequestResult<UpdateCloudFeaturesResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).patch<
+    UpdateCloudFeaturesResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/features",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getCloudStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudStatusData, ThrowOnError>,
+): RequestResult<GetCloudStatusResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudStatusResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/status",
     ...options,
   });
 
@@ -6511,6 +6692,35 @@ export const getDomainByName = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Import an already-provisioned email domain from the provider
+ *
+ * Use this endpoint when the domain identity was created directly in the email
+ * provider's console or API. Temps will fetch its current verification state
+ * rather than registering a new identity, preventing duplicate or conflicting
+ * provider-side entries.
+ */
+export const importEmailDomain = <ThrowOnError extends boolean = false>(
+  options: Options<ImportEmailDomainData, ThrowOnError>,
+): RequestResult<
+  ImportEmailDomainResponses,
+  ImportEmailDomainErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ImportEmailDomainResponses,
+    ImportEmailDomainErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-domains/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Delete an email domain
  */
 export const deleteEmailDomain = <ThrowOnError extends boolean = false>(
@@ -7323,6 +7533,45 @@ export const getClusterHealth = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/external-services/{id}/cluster-health",
     ...options,
+  });
+
+/**
+ * Repoint a service's continuous archive source
+ *
+ * Deliberately, explicitly moves where a service's continuous, standing
+ * archiving process writes: Postgres/Timescale's WAL-G `archive_command`,
+ * or MariaDB's binlog shipper. Both need everything written under one S3
+ * prefix to stay restorable — data archived before this call lives under
+ * the *previous* source and will no longer be verifiable or replayable
+ * once archiving points at the new one.
+ *
+ * This exists because a backup schedule that requests a different S3
+ * source than the one archiving is currently pinned to is refused, not
+ * silently honoured (see `ExternalServiceManager::repoint_continuous_archive_source`
+ * for the incident this prevents). Call this endpoint to deliberately move
+ * the pin instead — for example, to switch a service from an operator's
+ * own S3 source onto Temps Cloud's managed one.
+ */
+export const repointContinuousArchiveSource = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<RepointContinuousArchiveSourceData, ThrowOnError>,
+): RequestResult<
+  RepointContinuousArchiveSourceResponses,
+  RepointContinuousArchiveSourceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RepointContinuousArchiveSourceResponses,
+    RepointContinuousArchiveSourceErrors,
+    ThrowOnError
+  >({
+    url: "/external-services/{id}/continuous-archive-source",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -11034,6 +11283,202 @@ export const updateAlert = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Status of the most recent Temps Cloud telemetry backfill for a project.
+ */
+export const getCloudBackfillStatus = <ThrowOnError extends boolean = false>(
+  options: Options<GetCloudBackfillStatusData, ThrowOnError>,
+): RequestResult<
+  GetCloudBackfillStatusResponses,
+  GetCloudBackfillStatusErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetCloudBackfillStatusResponses,
+    GetCloudBackfillStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/backfill/{project_id}",
+    ...options,
+  });
+
+/**
+ * Queue the activation that was quoted.
+ */
+export const createBulkActivationJob = <ThrowOnError extends boolean = false>(
+  options: Options<CreateBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  CreateBulkActivationJobResponses,
+  CreateBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateBulkActivationJobResponses,
+    CreateBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * The activation currently pending or running, or `null`.
+ */
+export const getCurrentBulkActivationJob = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<GetCurrentBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  GetCurrentBulkActivationJobResponses,
+  GetCurrentBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetCurrentBulkActivationJobResponses,
+    GetCurrentBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/current",
+    ...options,
+  });
+
+/**
+ * Quote a bulk Cloud-telemetry activation. Sends nothing.
+ */
+export const estimateBulkActivation = <ThrowOnError extends boolean = false>(
+  options: Options<EstimateBulkActivationData, ThrowOnError>,
+): RequestResult<
+  EstimateBulkActivationResponses,
+  EstimateBulkActivationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    EstimateBulkActivationResponses,
+    EstimateBulkActivationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/estimate",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * One activation job, with per-project rows and an ETA.
+ */
+export const getBulkActivationJob = <ThrowOnError extends boolean = false>(
+  options: Options<GetBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  GetBulkActivationJobResponses,
+  GetBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetBulkActivationJobResponses,
+    GetBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/{batch_id}",
+    ...options,
+  });
+
+/**
+ * Ask an activation to stop at the next chunk boundary.
+ */
+export const cancelBulkActivationJob = <ThrowOnError extends boolean = false>(
+  options: Options<CancelBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  CancelBulkActivationJobResponses,
+  CancelBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CancelBulkActivationJobResponses,
+    CancelBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel",
+    ...options,
+  });
+
+/**
+ * A project's Cloud telemetry write mode and fidelity.
+ */
+export const getProjectCloudTelemetry = <ThrowOnError extends boolean = false>(
+  options: Options<GetProjectCloudTelemetryData, ThrowOnError>,
+): RequestResult<
+  GetProjectCloudTelemetryResponses,
+  GetProjectCloudTelemetryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetProjectCloudTelemetryResponses,
+    GetProjectCloudTelemetryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/projects/{project_id}",
+    ...options,
+  });
+
+/**
+ * Change a project's Cloud telemetry write mode and/or fidelity.
+ */
+export const updateProjectCloudTelemetry = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateProjectCloudTelemetryData, ThrowOnError>,
+): RequestResult<
+  UpdateProjectCloudTelemetryResponses,
+  UpdateProjectCloudTelemetryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateProjectCloudTelemetryResponses,
+    UpdateProjectCloudTelemetryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/projects/{project_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Instance-wide Cloud telemetry write status.
+ */
+export const getCloudTelemetryStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudTelemetryStatusData, ThrowOnError>,
+): RequestResult<
+  GetCloudTelemetryStatusResponses,
+  GetCloudTelemetryStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetCloudTelemetryStatusResponses,
+    GetCloudTelemetryStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/status",
+    ...options,
+  });
+
+/**
  * List dashboards for a project (newest first, paginated).
  */
 export const listDashboards = <ThrowOnError extends boolean = false>(
@@ -11992,10 +12437,14 @@ export const generatePresetDockerfile = <ThrowOnError extends boolean = false>(
 
 export const getPreviewGatewayLogs = <ThrowOnError extends boolean = false>(
   options?: Options<GetPreviewGatewayLogsData, ThrowOnError>,
-): RequestResult<GetPreviewGatewayLogsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetPreviewGatewayLogsResponses,
+  GetPreviewGatewayLogsErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).get<
     GetPreviewGatewayLogsResponses,
-    unknown,
+    GetPreviewGatewayLogsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12005,10 +12454,14 @@ export const getPreviewGatewayLogs = <ThrowOnError extends boolean = false>(
 
 export const restartPreviewGateway = <ThrowOnError extends boolean = false>(
   options?: Options<RestartPreviewGatewayData, ThrowOnError>,
-): RequestResult<RestartPreviewGatewayResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  RestartPreviewGatewayResponses,
+  RestartPreviewGatewayErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).post<
     RestartPreviewGatewayResponses,
-    unknown,
+    RestartPreviewGatewayErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12033,10 +12486,14 @@ export const patchPreviewGatewaySettings = <
   ThrowOnError extends boolean = false,
 >(
   options: Options<PatchPreviewGatewaySettingsData, ThrowOnError>,
-): RequestResult<PatchPreviewGatewaySettingsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  PatchPreviewGatewaySettingsResponses,
+  PatchPreviewGatewaySettingsErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).patch<
     PatchPreviewGatewaySettingsResponses,
-    unknown,
+    PatchPreviewGatewaySettingsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12050,10 +12507,14 @@ export const patchPreviewGatewaySettings = <
 
 export const getPreviewGatewayStatus = <ThrowOnError extends boolean = false>(
   options?: Options<GetPreviewGatewayStatusData, ThrowOnError>,
-): RequestResult<GetPreviewGatewayStatusResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetPreviewGatewayStatusResponses,
+  GetPreviewGatewayStatusErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).get<
     GetPreviewGatewayStatusResponses,
-    unknown,
+    GetPreviewGatewayStatusErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12063,10 +12524,14 @@ export const getPreviewGatewayStatus = <ThrowOnError extends boolean = false>(
 
 export const upgradePreviewGateway = <ThrowOnError extends boolean = false>(
   options: Options<UpgradePreviewGatewayData, ThrowOnError>,
-): RequestResult<UpgradePreviewGatewayResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  UpgradePreviewGatewayResponses,
+  UpgradePreviewGatewayErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).post<
     UpgradePreviewGatewayResponses,
-    unknown,
+    UpgradePreviewGatewayErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12159,9 +12624,9 @@ export const getVisibleCustomDomainByHostname = <
 /**
  * Create a new project from a template
  *
- * Creates a new repository from a template and sets up the project with the
- * specified configuration. The template is cloned to a new repository under
- * the authenticated user's account or specified organization.
+ * Image-backed service templates are created directly from their pinned image.
+ * Source-backed starter templates can either use their public repository or
+ * create a repository under the selected Git provider account.
  */
 export const createProjectFromTemplate = <ThrowOnError extends boolean = false>(
   options: Options<CreateProjectFromTemplateData, ThrowOnError>,
@@ -16590,9 +17055,8 @@ export const updateServiceTemplateRuntime = <
   });
 
 /**
- * Atomically replace a service-template project's image runtime and resource
- * profile. This endpoint is deliberately separate from generic project
- * settings because these fields form one deployable configuration.
+ * Return the immutable service-template release applied to a project together
+ * with catalog drift, missing requirements, and an available upgrade preview.
  */
 export const getProjectServiceTemplate = <ThrowOnError extends boolean = false>(
   options: Options<GetProjectServiceTemplateData, ThrowOnError>,
@@ -18011,6 +18475,31 @@ export const saveAiProviderCredential = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/settings/ai-providers/{provider_id}/credential",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Replace a compromised cluster CA and invalidate outstanding enrollment
+ * tokens. Existing workers fail closed until they are re-enrolled.
+ */
+export const rotateClusterCa = <ThrowOnError extends boolean = false>(
+  options: Options<RotateClusterCaData, ThrowOnError>,
+): RequestResult<
+  RotateClusterCaResponses,
+  RotateClusterCaErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RotateClusterCaResponses,
+    RotateClusterCaErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/cluster-ca/rotate",
     ...options,
     headers: {
       "Content-Type": "application/json",

@@ -18,6 +18,8 @@ temps-ai = { path = "../temps-ai" }
 temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
 temps-agents = { path = "../temps-agents" }
 temps-entities = { path = "../temps-entities" }
+temps-cloud-client = { path = "../temps-cloud-client" }
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -50,3 +52,4 @@ tower = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
+tempfile.workspace = true

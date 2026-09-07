@@ -59,7 +59,10 @@ impl TempsPlugin for AiGatewayPlugin {
             ));
             context.register_service(provider_preference_service.clone());
 
-            let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
+            let gateway_service = Arc::new(
+                GatewayService::new(provider_key_service.clone())
+                    .with_cloud_link(context.get_service::<temps_cloud_client::CloudLink>()),
+            );
             context.register_service(gateway_service.clone());
             let provider_model_service = Arc::new(ProviderModelService::new(
                 db.clone(),
