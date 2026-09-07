@@ -461,7 +461,8 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         "the forward corrective migration must demote ownership inferred by the shipped migration"
     );
 
-    Migrator::down(&db, Some(1)).await?;
+    let steps = steps_back_to("m20260904_000001_reset_ambiguous_managed_status_monitors");
+    Migrator::down(&db, Some(steps)).await?;
     let restored = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -474,7 +475,7 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         "rolling back the corrective migration must restore the captured ownership state"
     );
 
-    Migrator::up(&db, Some(1)).await?;
+    Migrator::up(&db, Some(steps)).await?;
     let corrected_again = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
