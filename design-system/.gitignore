@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Playwright run artifacts. The snapshot baselines under e2e/__screenshots__
+# ARE committed; these are not.
+/test-results/
+/playwright-report/
+/blob-report/
+/.playwright-cache/
