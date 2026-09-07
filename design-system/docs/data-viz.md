@@ -454,5 +454,5 @@ hovered day reads at the cursor and nothing is added under the grid; below `md`
 the readout is a row under the grid (tap to read, tap again to open); the grid
 is one focusable region where `←` `→` move a week, `↑` `↓` move a day and `⏎`
 opens; and the legend prints the numbers behind the five swatches
-(`0 · 1–2 · 3–4 · 5–7 · 8+`). Pass `ids` and the readout names what shipped
+derived from the data, so a legend cannot disagree with its grid (`0 · 1–2 · 3–4 · 5–6 · 7+` for twelve weeks that peak at eight). Pass `ids` and the readout names what shipped
 that day (`3 deploys · dep_91a, dep_91b, dep_90e`) instead of only counting it.

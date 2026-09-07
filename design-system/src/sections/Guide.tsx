@@ -859,6 +859,7 @@ const DEMOS_DATAVIZ: Record<string, ReactNode> = {
   '20. DeltaTable — release comparison': viz2('viz-delta'),
   '21. WindowTimeline — backups and PITR': viz2('viz-window'),
   '22. Topology — cluster and service map': viz2('viz-topology'),
+  '23. CalendarHeatmap has a readout too': viz2('viz-calendar'),
 }
 
 const DEMOS_GENUI: Record<string, ReactNode> = {

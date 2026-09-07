@@ -99,7 +99,7 @@ const BLOCKS: readonly string[] = [
   // copy honest: add a block there and this run goes red until it is added here.
   'viz-band', 'viz-compare', 'viz-stacked', 'viz-heatmap', 'viz-ladder', 'viz-cohort',
   'viz-paths', 'viz-session', 'viz-usage', 'viz-gauge', 'viz-state', 'viz-delta',
-  'viz-window', 'viz-topology',
+  'viz-window', 'viz-topology', 'viz-calendar',
   'genui-ledger', 'genui-provenance', 'genui-proposal', 'genui-streaming',
   'genui-question', 'genui-wrong',
   'content-error', 'content-time', 'content-fmt',

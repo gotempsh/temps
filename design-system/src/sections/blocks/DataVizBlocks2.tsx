@@ -4,7 +4,7 @@
 import { useState } from 'react'
 import { Block, Demo, Rule } from '@/components/op-doc'
 import {
-  BandChart, ChartFooter, CohortGrid, DeltaTable, Gauge, LatencyHeatmap, MetricGrid,
+  BandChart, CalendarHeatmap, ChartFooter, CohortGrid, DeltaTable, Gauge, LatencyHeatmap, MetricGrid,
   PathTree, PercentileLadder, SessionTimeline, StackedInk, StateTimeline, StatusStrip,
   TimeChart, Topology, UsageBar, WindowTimeline, fmtBytes,
   type Cohort, type InkLayer, type SessionEvent, type StateSegment, type TimePoint, type TopoLink, type TopoNode,
@@ -38,6 +38,7 @@ export const DATAVIZ2_TOC = [
   ['viz-delta', 'DeltaTable — release comparison'],
   ['viz-window', 'WindowTimeline — backups and PITR'],
   ['viz-topology', 'Topology — cluster and service map'],
+  ['viz-calendar', 'CalendarHeatmap — activity by day, with a readout'],
 ] as const
 
 // ── fixtures ───────────────────────────────────────────────────────────
@@ -151,10 +152,21 @@ const PITR_CEIL = '2026-09-06T20:33:00'
 
 // ── blocks ─────────────────────────────────────────────────────────────
 
+/** Twelve weeks of deploys; weekends quiet, ids so the readout can name what shipped. */
+const CAL_DAYS = Array.from({ length: 12 * 7 }, (_, i) => {
+  const count = i % 7 === 5 || i % 7 === 6 ? (i % 4 === 0 ? 1 : 0) : Math.floor(Math.abs(Math.sin(i / 2.7)) * 9)
+  return {
+    date: `2026-0${6 + Math.floor(i / 30)}-${String(1 + (i % 30)).padStart(2, '0')}`,
+    count,
+    ids: Array.from({ length: count }, (_, k) => `dep_${(80 + i).toString(36)}${'abcdefghi'[k]}`),
+  }
+})
+
 export function DataVizBlocks2() {
   const [compare, setCompare] = useState(true)
   const [pos, setPos] = useState(42_300)
   const [pit, setPit] = useState('2026-09-06T18:33:00')
+  const [opened, setOpened] = useState<string | null>(null)
   return (
     <>
       <Block
@@ -523,6 +535,27 @@ export function DataVizBlocks2() {
           <Topology nodes={NODES} links={LINKS} label="cluster" height={200}
             verdict="hetzner-3 has not sent a heartbeat for 4 minutes; its relay connection timed out."
             meta="3 nodes · 2 links · heartbeat every 15s, offline after 3 missed" />
+        </Demo>
+      </Block>
+
+      <Block
+        id="viz-calendar"
+        title="CalendarHeatmap — activity by day, with a readout"
+        rule={<>
+          <p>Deploys, backups, incidents by day: five ink steps, and a readout every input can reach. On a fine pointer the hovered day reads at the cursor; on a phone the readout is a row under the grid. The grid is one focusable region.</p>
+          <Rule state="ok">The legend prints the numbers behind the swatches, derived from the data so it cannot disagree with the grid; never "less … more".</Rule>
+          <Rule state="ok">With <code>ids</code> the readout names what shipped that day, not only how many.</Rule>
+          <Rule state="ok">← → move a week, ↑ ↓ move a day, ⏎ opens the day.</Rule>
+          <Rule state="error">A native <code>title</code> as the only readout: delayed, never on touch, unreachable by keyboard.</Rule>
+        </>}
+        api={`<CalendarHeatmap days={[{ date, count, ids? }]}
+  unit="deploys" onOpen={(day) => go(day)} />`}
+      >
+        <Demo label="12 weeks of deploys · hover or focus a day to read it">
+          <div className="border bg-background p-3">
+            <CalendarHeatmap days={CAL_DAYS} unit="deploys" onOpen={(d) => setOpened(`${d.date} · ${d.ids?.length ? d.ids.join(' · ') : `${d.count} deploys`}`)} />
+          </div>
+          <p className="mt-2 font-mono text-[10px] text-muted-foreground">{opened ? `opened ${opened}` : 'on a phone the readout is the row under the grid'}</p>
         </Demo>
       </Block>
     </>

@@ -180,7 +180,8 @@ export function ScoreRing({ value, size = 56, label, className }: { value: numbe
  *
  * The density is never the only encoding. The hovered or focused day reads in
  * full — date, count, and the deploy ids when `ids` is given — and the legend
- * prints the numbers behind the five swatches (`0 · 1–2 · 3–4 · 5–7 · 8+`), so
+ * prints the numbers behind the five swatches, derived from the data (for
+ * example `0 · 1–2 · 3–4 · 5–6 · 7+`), so
  * a reader can tell a dark cell from a darker one without pointing at either.
  *
  * The readout follows the same rule as `GeoMap`: on a fine pointer it sits at
