@@ -2134,6 +2134,23 @@ impl ApplicationService {
         self.get_with_status(user_id, public_id, "active").await
     }
 
+    /// Read an owned application without coupling the lookup to its lifecycle.
+    /// Conversation history has its own active/archived state and remains
+    /// readable after its parent application is archived.
+    pub async fn get_any_status(
+        &self,
+        user_id: i32,
+        public_id: &str,
+    ) -> Result<ApplicationWithProjects, ApplicationError> {
+        let application = ai_applications::Entity::find()
+            .filter(ai_applications::Column::PublicId.eq(public_id))
+            .filter(ai_applications::Column::CreatedBy.eq(user_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(public_id.to_string()))?;
+        self.with_projects(application).await
+    }
+
     pub async fn get_with_status(
         &self,
         user_id: i32,
@@ -2147,6 +2164,13 @@ impl ApplicationService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| ApplicationError::NotFound(public_id.to_string()))?;
+        self.with_projects(application).await
+    }
+
+    async fn with_projects(
+        &self,
+        application: ai_applications::Model,
+    ) -> Result<ApplicationWithProjects, ApplicationError> {
         let (projects, primary_project_id, environment_statuses) =
             self.projects(application.id).await?;
         Ok(ApplicationWithProjects {
@@ -2991,6 +3015,45 @@ mod tests {
             get_service.get(1, "app_missing").await,
             Err(ApplicationError::NotFound(id)) if id == "app_missing"
         ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_independent_lookup_returns_an_archived_application_for_history_reads() {
+        let now = Utc::now();
+        let archived = ai_applications::Model {
+            id: 11,
+            public_id: "app_archived".to_string(),
+            name: "Archived application".to_string(),
+            description: None,
+            status: "archived".to_string(),
+            created_by: 7,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![archived]])
+                .append_query_results([Vec::<ai_application_projects::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+
+        let application = service
+            .get_any_status(7, "app_archived")
+            .await
+            .expect("archived application history parent");
+        assert_eq!(application.application.status, "archived");
+
+        drop(service);
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!sql.contains("\"ai_applications\".\"status\" ="));
     }
 
     #[tokio::test]

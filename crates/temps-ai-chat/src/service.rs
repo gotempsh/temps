@@ -1932,25 +1932,22 @@ impl ConversationService {
 
         Ok(convs
             .into_iter()
-            .filter_map(|c| {
+            .map(|c| {
                 let info = c
                     .project_id
                     .and_then(|project_id| by_id.get(&project_id).cloned());
-                // Missing projects are excluded in SQL before pagination. Keep
-                // this defensive check for the narrow race where a project is
-                // deleted between the page query and metadata enrichment.
-                match info {
-                    Some((name, slug)) => Some(ConversationWithProject {
-                        project_name: Some(name),
-                        project_slug: Some(slug),
-                        conversation: c,
-                    }),
-                    None if c.project_id.is_none() => Some(ConversationWithProject {
-                        project_name: None,
-                        project_slug: None,
-                        conversation: c,
-                    }),
-                    _ => None,
+                // Missing projects are excluded before pagination. If one is
+                // deleted between that query and metadata enrichment, retain
+                // the private, creator-owned conversation without stale project
+                // labels so the response cannot become a misleading short page.
+                let (project_name, project_slug) = match info {
+                    Some((name, slug)) => (Some(name), Some(slug)),
+                    None => (None, None),
+                };
+                ConversationWithProject {
+                    project_name,
+                    project_slug,
+                    conversation: c,
                 }
             })
             .collect())
@@ -8818,23 +8815,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_all_conversations_excludes_currently_hidden_projects() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![conv_for(1, 7, "hidden"), conv_for(2, 8, "visible")]])
-            .append_query_results([vec![project_with_toggle(
-                8,
-                "Visible",
-                "visible",
-                Some(true),
-            )]])
-            .into_connection();
+        // MockDatabase does not execute query predicates, so return the row the
+        // database would retain and separately assert the visibility filter.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![conv_for(2, 8, "visible")]])
+                .append_query_results([vec![project_with_toggle(
+                    8,
+                    "Visible",
+                    "visible",
+                    Some(true),
+                )]])
+                .into_connection(),
+        );
 
-        let items = db_service(db)
+        let items = db_service_from_arc(db.clone())
             .list_all_conversations(5, &[7])
             .await
             .expect("hidden projects filter");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].conversation.public_id, "visible");
+        let sql = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("\"project_id\" NOT IN"));
     }
 
     #[tokio::test]
@@ -8970,10 +8980,10 @@ mod tests {
         assert!(items.iter().any(|i| i.conversation.public_id == "pubNull"));
     }
 
-    // list_all_conversations: also excludes conversations whose project row is
-    // missing entirely (defensive — a dangling project_id must not leak).
+    // A project deleted after the bounded conversation query must not shrink
+    // the page during the metadata enrichment query.
     #[tokio::test]
-    async fn test_list_all_conversations_excludes_missing_project() {
+    async fn test_list_all_conversations_preserves_page_when_project_metadata_disappears() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![conv_for(1, 7, "pubA")]])
             // Project lookup returns nothing for id 7.
@@ -8982,7 +8992,10 @@ mod tests {
         let svc = db_service(db);
 
         let items = svc.list_all_conversations(5, &[]).await.expect("query ok");
-        assert!(items.is_empty());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].conversation.public_id, "pubA");
+        assert_eq!(items[0].project_name, None);
+        assert_eq!(items[0].project_slug, None);
     }
 
     // get_by_public_id: returns the row when the (project_id, public_id) pair

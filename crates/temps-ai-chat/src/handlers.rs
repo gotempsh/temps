@@ -3019,7 +3019,17 @@ pub async fn list_application_conversations(
 ) -> Result<Json<Vec<ConversationResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
-    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    // Application and conversation lifecycles are independent. Read-only
+    // history remains available after its parent application is archived;
+    // mutating endpoints continue to use active-only authorization.
+    let application = authorized_application_for_permissions(
+        &state,
+        &auth,
+        &application_public_id,
+        None,
+        &[Permission::ProjectsRead],
+    )
+    .await?;
     let (page, page_size) = normalize_list_pagination(query.page, query.page_size);
     let conversations = state
         .applications
@@ -3613,7 +3623,7 @@ pub async fn upload_application_workspace_files(
         &state,
         &auth,
         &application_public_id,
-        "active",
+        Some("active"),
         &[Permission::ProjectsWrite, Permission::SandboxesWrite],
     )
     .await?;
@@ -3742,7 +3752,7 @@ pub async fn download_application_workspace_file(
         &state,
         &auth,
         &application_public_id,
-        "active",
+        Some("active"),
         &[Permission::ProjectsRead, Permission::SandboxesRead],
     )
     .await?;
@@ -4238,7 +4248,7 @@ pub async fn get_application_workspace_directory(
         &state,
         &auth,
         &application_public_id,
-        "active",
+        Some("active"),
         &[Permission::ProjectsRead, Permission::SandboxesRead],
     )
     .await?;
@@ -4299,7 +4309,7 @@ pub async fn get_application_workspace_file(
         &state,
         &auth,
         &application_public_id,
-        "active",
+        Some("active"),
         &[Permission::ProjectsRead, Permission::SandboxesRead],
     )
     .await?;
@@ -5345,7 +5355,7 @@ async fn authorized_application_with_status(
         state,
         auth,
         application_public_id,
-        status,
+        Some(status),
         &[Permission::ProjectsRead],
     )
     .await
@@ -5355,13 +5365,23 @@ async fn authorized_application_for_permissions(
     state: &AppState,
     auth: &AuthContext,
     application_public_id: &str,
-    status: &str,
+    status: Option<&str>,
     required_permissions: &[Permission],
 ) -> Result<crate::applications::ApplicationWithProjects, Problem> {
-    let application = state
-        .applications
-        .get_with_status(auth.user_id(), application_public_id, status)
-        .await?;
+    let application = match status {
+        Some(status) => {
+            state
+                .applications
+                .get_with_status(auth.user_id(), application_public_id, status)
+                .await?
+        }
+        None => {
+            state
+                .applications
+                .get_any_status(auth.user_id(), application_public_id)
+                .await?
+        }
+    };
     let project_ids = application
         .projects
         .iter()
