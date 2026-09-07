@@ -69,17 +69,21 @@ impl ControlPlaneOverlay {
             loop {
                 match allocator.control_plane_peer_list().await {
                     Ok(peers) => {
-                        if let Some(peer) = peers.iter().find(|peer| {
-                            !crate::allocator::is_private_underlay(peer.underlay_address)
-                        }) {
-                            warn!(
-                                node_id = %peer.node_id,
-                                underlay = %peer.underlay_address,
-                                "refusing publicly-routable control-plane overlay peer"
-                            );
-                            tokio::time::sleep(PEER_RECONCILE_INTERVAL).await;
-                            continue;
-                        }
+                        let peers: Vec<_> = peers
+                            .into_iter()
+                            .filter(|peer| {
+                                let allowed =
+                                    crate::allocator::is_private_underlay(peer.underlay_address);
+                                if !allowed {
+                                    warn!(
+                                        node_id = %peer.node_id,
+                                        underlay = %peer.underlay_address,
+                                        "refusing publicly-routable control-plane overlay peer"
+                                    );
+                                }
+                                allowed
+                            })
+                            .collect();
                         let reconcile = reconcile_peer_snapshot(
                             &manager,
                             &docker,
