@@ -187,6 +187,14 @@ export function useServiceTypePreset(serviceType: string | null): PresetState {
 // MariaDB preset — managed WAL-G image + custom.
 // -----------------------------------------------------------------------------
 
+// KNOWN GAP: this mutable tag currently fails backend validation
+// (`validate_immutable_mariadb_image` in mariadb.rs requires a pinned
+// `repository@sha256:<digest>` for any non-default MariaDB image). The image
+// itself hasn't been published yet — `.github/workflows/mariadb-walg-image.yml`
+// only runs `if: github.ref == 'refs/heads/main'`, so it can't produce a real
+// digest until this branch (PR #562) merges. Once it does, that workflow's
+// first run prints the real digest to its job summary — paste it in here as
+// `ghcr.io/gotempsh/mariadb-walg@sha256:<digest>` to make this preset work.
 const MARIADB_MANAGED_IMAGE = 'ghcr.io/gotempsh/mariadb-walg:11.4'
 
 const MARIADB_OPTIONS: PresetOption[] = [
