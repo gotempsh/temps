@@ -23,6 +23,13 @@ export function safeRegistryNavigationUrl(
 
 export type PluginInstallAction = 'install' | 'upgrade' | 'installed'
 
+const PLUGIN_ADMIN_ROLES = new Set(['admin', 'platform_admin'])
+
+/** Mirrors the roles that carry `Permission::SystemAdmin` in temps-auth. */
+export function canManageExternalPlugins(role?: string | null): boolean {
+  return role !== undefined && role !== null && PLUGIN_ADMIN_ROLES.has(role)
+}
+
 export function pluginInstallAction(
   installedVersion: string | undefined,
   registryVersion: string

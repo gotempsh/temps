@@ -13,6 +13,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -23,6 +24,7 @@ import {
 } from '@/hooks/usePlugins'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
+  canManageExternalPlugins,
   pluginInstallAction,
   safeRegistryNavigationUrl,
 } from '@/lib/plugin-registry'
@@ -40,12 +42,14 @@ import { toast } from 'sonner'
 
 export function PluginsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
+  const { user } = useAuth()
+  const canManagePlugins = canManageExternalPlugins(user?.role)
   const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
   const {
     data: catalog,
     isLoading: catalogLoading,
     error: catalogError,
-  } = usePluginCatalog()
+  } = usePluginCatalog(canManagePlugins)
   const installPlugin = useInstallPlugin()
   const reloadPlugins = useReloadPlugins()
   const { handleSensitiveActionError, verificationDialog } =
@@ -92,45 +96,50 @@ export function PluginsPage() {
 
   return (
     <div className="space-y-6">
-      {verificationDialog}
+      {canManagePlugins && verificationDialog}
       <Card>
         <CardHeader>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <CardTitle>External Plugins</CardTitle>
               <CardDescription>
-                Install signed, platform-specific releases from the trusted
-                Temps registry.
+                {canManagePlugins
+                  ? 'Install signed, platform-specific releases from the trusted Temps registry.'
+                  : 'View verified external plugins currently running in Temps.'}
               </CardDescription>
             </div>
-            <Button
-              variant="outline"
-              onClick={handleReload}
-              disabled={reloadPlugins.isPending}
-            >
-              {reloadPlugins.isPending ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <RefreshCw className="mr-2 h-4 w-4" />
-              )}
-              <span className="hidden sm:inline">Reload Plugins</span>
-              <span className="sm:hidden">Reload</span>
-            </Button>
+            {canManagePlugins && (
+              <Button
+                variant="outline"
+                onClick={handleReload}
+                disabled={reloadPlugins.isPending}
+              >
+                {reloadPlugins.isPending ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                )}
+                <span className="hidden sm:inline">Reload Plugins</span>
+                <span className="sm:hidden">Reload</span>
+              </Button>
+            )}
           </div>
         </CardHeader>
         <CardContent className="space-y-6">
-          <RegistryCatalog
-            catalog={catalog}
-            error={catalogError}
-            isLoading={catalogLoading}
-            installedVersions={
-              new Map(plugins.map((plugin) => [plugin.name, plugin.version]))
-            }
-            installingName={
-              installPlugin.isPending ? installPlugin.variables : undefined
-            }
-            onInstall={(name) => void handleInstall(name)}
-          />
+          {canManagePlugins && (
+            <RegistryCatalog
+              catalog={catalog}
+              error={catalogError}
+              isLoading={catalogLoading}
+              installedVersions={
+                new Map(plugins.map((plugin) => [plugin.name, plugin.version]))
+              }
+              installingName={
+                installPlugin.isPending ? installPlugin.variables : undefined
+              }
+              onInstall={(name) => void handleInstall(name)}
+            />
+          )}
 
           <section
             className="space-y-3"
@@ -159,7 +168,9 @@ export function PluginsPage() {
                   No verified plugins are running.
                 </p>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  Install a registry release above to add one.
+                  {canManagePlugins
+                    ? 'Install a registry release above to add one.'
+                    : 'Ask a system administrator to install one.'}
                 </p>
               </div>
             ) : (

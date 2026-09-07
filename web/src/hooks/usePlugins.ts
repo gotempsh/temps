@@ -47,7 +47,7 @@ export function usePlugins() {
 }
 
 /** Fetch the signed registry catalog exposed by the backend. */
-export function usePluginCatalog() {
+export function usePluginCatalog(enabled = true) {
   return useQuery({
     queryKey: PLUGIN_CATALOG_QUERY_KEY,
     queryFn: async (): Promise<PluginCatalogResponse> => {
@@ -56,6 +56,7 @@ export function usePluginCatalog() {
     },
     staleTime: 5 * 60 * 1000,
     retry: false,
+    enabled,
   })
 }
 

@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  canManageExternalPlugins,
   pluginInstallAction,
   safeRegistryNavigationUrl,
 } from './plugin-registry'
@@ -34,5 +35,15 @@ describe('pluginInstallAction', () => {
     expect(pluginInstallAction(undefined, '1.0.0')).toBe('install')
     expect(pluginInstallAction('1.0.0', '1.0.0')).toBe('installed')
     expect(pluginInstallAction('1.0.0', '1.1.0')).toBe('upgrade')
+  })
+})
+
+describe('canManageExternalPlugins', () => {
+  test('matches the roles that carry the backend SystemAdmin permission', () => {
+    expect(canManageExternalPlugins('admin')).toBe(true)
+    expect(canManageExternalPlugins('platform_admin')).toBe(true)
+    expect(canManageExternalPlugins('user')).toBe(false)
+    expect(canManageExternalPlugins('reader')).toBe(false)
+    expect(canManageExternalPlugins(null)).toBe(false)
   })
 })
