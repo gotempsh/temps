@@ -221,14 +221,16 @@ pub(crate) async fn open_static_file(
     // It catches directory-index symlinks as well as ordinary file symlinks.
     let canonical_path = match canonicalize(&final_candidate, "resolve final file").await {
         Ok(path) => path,
-        Err(error) if candidate_metadata.is_dir() && is_spa_route(&relative_request_path) => {
+        Err(StaticFileUnavailable::NotFound { .. })
+            if candidate_metadata.is_dir() && is_spa_route(&relative_request_path) =>
+        {
             // The request matched a real directory (e.g. an asset-only folder
             // that happens to share a name with a client-side route) with no
             // `index.html` of its own. Treat it the same as a missing file on
             // an extensionless path: fall back to the deployment's root SPA
             // shell instead of 404ing just because a same-named directory
-            // exists on disk.
-            let _ = error;
+            // exists on disk. Any other failure (permission denied, symlink
+            // loop, etc.) still propagates as-is rather than being masked.
             canonicalize(
                 &canonical_deployment_root.join("index.html"),
                 "resolve SPA fallback",
@@ -465,6 +467,31 @@ mod tests {
             .await
             .expect("existing asset inside the directory should still open");
         assert!(asset.canonical_path.ends_with("guide/screenshot.png"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_index_failures_other_than_not_found_are_not_masked_by_the_spa_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let (root, deployment) = deployment().await;
+        let broken_dir = deployment.join("broken");
+        fs::create_dir_all(&broken_dir)
+            .await
+            .expect("create directory with a broken index");
+        // A self-referential symlink makes canonicalize fail with a symlink-loop
+        // error (not NotFound), simulating any non-missing resolution failure
+        // (permission denied, loop, etc.) on the directory's own index.html.
+        symlink("index.html", broken_dir.join("index.html")).expect("create symlink loop");
+
+        let error = open_static_file(root.path(), STORED_DIR, "/broken")
+            .await
+            .expect_err("a symlink-loop failure must not be masked as a missing index");
+
+        assert!(
+            matches!(error, StaticFileUnavailable::Unusable { .. }),
+            "expected the underlying resolution failure to propagate, got {error:?}"
+        );
     }
 
     #[tokio::test]
