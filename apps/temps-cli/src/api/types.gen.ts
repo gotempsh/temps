@@ -9017,6 +9017,20 @@ export type ExternalServiceDetails = {
 
 export type ExternalServiceInfo = {
     connection_info?: string | null;
+    /**
+     * When `continuous_archive_s3_source_id` was last set. Null alongside
+     * a non-null source id means it was set by the original provisioning
+     * flow rather than an explicit repoint.
+     */
+    continuous_archive_pinned_at?: string | null;
+    /**
+     * S3 source ID that this service's continuous archiving (Postgres/
+     * Timescale WAL-G `archive_command`, or MariaDB's binlog shipper)
+     * currently writes to. Null for service types with no continuous
+     * archiving concept, or a Postgres/MariaDB service that has never had
+     * one provisioned. Change it with `repoint_continuous_archive_source`.
+     */
+    continuous_archive_s3_source_id?: number | null;
     created_at: string;
     /**
      * Error message from failed initialization.

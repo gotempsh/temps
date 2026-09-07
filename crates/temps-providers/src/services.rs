@@ -496,6 +496,16 @@ pub struct ExternalServiceInfo {
     /// Whether metric collection is enabled for this service.
     #[serde(default)]
     pub metrics_enabled: bool,
+    /// S3 source ID that this service's continuous archiving (Postgres/
+    /// Timescale WAL-G `archive_command`, or MariaDB's binlog shipper)
+    /// currently writes to. `None` for service types with no continuous
+    /// archiving concept, or a Postgres/MariaDB service that has never had
+    /// one provisioned. See `repoint_continuous_archive_source`.
+    pub continuous_archive_s3_source_id: Option<i32>,
+    /// When `continuous_archive_s3_source_id` was last set. `None` alongside
+    /// a `Some` source id means it was set by the original provisioning
+    /// flow rather than an explicit repoint.
+    pub continuous_archive_pinned_at: Option<String>,
 }
 
 /// Format a `tokio_postgres::Error` (or any `std::error::Error`) by
@@ -3359,6 +3369,10 @@ impl ExternalServiceManager {
             members,
             error_message: service.error_message,
             metrics_enabled: service.metrics_enabled,
+            continuous_archive_s3_source_id: service.continuous_archive_s3_source_id,
+            continuous_archive_pinned_at: service
+                .continuous_archive_pinned_at
+                .map(|pinned_at| pinned_at.to_rfc3339()),
         })
     }
 
@@ -10783,6 +10797,10 @@ echo "[restore] Pre-seed complete"
             members: Vec::new(),
             error_message: external_service.error_message,
             metrics_enabled: external_service.metrics_enabled,
+            continuous_archive_s3_source_id: external_service.continuous_archive_s3_source_id,
+            continuous_archive_pinned_at: external_service
+                .continuous_archive_pinned_at
+                .map(|pinned_at| pinned_at.to_rfc3339()),
         })
     }
 
@@ -15365,6 +15383,8 @@ mod tests {
             members: Vec::new(),
             error_message: None,
             metrics_enabled: false,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
 
         assert_eq!(service_info.id, 1);

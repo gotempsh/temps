@@ -19180,6 +19180,21 @@
               "null"
             ]
           },
+          "continuous_archive_pinned_at": {
+            "description": "When `continuous_archive_s3_source_id` was last set. Null alongside\na non-null source id means it was set by the original provisioning\nflow rather than an explicit repoint.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "continuous_archive_s3_source_id": {
+            "description": "S3 source ID that this service's continuous archiving (Postgres/\nTimescale WAL-G `archive_command`, or MariaDB's binlog shipper)\ncurrently writes to. Null for service types with no continuous\narchiving concept, or a Postgres/MariaDB service that has never had\none provisioned. Change it with `repoint_continuous_archive_source`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "created_at": {
             "type": "string"
           },

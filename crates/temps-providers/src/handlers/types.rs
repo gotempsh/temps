@@ -251,6 +251,18 @@ pub struct ExternalServiceInfo {
     /// to decide whether to poll the monitoring endpoints.
     #[serde(default)]
     pub metrics_enabled: bool,
+    /// S3 source ID that this service's continuous archiving (Postgres/
+    /// Timescale WAL-G `archive_command`, or MariaDB's binlog shipper)
+    /// currently writes to. Null for service types with no continuous
+    /// archiving concept, or a Postgres/MariaDB service that has never had
+    /// one provisioned. Change it with `repoint_continuous_archive_source`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous_archive_s3_source_id: Option<i32>,
+    /// When `continuous_archive_s3_source_id` was last set. Null alongside
+    /// a non-null source id means it was set by the original provisioning
+    /// flow rather than an explicit repoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous_archive_pinned_at: Option<String>,
 }
 
 /// Public info about a cluster member.
