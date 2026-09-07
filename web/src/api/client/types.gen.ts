@@ -899,6 +899,24 @@ export type AiSummaryPreferenceDto = {
 };
 
 /**
+ * Runtime limits for workspace file transfer and browser previews.
+ *
+ * The HTTP layer additionally enforces absolute ceilings so a malformed or
+ * legacy settings row cannot turn a configurable limit into unbounded control
+ * plane memory use.
+ */
+export type AiWorkspaceFileLimitsSettings = {
+    max_download_size_mb?: number;
+    max_file_size_mb?: number;
+    max_files_per_upload?: number;
+    max_image_preview_size_mb?: number;
+    max_text_preview_kb?: number;
+    max_upload_size_mb?: number;
+    max_workspace_entries?: number;
+    max_workspace_size_mb?: number;
+};
+
+/**
  * Paginated list of alarms.
  */
 export type AlarmListResponse = {
@@ -1397,6 +1415,12 @@ export type AppSettings = {
     ai_chat_limits?: AiChatLimitsSettings;
     ai_config?: AiConfigSettings;
     /**
+     * Transfer and preview limits for files in persistent AI workspaces.
+     * These are runtime settings because operators have different control
+     * plane memory budgets and commonly work with very different asset sizes.
+     */
+    ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -1579,6 +1603,10 @@ export type AppSettingsResponse = {
     ai_chat_limits: AiChatLimitsSettings;
     ai_config: AiConfigSettings;
     /**
+     * Persistent AI workspace file transfer and preview limits.
+     */
+    ai_workspace_file_limits: AiWorkspaceFileLimitsSettings;
+    /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
      */
@@ -1705,6 +1733,150 @@ export type AppSettingsResponse = {
      * directly. Unenforced by default.
      */
     tenant_resource_ceilings: TenantResourceCeilings;
+};
+
+export type ApplicationPreviewLinkResponse = {
+    expires_at: number;
+    /**
+     * A short-lived authenticated URL. Its fragment carries the grant and
+     * never reaches the development server or referrer headers.
+     */
+    url: string;
+};
+
+export type ApplicationProjectDeploymentResponse = {
+    environment_id: number;
+    id: number;
+    project_id: number;
+    slug: string;
+    source_type: string;
+    state: string;
+};
+
+export type ApplicationProjectEnvironmentResponse = {
+    deployment_state?: string | null;
+    name: string;
+    sleeping: boolean;
+    slug: string;
+};
+
+export type ApplicationProjectResponse = {
+    automatic_deploy: boolean;
+    environments: Array<ApplicationProjectEnvironmentResponse>;
+    id: number;
+    is_primary: boolean;
+    is_private: boolean;
+    last_deployment_at?: string | null;
+    main_branch: string;
+    name: string;
+    repository?: string | null;
+    slug: string;
+};
+
+export type ApplicationResponse = {
+    created_at: string;
+    description?: string | null;
+    name: string;
+    projects: Array<ApplicationProjectResponse>;
+    public_id: string;
+    status: string;
+    updated_at: string;
+};
+
+export type ApplicationWorkspaceChangesResponse = {
+    branch?: string | null;
+    changes: Array<ApplicationWorkspaceFileResponse>;
+    changes_truncated: boolean;
+    clean: boolean;
+    files: Array<string>;
+    files_truncated: boolean;
+    head?: string | null;
+    /**
+     * Number of file paths discovered within the server-side safety cap.
+     */
+    listed_file_count: number;
+    /**
+     * Opaque position for the next bounded page, when another page exists.
+     */
+    next_cursor?: number | null;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceDiffResponse = {
+    diff: string;
+    path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceDirectoryEntryResponse = {
+    kind: string;
+    name: string;
+    path: string;
+    size_bytes: number;
+};
+
+export type ApplicationWorkspaceDirectoryResponse = {
+    entries: Array<ApplicationWorkspaceDirectoryEntryResponse>;
+    next_cursor?: number | null;
+    path: string;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceFileContentResponse = {
+    binary: boolean;
+    content?: string | null;
+    /**
+     * Base64-encoded raster image bytes when this file has a verified,
+     * browser-safe image signature and is within the configured preview cap.
+     */
+    content_b64?: string | null;
+    media_type?: string | null;
+    path: string;
+    size_bytes: number;
+    truncated: boolean;
+};
+
+export type ApplicationWorkspaceFileResponse = {
+    path: string;
+    staged: boolean;
+    status?: string | null;
+    unstaged: boolean;
+};
+
+export type ApplicationWorkspaceFileWrite = {
+    contents_b64: string;
+    mode?: number | null;
+    /**
+     * Project-relative path. Absolute paths and traversal are rejected.
+     */
+    path: string;
+};
+
+export type ApplicationWorkspaceResponse = {
+    cpu_limit: number;
+    cpu_usage_usec?: number | null;
+    data_network_service_count: number;
+    desired_state: string;
+    /**
+     * Docker bind-mounted workspaces report usage but cannot enforce a
+     * per-directory quota. Firecracker workspaces enforce this value.
+     */
+    disk_limit_enforced: boolean;
+    disk_limit_mb: number;
+    disk_used_bytes?: number | null;
+    idle_timeout_secs: number;
+    image?: string | null;
+    last_error?: string | null;
+    memory_limit_mb: number;
+    memory_used_bytes?: number | null;
+    open_preview_ports: Array<number>;
+    persistent_volume_healthy: boolean;
+    pids_limit: number;
+    pids_used?: number | null;
+    runtime: string;
+    sandbox_public_id?: string | null;
+    snapshot_id?: string | null;
+    state: string;
 };
 
 /**
@@ -2652,6 +2824,24 @@ export type ChangeProjectSourceRequest = {
     source_type: SourceType;
 };
 
+export type ChatAttachmentReference = {
+    id: string;
+    name: string;
+};
+
+export type ChatAttachmentResponse = {
+    id: string;
+    is_image: boolean;
+    mime_type: string;
+    name: string;
+    sandbox_path: string;
+    size_bytes: number;
+};
+
+export type ChatAttachmentUpload = {
+    file: Blob | File;
+};
+
 export type ChatCompletionChoice = {
     finish_reason?: string | null;
     index: number;
@@ -2703,12 +2893,6 @@ export type ChatMessage = {
 
 /**
  * What still has to be true before an AI chat can run a turn in this project.
- *
- * The three gates are independent and fail for different reasons with different
- * fixes, so they are reported separately rather than collapsed into one boolean:
- * an instance admin configures a provider (instance-wide), while the two toggles
- * are per-project. Collapsing them would leave the user with "AI unavailable"
- * and no idea which of three places to go.
  */
 export type ChatReadinessResponse = {
     /**
@@ -2716,15 +2900,6 @@ export type ChatReadinessResponse = {
      * Settings → AI Providers; instance-wide, not per project.
      */
     ai_configured: boolean;
-    /**
-     * The per-project read-only chat toggle is on (the default).
-     */
-    chat_enabled: boolean;
-    /**
-     * The per-project write-actions opt-in is on. Required for any flow where
-     * the assistant *proposes* changes; irrelevant for read-only questions.
-     */
-    write_actions_enabled: boolean;
 };
 
 /**
@@ -4140,26 +4315,53 @@ export type ContinuousArchiveSourceResponse = {
     service_id: number;
 };
 
+export type ControlApplicationWorkspaceRequest = {
+    /**
+     * restart, pause, resume, rebuild, snapshot, or restore
+     */
+    action: string;
+    label?: string | null;
+    snapshot_id?: string | null;
+};
+
 export type ConversationDetailResponse = ConversationResponse & {
     /**
      * Turns oldest-first. The `system` seed message is omitted (internal).
      */
     messages: Array<MessageResponse>;
+    page: ConversationMessagePageResponse;
     pending_permission?: null | PermissionRequest;
 };
 
+export type ConversationListScope = 'all' | 'global';
+
+export type ConversationListStatus = 'active' | 'archived';
+
+export type ConversationMessagePageResponse = {
+    has_more: boolean;
+    next_before?: string | null;
+};
+
 export type ConversationResponse = {
+    active_turn_id?: string | null;
     ai_model: string;
     ai_permission_mode: string;
     ai_provider: string;
     ai_thinking_level?: string | null;
+    application_id?: number | null;
     context_id: string;
     context_type: string;
     created_at: string;
     last_activity_at: string;
+    project_id?: number | null;
     public_id: string;
     status: string;
     title?: string | null;
+    turn_started_at?: string | null;
+    /**
+     * Server-authoritative lifecycle for the current/most recent turn.
+     */
+    turn_status: string;
 };
 
 /**
@@ -4344,6 +4546,42 @@ export type CreateApiKeyResponse = {
     name: string;
     permissions?: Array<string> | null;
     role_type: string;
+};
+
+export type CreateApplicationConversationRequest = {
+    /**
+     * A registered development harness (for example `claude_cli`).
+     * Application threads never inherit an API-gateway provider.
+     */
+    ai_provider?: string | null;
+};
+
+export type CreateApplicationPreviewLinkRequest = {
+    /**
+     * Optional same-origin path to open after the preview grant is exchanged.
+     */
+    path?: string | null;
+    /**
+     * The development server port detected or selected in the sandbox.
+     */
+    port: number;
+};
+
+export type CreateApplicationProjectRequest = {
+    exposed_port?: number | null;
+    name: string;
+    /**
+     * Deployment preset for the project. Defaults to `autopack`, which
+     * detects the application runtime from the workspace source.
+     */
+    preset?: string | null;
+};
+
+export type CreateApplicationRequest = {
+    description?: string | null;
+    name: string;
+    project_ids?: Array<number>;
+    starter_project?: null | CreateApplicationProjectRequest;
 };
 
 export type CreateBackupScheduleRequest = {
@@ -4704,6 +4942,17 @@ export type CreateGiteaPatRequest = {
      * Personal access token issued by the Gitea instance.
      */
     token: string;
+};
+
+export type CreateGlobalConversationRequest = {
+    ai_model?: string | null;
+    ai_permission_mode?: string | null;
+    /**
+     * A registered development harness. Global operator chats run inside a
+     * persistent Temps-managed sandbox rather than on the host filesystem.
+     */
+    ai_provider?: string | null;
+    ai_thinking_level?: string | null;
 };
 
 export type CreateIncidentRequest = {
@@ -5323,6 +5572,12 @@ export type CreateTeamRequest = {
     slug: string;
 };
 
+export type CreateThreadArtifactRequest = {
+    kind: string;
+    payload: unknown;
+    title?: string | null;
+};
+
 export type CreateUserRequest = {
     email?: string | null;
     must_change_password?: boolean;
@@ -5685,6 +5940,14 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeployApplicationProjectRequest = {
+    /**
+     * Target environment. Omit to use production, then the project's oldest
+     * active environment as a fallback.
+     */
+    environment_id?: number | null;
 };
 
 export type DeployFromImageRequest = {
@@ -9141,7 +9404,7 @@ export type GatewayStatus = {
      */
     health: string;
     /**
-     * Host port that the container's :8080 is published on.
+     * Host port that the ingress relay's :8080 is published on.
      */
     host_port?: number | null;
     /**
@@ -9162,7 +9425,8 @@ export type GatewayStatus = {
      */
     last_exit_code?: number | null;
     /**
-     * Network the container is attached to (should be `temps-sandbox-net`).
+     * Trusted control network the gateway starts on. It is additionally attached
+     * to each per-sandbox isolated network during reconciliation.
      */
     network?: string | null;
     /**
@@ -9819,12 +10083,16 @@ export type GlobalConversationResponse = {
     context_type: string;
     created_at: string;
     last_activity_at: string;
-    project_id: number;
+    project_id?: number | null;
     project_name?: string | null;
     project_slug?: string | null;
     public_id: string;
     status: string;
     title?: string | null;
+    /**
+     * Server-authoritative lifecycle for the current/most recent turn.
+     */
+    turn_status: string;
 };
 
 export type GlobalEventStatsResponse = {
@@ -10217,6 +10485,17 @@ export type ImageRuntimeConfig = {
     command?: Array<string> | null;
     healthCheckPath?: string | null;
     imageRef: string;
+};
+
+export type ImportApplicationWorkspaceGitRequest = {
+    depth?: number | null;
+    /**
+     * Opaque user-owned connection reference. The credential value remains
+     * server-side and is restricted to the provider's configured origin.
+     */
+    git_connection_id?: number | null;
+    revision?: string | null;
+    url: string;
 };
 
 /**
@@ -11066,6 +11345,10 @@ export type LineContext = {
     before: Array<ContextLine>;
 };
 
+export type LinkApplicationProjectRequest = {
+    project_id: number;
+};
+
 export type LinkServiceRequest = {
     project_id: number;
 };
@@ -11637,8 +11920,17 @@ export type MessagePart = {
 };
 
 export type MessageResponse = {
+    /**
+     * Files copied into the persistent workspace for this user turn.
+     */
+    attachments?: Array<ChatAttachmentResponse> | null;
     content: string;
     created_at: string;
+    /**
+     * Stable opaque cursor for this stored message. Clients must treat this as
+     * an uninterpreted token and send it back through the `before` query.
+     */
+    cursor: string;
     /**
      * Ordered render segments (text / tool, in the order they occurred) so a
      * reloaded chat shows the same interleaving as the live stream. Absent for
@@ -12001,6 +12293,18 @@ export type MiscResult = {
 
 export type MkdirBody = {
     path: string;
+};
+
+export type ModelCapability = {
+    default_thinking_mode_id?: string | null;
+    id: string;
+    name: string;
+    thinking_modes: Array<SelectOption>;
+    /**
+     * Optional reasoning modes valid when function tools are attached. `None`
+     * inherits `thinking_modes`; `Some` is a model-specific restriction.
+     */
+    tool_thinking_modes?: Array<SelectOption> | null;
 };
 
 export type ModelInfo = {
@@ -15227,6 +15531,11 @@ export type ProviderCatalogDto = {
      * that as "Use provider default".
      */
     default_model?: string | null;
+    default_permission_mode_id: string;
+    /**
+     * Explicit default used when a new harness thread is created.
+     */
+    default_runtime_model_id?: string | null;
     /**
      * Explains why `host_authenticated` is false (not installed vs.
      * installed-but-not-authenticated), or `None` when it's true.
@@ -15242,14 +15551,11 @@ export type ProviderCatalogDto = {
      * True when the CLI is installed AND authenticated on **this host** —
      * the machine running the Temps server process. This is a completely
      * different signal from `credential_saved`: that field is about a
-     * credential seeded into a *sandboxed autofixer container*, while this
-     * one is what actually gates whether the AI Gateway can route requests
-     * to this provider (ADR-037's `AgentCliAiService` uses only the host's
-     * ambient CLI session — ordering `claude setup-token`/`codex login` on
-     * this machine — and never reads the sandbox credential at all). A
-     * provider can show `credential_saved: true` and `host_authenticated:
-     * false` at the same time; only the latter means chat/gateway routing
-     * will actually work.
+     * credential available to the server-side, turn-scoped workspace relay.
+     * Persistent workspace chat never inherits the host's ambient CLI
+     * session. A provider can show
+     * `credential_saved: true` and `host_authenticated: false` at the same
+     * time.
      */
     host_authenticated: boolean;
     /**
@@ -15289,11 +15595,30 @@ export type ProviderCatalogDto = {
     models_refreshed_at?: string | null;
     name: string;
     /**
+     * Provider-native permission modes available to sandboxed harness turns.
+     */
+    permission_modes: Array<SelectOption>;
+    /**
+     * Full normalized runtime capabilities used by application chat. Unlike
+     * `models`, this preserves resolved display names and reasoning choices.
+     */
+    runtime_models: Array<ModelCapability>;
+    /**
      * True when this provider's CLI supports enforcing a turn cap. False
      * for Codex/OpenCode, which run to completion — the UI labels their
      * max-turns inputs accordingly.
      */
     supports_max_turns: boolean;
+    /**
+     * Actionable explanation when `workspace_ready` is false.
+     */
+    workspace_readiness_hint?: string | null;
+    /**
+     * True only when this provider can execute inside a persistent Temps
+     * workspace with a saved credential and a secure turn-scoped relay.
+     * This is the authoritative signal for workspace harness pickers.
+     */
+    workspace_ready: boolean;
 };
 
 export type ProviderCatalogResponse = {
@@ -17615,6 +17940,12 @@ export type SecurityHeadersSettings = {
     x_xss_protection?: string;
 };
 
+export type SelectOption = {
+    description?: string | null;
+    id: string;
+    name: string;
+};
+
 /**
  * A single update attempt. Persisted to `<data_dir>/self-update.json` so the
  * result survives the restart it causes.
@@ -17787,6 +18118,21 @@ export type SendFailureReportRequest = {
     report_text: string;
 };
 
+/**
+ * Acknowledgement that a durable, server-owned turn has started. Live token,
+ * tool, permission, error, and completion events are delivered exclusively by
+ * the conversation WebSocket.
+ */
+export type SendMessageAcceptedResponse = {
+    status: string;
+    turn_id: string;
+    /**
+     * Server timestamp used by every observer to render one continuous
+     * elapsed-time counter across refreshes and reconnects.
+     */
+    turn_started_at: string;
+};
+
 export type SendMessageRequest = {
     /**
      * Optional next-turn model. The provider harness remains pinned, but its
@@ -17801,6 +18147,10 @@ export type SendMessageRequest = {
      * Optional next-turn thinking level.
      */
     ai_thinking_level?: string | null;
+    /**
+     * Opaque references returned by the conversation attachment endpoint.
+     */
+    attachments?: Array<ChatAttachmentReference>;
     content: string;
     /**
      * Optional, client-supplied description of the page/entity the user is
@@ -17809,6 +18159,11 @@ export type SendMessageRequest = {
      * side; oversized values are ignored rather than rejected.
      */
     page_context?: string | null;
+    /**
+     * Client-generated opaque idempotency key for this turn. Retries with the
+     * same id never create a second user message or harness execution.
+     */
+    turn_id?: string | null;
 };
 
 export type SensitiveConfigValueResponse = {
@@ -20276,6 +20631,17 @@ export type TestProviderResponse = {
     success: boolean;
 };
 
+export type ThreadArtifactResponse = {
+    created_at: string;
+    kind: string;
+    payload: unknown;
+    public_id: string;
+    schema_version: number;
+    status: string;
+    title?: string | null;
+    updated_at: string;
+};
+
 /**
  * Time bucket statistics response
  */
@@ -21199,6 +21565,15 @@ export type UpdateApiKeyRequest = {
     permissions?: Array<string> | null;
 };
 
+export type UpdateApplicationWorkspaceRequest = {
+    cpu_limit?: number | null;
+    disk_limit_mb?: number | null;
+    idle_timeout_secs?: number | null;
+    memory_limit_mb?: number | null;
+    pids_limit?: number | null;
+    runtime?: string | null;
+};
+
 export type UpdateAutomaticDeployRequest = {
     automatic_deploy: boolean;
 };
@@ -21880,6 +22255,15 @@ export type UpdateOidcProviderRequest = {
     scopes?: string | null;
     template?: string | null;
     trust_idp_email?: boolean | null;
+};
+
+export type UpdatePermissionModeRequest = {
+    /**
+     * Provider permission mode to persist. During a running turn only `Auto`
+     * (`full-access`) can be applied because provider CLI launch flags cannot
+     * be safely reduced after the process has started.
+     */
+    permission_mode: string;
 };
 
 export type UpdatePreferencesRequest = {
@@ -23256,6 +23640,14 @@ export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'fail
  */
 export type WorkloadType = 'container' | 'function' | 'static-site' | 'server-side-app' | 'worker' | 'database' | 'message-queue' | 'cache' | 'cron-job' | 'other';
 
+export type WriteApplicationWorkspaceFilesRequest = {
+    files: Array<ApplicationWorkspaceFileWrite>;
+};
+
+export type WriteApplicationWorkspaceFilesResponse = {
+    written: number;
+};
+
 export type WriteFileBody = {
     /**
      * File contents, base64-encoded. Required — lets callers ship binary
@@ -24088,10 +24480,670 @@ export type WebhookTriggerResponses = {
 
 export type WebhookTriggerResponse2 = WebhookTriggerResponses[keyof WebhookTriggerResponses];
 
+export type ListApplicationsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Number of applications or conversations per page (clamped to 1..=100).
+         */
+        page_size?: number;
+    };
+    url: '/ai/applications';
+};
+
+export type ListApplicationsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type ListApplicationsResponses = {
+    200: Array<ApplicationResponse>;
+};
+
+export type ListApplicationsResponse = ListApplicationsResponses[keyof ListApplicationsResponses];
+
+export type CreateApplicationData = {
+    body: CreateApplicationRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/applications';
+};
+
+export type CreateApplicationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+};
+
+export type CreateApplicationResponses = {
+    201: ApplicationResponse;
+};
+
+export type CreateApplicationResponse = CreateApplicationResponses[keyof CreateApplicationResponses];
+
+export type ArchiveApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type ArchiveApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type ArchiveApplicationResponses = {
+    204: void;
+};
+
+export type ArchiveApplicationResponse = ArchiveApplicationResponses[keyof ArchiveApplicationResponses];
+
+export type GetApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+    };
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type GetApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type GetApplicationResponse = GetApplicationResponses[keyof GetApplicationResponses];
+
+export type ListApplicationConversationsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Resource lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Number of applications or conversations per page (clamped to 1..=100).
+         */
+        page_size?: number;
+    };
+    url: '/ai/applications/{application_public_id}/conversations';
+};
+
+export type ListApplicationConversationsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListApplicationConversationsResponses = {
+    200: Array<ConversationResponse>;
+};
+
+export type ListApplicationConversationsResponse = ListApplicationConversationsResponses[keyof ListApplicationConversationsResponses];
+
+export type CreateApplicationConversationData = {
+    body: CreateApplicationConversationRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations';
+};
+
+export type CreateApplicationConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateApplicationConversationResponses = {
+    201: ConversationResponse;
+};
+
+export type CreateApplicationConversationResponse = CreateApplicationConversationResponses[keyof CreateApplicationConversationResponses];
+
+export type ListThreadArtifactsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        conversation_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts';
+};
+
+export type ListThreadArtifactsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListThreadArtifactsResponses = {
+    200: Array<ThreadArtifactResponse>;
+};
+
+export type ListThreadArtifactsResponse = ListThreadArtifactsResponses[keyof ListThreadArtifactsResponses];
+
+export type CreateThreadArtifactData = {
+    body: CreateThreadArtifactRequest;
+    path: {
+        application_public_id: string;
+        conversation_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts';
+};
+
+export type CreateThreadArtifactErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateThreadArtifactResponses = {
+    201: ThreadArtifactResponse;
+};
+
+export type CreateThreadArtifactResponse = CreateThreadArtifactResponses[keyof CreateThreadArtifactResponses];
+
+export type CreateApplicationPreviewLinkData = {
+    body: CreateApplicationPreviewLinkRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/preview-link';
+};
+
+export type CreateApplicationPreviewLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type CreateApplicationPreviewLinkResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type CreateApplicationPreviewLinkResponse = CreateApplicationPreviewLinkResponses[keyof CreateApplicationPreviewLinkResponses];
+
+export type CreateApplicationProjectData = {
+    body: CreateApplicationProjectRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects';
+};
+
+export type CreateApplicationProjectErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateApplicationProjectResponses = {
+    201: ApplicationResponse;
+};
+
+export type CreateApplicationProjectResponse = CreateApplicationProjectResponses[keyof CreateApplicationProjectResponses];
+
+export type LinkApplicationProjectData = {
+    body: LinkApplicationProjectRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/link';
+};
+
+export type LinkApplicationProjectErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type LinkApplicationProjectResponses = {
+    200: ApplicationResponse;
+};
+
+export type LinkApplicationProjectResponse = LinkApplicationProjectResponses[keyof LinkApplicationProjectResponses];
+
+export type UnlinkApplicationProjectData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}';
+};
+
+export type UnlinkApplicationProjectErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type UnlinkApplicationProjectResponses = {
+    200: ApplicationResponse;
+};
+
+export type UnlinkApplicationProjectResponse = UnlinkApplicationProjectResponses[keyof UnlinkApplicationProjectResponses];
+
+export type DeployApplicationWorkspaceProjectData = {
+    body: DeployApplicationProjectRequest;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/deploy';
+};
+
+export type DeployApplicationWorkspaceProjectErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+};
+
+export type DeployApplicationWorkspaceProjectResponses = {
+    202: ApplicationProjectDeploymentResponse;
+};
+
+export type DeployApplicationWorkspaceProjectResponse = DeployApplicationWorkspaceProjectResponses[keyof DeployApplicationWorkspaceProjectResponses];
+
+export type SetApplicationPrimaryProjectData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/primary';
+};
+
+export type SetApplicationPrimaryProjectErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type SetApplicationPrimaryProjectResponses = {
+    200: ApplicationResponse;
+};
+
+export type SetApplicationPrimaryProjectResponse = SetApplicationPrimaryProjectResponses[keyof SetApplicationPrimaryProjectResponses];
+
+export type WriteApplicationWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/workspace/files';
+};
+
+export type WriteApplicationWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type WriteApplicationWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type WriteApplicationWorkspaceFilesResponse2 = WriteApplicationWorkspaceFilesResponses[keyof WriteApplicationWorkspaceFilesResponses];
+
+export type ImportApplicationWorkspaceGitData = {
+    body: ImportApplicationWorkspaceGitRequest;
+    path: {
+        application_public_id: string;
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/projects/{project_id}/workspace/source';
+};
+
+export type ImportApplicationWorkspaceGitErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type ImportApplicationWorkspaceGitResponses = {
+    204: void;
+};
+
+export type ImportApplicationWorkspaceGitResponse = ImportApplicationWorkspaceGitResponses[keyof ImportApplicationWorkspaceGitResponses];
+
+export type RestoreApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/restore';
+};
+
+export type RestoreApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RestoreApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type RestoreApplicationResponse = RestoreApplicationResponses[keyof RestoreApplicationResponses];
+
+export type GetApplicationWorkspaceData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace';
+};
+
+export type GetApplicationWorkspaceErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+};
+
+export type GetApplicationWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type GetApplicationWorkspaceResponse = GetApplicationWorkspaceResponses[keyof GetApplicationWorkspaceResponses];
+
+export type UpdateApplicationWorkspaceData = {
+    body: UpdateApplicationWorkspaceRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace';
+};
+
+export type UpdateApplicationWorkspaceErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type UpdateApplicationWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type UpdateApplicationWorkspaceResponse = UpdateApplicationWorkspaceResponses[keyof UpdateApplicationWorkspaceResponses];
+
+export type ControlApplicationWorkspaceData = {
+    body: ControlApplicationWorkspaceRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace/actions';
+};
+
+export type ControlApplicationWorkspaceErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type ControlApplicationWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type ControlApplicationWorkspaceResponse = ControlApplicationWorkspaceResponses[keyof ControlApplicationWorkspaceResponses];
+
+export type GetApplicationWorkspaceChangesData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Files per page (1-200, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/changes';
+};
+
+export type GetApplicationWorkspaceChangesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetApplicationWorkspaceChangesResponses = {
+    200: ApplicationWorkspaceChangesResponse;
+};
+
+export type GetApplicationWorkspaceChangesResponse = GetApplicationWorkspaceChangesResponses[keyof GetApplicationWorkspaceChangesResponses];
+
+export type GetApplicationWorkspaceDiffData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/diff';
+};
+
+export type GetApplicationWorkspaceDiffErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetApplicationWorkspaceDiffResponses = {
+    200: ApplicationWorkspaceDiffResponse;
+};
+
+export type GetApplicationWorkspaceDiffResponse = GetApplicationWorkspaceDiffResponses[keyof GetApplicationWorkspaceDiffResponses];
+
+export type GetApplicationWorkspaceDirectoryData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/directory';
+};
+
+export type GetApplicationWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetApplicationWorkspaceDirectoryResponse = GetApplicationWorkspaceDirectoryResponses[keyof GetApplicationWorkspaceDirectoryResponses];
+
+export type GetApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file';
+};
+
+export type GetApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetApplicationWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetApplicationWorkspaceFileResponse = GetApplicationWorkspaceFileResponses[keyof GetApplicationWorkspaceFileResponses];
+
+export type DownloadApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file/download';
+};
+
+export type DownloadApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadApplicationWorkspaceFileResponses = {
+    200: Array<number>;
+};
+
+export type DownloadApplicationWorkspaceFileResponse = DownloadApplicationWorkspaceFileResponses[keyof DownloadApplicationWorkspaceFileResponses];
+
+export type UploadApplicationWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace/files';
+};
+
+export type UploadApplicationWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadApplicationWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Conversation lifecycle state (defaults to active).
+         */
+        status?: ConversationListStatus;
+        /**
+         * Limit results to the global workspace, or return every readable context.
+         */
+        scope?: ConversationListScope;
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Number of conversations per page (clamped to 1..=100).
+         */
+        page_size?: number;
+    };
     url: '/ai/conversations';
 };
 
@@ -24105,6 +25157,347 @@ export type ListAllConversationsResponses = {
 };
 
 export type ListAllConversationsResponse = ListAllConversationsResponses[keyof ListAllConversationsResponses];
+
+export type CreateGlobalConversationData = {
+    body: CreateGlobalConversationRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/conversations';
+};
+
+export type CreateGlobalConversationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    409: unknown;
+    503: unknown;
+};
+
+export type CreateGlobalConversationResponses = {
+    201: ConversationResponse;
+};
+
+export type CreateGlobalConversationResponse = CreateGlobalConversationResponses[keyof CreateGlobalConversationResponses];
+
+export type GetUserConversationData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: {
+        /**
+         * Opaque next_before cursor returned by the previous page
+         */
+        before?: string;
+        /**
+         * Messages per page (default 50, maximum 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/conversations/{public_id}';
+};
+
+export type GetUserConversationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationResponses = {
+    200: ConversationDetailResponse;
+};
+
+export type GetUserConversationResponse = GetUserConversationResponses[keyof GetUserConversationResponses];
+
+export type RenameUserConversationData = {
+    body: RenameConversationRequest;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}';
+};
+
+export type RenameUserConversationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RenameUserConversationResponses = {
+    200: ConversationResponse;
+};
+
+export type RenameUserConversationResponse = RenameUserConversationResponses[keyof RenameUserConversationResponses];
+
+export type ArchiveUserConversationData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/archive';
+};
+
+export type ArchiveUserConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ArchiveUserConversationResponses = {
+    204: void;
+};
+
+export type ArchiveUserConversationResponse = ArchiveUserConversationResponses[keyof ArchiveUserConversationResponses];
+
+export type UploadUserConversationAttachmentData = {
+    body: ChatAttachmentUpload;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachments';
+};
+
+export type UploadUserConversationAttachmentErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+};
+
+export type UploadUserConversationAttachmentResponses = {
+    201: ChatAttachmentResponse;
+};
+
+export type UploadUserConversationAttachmentResponse = UploadUserConversationAttachmentResponses[keyof UploadUserConversationAttachmentResponses];
+
+export type GetUserConversationAttachmentData = {
+    body?: never;
+    path: {
+        public_id: string;
+        attachment_id: string;
+    };
+    query: {
+        name: string;
+    };
+    url: '/ai/conversations/{public_id}/attachments/{attachment_id}';
+};
+
+export type GetUserConversationAttachmentErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationAttachmentResponses = {
+    200: Array<number>;
+};
+
+export type GetUserConversationAttachmentResponse = GetUserConversationAttachmentResponses[keyof GetUserConversationAttachmentResponses];
+
+export type SendUserMessageData = {
+    body: SendMessageRequest;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/messages';
+};
+
+export type SendUserMessageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type SendUserMessageResponses = {
+    202: SendMessageAcceptedResponse;
+};
+
+export type SendUserMessageResponse = SendUserMessageResponses[keyof SendUserMessageResponses];
+
+export type ListUserPendingActionsData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/pending-actions';
+};
+
+export type ListUserPendingActionsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListUserPendingActionsResponses = {
+    200: Array<PendingActionResponse>;
+};
+
+export type ListUserPendingActionsResponse = ListUserPendingActionsResponses[keyof ListUserPendingActionsResponses];
+
+export type UpdateUserPermissionModeData = {
+    body: UpdatePermissionModeRequest;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/permission-mode';
+};
+
+export type UpdateUserPermissionModeErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type UpdateUserPermissionModeResponses = {
+    200: ConversationResponse;
+};
+
+export type UpdateUserPermissionModeResponse = UpdateUserPermissionModeResponses[keyof UpdateUserPermissionModeResponses];
+
+export type ResolveUserPermissionData = {
+    body: ResolvePermissionRequest;
+    path: {
+        public_id: string;
+        permission_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/permissions/{permission_id}/resolve';
+};
+
+export type ResolveUserPermissionErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    410: unknown;
+};
+
+export type ResolveUserPermissionResponses = {
+    204: void;
+};
+
+export type ResolveUserPermissionResponse = ResolveUserPermissionResponses[keyof ResolveUserPermissionResponses];
+
+export type RestoreUserConversationData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/restore';
+};
+
+export type RestoreUserConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RestoreUserConversationResponses = {
+    204: void;
+};
+
+export type RestoreUserConversationResponse = RestoreUserConversationResponses[keyof RestoreUserConversationResponses];
+
+export type StopUserTurnData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/stop';
+};
+
+export type StopUserTurnErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type StopUserTurnResponses = {
+    204: void;
+};
+
+export type StopUserTurnResponse = StopUserTurnResponses[keyof StopUserTurnResponses];
+
+export type GetUserPendingActionData = {
+    body?: never;
+    path: {
+        action_public_id: string;
+    };
+    query?: never;
+    url: '/ai/pending-actions/{action_public_id}';
+};
+
+export type GetUserPendingActionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserPendingActionResponses = {
+    200: PendingActionResponse;
+};
+
+export type GetUserPendingActionResponse = GetUserPendingActionResponses[keyof GetUserPendingActionResponses];
+
+export type ConfirmUserPendingActionData = {
+    body?: never;
+    path: {
+        action_public_id: string;
+    };
+    query?: never;
+    url: '/ai/pending-actions/{action_public_id}/confirm';
+};
+
+export type ConfirmUserPendingActionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type ConfirmUserPendingActionResponses = {
+    200: PendingActionResponse;
+};
+
+export type ConfirmUserPendingActionResponse = ConfirmUserPendingActionResponses[keyof ConfirmUserPendingActionResponses];
+
+export type RejectUserPendingActionData = {
+    body?: never;
+    path: {
+        action_public_id: string;
+    };
+    query?: never;
+    url: '/ai/pending-actions/{action_public_id}/reject';
+};
+
+export type RejectUserPendingActionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type RejectUserPendingActionResponses = {
+    200: PendingActionResponse;
+};
+
+export type RejectUserPendingActionResponse = RejectUserPendingActionResponses[keyof RejectUserPendingActionResponses];
 
 export type GetPricingData = {
     body?: never;
@@ -25040,6 +26433,221 @@ export type ListModelsResponses = {
 };
 
 export type ListModelsResponse = ListModelsResponses[keyof ListModelsResponses];
+
+export type GetGlobalAiWorkspaceData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace';
+};
+
+export type GetGlobalAiWorkspaceErrors = {
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type GetGlobalAiWorkspaceResponses = {
+    200: ApplicationWorkspaceResponse;
+};
+
+export type GetGlobalAiWorkspaceResponse = GetGlobalAiWorkspaceResponses[keyof GetGlobalAiWorkspaceResponses];
+
+export type GetGlobalWorkspaceChangesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Files per page (1-200, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/changes';
+};
+
+export type GetGlobalWorkspaceChangesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceChangesResponses = {
+    200: ApplicationWorkspaceChangesResponse;
+};
+
+export type GetGlobalWorkspaceChangesResponse = GetGlobalWorkspaceChangesResponses[keyof GetGlobalWorkspaceChangesResponses];
+
+export type GetGlobalWorkspaceDiffData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/diff';
+};
+
+export type GetGlobalWorkspaceDiffErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    503: unknown;
+    504: unknown;
+};
+
+export type GetGlobalWorkspaceDiffResponses = {
+    200: ApplicationWorkspaceDiffResponse;
+};
+
+export type GetGlobalWorkspaceDiffResponse = GetGlobalWorkspaceDiffResponses[keyof GetGlobalWorkspaceDiffResponses];
+
+export type GetGlobalWorkspaceDirectoryData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Workspace-relative directory; omit for the root
+         */
+        path?: string;
+        /**
+         * Position returned by the previous page
+         */
+        cursor?: number;
+        /**
+         * Entries per page (1-100, default 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/workspace/directory';
+};
+
+export type GetGlobalWorkspaceDirectoryErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceDirectoryResponses = {
+    200: ApplicationWorkspaceDirectoryResponse;
+};
+
+export type GetGlobalWorkspaceDirectoryResponse = GetGlobalWorkspaceDirectoryResponses[keyof GetGlobalWorkspaceDirectoryResponses];
+
+export type GetGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file';
+};
+
+export type GetGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetGlobalWorkspaceFileResponses = {
+    200: ApplicationWorkspaceFileContentResponse;
+};
+
+export type GetGlobalWorkspaceFileResponse = GetGlobalWorkspaceFileResponses[keyof GetGlobalWorkspaceFileResponses];
+
+export type GetWorkspaceFileLimitsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/file-limits';
+};
+
+export type GetWorkspaceFileLimitsErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type GetWorkspaceFileLimitsResponses = {
+    200: AiWorkspaceFileLimitsSettings;
+};
+
+export type GetWorkspaceFileLimitsResponse = GetWorkspaceFileLimitsResponses[keyof GetWorkspaceFileLimitsResponses];
+
+export type DownloadGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file/download';
+};
+
+export type DownloadGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadGlobalWorkspaceFileResponses = {
+    200: Array<number>;
+};
+
+export type DownloadGlobalWorkspaceFileResponse = DownloadGlobalWorkspaceFileResponses[keyof DownloadGlobalWorkspaceFileResponses];
+
+export type UploadGlobalWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/files';
+};
+
+export type UploadGlobalWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadGlobalWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadGlobalWorkspaceFilesResponse = UploadGlobalWorkspaceFilesResponses[keyof UploadGlobalWorkspaceFilesResponses];
+
+export type CreateGlobalWorkspacePreviewLinkData = {
+    body: CreateApplicationPreviewLinkRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/preview-link';
+};
+
+export type CreateGlobalWorkspacePreviewLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponses = {
+    200: ApplicationPreviewLinkResponse;
+};
+
+export type CreateGlobalWorkspacePreviewLinkResponse = CreateGlobalWorkspacePreviewLinkResponses[keyof CreateGlobalWorkspacePreviewLinkResponses];
 
 export type GetAnalyticsActiveVisitorsData = {
     body?: never;
@@ -43927,11 +45535,21 @@ export type GetConversationData = {
         project_id: number;
         public_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Opaque next_before cursor returned by the previous page
+         */
+        before?: string;
+        /**
+         * Messages per page (default 50, maximum 100)
+         */
+        limit?: number;
+    };
     url: '/projects/{project_id}/ai/conversations/{public_id}';
 };
 
 export type GetConversationErrors = {
+    400: unknown;
     401: unknown;
     403: unknown;
     404: unknown;
@@ -43988,6 +45606,32 @@ export type ArchiveConversationResponses = {
 
 export type ArchiveConversationResponse = ArchiveConversationResponses[keyof ArchiveConversationResponses];
 
+export type SendProjectAiMessageData = {
+    body: SendMessageRequest;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/messages';
+};
+
+export type SendProjectAiMessageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type SendProjectAiMessageResponses = {
+    /**
+     * Turn accepted; output follows on the conversation WebSocket
+     */
+    202: SendMessageAcceptedResponse;
+};
+
+export type SendProjectAiMessageResponse = SendProjectAiMessageResponses[keyof SendProjectAiMessageResponses];
+
 export type ListPendingActionsData = {
     body?: never;
     path: {
@@ -44012,6 +45656,30 @@ export type ListPendingActionsResponses = {
 };
 
 export type ListPendingActionsResponse = ListPendingActionsResponses[keyof ListPendingActionsResponses];
+
+export type UpdatePermissionModeData = {
+    body: UpdatePermissionModeRequest;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/permission-mode';
+};
+
+export type UpdatePermissionModeErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+};
+
+export type UpdatePermissionModeResponses = {
+    200: ConversationResponse;
+};
+
+export type UpdatePermissionModeResponse = UpdatePermissionModeResponses[keyof UpdatePermissionModeResponses];
 
 export type ResolvePermissionData = {
     body: ResolvePermissionRequest;
@@ -44065,6 +45733,28 @@ export type ResolvePermissionResponses = {
 };
 
 export type ResolvePermissionResponse = ResolvePermissionResponses[keyof ResolvePermissionResponses];
+
+export type StopTurnData = {
+    body?: never;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/stop';
+};
+
+export type StopTurnErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type StopTurnResponses = {
+    204: void;
+};
+
+export type StopTurnResponse = StopTurnResponses[keyof StopTurnResponses];
 
 export type GetPendingActionData = {
     body?: never;
@@ -54760,7 +56450,20 @@ export type SaveAgentTokenResponse2 = SaveAgentTokenResponses[keyof SaveAgentTok
 export type ListAiProvidersData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Return only static/cached catalog metadata. This path deliberately
+         * skips the settings-row read as well as CLI probes and is used for chat
+         * first paint; an authenticated refresh follows in the background.
+         */
+        catalog_only?: boolean;
+        /**
+         * Run account-aware model discovery before returning. Normal catalog
+         * reads intentionally use cached/bootstrap models so chat first paint is
+         * not held hostage by provider CLIs that can take 10-15 seconds.
+         */
+        refresh_models?: boolean;
+    };
     url: '/settings/ai-providers';
 };
 

@@ -72,6 +72,7 @@
     "cobe": "^2.0.1",
     "date-fns": "^4.4.0",
     "date-fns-tz": "^3.2.0",
+    "fflate": "^0.8.2",
     "fuse.js": "^7.5.0",
     "ghostty-web": "^0.4.0",
     "highlight.js": "^11.12.0",

@@ -7,6 +7,18 @@
 
 use async_trait::async_trait;
 
+/// Optional cross-domain hook for revoking or granting application-workspace
+/// data-plane access after project topology changes. Implementations must
+/// fail closed: if the exact network membership cannot be applied, affected
+/// workspace compute is stopped before an error is returned.
+#[async_trait]
+pub trait ApplicationDataNetworkReconciler: Send + Sync {
+    async fn project_topology_changed(
+        &self,
+        project_id: i32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// OSS extension point for team-based project access enforcement.
 ///
 /// OSS itself never implements this trait and has no concept of what

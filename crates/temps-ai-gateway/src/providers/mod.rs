@@ -125,6 +125,13 @@ pub fn route_model_to_provider(model: &str) -> Option<&'static str> {
         return Some("gemini");
     }
 
+    // OpenRouter model ids are always `vendor/model` (e.g. "openai/gpt-4o",
+    // "anthropic/claude-sonnet-5"); no native provider uses a slash, so this
+    // is an unambiguous signal.
+    if model_lower.contains('/') {
+        return Some("openrouter");
+    }
+
     None
 }
 
@@ -218,6 +225,19 @@ mod tests {
     fn test_route_other_providers() {
         assert_eq!(route_model_to_provider("grok-3"), Some("xai"));
         assert_eq!(route_model_to_provider("gemini-3.1-pro"), Some("gemini"));
+    }
+
+    #[test]
+    fn test_route_openrouter_models() {
+        assert_eq!(route_model_to_provider("openai/gpt-4o"), Some("openrouter"));
+        assert_eq!(
+            route_model_to_provider("anthropic/claude-sonnet-5"),
+            Some("openrouter")
+        );
+        assert_eq!(
+            route_model_to_provider("meta-llama/llama-3.3-70b-instruct"),
+            Some("openrouter")
+        );
     }
 
     #[test]

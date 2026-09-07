@@ -43,6 +43,10 @@ pub struct AppState {
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Reconciles private application database networks after a service link
+    /// changes. Absent when application workspaces are not installed.
+    pub application_network_reconciler:
+        Option<Arc<dyn temps_core::ApplicationDataNetworkReconciler>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -447,7 +451,9 @@ impl ProviderMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreatableServiceTypeRoute, ProviderMetadata, ServiceTypeRoute};
+    use super::{
+        CreatableServiceTypeRoute, CreateExternalServiceRequest, ProviderMetadata, ServiceTypeRoute,
+    };
 
     #[test]
     fn deprecated_minio_is_not_advertised_for_creation() {
@@ -493,6 +499,28 @@ mod tests {
             CreatableServiceTypeRoute::S3
         );
     }
+
+    #[test]
+    fn create_service_project_link_is_optional_and_deserializes_when_selected() {
+        let unlinked: CreateExternalServiceRequest = serde_json::from_value(serde_json::json!({
+            "name": "standalone-db",
+            "service_type": "postgres",
+            "version": "18",
+            "parameters": {}
+        }))
+        .expect("project selection should remain optional");
+        assert_eq!(unlinked.project_id, None);
+
+        let linked: CreateExternalServiceRequest = serde_json::from_value(serde_json::json!({
+            "name": "project-db",
+            "service_type": "postgres",
+            "version": "18",
+            "parameters": {},
+            "project_id": 42
+        }))
+        .expect("a project selection should deserialize");
+        assert_eq!(linked.project_id, Some(42));
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -510,7 +538,17 @@ pub struct CreateExternalServiceRequest {
     pub name: String,
     pub service_type: CreatableServiceTypeRoute,
     pub version: Option<String>,
+    /// Service-type-specific configuration. Read
+    /// `GET /external-services/types/{service_type}/parameters` before creating
+    /// a service and provide every field its schema marks as required. Secret
+    /// values that the schema describes as auto-generated may be omitted.
     pub parameters: HashMap<String, serde_json::Value>,
+    /// Optionally link the new service to this project as part of the same
+    /// request. The caller must have write access to the target project. If
+    /// linking fails, Temps removes the newly created service so callers do
+    /// not have to recover an ambiguous half-created resource.
+    #[serde(default)]
+    pub project_id: Option<i32>,
     /// Target node ID for the service. Omit or null to run on the control plane.
     #[serde(default)]
     pub node_id: Option<i32>,

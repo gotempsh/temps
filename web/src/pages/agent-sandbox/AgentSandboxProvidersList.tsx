@@ -19,6 +19,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 interface CatalogEntry {
@@ -29,6 +30,8 @@ interface CatalogEntry {
   credential_saved: boolean
   current_auth_type: string | null
   default_model: string | null
+  workspace_ready: boolean
+  workspace_readiness_hint: string | null
 }
 
 interface CatalogResponse {
@@ -80,9 +83,9 @@ export function AgentSandboxProvidersList() {
             AI Providers
           </CardTitle>
           <CardDescription>
-            Each provider has its own credential. The active provider is what
-            workspaces and agents will use — saving Codex's API key won't
-            replace your Claude subscription.
+            Configure each CLI independently. “Workspace ready” means Temps can
+            broker that credential through a short-lived sandbox relay; “Host
+            only” means it is currently limited to server-side workflows.
           </CardDescription>
         </CardHeader>
         <CardContent className="divide-y">
@@ -94,7 +97,8 @@ export function AgentSandboxProvidersList() {
                 className="flex flex-col sm:flex-row sm:items-center gap-3 py-3 first:pt-0 last:pb-0"
               >
                 <div className="flex items-center gap-3 min-w-0 flex-1">
-                  {p.credential_saved ? (
+                  <AiHarnessLogo providerId={p.id} size={34} />
+                  {p.workspace_ready ? (
                     <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
                   ) : (
                     <XCircle className="h-4 w-4 text-muted-foreground shrink-0" />
@@ -116,13 +120,25 @@ export function AgentSandboxProvidersList() {
                               : 'API key'}
                         </span>
                       )}
+                      <span
+                        className={
+                          p.workspace_ready
+                            ? 'inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300'
+                            : 'inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300'
+                        }
+                      >
+                        {p.workspace_ready ? 'Workspace ready' : 'Host only'}
+                      </span>
                     </div>
                     <p className="text-xs text-muted-foreground truncate">
-                      {p.credential_saved
+                      {p.workspace_ready
                         ? p.default_model
-                          ? `Model: ${p.default_model}`
-                          : 'Model: provider default'
-                        : 'No credential saved'}
+                          ? `Workspace model: ${p.default_model}`
+                          : 'Workspace model: provider default'
+                        : (p.workspace_readiness_hint ??
+                          (p.credential_saved
+                            ? 'Credential saved for host workflows'
+                            : 'No credential saved'))}
                     </p>
                   </div>
                 </div>

@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Capability and preference endpoints for the ADR-037 provider switching seam.
+//! Capability and summary-preference endpoints for API gateway inference.
 //!
 //! `GET /api/ai/provider-status`  — returns the current routing preference and
 //!   availability state so the UI can onboard instead of disappearing.
 //!
-//! `PUT /api/ai/provider-preference` — lets an operator switch the instance-level
-//!   routing preference between the BYOK gateway and a subscription-backed agent
-//!   CLI; emits an audit event on every write.
+//! Host-authenticated development harnesses are intentionally absent: they are
+//! selected by an application thread and run through the agent runtime.
 
 use anyhow::Result as AnyhowResult;
 use axum::{
@@ -19,7 +18,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,11 +38,6 @@ use crate::services::ProviderPreferenceError;
 impl From<ProviderPreferenceError> for Problem {
     fn from(error: ProviderPreferenceError) -> Self {
         match error {
-            ProviderPreferenceError::Validation { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Validation Error")
-                    .with_detail(error.to_string())
-            }
             ProviderPreferenceError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -63,7 +56,6 @@ impl From<ProviderPreferenceError> for Problem {
     paths(
         get_ai_provider_status,
         refresh_ai_provider_status,
-        update_ai_provider_preference,
         update_ai_summary_preference
     ),
     components(schemas(
@@ -71,18 +63,16 @@ impl From<ProviderPreferenceError> for Problem {
         AvailableAiProviderDto,
         AiModelOptionDto,
         AiSelectOptionDto,
-        AiCliStatusDto,
-        UpdateProviderPreferenceRequest,
         UpdateAiSummaryPreferenceRequest,
         AiSummaryPreferenceDto,
     )),
     info(
         title = "AI Provider Status API",
-        description = "Inspect and update the instance-level AI provider preference (ADR-037)",
+        description = "Inspect API gateway capability and summary defaults",
         version = "1.0.0"
     ),
     tags(
-        (name = "AI Provider Status", description = "Provider preference and availability endpoints")
+        (name = "AI Provider Status", description = "Gateway capability and summary-default endpoints")
     )
 )]
 pub struct AiProviderStatusApiDoc;
@@ -94,10 +84,6 @@ pub fn configure_provider_status_routes() -> Router<Arc<AiGatewayAppState>> {
             "/ai/provider-status/refresh",
             post(refresh_ai_provider_status),
         )
-        .route(
-            "/ai/provider-preference",
-            put(update_ai_provider_preference),
-        )
         .route("/ai/summary-preference", put(update_ai_summary_preference))
 }
 
@@ -105,18 +91,13 @@ pub fn configure_provider_status_routes() -> Router<Arc<AiGatewayAppState>> {
 // DTOs
 // ============================================================================
 
-/// Current AI provider routing preference and availability for this instance.
+/// Current API-gateway availability for this instance.
 ///
 /// The `configured` field drives the UI onboarding state: when `false` the UI
 /// must show _exactly what is missing_ (`reason`) and _where to fix it_
 /// (`setup_path`), not hide the feature.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AiProviderStatusResponse {
-    /// Active preference: `"gateway"` (BYOK) or `"agent_cli"` (subscription).
-    pub active_provider_type: String,
-    /// Catalog id of the active agent CLI provider, or `null` when
-    /// `active_provider_type` is `"gateway"`.
-    pub agent_cli_provider_id: Option<String>,
     /// Whether the active provider is ready to serve requests.
     pub configured: bool,
     /// Human-readable explanation of why `configured` is `false`.
@@ -125,12 +106,9 @@ pub struct AiProviderStatusResponse {
     pub setup_path: Option<String>,
     /// Whether at least one active BYOK provider key exists.
     pub gateway_available: bool,
-    /// Providers a chat user may choose for a new conversation. Authentication
-    /// source is descriptive metadata only and never contains credentials.
+    /// Gateway providers available to API-backed chat and summaries. Credential
+    /// source is descriptive metadata only and never contains secret values.
     pub available_providers: Vec<AvailableAiProviderDto>,
-    /// Live status of the selected agent CLI, or `null` when
-    /// `active_provider_type` is `"gateway"`.
-    pub agent_cli_status: Option<AiCliStatusDto>,
     /// Whether the active adapter's normalized realtime contract exposes tool
     /// events. Kept under the legacy field name for API compatibility.
     pub supports_interactive_tools: bool,
@@ -143,8 +121,8 @@ pub struct AiProviderStatusResponse {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct AiSummaryPreferenceDto {
-    /// Normalized provider route (`gateway_key:{id}`, `claude_cli`, etc.).
-    /// `null` inherits the active instance provider.
+    /// Normalized gateway route (`gateway_key:{id}`). `null` inherits the
+    /// active gateway key.
     pub provider_id: Option<String>,
     /// `null` uses the selected provider's default model.
     pub model: Option<String>,
@@ -156,8 +134,7 @@ pub struct AiSummaryPreferenceDto {
 pub struct AvailableAiProviderDto {
     pub id: String,
     pub name: String,
-    /// `configured_key` for the gateway or `host_environment` for an ambient
-    /// CLI login discovered in the Temps process environment.
+    /// `configured_key` for an encrypted gateway key.
     pub auth_source: String,
     pub models: Vec<AiModelOptionDto>,
     pub default_model_id: Option<String>,
@@ -247,21 +224,6 @@ fn provider_option(capabilities: temps_ai::ProviderCapabilities) -> AvailableAiP
     }
 }
 
-/// Mirrors `temps_agents::ai_cli::AiCliStatus` with utoipa `ToSchema` added.
-/// `AiCliStatus` itself does not derive `ToSchema`, so this local projection is
-/// used for OpenAPI generation only — the fields are identical.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AiCliStatusDto {
-    pub provider: String,
-    pub installed: bool,
-    pub version: Option<String>,
-    pub authenticated: bool,
-    pub auth_method: Option<String>,
-    pub subscription_type: Option<String>,
-    /// Instructions for the operator when not installed or not authenticated.
-    pub setup_hint: Option<String>,
-}
-
 const PROVIDER_STATUS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 struct CachedProviderStatus {
@@ -317,32 +279,6 @@ impl AiProviderStatusCache {
     }
 }
 
-impl From<temps_agents::ai_cli::AiCliStatus> for AiCliStatusDto {
-    fn from(s: temps_agents::ai_cli::AiCliStatus) -> Self {
-        Self {
-            provider: s.provider,
-            installed: s.installed,
-            version: s.version,
-            authenticated: s.authenticated,
-            auth_method: s.auth_method,
-            subscription_type: s.subscription_type,
-            setup_hint: s.setup_hint,
-        }
-    }
-}
-
-/// Request body for `PUT /api/ai/provider-preference`.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateProviderPreferenceRequest {
-    /// `"gateway"` or `"agent_cli"`.
-    pub provider_type: String,
-    /// Required when `provider_type` is `"agent_cli"`.
-    pub agent_cli_provider_id: Option<String>,
-    /// Deprecated compatibility field. Adapter realtime behavior is derived
-    /// from its capability contract and cannot be toggled independently.
-    pub interactive_bridge_enabled: Option<bool>,
-}
-
 /// Replace the instance-wide defaults inherited by every AI summary.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateAiSummaryPreferenceRequest {
@@ -356,16 +292,14 @@ pub struct UpdateAiSummaryPreferenceRequest {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize)]
-struct ProviderPreferenceUpdatedAudit {
+struct AiSummaryPreferenceUpdatedAudit {
     context: AuditContext,
-    scope: String,
-    provider_type: String,
-    agent_cli_provider_id: Option<String>,
+    provider_id: Option<String>,
 }
 
-impl AuditOperation for ProviderPreferenceUpdatedAudit {
+impl AuditOperation for AiSummaryPreferenceUpdatedAudit {
     fn operation_type(&self) -> String {
-        "ai_gateway.provider_preference.updated".to_string()
+        "ai_gateway.summary_preference.updated".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {
@@ -390,30 +324,18 @@ impl AuditOperation for ProviderPreferenceUpdatedAudit {
 // Shared helper
 // ============================================================================
 
-/// Assemble the full `AiProviderStatusResponse` from the current preference row
-/// and live provider checks.  Shared between GET and the PUT response so the
-/// two handlers never diverge.
+/// Assemble the full `AiProviderStatusResponse` from gateway configuration and
+/// live gateway-key checks.
 async fn build_status_response(
     app_state: &AiGatewayAppState,
 ) -> Result<AiProviderStatusResponse, Problem> {
-    // Chat may advertise and execute a host CLI only after an administrator
-    // explicitly selected it. Ambient authentication proves availability, not
-    // authorization to expose the host process to conversation prompts.
     let preference = app_state
         .provider_preference_service
         .get("instance")
         .await
         .map_err(Problem::from)?;
-    let agent_cli_provider_id = preference
-        .as_ref()
-        .filter(|row| row.provider_type == "agent_cli")
-        .and_then(|row| row.agent_cli_provider_id.clone());
-    let active_provider_type = if agent_cli_provider_id.is_some() {
-        "agent_cli".to_string()
-    } else {
-        "gateway".to_string()
-    };
-
+    // The API gateway never routes to an ambient host harness. Those are
+    // available only through the agent runtime selected by a chat thread.
     // Determine gateway availability: at least one active provider key exists.
     let active_keys = app_state
         .provider_key_service
@@ -461,120 +383,28 @@ async fn build_status_response(
             ),
         ));
     }
-    // Probe independent CLIs concurrently. A cold cache is bounded by the
-    // slowest provider rather than the sum of every subprocess timeout.
-    let cli_probes =
-        futures_util::future::join_all(temps_agents::ai_cli::PROVIDER_CATALOG.iter().map(
-            |registration| async move {
-                let provider = temps_agents::ai_cli::create_provider(registration.id)?;
-                let (status, capabilities) =
-                    tokio::join!(provider.get_status(), provider.capabilities());
-                let realtime = capabilities
-                    .as_ref()
-                    .map(|capabilities| capabilities.realtime.clone());
-                let option = capabilities.map(provider_option);
-                Some((registration.id.to_string(), status, option, realtime))
-            },
-        ))
-        .await;
-    let mut cli_statuses = HashMap::new();
-    let mut cli_realtime = HashMap::new();
-    for (provider_id, status, option, realtime) in cli_probes.into_iter().flatten() {
-        if status.installed && status.authenticated {
-            if let Some(option) = option {
-                available_providers.push(option);
-            }
-        }
-        if let Some(realtime) = realtime {
-            cli_realtime.insert(provider_id.clone(), realtime);
-        }
-        cli_statuses.insert(provider_id, status);
-    }
-
-    let (configured, reason, setup_path, agent_cli_status) = if active_provider_type == "agent_cli"
-    {
-        let provider_id = agent_cli_provider_id.as_deref().unwrap_or("");
-        match cli_statuses.get(provider_id).cloned() {
-            Some(status) => {
-                let configured = status.installed && status.authenticated;
-                let reason = if !configured {
-                    Some(if !status.installed {
-                        format!(
-                            "The {} CLI is not installed on the Temps host",
-                            status.provider
-                        )
-                    } else {
-                        format!(
-                            "The {} CLI is installed but not authenticated",
-                            status.provider
-                        )
-                    })
-                } else {
-                    None
-                };
-                let setup_path = if !configured {
-                    Some("/agent-sandbox/providers".to_string())
-                } else {
-                    None
-                };
-                let dto = AiCliStatusDto::from(status);
-                (configured, reason, setup_path, Some(dto))
-            }
-            None => {
-                // Stored id doesn't match any known provider — surface as
-                // misconfigured so the operator can fix it.
-                (
-                        false,
-                        Some(format!(
-                            "Unknown agent CLI provider '{}' — update the preference to a valid provider id",
-                            provider_id
-                        )),
-                        Some("/agent-sandbox/providers".to_string()),
-                        None,
-                    )
-            }
-        }
+    let (configured, reason, setup_path) = if gateway_available {
+        (true, None, None)
     } else {
-        // Gateway path.
-        let (configured, reason, setup_path) = if gateway_available {
-            (true, None, None)
-        } else {
-            (
-                false,
-                Some("No AI provider key is configured".to_string()),
-                Some("/ai-gateway".to_string()),
-            )
-        };
-        (configured, reason, setup_path, None)
+        (
+            false,
+            Some("No AI provider key is configured".to_string()),
+            Some("/ai-gateway".to_string()),
+        )
     };
 
     // Legacy response fields are now derived from the provider-neutral
     // realtime contract. The old Claude-only bridge toggle no longer controls
     // whether chat gets tools, streaming, cancellation, or interactions.
-    let active_realtime = agent_cli_provider_id
-        .as_deref()
-        .and_then(|provider| cli_realtime.get(provider));
-    let supports_interactive_tools = active_provider_type == "gateway"
-        || active_realtime.is_some_and(|realtime| realtime.tool_events);
-    let interactive_bridge_status = active_realtime
-        .filter(|realtime| realtime.user_interactions)
-        .map(|_| {
-            if configured {
-                "healthy".to_string()
-            } else {
-                "unavailable".to_string()
-            }
-        });
+    let supports_interactive_tools = true;
+    let interactive_bridge_status = None;
 
     Ok(AiProviderStatusResponse {
-        active_provider_type,
-        agent_cli_provider_id,
         configured,
         reason,
         setup_path,
         gateway_available,
         available_providers,
-        agent_cli_status,
         supports_interactive_tools,
         interactive_bridge_status,
         summary_preference: preference
@@ -671,69 +501,12 @@ async fn refresh_ai_provider_status(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
-    // A forced refresh launches authenticated host CLI subprocesses. Keep it
+    // A forced refresh rebuilds gateway-key capability metadata. Keep it
     // behind the settings write permission so read-only users cannot use the
-    // endpoint to repeatedly consume host resources.
+    // endpoint to repeatedly consume provider resources.
     permission_guard!(auth, AiGatewayWrite);
 
     app_state.provider_status_cache.invalidate().await;
-    temps_agents::ai_cli::invalidate_model_discovery_cache().await;
-    let response = cached_status_response(&app_state).await?;
-    Ok(Json(response))
-}
-
-#[utoipa::path(
-    tag = "AI Provider Status",
-    put,
-    path = "/ai/provider-preference",
-    request_body = UpdateProviderPreferenceRequest,
-    responses(
-        (status = 200, description = "Updated provider preference and availability", body = AiProviderStatusResponse),
-        (status = 400, description = "Validation error", body = ProblemDetails),
-        (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
-        (status = 500, description = "Internal server error", body = ProblemDetails)
-    ),
-    security(("bearer_auth" = []))
-)]
-async fn update_ai_provider_preference(
-    RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AiGatewayAppState>>,
-    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
-    Json(request): Json<UpdateProviderPreferenceRequest>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayWrite);
-
-    app_state
-        .provider_preference_service
-        .set(
-            "instance",
-            request.provider_type.clone(),
-            request.agent_cli_provider_id.clone(),
-            request.interactive_bridge_enabled,
-        )
-        .await
-        .map_err(Problem::from)?;
-    app_state.provider_status_cache.invalidate().await;
-
-    // Audit the write — failure is logged but does not fail the request.
-    let audit = ProviderPreferenceUpdatedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        scope: "instance".to_string(),
-        provider_type: request.provider_type.clone(),
-        agent_cli_provider_id: request.agent_cli_provider_id.clone(),
-    };
-    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-        tracing::error!(
-            provider_type = %request.provider_type,
-            "Failed to create audit log for provider preference update: {e}"
-        );
-    }
-
     let response = cached_status_response(&app_state).await?;
     Ok(Json(response))
 }
@@ -772,15 +545,13 @@ async fn update_ai_summary_preference(
         .map_err(Problem::from)?;
     app_state.provider_status_cache.invalidate().await;
 
-    let audit = ProviderPreferenceUpdatedAudit {
+    let audit = AiSummaryPreferenceUpdatedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        scope: "ai_summaries".to_string(),
-        provider_type: "summary_profile".to_string(),
-        agent_cli_provider_id: request.provider_id.clone(),
+        provider_id: request.provider_id.clone(),
     };
     if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
         tracing::error!(%error, "Failed to create audit log for AI summary preference update");
@@ -866,14 +637,11 @@ mod tests {
 
     fn cached_response() -> AiProviderStatusResponse {
         AiProviderStatusResponse {
-            active_provider_type: "gateway".to_string(),
-            agent_cli_provider_id: None,
             configured: true,
             reason: None,
             setup_path: None,
             gateway_available: true,
             available_providers: Vec::new(),
-            agent_cli_status: None,
             supports_interactive_tools: true,
             interactive_bridge_status: None,
             summary_preference: AiSummaryPreferenceDto::default(),

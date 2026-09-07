@@ -16,6 +16,7 @@ pub struct DatabaseConfig {
 
 /// Common pagination parameters
 #[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PaginationParams {
     /// Page number (1-indexed)
     #[param(example = 1)]

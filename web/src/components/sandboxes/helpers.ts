@@ -34,6 +34,19 @@ export function isWorkspace(s: Pick<SandboxView, 'lifecycle'>): boolean {
   return s.lifecycle === 'workspace'
 }
 
+/**
+ * Whether the sandbox belongs in the destructive Expired view. Workspace
+ * deadlines suspend compute only; their persistent files remain live.
+ */
+export function isSandboxExpired(
+  s: Pick<SandboxView, 'lifecycle' | 'status' | 'expires_at'>,
+  now: number
+): boolean {
+  if (s.status === 'destroyed') return true
+  if (isWorkspace(s)) return false
+  return new Date(s.expires_at).getTime() <= now
+}
+
 export type JobSummary = JobSummaryResponse
 
 // Flatten `@vercel/sandbox`-compatible `{ sandbox, routes }` into the

@@ -115,6 +115,10 @@ pub struct ProviderCatalogEntry {
     pub text_streaming: bool,
     pub reasoning_streaming: bool,
     pub user_interactions: bool,
+    /// Whether this adapter has a secure, turn-scoped model relay for running
+    /// inside a persistent Temps workspace. Host authentication alone is not
+    /// enough: workspace harnesses never receive reusable provider tokens.
+    pub workspace_chat_supported: bool,
     /// Constructs the adapter. Keeping this beside the metadata eliminates the
     /// second provider-id match that previously had to be updated separately.
     pub factory: ProviderFactory,
@@ -180,7 +184,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         permission_modes: &[
             ProviderOption {
                 id: "default",
-                name: "Default",
+                name: "Ask each time",
                 description: "Ask before sensitive provider-native actions",
                 requires_system_admin: false,
             },
@@ -198,8 +202,8 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
             },
             ProviderOption {
                 id: "full-access",
-                name: "Full access",
-                description: "Bypass provider-native permission prompts",
+                name: "Auto",
+                description: "Run provider-native actions automatically inside the Temps sandbox",
                 requires_system_admin: true,
             },
         ],
@@ -208,6 +212,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: true,
         reasoning_streaming: false,
         user_interactions: true,
+        workspace_chat_supported: true,
         factory: || Box::new(super::claude::ClaudeCliProvider),
     },
     ProviderCatalogEntry {
@@ -272,6 +277,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: false,
         reasoning_streaming: false,
         user_interactions: false,
+        workspace_chat_supported: false,
         factory: || Box::new(super::codex::CodexCliProvider),
     },
     ProviderCatalogEntry {
@@ -312,6 +318,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: false,
         reasoning_streaming: false,
         user_interactions: false,
+        workspace_chat_supported: false,
         factory: || Box::new(super::opencode::OpenCodeCliProvider),
     },
 ];
@@ -388,6 +395,25 @@ mod tests {
     fn claude_subscription_is_first_flavor() {
         let claude = find_provider("claude_cli").expect("claude_cli in catalog");
         assert_eq!(claude.default_flavor().id, "subscription");
+    }
+
+    #[test]
+    fn claude_permission_labels_explain_runtime_behavior() {
+        let claude = find_provider("claude_cli").expect("claude_cli in catalog");
+        let ask = claude
+            .permission_modes
+            .iter()
+            .find(|mode| mode.id == "default")
+            .expect("default Claude permission mode");
+        let automatic = claude
+            .permission_modes
+            .iter()
+            .find(|mode| mode.id == "full-access")
+            .expect("automatic Claude permission mode");
+
+        assert_eq!(ask.name, "Ask each time");
+        assert_eq!(automatic.name, "Auto");
+        assert!(automatic.requires_system_admin);
     }
 
     #[test]

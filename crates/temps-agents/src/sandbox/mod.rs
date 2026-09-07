@@ -200,6 +200,13 @@ pub struct SandboxCreateConfig {
     pub owner_user_id: Option<i32>,
 }
 
+fn direct_model_relay_base_url(control_plane_url: &str) -> String {
+    format!(
+        "{}/api/ai/sandbox-models",
+        control_plane_url.trim_end_matches('/')
+    )
+}
+
 /// Artifact produced by a successful [`SandboxProvider::take_snapshot`] call.
 ///
 /// Contains everything the service layer needs to persist the snapshot row and
@@ -357,6 +364,52 @@ pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
 pub trait SandboxProvider: Send + Sync {
     /// Create and start a new sandbox for a run.
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError>;
+
+    /// Return the base URL a process inside `handle` must use for its
+    /// turn-scoped model relay. Backends with ordinary reachability can use
+    /// the control-plane URL directly. Network-isolated backends override
+    /// this with a capability-only bridge owned by that backend.
+    async fn model_relay_base_url(
+        &self,
+        _handle: &SandboxHandle,
+        control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        Ok(direct_model_relay_base_url(control_plane_url))
+    }
+
+    /// Return the URL a process inside `handle` must use for a turn-scoped
+    /// harness MCP server. Backends with ordinary control-plane reachability
+    /// can use the registered URL directly. Network-isolated backends override
+    /// this with a capability-only relay owned by that backend.
+    async fn harness_mcp_url(
+        &self,
+        _handle: &SandboxHandle,
+        _control_plane_url: &str,
+        registered_url: &str,
+    ) -> Result<String, AgentError> {
+        Ok(registered_url.to_string())
+    }
+
+    /// Attach a sandbox and a bounded set of application-owned data services
+    /// to an isolated per-application network. The default rejects the
+    /// operation; only providers capable of enforcing network membership
+    /// should implement it.
+    async fn configure_application_network(
+        &self,
+        handle: &SandboxHandle,
+        network_name: &str,
+        service_containers: &[String],
+    ) -> Result<(), AgentError> {
+        let _ = (network_name, service_containers);
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "application networks are not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
 
     /// Execute a command inside an existing sandbox, streaming stdout via callback.
     async fn exec(
@@ -798,5 +851,13 @@ mod tests {
         // We never actually construct one here — the type check alone is
         // the guard. The closure is never invoked.
         let _ = |p: Arc<dyn SandboxProvider>| assert_object_safe(&p);
+    }
+
+    #[test]
+    fn direct_model_relay_base_includes_the_registered_api_route() {
+        assert_eq!(
+            direct_model_relay_base_url("http://control-plane.test:8080/"),
+            "http://control-plane.test:8080/api/ai/sandbox-models"
+        );
     }
 }

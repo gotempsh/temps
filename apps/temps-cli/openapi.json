@@ -1828,6 +1828,76 @@
         },
         "type": "object"
       },
+      "AiWorkspaceFileLimitsSettings": {
+        "description": "Runtime limits for workspace file transfer and browser previews.\n\nThe HTTP layer additionally enforces absolute ceilings so a malformed or\nlegacy settings row cannot turn a configurable limit into unbounded control\nplane memory use.",
+        "properties": {
+          "max_download_size_mb": {
+            "default": 32,
+            "example": 32,
+            "format": "int32",
+            "maximum": 32,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_file_size_mb": {
+            "default": 16,
+            "example": 16,
+            "format": "int32",
+            "maximum": 32,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_files_per_upload": {
+            "default": 32,
+            "example": 32,
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_image_preview_size_mb": {
+            "default": 8,
+            "example": 8,
+            "format": "int32",
+            "maximum": 16,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_text_preview_kb": {
+            "default": 256,
+            "example": 256,
+            "format": "int32",
+            "maximum": 1024,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_upload_size_mb": {
+            "default": 32,
+            "example": 32,
+            "format": "int32",
+            "maximum": 32,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_workspace_entries": {
+            "default": 5000,
+            "example": 5000,
+            "format": "int32",
+            "maximum": 50000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_workspace_size_mb": {
+            "default": 256,
+            "example": 256,
+            "format": "int32",
+            "maximum": 2048,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "AlarmListResponse": {
         "description": "Paginated list of alarms.",
         "properties": {
@@ -2829,6 +2899,24 @@
               }
             ]
           },
+          "ai_workspace_file_limits": {
+            "default": {
+              "max_download_size_mb": 32,
+              "max_file_size_mb": 16,
+              "max_files_per_upload": 32,
+              "max_image_preview_size_mb": 8,
+              "max_text_preview_kb": 256,
+              "max_upload_size_mb": 32,
+              "max_workspace_entries": 5000,
+              "max_workspace_size_mb": 256
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
+                "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
+              }
+            ]
+          },
           "build_limits": {
             "default": {
               "cpu_limit_cores": 0,
@@ -3095,7 +3183,7 @@
               "auto_upgrade": true,
               "container_name": "temps-preview-gateway",
               "host_port": 8090,
-              "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
+              "image": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
             },
             "oneOf": [
               {
@@ -3219,6 +3307,10 @@
           },
           "ai_config": {
             "$ref": "#/components/schemas/AiConfigSettings"
+          },
+          "ai_workspace_file_limits": {
+            "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
+            "description": "Persistent AI workspace file transfer and preview limits."
           },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
@@ -3395,12 +3487,538 @@
           "cluster_dns",
           "build_limits",
           "ai_chat_limits",
+          "ai_workspace_file_limits",
           "request_timeouts",
           "connection_limits",
           "tenant_resource_ceilings",
           "self_update",
           "image_retention",
           "mcp_server"
+        ],
+        "type": "object"
+      },
+      "ApplicationPreviewLinkResponse": {
+        "properties": {
+          "expires_at": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "url": {
+            "description": "A short-lived authenticated URL. Its fragment carries the grant and\nnever reaches the development server or referrer headers.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "ApplicationProjectDeploymentResponse": {
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "source_type": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "environment_id",
+          "slug",
+          "state",
+          "source_type"
+        ],
+        "type": "object"
+      },
+      "ApplicationProjectEnvironmentResponse": {
+        "properties": {
+          "deployment_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "sleeping": {
+            "type": "boolean"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "slug",
+          "sleeping"
+        ],
+        "type": "object"
+      },
+      "ApplicationProjectResponse": {
+        "properties": {
+          "automatic_deploy": {
+            "type": "boolean"
+          },
+          "environments": {
+            "items": {
+              "$ref": "#/components/schemas/ApplicationProjectEnvironmentResponse"
+            },
+            "type": "array"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_primary": {
+            "type": "boolean"
+          },
+          "is_private": {
+            "type": "boolean"
+          },
+          "last_deployment_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "main_branch": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "main_branch",
+          "is_private",
+          "is_primary",
+          "automatic_deploy",
+          "environments"
+        ],
+        "type": "object"
+      },
+      "ApplicationResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/ApplicationProjectResponse"
+            },
+            "type": "array"
+          },
+          "public_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_id",
+          "name",
+          "status",
+          "projects",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceChangesResponse": {
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/ApplicationWorkspaceFileResponse"
+            },
+            "type": "array"
+          },
+          "changes_truncated": {
+            "type": "boolean"
+          },
+          "clean": {
+            "type": "boolean"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_truncated": {
+            "type": "boolean"
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listed_file_count": {
+            "description": "Number of file paths discovered within the server-side safety cap.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Opaque position for the next bounded page, when another page exists.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "clean",
+          "truncated",
+          "files_truncated",
+          "changes_truncated",
+          "listed_file_count",
+          "files",
+          "changes"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceDiffResponse": {
+        "properties": {
+          "diff": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "diff",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceDirectoryEntryResponse": {
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "size_bytes"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceDirectoryResponse": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryEntryResponse"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "entries",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceFileContentResponse": {
+        "properties": {
+          "binary": {
+            "type": "boolean"
+          },
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_b64": {
+            "description": "Base64-encoded raster image bytes when this file has a verified,\nbrowser-safe image signature and is within the configured preview cap.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "media_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "binary",
+          "size_bytes",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceFileResponse": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "staged": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unstaged": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "staged",
+          "unstaged"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceFileWrite": {
+        "additionalProperties": false,
+        "properties": {
+          "contents_b64": {
+            "type": "string"
+          },
+          "mode": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Project-relative path. Absolute paths and traversal are rejected.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "contents_b64"
+        ],
+        "type": "object"
+      },
+      "ApplicationWorkspaceResponse": {
+        "properties": {
+          "cpu_limit": {
+            "format": "double",
+            "type": "number"
+          },
+          "cpu_usage_usec": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "data_network_service_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "desired_state": {
+            "type": "string"
+          },
+          "disk_limit_enforced": {
+            "description": "Docker bind-mounted workspaces report usage but cannot enforce a\nper-directory quota. Firecracker workspaces enforce this value.",
+            "type": "boolean"
+          },
+          "disk_limit_mb": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "disk_used_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "idle_timeout_secs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit_mb": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "memory_used_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "open_preview_ports": {
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "persistent_volume_healthy": {
+            "type": "boolean"
+          },
+          "pids_limit": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pids_used": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "runtime": {
+            "type": "string"
+          },
+          "sandbox_public_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snapshot_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "desired_state",
+          "runtime",
+          "cpu_limit",
+          "memory_limit_mb",
+          "pids_limit",
+          "disk_limit_mb",
+          "disk_limit_enforced",
+          "idle_timeout_secs",
+          "open_preview_ports",
+          "persistent_volume_healthy",
+          "data_network_service_count"
         ],
         "type": "object"
       },
@@ -5381,6 +5999,66 @@
         ],
         "type": "object"
       },
+      "ChatAttachmentReference": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ChatAttachmentResponse": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "is_image": {
+            "type": "boolean"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "sandbox_path": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "mime_type",
+          "size_bytes",
+          "sandbox_path",
+          "is_image"
+        ],
+        "type": "object"
+      },
+      "ChatAttachmentUpload": {
+        "properties": {
+          "file": {
+            "format": "binary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      },
       "ChatCompletionChoice": {
         "properties": {
           "finish_reason": {
@@ -5596,25 +6274,15 @@
         "type": "object"
       },
       "ChatReadinessResponse": {
-        "description": "What still has to be true before an AI chat can run a turn in this project.\n\nThe three gates are independent and fail for different reasons with different\nfixes, so they are reported separately rather than collapsed into one boolean:\nan instance admin configures a provider (instance-wide), while the two toggles\nare per-project. Collapsing them would leave the user with \"AI unavailable\"\nand no idea which of three places to go.",
+        "description": "What still has to be true before an AI chat can run a turn in this project.",
         "properties": {
           "ai_configured": {
             "description": "An AI provider is configured on this instance. Fixed in\nSettings → AI Providers; instance-wide, not per project.",
             "type": "boolean"
-          },
-          "chat_enabled": {
-            "description": "The per-project read-only chat toggle is on (the default).",
-            "type": "boolean"
-          },
-          "write_actions_enabled": {
-            "description": "The per-project write-actions opt-in is on. Required for any flow where\nthe assistant *proposes* changes; irrelevant for read-only questions.",
-            "type": "boolean"
           }
         },
         "required": [
-          "ai_configured",
-          "chat_enabled",
-          "write_actions_enabled"
+          "ai_configured"
         ],
         "type": "object"
       },
@@ -8228,6 +8896,30 @@
         ],
         "type": "object"
       },
+      "ControlApplicationWorkspaceRequest": {
+        "properties": {
+          "action": {
+            "description": "restart, pause, resume, rebuild, snapshot, or restore",
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snapshot_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
       "ConversationDetailResponse": {
         "allOf": [
           {
@@ -8242,6 +8934,9 @@
                 },
                 "type": "array"
               },
+              "page": {
+                "$ref": "#/components/schemas/ConversationMessagePageResponse"
+              },
               "pending_permission": {
                 "oneOf": [
                   {
@@ -8255,14 +8950,52 @@
               }
             },
             "required": [
-              "messages"
+              "messages",
+              "page"
             ],
             "type": "object"
           }
         ]
       },
+      "ConversationListScope": {
+        "enum": [
+          "all",
+          "global"
+        ],
+        "type": "string"
+      },
+      "ConversationListStatus": {
+        "enum": [
+          "active",
+          "archived"
+        ],
+        "type": "string"
+      },
+      "ConversationMessagePageResponse": {
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_before": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "has_more"
+        ],
+        "type": "object"
+      },
       "ConversationResponse": {
         "properties": {
+          "active_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ai_model": {
             "type": "string"
           },
@@ -8278,6 +9011,13 @@
               "null"
             ]
           },
+          "application_id": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "context_id": {
             "type": "string"
           },
@@ -8290,6 +9030,13 @@
           "last_activity_at": {
             "type": "string"
           },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "public_id": {
             "type": "string"
           },
@@ -8301,6 +9048,16 @@
               "string",
               "null"
             ]
+          },
+          "turn_started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_status": {
+            "description": "Server-authoritative lifecycle for the current/most recent turn.",
+            "type": "string"
           }
         },
         "required": [
@@ -8312,7 +9069,8 @@
           "last_activity_at",
           "ai_provider",
           "ai_model",
-          "ai_permission_mode"
+          "ai_permission_mode",
+          "turn_status"
         ],
         "type": "object"
       },
@@ -8722,6 +9480,99 @@
           "role_type",
           "api_key",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "CreateApplicationConversationRequest": {
+        "properties": {
+          "ai_provider": {
+            "description": "A registered development harness (for example `claude_cli`).\nApplication threads never inherit an API-gateway provider.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CreateApplicationPreviewLinkRequest": {
+        "properties": {
+          "path": {
+            "description": "Optional same-origin path to open after the preview grant is exchanged.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "description": "The development server port detected or selected in the sandbox.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "port"
+        ],
+        "type": "object"
+      },
+      "CreateApplicationProjectRequest": {
+        "properties": {
+          "exposed_port": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "preset": {
+            "description": "Deployment preset for the project. Defaults to `autopack`, which\ndetects the application runtime from the workspace source.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "CreateApplicationRequest": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "starter_project": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreateApplicationProjectRequest",
+                "description": "Recommended default: create a deployable, Git-less starter project in\nthe application's persistent workspace."
+              }
+            ]
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -9518,6 +10369,36 @@
           "token",
           "base_url"
         ],
+        "type": "object"
+      },
+      "CreateGlobalConversationRequest": {
+        "properties": {
+          "ai_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_permission_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_provider": {
+            "description": "A registered development harness. Global operator chats run inside a\npersistent Temps-managed sandbox rather than on the host filesystem.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "CreateIncidentRequest": {
@@ -10739,6 +11620,25 @@
         ],
         "type": "object"
       },
+      "CreateThreadArtifactRequest": {
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "payload": {},
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "payload"
+        ],
+        "type": "object"
+      },
       "CreateUserRequest": {
         "properties": {
           "email": {
@@ -11512,6 +12412,19 @@
         "required": [
           "deleted"
         ],
+        "type": "object"
+      },
+      "DeployApplicationProjectRequest": {
+        "properties": {
+          "environment_id": {
+            "description": "Target environment. Omit to use production, then the project's oldest\nactive environment as a fallback.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "DeployFromImageRequest": {
@@ -19147,7 +20060,7 @@
             "type": "string"
           },
           "host_port": {
-            "description": "Host port that the container's :8080 is published on.",
+            "description": "Host port that the ingress relay's :8080 is published on.",
             "format": "int32",
             "minimum": 0,
             "type": [
@@ -19185,7 +20098,7 @@
             ]
           },
           "network": {
-            "description": "Network the container is attached to (should be `temps-sandbox-net`).",
+            "description": "Trusted control network the gateway starts on. It is additionally attached\nto each per-sandbox isolated network during reconciliation.",
             "type": [
               "string",
               "null"
@@ -20574,7 +21487,10 @@
           },
           "project_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "project_name": {
             "type": [
@@ -20599,11 +21515,14 @@
               "string",
               "null"
             ]
+          },
+          "turn_status": {
+            "description": "Server-authoritative lifecycle for the current/most recent turn.",
+            "type": "string"
           }
         },
         "required": [
           "public_id",
-          "project_id",
           "context_type",
           "context_id",
           "status",
@@ -20611,7 +21530,8 @@
           "last_activity_at",
           "ai_provider",
           "ai_model",
-          "ai_permission_mode"
+          "ai_permission_mode",
+          "turn_status"
         ],
         "type": "object"
       },
@@ -21580,6 +22500,40 @@
         },
         "required": [
           "imageRef"
+        ],
+        "type": "object"
+      },
+      "ImportApplicationWorkspaceGitRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "depth": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "git_connection_id": {
+            "description": "Opaque user-owned connection reference. The credential value remains\nserver-side and is restricted to the provider's configured origin.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
         ],
         "type": "object"
       },
@@ -23240,6 +24194,18 @@
         ],
         "type": "object"
       },
+      "LinkApplicationProjectRequest": {
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "type": "object"
+      },
       "LinkServiceRequest": {
         "properties": {
           "project_id": {
@@ -24781,10 +25747,24 @@
       },
       "MessageResponse": {
         "properties": {
+          "attachments": {
+            "description": "Files copied into the persistent workspace for this user turn.",
+            "items": {
+              "$ref": "#/components/schemas/ChatAttachmentResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "content": {
             "type": "string"
           },
           "created_at": {
+            "type": "string"
+          },
+          "cursor": {
+            "description": "Stable opaque cursor for this stored message. Clients must treat this as\nan uninterpreted token and send it back through the `before` query.",
             "type": "string"
           },
           "parts": {
@@ -24812,6 +25792,7 @@
           }
         },
         "required": [
+          "cursor",
           "role",
           "content",
           "created_at"
@@ -25666,6 +26647,44 @@
         },
         "required": [
           "path"
+        ],
+        "type": "object"
+      },
+      "ModelCapability": {
+        "properties": {
+          "default_thinking_mode_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "thinking_modes": {
+            "items": {
+              "$ref": "#/components/schemas/SelectOption"
+            },
+            "type": "array"
+          },
+          "tool_thinking_modes": {
+            "description": "Optional reasoning modes valid when function tools are attached. `None`\ninherits `thinking_modes`; `Some` is a model-specific restriction.",
+            "items": {
+              "$ref": "#/components/schemas/SelectOption"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "thinking_modes"
         ],
         "type": "object"
       },
@@ -32349,6 +33368,16 @@
               "null"
             ]
           },
+          "default_permission_mode_id": {
+            "type": "string"
+          },
+          "default_runtime_model_id": {
+            "description": "Explicit default used when a new harness thread is created.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "host_auth_hint": {
             "description": "Explains why `host_authenticated` is false (not installed vs.\ninstalled-but-not-authenticated), or `None` when it's true.",
             "type": [
@@ -32364,7 +33393,7 @@
             ]
           },
           "host_authenticated": {
-            "description": "True when the CLI is installed AND authenticated on **this host** —\nthe machine running the Temps server process. This is a completely\ndifferent signal from `credential_saved`: that field is about a\ncredential seeded into a *sandboxed autofixer container*, while this\none is what actually gates whether the AI Gateway can route requests\nto this provider (ADR-037's `AgentCliAiService` uses only the host's\nambient CLI session — ordering `claude setup-token`/`codex login` on\nthis machine — and never reads the sandbox credential at all). A\nprovider can show `credential_saved: true` and `host_authenticated:\nfalse` at the same time; only the latter means chat/gateway routing\nwill actually work.",
+            "description": "True when the CLI is installed AND authenticated on **this host** —\nthe machine running the Temps server process. This is a completely\ndifferent signal from `credential_saved`: that field is about a\ncredential available to the server-side, turn-scoped workspace relay.\nPersistent workspace chat never inherits the host's ambient CLI\nsession. A provider can show\n`credential_saved: true` and `host_authenticated: false` at the same\ntime.",
             "type": "boolean"
           },
           "host_version": {
@@ -32425,8 +33454,33 @@
           "name": {
             "type": "string"
           },
+          "permission_modes": {
+            "description": "Provider-native permission modes available to sandboxed harness turns.",
+            "items": {
+              "$ref": "#/components/schemas/SelectOption"
+            },
+            "type": "array"
+          },
+          "runtime_models": {
+            "description": "Full normalized runtime capabilities used by application chat. Unlike\n`models`, this preserves resolved display names and reasoning choices.",
+            "items": {
+              "$ref": "#/components/schemas/ModelCapability"
+            },
+            "type": "array"
+          },
           "supports_max_turns": {
             "description": "True when this provider's CLI supports enforcing a turn cap. False\nfor Codex/OpenCode, which run to completion — the UI labels their\nmax-turns inputs accordingly.",
+            "type": "boolean"
+          },
+          "workspace_readiness_hint": {
+            "description": "Actionable explanation when `workspace_ready` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_ready": {
+            "description": "True only when this provider can execute inside a persistent Temps\nworkspace with a saved credential and a secure turn-scoped relay.\nThis is the authoritative signal for workspace harness pickers.",
             "type": "boolean"
           }
         },
@@ -32437,10 +33491,14 @@
           "auth_command",
           "auth_flavors",
           "models",
+          "runtime_models",
+          "permission_modes",
+          "default_permission_mode_id",
           "credential_saved",
           "supports_max_turns",
           "host_authenticated",
-          "model_source"
+          "model_source",
+          "workspace_ready"
         ],
         "type": "object"
       },
@@ -37576,6 +38634,27 @@
         },
         "type": "object"
       },
+      "SelectOption": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
       "SelfUpdateAttempt": {
         "description": "A single update attempt. Persisted to `<data_dir>/self-update.json` so the\nresult survives the restart it causes.",
         "properties": {
@@ -37880,6 +38959,27 @@
         ],
         "type": "object"
       },
+      "SendMessageAcceptedResponse": {
+        "description": "Acknowledgement that a durable, server-owned turn has started. Live token,\ntool, permission, error, and completion events are delivered exclusively by\nthe conversation WebSocket.",
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          },
+          "turn_started_at": {
+            "description": "Server timestamp used by every observer to render one continuous\nelapsed-time counter across refreshes and reconnects.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "status",
+          "turn_started_at"
+        ],
+        "type": "object"
+      },
       "SendMessageRequest": {
         "properties": {
           "ai_model": {
@@ -37903,11 +39003,25 @@
               "null"
             ]
           },
+          "attachments": {
+            "description": "Opaque references returned by the conversation attachment endpoint.",
+            "items": {
+              "$ref": "#/components/schemas/ChatAttachmentReference"
+            },
+            "type": "array"
+          },
           "content": {
             "type": "string"
           },
           "page_context": {
             "description": "Optional, client-supplied description of the page/entity the user is\ncurrently viewing (e.g. a trace in a project). Injected into the model's\nview of this turn only — never stored or shown in history. Capped server\nside; oversized values are ignored rather than rejected.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_id": {
+            "description": "Client-generated opaque idempotency key for this turn. Retries with the\nsame id never create a second user message or harness execution.",
             "type": [
               "string",
               "null"
@@ -43439,6 +44553,46 @@
         ],
         "type": "object"
       },
+      "ThreadArtifactResponse": {
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "payload": {},
+          "public_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_id",
+          "kind",
+          "schema_version",
+          "payload",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "TimeBucketStats": {
         "description": "Time bucket statistics response",
         "properties": {
@@ -45524,6 +46678,52 @@
         },
         "type": "object"
       },
+      "UpdateApplicationWorkspaceRequest": {
+        "properties": {
+          "cpu_limit": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "disk_limit_mb": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "idle_timeout_secs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit_mb": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pids_limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "runtime": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateAutomaticDeployRequest": {
         "properties": {
           "automatic_deploy": {
@@ -46907,6 +48107,18 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdatePermissionModeRequest": {
+        "properties": {
+          "permission_mode": {
+            "description": "Provider permission mode to persist. During a running turn only `Auto`\n(`full-access`) can be applied because provider CLI launch flags cannot\nbe safely reduced after the process has started.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "permission_mode"
+        ],
         "type": "object"
       },
       "UpdatePreferencesRequest": {
@@ -50305,6 +51517,33 @@
         ],
         "type": "string"
       },
+      "WriteApplicationWorkspaceFilesRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/ApplicationWorkspaceFileWrite"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      },
+      "WriteApplicationWorkspaceFilesResponse": {
+        "properties": {
+          "written": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "written"
+        ],
+        "type": "object"
+      },
       "WriteFileBody": {
         "additionalProperties": false,
         "properties": {
@@ -51607,13 +52846,1633 @@
         "summary": "Public webhook endpoint. Authenticated via `X-Webhook-Token` header.",
         "tags": [
           "Agents"
+        ]
+      }
+    },
+    "/ai/applications": {
+      "get": {
+        "operationId": "list_applications",
+        "parameters": [
+          {
+            "description": "Resource lifecycle state (defaults to active).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          },
+          {
+            "description": "Page number (1-indexed).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of applications or conversations per page (clamped to 1..=100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
         ],
-        "x-maturity": "experimental"
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ApplicationResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      },
+      "post": {
+        "operationId": "create_application",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApplicationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}": {
+      "delete": {
+        "description": "Archives the application and pauses its workspace compute while retaining projects, conversations, and persistent files.",
+        "operationId": "archive_application",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Archive an AI application",
+        "tags": [
+          "AI Applications"
+        ]
+      },
+      "get": {
+        "operationId": "get_application",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Resource lifecycle state (defaults to active).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/conversations": {
+      "get": {
+        "operationId": "list_application_conversations",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Resource lifecycle state (defaults to active).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          },
+          {
+            "description": "Page number (1-indexed).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of applications or conversations per page (clamped to 1..=100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ConversationResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      },
+      "post": {
+        "operationId": "create_application_conversation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApplicationConversationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts": {
+      "get": {
+        "operationId": "list_thread_artifacts",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "conversation_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ThreadArtifactResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      },
+      "post": {
+        "operationId": "create_thread_artifact",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "conversation_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateThreadArtifactRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadArtifactResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/preview-link": {
+      "post": {
+        "operationId": "create_application_preview_link",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApplicationPreviewLinkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mint a short-lived URL for a port running in the application harness\nsandbox. This intentionally does not return the bare `ws-…` hostname:\napplication sandboxes always have a private preview password and only the\ngateway can exchange this grant for the preview cookie.",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/projects": {
+      "post": {
+        "description": "Creates a Temps project, links it to the user-owned application, creates projects/<slug> in its persistent workspace, and refreshes the application topology in one approval-gated server workflow.",
+        "operationId": "create_application_project",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApplicationProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create and link an application project",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/projects/link": {
+      "post": {
+        "operationId": "link_application_project",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkApplicationProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Link an existing project to an application",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/projects/{project_id}": {
+      "delete": {
+        "description": "Unlinks a project and its data-network access. A workspace may contain no linked projects.",
+        "operationId": "unlink_application_project",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Unlink an application project",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/projects/{project_id}/deploy": {
+      "post": {
+        "description": "Packages projects/<slug> from the application's persistent workspace and starts the existing Temps uploaded-source Drop workflow. The operation is exposed to chat through temps_write and therefore follows the active native approval mode.",
+        "operationId": "deploy_application_workspace_project",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeployApplicationProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationProjectDeploymentResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Deploy an application workspace project with Drop",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/projects/{project_id}/primary": {
+      "post": {
+        "operationId": "set_application_primary_project",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Choose the application's primary project",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/projects/{project_id}/workspace/files": {
+      "post": {
+        "description": "Re-authorizes every linked project and writes a configured, bounded batch of project-relative files into the selected persistent workspace directory.",
+        "operationId": "write_application_workspace_files",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Write a bounded batch of local files into an application project",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/projects/{project_id}/workspace/source": {
+      "post": {
+        "description": "Re-authorizes every linked project, resolves an optional user-owned Git connection server-side, and shallow-clones into the selected project directory.",
+        "operationId": "import_application_workspace_git",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportApplicationWorkspaceGitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import a Git repository into an application project",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/restore": {
+      "post": {
+        "description": "Restores an archived application and requests that its retained persistent workspace resume on next access.",
+        "operationId": "restore_application",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Restore an archived AI application",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace": {
+      "get": {
+        "operationId": "get_application_workspace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      },
+      "patch": {
+        "description": "Persists desired runtime and resource settings server-side, then replaces compute while retaining the application files.",
+        "operationId": "update_application_workspace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateApplicationWorkspaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update desired application workspace resources",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/actions": {
+      "post": {
+        "description": "Restart, pause, resume, rebuild, snapshot, or restore the application's persistent workspace. Files outlive suspended or replaced compute.",
+        "operationId": "control_application_workspace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ControlApplicationWorkspaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Control an application workspace",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/changes": {
+      "get": {
+        "operationId": "get_application_workspace_changes",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Position returned by the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Files per page (1-200, default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceChangesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          },
+          "504": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/diff": {
+      "get": {
+        "operationId": "get_application_workspace_diff",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceDiffResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          },
+          "504": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/directory": {
+      "get": {
+        "operationId": "get_application_workspace_directory",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Workspace-relative directory; omit for the root",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Position returned by the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page (1-100, default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/file": {
+      "get": {
+        "operationId": "get_application_workspace_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceFileContentResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/file/download": {
+      "get": {
+        "operationId": "download_application_workspace_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Download one application workspace file",
+        "tags": [
+          "AI Applications"
+        ]
+      }
+    },
+    "/ai/applications/{application_public_id}/workspace/files": {
+      "post": {
+        "description": "Writes a configured, bounded batch of safe workspace-relative files into the persistent workspace without waking compute.",
+        "operationId": "upload_application_workspace_files",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Upload files into an application workspace",
+        "tags": [
+          "AI Applications"
+        ]
       }
     },
     "/ai/conversations": {
       "get": {
         "operationId": "list_all_conversations",
+        "parameters": [
+          {
+            "description": "Conversation lifecycle state (defaults to active).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListStatus"
+            }
+          },
+          {
+            "description": "Limit results to the global workspace, or return every readable context.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ConversationListScope"
+            }
+          },
+          {
+            "description": "Page number (1-indexed).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of conversations per page (clamped to 1..=100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -51643,8 +54502,786 @@
         "summary": "List the current user's active conversations across all projects,\nmost-recently-active first, annotated with project name/slug.",
         "tags": [
           "AI Chat"
+        ]
+      },
+      "post": {
+        "operationId": "create_global_conversation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGlobalConversationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
         ],
-        "x-maturity": "experimental"
+        "summary": "Create a private user-owned operator thread without binding its lifetime or\nauthority to a project. Project access is selected per tool call and checked\nagainst the user's current role and memberships.",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}": {
+      "get": {
+        "operationId": "get_user_conversation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque next_before cursor returned by the previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Messages per page (default 50, maximum 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationDetailResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Load one bounded history page for a private conversation by its owner-facing\nid. Project/application context is revalidated, but never used as the\nownership key.",
+        "tags": [
+          "AI Chat"
+        ]
+      },
+      "patch": {
+        "operationId": "rename_user_conversation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameConversationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/archive": {
+      "post": {
+        "operationId": "archive_user_conversation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/attachments": {
+      "post": {
+        "operationId": "upload_user_conversation_attachment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatAttachmentUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatAttachmentResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/attachments/{attachment_id}": {
+      "get": {
+        "operationId": "get_user_conversation_attachment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "attachment_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/messages": {
+      "post": {
+        "operationId": "send_user_message",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendMessageAcceptedResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Submit a turn to a user-owned conversation. The authenticated user's\ncurrent role and permissions are captured for this turn's tool executor;\nno project id from the browser is trusted or required.",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/pending-actions": {
+      "get": {
+        "operationId": "list_user_pending_actions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PendingActionResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/permission-mode": {
+      "post": {
+        "operationId": "update_user_permission_mode",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePermissionModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/permissions/{permission_id}/resolve": {
+      "post": {
+        "operationId": "resolve_user_permission",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "permission_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolvePermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          },
+          "410": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/restore": {
+      "post": {
+        "operationId": "restore_user_conversation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Restore a user-owned archived conversation.",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/conversations/{public_id}/stop": {
+      "post": {
+        "operationId": "stop_user_turn",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/pending-actions/{action_public_id}": {
+      "get": {
+        "operationId": "get_user_pending_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingActionResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/pending-actions/{action_public_id}/confirm": {
+      "post": {
+        "operationId": "confirm_user_pending_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingActionResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/pending-actions/{action_public_id}/reject": {
+      "post": {
+        "operationId": "reject_user_pending_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingActionResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
       }
     },
     "/ai/pricing": {
@@ -53482,6 +57119,474 @@
           "AI Gateway"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/ai/workspace": {
+      "get": {
+        "operationId": "get_global_ai_workspace",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/changes": {
+      "get": {
+        "operationId": "get_global_workspace_changes",
+        "parameters": [
+          {
+            "description": "Position returned by the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Files per page (1-200, default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceChangesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          },
+          "504": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/diff": {
+      "get": {
+        "operationId": "get_global_workspace_diff",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceDiffResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          },
+          "504": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/directory": {
+      "get": {
+        "operationId": "get_global_workspace_directory",
+        "parameters": [
+          {
+            "description": "Workspace-relative directory; omit for the root",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Position returned by the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page (1-100, default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/file": {
+      "get": {
+        "operationId": "get_global_workspace_file",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationWorkspaceFileContentResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/file-limits": {
+      "get": {
+        "description": "Returns the non-sensitive effective transfer and preview policy for the current workspace user.",
+        "operationId": "get_workspace_file_limits",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get effective AI workspace file limits",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/file/download": {
+      "get": {
+        "operationId": "download_global_workspace_file",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Download one global AI workspace file",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/files": {
+      "post": {
+        "description": "Writes a configured, bounded batch of safe workspace-relative files into the user's persistent global workspace without waking compute.",
+        "operationId": "upload_global_workspace_files",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "413": {
+            "description": ""
+          },
+          "500": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Upload files into the global AI workspace",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/ai/workspace/preview-link": {
+      "post": {
+        "operationId": "create_global_workspace_preview_link",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApplicationPreviewLinkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "503": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mint a short-lived preview URL for a port in the user's shared global AI\nworkspace. The gateway grant is identical to application previews; the\nonly difference is how the owning sandbox is resolved.",
+        "tags": [
+          "AI Chat"
+        ]
       }
     },
     "/analytics/active-visitors": {
@@ -82181,8 +86286,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "post": {
         "operationId": "create_agent",
@@ -82239,8 +86343,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/cli-status": {
@@ -82285,8 +86388,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/runs": {
@@ -82354,8 +86456,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/runs/latest-for-source": {
@@ -82427,8 +86528,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}": {
@@ -82487,8 +86587,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/cancel": {
@@ -82550,8 +86649,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/retry": {
@@ -82614,8 +86712,7 @@
         "summary": "Retry a completed, failed, cancelled, or no_fix run with the same trigger context.\nCreates a new run record and spawns the executor.",
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/stream": {
@@ -82668,8 +86765,7 @@
         "summary": "SSE endpoint for real-time streaming of run events.\nPolls the agent_run_logs table every 500ms for new entries and streams them.\nCloses when the run reaches a terminal status.",
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/sandbox-status": {
@@ -82712,8 +86808,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/smoke-test": {
@@ -82766,8 +86861,7 @@
         "summary": "Run a smoke test to verify the selected AI CLI works in the environment\nwhere agents will actually execute (host or sandbox container). If no\n`provider_id` is supplied the globally active provider is tested.",
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/{slug}": {
@@ -82818,8 +86912,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "get": {
         "operationId": "get_agent",
@@ -82872,8 +86965,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       },
       "put": {
         "operationId": "update_agent",
@@ -82942,8 +87034,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/{slug}/runs": {
@@ -83023,8 +87114,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/agents/{slug}/trigger": {
@@ -83104,8 +87194,7 @@
         ],
         "tags": [
           "Agents"
-        ],
-        "x-maturity": "experimental"
+        ]
       }
     },
     "/projects/{project_id}/aggregated-buckets": {
@@ -83271,7 +87360,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Find the current user's existing chat for a context (returns `null` if none\nyet). Conversations are private even between members of the same project.\nRequires the per-project `ai_debug_chat_enabled` toggle to be on.",
+        "summary": "Find the current user's existing chat for a context (returns `null` if none\nyet). Conversations are private even between members of the same project.",
         "tags": [
           "AI Chat"
         ]
@@ -83397,6 +87486,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Opaque next_before cursor returned by the previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Messages per page (default 50, maximum 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -83408,6 +87517,9 @@
                 }
               }
             },
+            "description": ""
+          },
+          "400": {
             "description": ""
           },
           "401": {
@@ -83425,7 +87537,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Full conversation history (excluding the internal system seed).",
+        "summary": "One bounded conversation-history page (excluding internal context rows).",
         "tags": [
           "AI Chat"
         ]
@@ -83545,7 +87657,7 @@
     },
     "/projects/{project_id}/ai/conversations/{public_id}/messages": {
       "post": {
-        "operationId": "send_message",
+        "operationId": "send_project_ai_message",
         "parameters": [
           {
             "in": "path",
@@ -83576,11 +87688,15 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
-              "text/event-stream": {}
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendMessageAcceptedResponse"
+                }
+              }
             },
-            "description": "SSE stream of assistant text deltas"
+            "description": "Turn accepted; output follows on the conversation WebSocket"
           },
           "401": {
             "description": ""
@@ -83590,6 +87706,9 @@
           },
           "404": {
             "description": ""
+          },
+          "409": {
+            "description": ""
           }
         },
         "security": [
@@ -83597,7 +87716,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Send a user message; stream the assistant reply as Server-Sent Events.",
+        "summary": "Submit a user message and start a server-owned turn. The command returns as\nsoon as the turn is durable; subscribe to the conversation WebSocket for\nreal-time output.",
         "tags": [
           "AI Chat"
         ]
@@ -83656,6 +87775,75 @@
           }
         ],
         "summary": "List all pending actions for a conversation (most-recently-proposed first).",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/projects/{project_id}/ai/conversations/{public_id}/permission-mode": {
+      "post": {
+        "operationId": "update_permission_mode",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePermissionModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "AI Chat"
         ]
@@ -83731,6 +87919,53 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/projects/{project_id}/ai/conversations/{public_id}/stop": {
+      "post": {
+        "operationId": "stop_turn",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Explicitly cancel the server-owned active turn. Closing or refreshing a\nbrowser only detaches its stream; this endpoint is the sole UI cancellation\npath so execution lifetime is not coupled to connectivity.",
         "tags": [
           "AI Chat"
         ]
@@ -101076,6 +105311,26 @@
     "/settings/ai-providers": {
       "get": {
         "operationId": "list_ai_providers",
+        "parameters": [
+          {
+            "description": "Return only static/cached catalog metadata. This path deliberately\nskips the settings-row read as well as CLI probes and is used for chat\nfirst paint; an authenticated refresh follows in the background.",
+            "in": "query",
+            "name": "catalog_only",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Run account-aware model discovery before returning. Normal catalog\nreads intentionally use cached/bootstrap models so chat first paint is\nnot held hostage by provider CLIs that can take 10-15 seconds.",
+            "in": "query",
+            "name": "refresh_models",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -107574,7 +111829,7 @@
       "name": "Events"
     },
     {
-      "description": "Analytics metrics collection endpoints including performance web vitals",
+      "description": "Time-series metrics and alert rule endpoints",
       "name": "Metrics"
     },
     {
@@ -107696,10 +111951,6 @@
     {
       "description": "Data querying and exploration endpoints",
       "name": "External Services - Query"
-    },
-    {
-      "description": "Time-series metrics and alert rule endpoints",
-      "name": "Metrics"
     },
     {
       "description": "Key-Value storage operations",

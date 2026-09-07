@@ -214,14 +214,18 @@ mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
 mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
 mod m20260830_000001_create_traefik_discovered_routes;
-// Main shipped this migration first with the same date and sequence stamp as
-// the certificates migration below. Preserve that upgrade history.
+// Module declarations are kept lexically sorted by rustfmt. Migration execution
+// order is defined by Migrator::migrations below, where all mainline migrations
+// remain ahead of this branch's AI workspace chain.
+mod m20260831_000001_ai_first_applications;
 mod m20260831_000001_create_analytics_ingest_keys;
 mod m20260831_000001_create_traefik_route_certificates;
 mod m20260831_000002_add_managed_status_monitors;
 mod m20260831_000002_backfill_acme_verification_method;
 mod m20260901_000001_add_cloud_telemetry_fidelity;
+mod m20260901_000001_persist_ai_turn_state;
 mod m20260901_000002_create_cloud_telemetry_backfills;
+mod m20260901_000002_user_owned_ai_conversations;
 mod m20260901_000003_constrain_cloud_telemetry_fidelity;
 mod m20260901_000004_create_cloud_span_outbox;
 mod m20260901_000005_add_cloud_telemetry_write_mode;
@@ -235,10 +239,14 @@ mod m20260902_000001_backup_safety_and_provenance;
 // and main. Preserve that upgrade history rather than renumbering.
 mod m20260903_000001_add_service_project_identity;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
+mod m20260903_000001_application_workspace_topology;
 mod m20260903_000001_generalize_cloud_telemetry_outbox;
 mod m20260903_000002_add_signal_group_to_write_intervals;
+mod m20260903_000002_harden_application_workspaces;
 mod m20260903_000003_add_cloud_analytics_write_mode;
+mod m20260903_000003_application_workspace_quarantine;
 mod m20260903_000004_add_target_table_and_payload_row_to_outbox;
+mod m20260903_000004_repair_application_primary_projects;
 // This branch and main each shipped a migration with the same date and
 // sequence stamp. Preserve that upgrade history rather than renumbering.
 mod m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources;
@@ -547,6 +555,15 @@ impl MigratorTrait for Migrator {
                 m20260904_000003_add_continuous_archive_source_to_external_services::Migration,
             ),
             Box::new(m20260907_000001_add_mfa_pending_origin_to_sessions::Migration),
+            // Keep the canonical main-branch migrations before feature-branch
+            // migrations so existing main upgrade history remains a stable prefix.
+            Box::new(m20260831_000001_ai_first_applications::Migration),
+            Box::new(m20260901_000001_persist_ai_turn_state::Migration),
+            Box::new(m20260901_000002_user_owned_ai_conversations::Migration),
+            Box::new(m20260903_000001_application_workspace_topology::Migration),
+            Box::new(m20260903_000002_harden_application_workspaces::Migration),
+            Box::new(m20260903_000003_application_workspace_quarantine::Migration),
+            Box::new(m20260903_000004_repair_application_primary_projects::Migration),
         ]
     }
 }
@@ -593,6 +610,10 @@ mod registry_tests {
             (
                 "m20260903_000001_add_service_project_identity",
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",
+            ),
+            (
+                "m20260904_000001_reset_ambiguous_managed_status_monitors",
+                "m20260831_000001_ai_first_applications",
             ),
         ] {
             let shipped_position = names

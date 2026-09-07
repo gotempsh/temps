@@ -187,6 +187,7 @@ fn default_model_for_provider(provider: &str) -> Option<String> {
         "anthropic" => "claude-haiku-4-5",
         "gemini" => "gemini-3.5-flash-lite",
         "xai" => "grok-4.5",
+        "openrouter" => "openai/gpt-4o-mini",
         _ => return None,
     };
     Some(model.to_string())
@@ -1047,6 +1048,7 @@ mod tests {
             ("anthropic", "claude-haiku-4-5"),
             ("gemini", "gemini-3.5-flash-lite"),
             ("xai", "grok-4.5"),
+            ("openrouter", "openai/gpt-4o-mini"),
         ] {
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
@@ -1162,6 +1164,10 @@ mod tests {
         assert_eq!(
             default_model_for_provider("xai"),
             Some("grok-4.5".to_string())
+        );
+        assert_eq!(
+            default_model_for_provider("openrouter"),
+            Some("openai/gpt-4o-mini".to_string())
         );
         // Unknown / custom providers have no built-in default.
         assert_eq!(default_model_for_provider("custom"), None);

@@ -10399,13 +10399,16 @@ version = "0.1.0-beta.56"
 dependencies = [
  "async-trait",
  "axum",
+ "bytes",
  "futures",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "subtle",
  "tempfile",
  "temps-agents",
  "temps-ai",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tracing",
@@ -10448,7 +10451,9 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "nix 0.31.3",
  "regex",
+ "rustix",
  "sea-orm",
  "serde",
  "serde_json",
@@ -10464,11 +10469,18 @@ dependencies = [
  "temps-entities",
  "temps-git",
  "temps-logs",
+ "temps-projects",
+ "temps-sandbox",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
+ "unicode-casefold",
+ "unicode-normalization",
  "utoipa",
  "uuid",
+ "walkdir",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -10510,6 +10522,7 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -12869,6 +12882,7 @@ dependencies = [
  "futures",
  "hex",
  "http 1.5.0",
+ "percent-encoding",
  "rand 0.10.2",
  "sea-orm",
  "serde",
@@ -14033,6 +14047,12 @@ name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
 
 [[package]]
 name = "unicode-general-category"

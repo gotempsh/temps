@@ -34,9 +34,11 @@ pub mod registry_prefix;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
+pub mod sandbox_runtime;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
+pub mod source_drop;
 pub mod static_files;
 pub mod telemetry;
 pub mod time_window;
@@ -90,7 +92,9 @@ pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
-pub use project_access::{MembershipPermissionResolver, ProjectAccessChecker};
+pub use project_access::{
+    ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
+};
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
@@ -104,10 +108,14 @@ pub use runtime::{
     RuntimeConfigurationError, RuntimeContext, ServiceEndpoint, ServiceEndpointResolver,
     ServiceEndpointScheme, EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
 };
+pub use sandbox_runtime::{SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider};
 pub use secrets_manager::SecretsManagerResolver;
 pub use sensitive_action::{
     SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,
     SensitiveActionDecision, SensitiveActionPrincipal,
+};
+pub use source_drop::{
+    SourceDropDeployer, SourceDropDeployment, SourceDropError, SourceDropRequest,
 };
 pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use traces::{
@@ -119,11 +127,11 @@ pub use utils::*;
 // Re-export external dependencies
 pub use anyhow;
 pub use app_settings::{
-    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
-    CeilingEnforcement, CloudSettings, ClusterDnsSettings, ConnectionLimitSettings,
-    ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings,
-    ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
-    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
+    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
+    AppSettings, BuildLimitsSettings, CeilingEnforcement, CloudSettings, ClusterDnsSettings,
+    ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
+    DockerRegistrySettings, ImageRetentionSettings, LetsEncryptSettings, McpServerSettings,
+    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
     TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
