@@ -412,7 +412,8 @@ pub struct MariaDbInputConfig {
     pub root_password: Option<String>,
 
     /// Full Docker image reference.
-    #[schemars(example = example_docker_image())]
+    #[serde(default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: String,
 
     /// Managed service size/tuning profile.
@@ -516,6 +517,17 @@ fn default_database() -> String {
 
 fn default_username() -> String {
     "app".to_string()
+}
+
+/// Mirrors the runtime fallback in `parameter_strategies.rs` (which already
+/// substitutes `MARIADB_DEFAULT_IMAGE` for a missing/empty `docker_image` at
+/// request time) so the *advertised* schema agrees with actual behavior:
+/// without this, `schemars` marks `docker_image` required with no default,
+/// and a client that renders this field as hidden/preset-owned (filling it in
+/// only after its own form validation runs) rejects the submission before
+/// ever sending a request the server would have accepted.
+fn default_docker_image() -> String {
+    MARIADB_DEFAULT_IMAGE.to_string()
 }
 
 fn mariadb_image_pull_failure_message(image: &str, error: &str) -> String {
@@ -6219,6 +6231,30 @@ mod tests {
         assert!(
             !schema.to_string().contains("container_name"),
             "container_name leaked into the MariaDB create schema"
+        );
+    }
+
+    /// Regression guard: `docker_image` was schema-required with no default,
+    /// even though the server has always accepted a missing/empty value and
+    /// substituted `MARIADB_DEFAULT_IMAGE` (`parameter_strategies.rs`). A
+    /// client that renders `docker_image` as a hidden, preset-owned field
+    /// (filling it in only *after* its own form validation runs, e.g. the
+    /// "Managed + WAL-G" preset) rejected every submission before ever
+    /// sending a request the server would have accepted, with no way to
+    /// surface an error for a field that isn't on screen.
+    #[test]
+    fn test_docker_image_is_not_required_and_has_a_default() {
+        let schema = serde_json::to_value(schemars::schema_for!(MariaDbInputConfig)).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|value| value == "docker_image"),
+            "docker_image must not be schema-required: {:?}",
+            required
+        );
+        assert_eq!(
+            schema["properties"]["docker_image"]["default"],
+            serde_json::json!(MARIADB_DEFAULT_IMAGE),
+            "docker_image's advertised schema default must match the runtime fallback"
         );
     }
 
