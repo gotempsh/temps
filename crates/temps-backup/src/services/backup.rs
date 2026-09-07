@@ -2379,7 +2379,11 @@ SELECT cp.id
             .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
             .collect();
 
-        // Write the env file via docker exec
+        // Write the env file via docker exec. `walg_env_path` is derived from
+        // the container's PGDATA and must be escaped like any other value
+        // reaching `sh -c` -- an unescaped path lets shell metacharacters in
+        // it inject arbitrary commands into the exec.
+        let escaped_walg_env_path = shell_escape(&walg_env_path);
         let write_cmd = format!(
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
@@ -2388,8 +2392,8 @@ SELECT cp.id
                     .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
-            walg_env_path,
-            walg_env_path,
+            escaped_walg_env_path,
+            escaped_walg_env_path,
         );
 
         let exec = docker
@@ -4056,6 +4060,12 @@ SELECT cp.id
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "/var/lib/postgresql".to_string());
         let restore_temp = format!("{}/restore_temp", volume_root);
+        // Both paths reach `sh -c` below in several commands; escape once and
+        // reuse rather than risk an unescaped interpolation creeping back in
+        // at one of the call sites. `pgdata` is configured per-service, so an
+        // unescaped path here is a shell-injection vector into the container.
+        let escaped_pgdata = shell_escape(&pgdata);
+        let escaped_restore_temp = shell_escape(&restore_temp);
 
         info!(
             "Step 1: Fetching WAL-G backup to {} in container {}",
@@ -4063,7 +4073,7 @@ SELECT cp.id
         );
         let fetch_cmd_str = format!(
             "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} LATEST > /tmp/walg_restore.log 2>&1",
-            restore_temp = restore_temp,
+            restore_temp = escaped_restore_temp,
         );
 
         let exec = docker
@@ -4140,8 +4150,8 @@ SELECT cp.id
                 "rm -rf {restore_temp}/pg_wal && ",
                 "cp -a {pgdata}/pg_wal {restore_temp}/pg_wal"
             ),
-            restore_temp = restore_temp,
-            pgdata = pgdata,
+            restore_temp = escaped_restore_temp,
+            pgdata = escaped_pgdata,
         );
 
         let exec = docker
@@ -4224,8 +4234,8 @@ SELECT cp.id
         info!("Step 4: Swapping PGDATA via helper container");
         let swap_script = format!(
             "rm -rf {pgdata}/* && cp -a {restore_temp}/* {pgdata}/ && rm -rf {restore_temp}",
-            pgdata = pgdata,
-            restore_temp = restore_temp,
+            pgdata = escaped_pgdata,
+            restore_temp = escaped_restore_temp,
         );
 
         // Get the image from the container's config to use the same image for the helper
