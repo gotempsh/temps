@@ -345,16 +345,19 @@ pub async fn list_discoverable_domains(
         .list_provider_domains(id)
         .await
         .map_err(|e| match e {
-            crate::EmailError::ProviderNotFound(_) => {
-                not_found().detail("Provider not found").build()
-            }
+            crate::EmailError::ProviderNotFound(_) => not_found()
+                .detail(format!("Provider {} not found", id))
+                .build(),
             e => {
                 error!(
                     "Failed to list discoverable domains for provider {}: {}",
                     id, e
                 );
                 internal_server_error()
-                    .detail(format!("Failed to list discoverable domains: {}", e))
+                    .detail(format!(
+                        "Failed to list discoverable domains for provider {}: {}",
+                        id, e
+                    ))
                     .build()
             }
         })?;

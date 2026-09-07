@@ -4,8 +4,8 @@
 //! Provider service for managing email provider configurations
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -423,7 +423,15 @@ impl ProviderService {
             });
         }
 
-        let updated = active.update(self.db.as_ref()).await?;
+        // The credential rotation and the domain-verification reset below
+        // must land together: if the reset failed after the credentials had
+        // already been committed, domains would keep a stale `verified`
+        // status scoped to the old provider account, letting a later send
+        // skip the local verification gate and fail against the provider
+        // instead of being caught locally. A transaction makes that
+        // impossible — either both writes land or neither does.
+        let txn = self.db.begin().await?;
+        let updated = active.update(&txn).await?;
         debug!(
             "Updated email provider {} (changed fields: {:?})",
             id, changed_fields
@@ -440,8 +448,10 @@ impl ProviderService {
         // a checked domain") instead of the graceful "domain not verified"
         // capture path. Forcing re-verification keeps the local status honest.
         if changed_fields.contains(&"credentials".to_string()) {
-            self.invalidate_domain_verification(id).await?;
+            Self::invalidate_domain_verification(&txn, id).await?;
         }
+
+        txn.commit().await?;
 
         Ok(UpdateProviderOutcome {
             provider: updated,
@@ -452,8 +462,13 @@ impl ProviderService {
     /// Reset every domain bound to `provider_id` back to `pending`, clearing
     /// its last-verified timestamp so the operator must re-verify before
     /// Temps will send through it again. Called after a provider's
-    /// credentials change; see the call site for why that's necessary.
-    async fn invalidate_domain_verification(&self, provider_id: i32) -> Result<(), EmailError> {
+    /// credentials change, in the same transaction as that change, so the
+    /// two writes commit or roll back together; see the call site for why
+    /// that's necessary.
+    async fn invalidate_domain_verification(
+        conn: &impl ConnectionTrait,
+        provider_id: i32,
+    ) -> Result<(), EmailError> {
         use sea_orm::sea_query::Expr;
 
         let reset = email_domains::Entity::update_many()
@@ -470,7 +485,7 @@ impl ProviderService {
             )
             .filter(email_domains::Column::ProviderId.eq(provider_id))
             .filter(email_domains::Column::Status.ne("pending"))
-            .exec(self.db.as_ref())
+            .exec(conn)
             .await?;
 
         if reset.rows_affected > 0 {
