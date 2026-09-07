@@ -1482,6 +1482,15 @@ async fn get_external_service_backup_capability(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "external service",
+        "backup",
+    )
+    .await?;
     let capability = app_state
         .backup_service
         .get_external_service_backup_capability(id)
