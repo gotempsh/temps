@@ -168,7 +168,7 @@ describe('WorkspaceStatusIndicator', () => {
 })
 
 describe('ApplicationStartScreen', () => {
-  test('offers bounded blank, local-folder, and credentialed Git starts', () => {
+  test('offers bounded blank, files-or-ZIP, and credentialed Git starts', () => {
     const html = renderToStaticMarkup(
       <MemoryRouter>
         <ApplicationStartScreen
@@ -188,7 +188,7 @@ describe('ApplicationStartScreen', () => {
     )
 
     expect(html).toContain('Blank project')
-    expect(html).toContain('Local folder')
+    expect(html).toContain('Files or ZIP')
     expect(html).toContain('Git repository')
     expect(html).toContain('Autopack project')
   })

@@ -6792,6 +6792,12 @@ export type DomainResponse = {
     verification_method: string;
 };
 
+export type DownloadWorkspaceFileResponse = {
+    contents_b64: string;
+    file_name: string;
+    size_bytes: number;
+};
+
 export type DrainNodeResponse = {
     affected_environments: number;
     id: number;
@@ -8761,7 +8767,7 @@ export type GatewayStatus = {
      */
     health: string;
     /**
-     * Host port that the container's :8080 is published on.
+     * Host port that the ingress relay's :8080 is published on.
      */
     host_port?: number | null;
     /**
@@ -13926,11 +13932,13 @@ export type PreviewGatewayLogsResponse = {
 /**
  * Workspace preview gateway settings.
  *
- * The preview gateway is a single shared Docker container that lives on the
- * `temps-sandbox-net` network and routes requests to workspace sandbox dev
- * servers based on the `Host` header (`ws-<sid>-<port>.<preview_domain>`).
- * `temps serve` reconciles this container on startup; these settings let an
- * operator override the image, host port, and auto-upgrade behavior.
+ * The preview gateway uses a private routing container plus a hardened ingress
+ * relay bound to host loopback. The router joins each sandbox's isolated
+ * network and routes requests to workspace dev servers based on the `Host`
+ * header (`ws-<sid>-<port>.<preview_domain>`), while the relay never joins a
+ * tenant network. `temps serve` reconciles both containers on startup; these
+ * settings let an operator override the router image, host port, and
+ * auto-upgrade behavior.
  */
 export type PreviewGatewaySettings = {
     /**
@@ -24195,6 +24203,56 @@ export type GetApplicationWorkspaceFileResponses = {
 
 export type GetApplicationWorkspaceFileResponse = GetApplicationWorkspaceFileResponses[keyof GetApplicationWorkspaceFileResponses];
 
+export type DownloadApplicationWorkspaceFileData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query: {
+        path: string;
+    };
+    url: '/ai/applications/{application_public_id}/workspace/file/download';
+};
+
+export type DownloadApplicationWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadApplicationWorkspaceFileResponses = {
+    200: DownloadWorkspaceFileResponse;
+};
+
+export type DownloadApplicationWorkspaceFileResponse = DownloadApplicationWorkspaceFileResponses[keyof DownloadApplicationWorkspaceFileResponses];
+
+export type UploadApplicationWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/workspace/files';
+};
+
+export type UploadApplicationWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadApplicationWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -25599,6 +25657,51 @@ export type GetGlobalWorkspaceFileResponses = {
 };
 
 export type GetGlobalWorkspaceFileResponse = GetGlobalWorkspaceFileResponses[keyof GetGlobalWorkspaceFileResponses];
+
+export type DownloadGlobalWorkspaceFileData = {
+    body?: never;
+    path?: never;
+    query: {
+        path: string;
+    };
+    url: '/ai/workspace/file/download';
+};
+
+export type DownloadGlobalWorkspaceFileErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type DownloadGlobalWorkspaceFileResponses = {
+    200: DownloadWorkspaceFileResponse;
+};
+
+export type DownloadGlobalWorkspaceFileResponse = DownloadGlobalWorkspaceFileResponses[keyof DownloadGlobalWorkspaceFileResponses];
+
+export type UploadGlobalWorkspaceFilesData = {
+    body: WriteApplicationWorkspaceFilesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/files';
+};
+
+export type UploadGlobalWorkspaceFilesErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    500: unknown;
+};
+
+export type UploadGlobalWorkspaceFilesResponses = {
+    200: WriteApplicationWorkspaceFilesResponse;
+};
+
+export type UploadGlobalWorkspaceFilesResponse = UploadGlobalWorkspaceFilesResponses[keyof UploadGlobalWorkspaceFilesResponses];
 
 export type CreateGlobalWorkspacePreviewLinkData = {
     body: CreateApplicationPreviewLinkRequest;

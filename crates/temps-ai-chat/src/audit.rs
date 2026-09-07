@@ -188,7 +188,14 @@ pub struct ApplicationWorkspaceSourceImportedAudit {
 pub struct ApplicationWorkspaceFilesWrittenAudit {
     pub context: AuditContext,
     pub application_id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GlobalWorkspaceFilesWrittenAudit {
+    pub context: AuditContext,
+    pub workspace_id: String,
     pub file_count: usize,
 }
 
@@ -227,6 +234,10 @@ impl_audit_operation!(
 impl_audit_operation!(
     ApplicationWorkspaceFilesWrittenAudit,
     "ai.application.workspace_files.written"
+);
+impl_audit_operation!(
+    GlobalWorkspaceFilesWrittenAudit,
+    "ai.workspace.files.written"
 );
 impl_audit_operation!(
     ConversationAttachmentUploadedAudit,

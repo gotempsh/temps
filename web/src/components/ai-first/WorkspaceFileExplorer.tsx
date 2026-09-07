@@ -5,6 +5,7 @@ import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
+  Download,
   File,
   FileQuestion,
   Folder,
@@ -12,20 +13,40 @@ import {
   Link2,
   Loader2,
   RefreshCw,
+  UploadCloud,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  downloadApplicationWorkspaceFile,
+  downloadGlobalWorkspaceFile,
   getApplicationWorkspaceDirectory,
   getApplicationWorkspaceFile,
   getGlobalWorkspaceDirectory,
   getGlobalWorkspaceFile,
+  uploadApplicationWorkspaceFiles,
+  uploadGlobalWorkspaceFiles,
   type ApplicationWorkspaceDirectoryEntryResponse,
   type ApplicationWorkspaceFileContentResponse,
   type ApplicationWorkspaceFileResponse,
 } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { HighlightedCode } from '@/components/ui/code-block'
 import { cn } from '@/lib/utils'
+import {
+  batchLocalImportFiles,
+  fileToBase64,
+  prepareLocalImport,
+} from './workspace-import'
+import {
+  MAX_LOCAL_IMPORT_PATH_BYTES,
+  shouldSkipLocalImportPath,
+} from './workspace-import-policy'
 import { problemDetail } from './problem-detail'
+import { workspaceFileLanguage } from './workspace-file-language'
+import {
+  LatestWorkspaceRequest,
+  uploadWorkspaceBatches,
+} from './workspace-file-operations'
 
 const DIRECTORY_PAGE_SIZE = 100
 
@@ -68,9 +89,15 @@ function entryIcon(
 export function WorkspaceFileExplorer({
   applicationPublicId,
   changes,
+  onWorkspaceMutated,
+  revision = 0,
+  uploadRoot = '',
 }: {
   applicationPublicId?: string
   changes: ApplicationWorkspaceFileResponse[]
+  onWorkspaceMutated?: () => void
+  revision?: number
+  uploadRoot?: string
 }) {
   const [directories, setDirectories] = useState<
     Record<string, DirectoryState>
@@ -81,7 +108,14 @@ export function WorkspaceFileExplorer({
     useState<ApplicationWorkspaceFileContentResponse | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
+  const [transferError, setTransferError] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const folderInputRef = useRef<HTMLInputElement | null>(null)
   const generation = useRef(0)
+  const previewRequests = useRef(new LatestWorkspaceRequest())
+  const mounted = useRef(true)
   const changeByPath = useMemo(
     () => new Map(changes.map((change) => [change.path, change.status])),
     [changes]
@@ -153,7 +187,7 @@ export function WorkspaceFileExplorer({
 
   const loadPreview = useCallback(
     async (path: string) => {
-      const requestGeneration = generation.current
+      const requestGeneration = previewRequests.current.begin()
       setSelectedPath(path)
       setPreview(null)
       setPreviewError(null)
@@ -169,13 +203,16 @@ export function WorkspaceFileExplorer({
               query: { path },
               throwOnError: true,
             })
-        if (requestGeneration === generation.current) setPreview(data)
+        if (previewRequests.current.isCurrent(requestGeneration))
+          setPreview(data)
       } catch (cause) {
-        if (requestGeneration === generation.current) {
+        if (previewRequests.current.isCurrent(requestGeneration)) {
           setPreviewError(problemDetail(cause, 'Could not preview this file.'))
         }
       } finally {
-        if (requestGeneration === generation.current) setPreviewLoading(false)
+        if (previewRequests.current.isCurrent(requestGeneration)) {
+          setPreviewLoading(false)
+        }
       }
     },
     [applicationPublicId]
@@ -183,6 +220,7 @@ export function WorkspaceFileExplorer({
 
   const reset = useCallback(() => {
     generation.current += 1
+    previewRequests.current.invalidate()
     setDirectories({})
     setExpanded(new Set(['']))
     setSelectedPath(null)
@@ -192,12 +230,121 @@ export function WorkspaceFileExplorer({
     void loadDirectory('')
   }, [loadDirectory])
 
+  const uploadFiles = async (selected: FileList | null) => {
+    if (!selected || selected.length === 0 || uploading) return
+    setUploading(true)
+    setTransferError(null)
+    try {
+      const selection = prepareLocalImport(Array.from(selected))
+      const files = selection.accepted.map((entry) => ({
+        ...entry,
+        path: uploadRoot ? `${uploadRoot}/${entry.path}` : entry.path,
+      }))
+      const invalidTarget = files.find(({ path }) =>
+        shouldSkipLocalImportPath(path)
+      )
+      if (invalidTarget) {
+        throw new Error(
+          `Cannot upload ${invalidTarget.path}. The final workspace path is sensitive or longer than ${MAX_LOCAL_IMPORT_PATH_BYTES} bytes.`
+        )
+      }
+      const result = await uploadWorkspaceBatches(
+        batchLocalImportFiles(files),
+        async (batch) => {
+          const body = {
+            files: await Promise.all(
+              batch.map(async ({ file, path }) => ({
+                path,
+                contents_b64: await fileToBase64(file),
+              }))
+            ),
+          }
+          if (applicationPublicId) {
+            await uploadApplicationWorkspaceFiles({
+              path: { application_public_id: applicationPublicId },
+              body,
+              throwOnError: true,
+            })
+          } else {
+            await uploadGlobalWorkspaceFiles({ body, throwOnError: true })
+          }
+        }
+      )
+      if (!mounted.current) return
+      if (result.completed > 0) {
+        reset()
+        onWorkspaceMutated?.()
+      }
+      if (result.error) {
+        const detail = problemDetail(
+          result.error,
+          'Could not upload these files.'
+        )
+        if (result.completed === 0) {
+          setTransferError(detail)
+          return
+        }
+        setTransferError(
+          `${result.completed} file${result.completed === 1 ? '' : 's'} uploaded before the transfer stopped. ${detail}`
+        )
+      }
+    } catch (cause) {
+      if (mounted.current) {
+        setTransferError(problemDetail(cause, 'Could not upload these files.'))
+      }
+    } finally {
+      if (mounted.current) setUploading(false)
+    }
+  }
+
+  const downloadSelectedFile = async () => {
+    if (!selectedPath || downloading) return
+    setDownloading(true)
+    setTransferError(null)
+    try {
+      const { data } = applicationPublicId
+        ? await downloadApplicationWorkspaceFile({
+            path: { application_public_id: applicationPublicId },
+            query: { path: selectedPath },
+            throwOnError: true,
+          })
+        : await downloadGlobalWorkspaceFile({
+            query: { path: selectedPath },
+            throwOnError: true,
+          })
+      if (!mounted.current) return
+      const binary = atob(data.contents_b64)
+      const bytes = Uint8Array.from(binary, (character) =>
+        character.charCodeAt(0)
+      )
+      const url = URL.createObjectURL(new Blob([bytes]))
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = data.file_name
+      anchor.click()
+      globalThis.setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (cause) {
+      if (mounted.current) {
+        setTransferError(problemDetail(cause, 'Could not download this file.'))
+      }
+    } finally {
+      if (mounted.current) setDownloading(false)
+    }
+  }
+
+  useEffect(() => {
+    const activePreviewRequests = previewRequests.current
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      generation.current += 1
+      activePreviewRequests.invalidate()
+    }
+  }, [])
+
   useEffect(() => {
     reset()
-    return () => {
-      generation.current += 1
-    }
-  }, [reset])
+  }, [reset, revision])
 
   const toggleDirectory = (path: string) => {
     const willExpand = !expanded.has(path)
@@ -333,17 +480,81 @@ export function WorkspaceFileExplorer({
             Persistent files, available while compute sleeps
           </p>
         </div>
-        <Button
-          aria-label="Refresh file explorer"
-          className="size-7"
-          onClick={reset}
-          size="icon"
-          type="button"
-          variant="ghost"
-        >
-          <RefreshCw className="size-3.5" />
-        </Button>
+        <div className="flex items-center gap-1">
+          <input
+            aria-label="Upload workspace files"
+            className="hidden"
+            multiple
+            onChange={(event) => {
+              void uploadFiles(event.target.files)
+              event.target.value = ''
+            }}
+            ref={fileInputRef}
+            type="file"
+          />
+          <input
+            aria-label="Upload workspace folder"
+            className="hidden"
+            multiple
+            onChange={(event) => {
+              void uploadFiles(event.target.files)
+              event.target.value = ''
+            }}
+            ref={(element) => {
+              folderInputRef.current = element
+              element?.setAttribute('webkitdirectory', '')
+              element?.setAttribute('directory', '')
+            }}
+            type="file"
+          />
+          <Button
+            aria-label={`Upload files to ${uploadRoot || 'workspace root'}`}
+            className="size-7"
+            disabled={uploading}
+            onClick={() => fileInputRef.current?.click()}
+            size="icon"
+            title={`Upload files to ${uploadRoot || 'workspace root'}`}
+            type="button"
+            variant="ghost"
+          >
+            {uploading ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <UploadCloud className="size-3.5" />
+            )}
+          </Button>
+          <Button
+            aria-label={`Upload folder to ${uploadRoot || 'workspace root'}`}
+            className="size-7"
+            disabled={uploading}
+            onClick={() => folderInputRef.current?.click()}
+            size="icon"
+            title={`Upload folder to ${uploadRoot || 'workspace root'}`}
+            type="button"
+            variant="ghost"
+          >
+            <FolderOpen className="size-3.5" />
+          </Button>
+          <Button
+            aria-label="Refresh file explorer"
+            className="size-7"
+            onClick={reset}
+            size="icon"
+            type="button"
+            variant="ghost"
+          >
+            <RefreshCw className="size-3.5" />
+          </Button>
+        </div>
       </div>
+      {transferError && (
+        <p
+          className="border-b border-border bg-destructive/5 px-3 py-2 text-[10px] text-destructive"
+          role="alert"
+        >
+          {transferError}
+        </p>
+      )}
       <div className="max-h-72 overflow-auto p-1.5">
         {renderDirectory('', 0)}
       </div>
@@ -357,6 +568,22 @@ export function WorkspaceFileExplorer({
                 {formatBytes(preview.size_bytes)}
               </span>
             )}
+            <Button
+              aria-label={`Download ${selectedPath}`}
+              className="size-6"
+              disabled={!selectedPath || downloading}
+              onClick={() => void downloadSelectedFile()}
+              size="icon"
+              title="Download file"
+              type="button"
+              variant="ghost"
+            >
+              {downloading ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <Download className="size-3" />
+              )}
+            </Button>
           </div>
           {previewLoading ? (
             <div className="flex items-center gap-2 px-3 py-5 text-[10px] text-muted-foreground">
@@ -372,8 +599,11 @@ export function WorkspaceFileExplorer({
             </p>
           ) : (
             <>
-              <pre className="max-h-80 overflow-auto whitespace-pre p-3 font-mono text-[10px] leading-4 text-foreground">
-                {preview?.content}
+              <pre className="max-h-80 overflow-auto whitespace-pre bg-white p-3 font-mono text-[10px] leading-4 dark:bg-zinc-900">
+                <HighlightedCode
+                  code={preview?.content ?? ''}
+                  language={workspaceFileLanguage(selectedPath ?? '')}
+                />
               </pre>
               {preview?.truncated && (
                 <p className="border-t border-border px-3 py-2 text-[9px] text-amber-600 dark:text-amber-300">

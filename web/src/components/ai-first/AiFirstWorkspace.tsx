@@ -6,6 +6,7 @@ import {
   ArchiveRestore,
   Boxes,
   Code2,
+  FileArchive,
   FileCode2,
   FolderTree,
   GitBranch,
@@ -22,6 +23,7 @@ import {
   Sparkles,
   Terminal,
   TerminalSquare,
+  UploadCloud,
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -95,6 +97,11 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
+import {
+  filesFromDrop,
+  filesFromInput,
+  inferredProjectName,
+} from '@/lib/drop-files'
 import { ArtifactRenderer } from './ArtifactRenderer'
 import { ApplicationPreviewPanel } from './ApplicationPreviewPanel'
 import { ApplicationProjectsPanel } from './ApplicationProjectsPanel'
@@ -102,6 +109,10 @@ import { ApplicationWorkspaceSettingsPanel } from './ApplicationWorkspaceSetting
 import { GlobalWorkspaceStatusPanel } from './GlobalWorkspaceStatusPanel'
 import { WorkspaceDiffViewer } from './WorkspaceDiffViewer'
 import { WorkspaceFileExplorer } from './WorkspaceFileExplorer'
+import {
+  nextWorkspaceFileRevision,
+  workspaceFileExplorerKey,
+} from './workspace-file-operations'
 import { shouldRefreshArtifactsForLiveEvent } from './artifact-refresh'
 import {
   applicationsFromPages,
@@ -119,7 +130,9 @@ import { threadTitleFromLiveEvent } from './thread-title-event'
 import {
   batchLocalImportFiles,
   fileToBase64,
-  prepareLocalImport,
+  isSensitiveLocalImportPath,
+  MAX_LOCAL_IMPORT_FILES,
+  prepareWorkspaceImport,
   type LocalImportSelection,
   type WorkspaceSourceMode,
 } from './workspace-import'
@@ -250,6 +263,7 @@ export function AiFirstWorkspace() {
   const restoreLeftNavigationFocusRef = useRef(true)
   const [workspaceChanges, setWorkspaceChanges] =
     useState<ApplicationWorkspaceChangesResponse | null>(null)
+  const [workspaceFilesRevision, setWorkspaceFilesRevision] = useState(0)
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
   const [workspaceLoadPhase, setWorkspaceLoadPhase] =
     useState<WorkspaceLoadPhase>('idle')
@@ -447,6 +461,12 @@ export function AiFirstWorkspace() {
     applications.find(
       (application) => application.public_id === activeApplicationId
     ) ?? selectedApplicationQuery.data
+  const primaryWorkspaceProject = activeApplication?.projects.find(
+    (project) => project.is_primary
+  )
+  const primaryWorkspaceUploadRoot = primaryWorkspaceProject
+    ? `projects/${primaryWorkspaceProject.slug}`
+    : ''
   const workspaceStatusTarget = workspaceStatusClickTarget(
     Boolean(activeApplication),
     activeWorkspaceStatus
@@ -1039,6 +1059,11 @@ export function AiFirstWorkspace() {
     () => loadWorkspacePage(0),
     [loadWorkspacePage]
   )
+
+  const refreshWorkspaceFiles = useCallback(() => {
+    setWorkspaceFilesRevision(nextWorkspaceFileRevision)
+    void refreshWorkspace()
+  }, [refreshWorkspace])
 
   useEffect(() => {
     if (rightView !== 'files') return
@@ -2038,12 +2063,14 @@ export function AiFirstWorkspace() {
                 diff={workspaceDiff}
                 diffLoading={workspaceDiffLoading}
                 error={workspaceError}
+                explorerRevision={workspaceFilesRevision}
                 loading={workspaceLoading}
                 loadPhase={workspaceLoadPhase}
-                onRefresh={() => void refreshWorkspace()}
+                onRefresh={refreshWorkspaceFiles}
                 onOpenSettings={() => setRightView('workspace')}
                 onSelect={setSelectedWorkspacePath}
                 selectedPath={selectedWorkspacePath}
+                uploadRoot={primaryWorkspaceUploadRoot}
               />
             ) : rightView === 'projects' && activeApplication ? (
               <ApplicationProjectsPanel
@@ -2121,12 +2148,14 @@ export function AiFirstWorkspace() {
                 diff={workspaceDiff}
                 diffLoading={workspaceDiffLoading}
                 error={workspaceError}
+                explorerRevision={workspaceFilesRevision}
                 loading={workspaceLoading}
                 loadPhase={workspaceLoadPhase}
-                onRefresh={() => void refreshWorkspace()}
+                onRefresh={refreshWorkspaceFiles}
                 onOpenSettings={() => setRightView('workspace')}
                 onSelect={setSelectedWorkspacePath}
                 selectedPath={selectedWorkspacePath}
+                uploadRoot={primaryWorkspaceUploadRoot}
               />
             ) : rightView === 'projects' && activeApplication ? (
               <ApplicationProjectsPanel
@@ -2366,24 +2395,28 @@ export function WorkspaceFilesPanel({
   diff,
   diffLoading,
   error,
+  explorerRevision = 0,
   loading,
   loadPhase,
   onOpenSettings,
   onRefresh,
   onSelect,
   selectedPath,
+  uploadRoot,
 }: {
   applicationPublicId?: string
   changes: ApplicationWorkspaceChangesResponse | null
   diff: ApplicationWorkspaceDiffResponse | null
   diffLoading: boolean
   error: string | null
+  explorerRevision?: number
   loading: boolean
   loadPhase: WorkspaceLoadPhase
   onOpenSettings: () => void
   onRefresh: () => void
   onSelect: (path: string) => void
   selectedPath: string | null
+  uploadRoot?: string
 }) {
   return (
     <div className="space-y-4">
@@ -2429,6 +2462,10 @@ export function WorkspaceFilesPanel({
       <WorkspaceFileExplorer
         applicationPublicId={applicationPublicId}
         changes={changes?.changes ?? []}
+        key={workspaceFileExplorerKey(applicationPublicId)}
+        onWorkspaceMutated={onRefresh}
+        revision={explorerRevision}
+        uploadRoot={uploadRoot}
       />
 
       {!changes && loading ? (
@@ -2842,8 +2879,21 @@ export function ApplicationStartScreen({
   const [savingStep, setSavingStep] = useState('')
   const [error, setError] = useState<string | null>(null)
   const folderInputRef = useRef<HTMLInputElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const localImportRequestRef = useRef(0)
+  const localImportAbortRef = useRef<AbortController | null>(null)
+  const [localImportLoading, setLocalImportLoading] = useState(false)
+  const [localImportDragging, setLocalImportDragging] = useState(false)
 
   const selectedHarnessId = harnessId ?? defaultHarnessId(harnesses)
+
+  useEffect(
+    () => () => {
+      localImportRequestRef.current += 1
+      localImportAbortRef.current?.abort()
+    },
+    []
+  )
 
   useEffect(() => {
     if (sourceMode !== 'git' || connections.length > 0) return
@@ -2872,6 +2922,46 @@ export function ApplicationStartScreen({
 
   const providerForConnection = (connection: ConnectionResponse) =>
     gitProviders.find((provider) => provider.id === connection.provider_id)
+
+  const selectLocalImport = async (
+    load: (signal: AbortSignal) => Promise<{
+      files: Awaited<ReturnType<typeof filesFromDrop>>
+      skipped?: string[]
+    }>
+  ) => {
+    localImportAbortRef.current?.abort()
+    const controller = new AbortController()
+    localImportAbortRef.current = controller
+    const requestId = ++localImportRequestRef.current
+    setLocalImportLoading(true)
+    try {
+      const { files, skipped } = await load(controller.signal)
+      const selection = await prepareWorkspaceImport(files, {
+        skipped,
+        signal: controller.signal,
+      })
+      if (requestId !== localImportRequestRef.current) return
+      setLocalImport(selection)
+      setError(null)
+      const suggestedName =
+        selection.rootName ??
+        (selection.sourceKind === 'zip' ? inferredProjectName(files) : '')
+      if (suggestedName) {
+        setName((current) => (current.trim() ? current : suggestedName))
+      }
+    } catch (cause) {
+      if (requestId !== localImportRequestRef.current) return
+      setLocalImport(null)
+      setError(problemDetail(cause, 'Could not read the selected files.'))
+    } finally {
+      if (requestId === localImportRequestRef.current) {
+        setLocalImportLoading(false)
+      }
+      if (localImportAbortRef.current === controller) {
+        localImportAbortRef.current = null
+      }
+    }
+  }
 
   const importSource = async (application: ApplicationResponse) => {
     if (sourceMode === 'blank') return
@@ -2910,7 +3000,9 @@ export function ApplicationStartScreen({
     }
 
     if (!localImport) {
-      throw new Error('Choose a local folder before creating the workspace.')
+      throw new Error(
+        'Choose a ZIP archive, files, or a folder before creating the workspace.'
+      )
     }
     const batches = batchLocalImportFiles(localImport.accepted)
     for (let index = 0; index < batches.length; index += 1) {
@@ -3019,7 +3111,16 @@ export function ApplicationStartScreen({
               any Temps resource allowed by your current role.
             </p>
           </div>
-          <Button onClick={onCancel} size="sm" type="button" variant="ghost">
+          <Button
+            onClick={() => {
+              localImportRequestRef.current += 1
+              localImportAbortRef.current?.abort()
+              onCancel()
+            }}
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
             Cancel
           </Button>
         </div>
@@ -3057,8 +3158,8 @@ export function ApplicationStartScreen({
                   },
                   {
                     id: 'local',
-                    label: 'Local folder',
-                    detail: 'Upload existing code',
+                    label: 'Files or ZIP',
+                    detail: 'Drop or browse',
                     icon: FolderTree,
                   },
                   {
@@ -3081,6 +3182,11 @@ export function ApplicationStartScreen({
                     disabled={Boolean(provisionedApplication)}
                     key={option.id}
                     onClick={() => {
+                      if (option.id !== 'local') {
+                        localImportRequestRef.current += 1
+                        localImportAbortRef.current?.abort()
+                        setLocalImportLoading(false)
+                      }
                       setSourceMode(option.id)
                       setConnectionsLoading(
                         option.id === 'git' && connections.length === 0
@@ -3104,24 +3210,57 @@ export function ApplicationStartScreen({
             </div>
 
             {sourceMode === 'local' && (
-              <div className="rounded-lg border border-border bg-muted/30 p-3">
+              <div
+                aria-busy={localImportLoading}
+                className={cn(
+                  'rounded-lg border border-dashed bg-muted/30 p-4 transition-colors',
+                  localImportDragging &&
+                    'border-primary bg-primary/5 ring-2 ring-primary/15'
+                )}
+                onDragEnter={(event) => {
+                  event.preventDefault()
+                  if (!provisionedApplication && !localImportLoading) {
+                    setLocalImportDragging(true)
+                  }
+                }}
+                onDragLeave={(event) => {
+                  if (
+                    !event.currentTarget.contains(event.relatedTarget as Node)
+                  ) {
+                    setLocalImportDragging(false)
+                  }
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault()
+                  event.dataTransfer.dropEffect = 'copy'
+                }}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  setLocalImportDragging(false)
+                  if (provisionedApplication || localImportLoading) return
+                  const skipped: string[] = []
+                  void selectLocalImport(async (signal) => ({
+                    files: await filesFromDrop(event, {
+                      maxEntries: MAX_LOCAL_IMPORT_FILES,
+                      signal,
+                      shouldSkipPath: (path) =>
+                        isSensitiveLocalImportPath(path),
+                      onSkippedPath: (path) => skipped.push(path),
+                    }),
+                    skipped,
+                  }))
+                }}
+              >
                 <input
                   className="hidden"
-                  disabled={Boolean(provisionedApplication)}
+                  disabled={
+                    Boolean(provisionedApplication) || localImportLoading
+                  }
                   multiple
                   onChange={(event) => {
-                    try {
-                      const selection = prepareLocalImport(
-                        Array.from(event.target.files ?? [])
-                      )
-                      setLocalImport(selection)
-                      setError(null)
-                    } catch (cause) {
-                      setLocalImport(null)
-                      setError(
-                        problemDetail(cause, 'Could not read the local folder.')
-                      )
-                    }
+                    const files = filesFromInput(event.target.files)
+                    void selectLocalImport(async () => ({ files }))
+                    event.target.value = ''
                   }}
                   ref={(element) => {
                     folderInputRef.current = element
@@ -3130,10 +3269,36 @@ export function ApplicationStartScreen({
                   }}
                   type="file"
                 />
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
+                <input
+                  className="hidden"
+                  disabled={
+                    Boolean(provisionedApplication) || localImportLoading
+                  }
+                  multiple
+                  onChange={(event) => {
+                    const files = filesFromInput(event.target.files)
+                    void selectLocalImport(async () => ({ files }))
+                    event.target.value = ''
+                  }}
+                  ref={fileInputRef}
+                  type="file"
+                />
+                <div className="flex items-center gap-3">
+                  <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border bg-background">
+                    {localImportLoading ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : localImport?.sourceKind === 'zip' ? (
+                      <FileArchive className="size-4" />
+                    ) : (
+                      <UploadCloud className="size-4" />
+                    )}
+                  </div>
+                  <div aria-live="polite" className="min-w-0" role="status">
                     <p className="truncate text-sm font-medium">
-                      {localImport?.rootName ?? 'Choose a folder'}
+                      {localImportLoading
+                        ? 'Reading selection…'
+                        : (localImport?.sourceLabel ??
+                          'Drop a ZIP, files, or folders')}
                     </p>
                     <p className="mt-0.5 text-xs text-muted-foreground">
                       {localImport
@@ -3146,17 +3311,33 @@ export function ApplicationStartScreen({
                               ? ` · ${localImport.skipped.length} excluded`
                               : ''
                           }`
-                        : 'Dependencies, Git metadata, and credential files are excluded.'}
+                        : 'Relative paths are preserved. Dependencies, Git metadata, and credentials are excluded.'}
                     </p>
                   </div>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2 pl-0 sm:pl-[3.25rem]">
                   <Button
-                    disabled={Boolean(provisionedApplication)}
+                    disabled={
+                      Boolean(provisionedApplication) || localImportLoading
+                    }
+                    onClick={() => fileInputRef.current?.click()}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    <FileArchive className="mr-1.5 size-3.5" /> Choose files or
+                    ZIP
+                  </Button>
+                  <Button
+                    disabled={
+                      Boolean(provisionedApplication) || localImportLoading
+                    }
                     onClick={() => folderInputRef.current?.click()}
                     size="sm"
                     type="button"
                     variant="outline"
                   >
-                    Browse
+                    <FolderTree className="mr-1.5 size-3.5" /> Choose folder
                   </Button>
                 </div>
               </div>
@@ -3282,6 +3463,7 @@ export function ApplicationStartScreen({
           <Button
             disabled={
               saving ||
+              localImportLoading ||
               !name.trim() ||
               !selectedHarnessId ||
               (sourceMode === 'git' && !gitUrl.trim()) ||

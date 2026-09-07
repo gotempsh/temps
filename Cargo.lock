@@ -10472,6 +10472,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "unicode-casefold",
+ "unicode-normalization",
  "utoipa",
  "uuid",
  "walkdir",
@@ -13956,6 +13958,12 @@ name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
 
 [[package]]
 name = "unicode-general-category"

@@ -1,57 +1,36 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { DropFile } from '@/lib/drop-archive'
+import {
+  MAX_LOCAL_IMPORT_BYTES,
+  MAX_LOCAL_IMPORT_FILE_BYTES,
+  MAX_LOCAL_IMPORT_FILES,
+  MAX_WRITE_BATCH_BYTES,
+  MAX_WRITE_BATCH_FILES,
+  isSensitiveLocalImportPath,
+  normalizedWorkspaceImportPath,
+  shouldSkipLocalImportPath,
+} from './workspace-import-policy'
+
+export {
+  MAX_LOCAL_IMPORT_BYTES,
+  MAX_LOCAL_IMPORT_FILE_BYTES,
+  MAX_LOCAL_IMPORT_FILES,
+  MAX_LOCAL_IMPORT_PATH_BYTES,
+  MAX_WRITE_BATCH_BYTES,
+  MAX_WRITE_BATCH_FILES,
+  isSensitiveLocalImportPath,
+  shouldSkipLocalImportPath,
+} from './workspace-import-policy'
+
 export type WorkspaceSourceMode = 'blank' | 'local' | 'git'
 
-export const MAX_LOCAL_IMPORT_FILES = 5_000
-export const MAX_LOCAL_IMPORT_BYTES = 256 * 1024 * 1024
-export const MAX_LOCAL_IMPORT_FILE_BYTES = 32 * 1024 * 1024
-export const MAX_WRITE_BATCH_BYTES = 4 * 1024 * 1024
-export const MAX_WRITE_BATCH_FILES = 32
-
-const IGNORED_DIRECTORY_NAMES = new Set([
-  '.aws',
-  '.azure',
-  '.docker',
-  '.gnupg',
-  '.git',
-  '.kube',
-  '.next',
-  '.pulumi',
-  '.ssh',
-  '.terraform',
-  '.turbo',
-  '.vercel',
-  'build',
-  'coverage',
-  'dist',
-  'node_modules',
-  'target',
-])
-
-const SENSITIVE_FILE_NAMES = new Set([
-  '.netrc',
-  '.npmrc',
-  '.pypirc',
-  '.envrc',
-  '.git-credentials',
-  'credentials',
-  'credentials.json',
-  'id_dsa',
-  'id_ed25519',
-  'id_rsa',
-])
-
-const SENSITIVE_SUFFIXES = [
-  '.jks',
-  '.key',
-  '.keystore',
-  '.p12',
-  '.pfx',
-  '.pem',
-  '.tfstate',
-  '.tfstate.backup',
-]
+const MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
+const MAX_ZIP_COMPRESSION_RATIO = 2_000
+const MAX_ZIP_TRAILER_BYTES = 65_535 + 22
+const ZIP_END_SIGNATURE = 0x06054b50
+const ZIP_CENTRAL_ENTRY_SIGNATURE = 0x02014b50
 
 export type LocalImportFile = {
   file: File
@@ -63,76 +42,324 @@ export type LocalImportSelection = {
   skipped: string[]
   totalBytes: number
   rootName: string | null
+  sourceLabel: string
+  sourceKind: 'files' | 'zip'
 }
 
-function normalizedRelativePath(file: File): {
-  path: string
-  rootName: string | null
-} | null {
-  const browserPath = file.webkitRelativePath || file.name
-  const rawParts = browserPath.replace(/\\/g, '/').split('/')
-  const parts = rawParts.filter(Boolean)
-  const rootName = parts.length > 1 ? (parts.shift() ?? null) : null
-  if (
-    parts.length === 0 ||
-    parts.some((part) => part === '.' || part === '..' || part.includes('\0'))
-  ) {
-    return null
+type WorkspaceImportInput = File | DropFile
+
+function inputFile(input: WorkspaceImportInput): File {
+  return input instanceof File ? input : input.file
+}
+
+function inputPath(input: WorkspaceImportInput): string {
+  if (input instanceof File) {
+    return input.webkitRelativePath || input.name
   }
-  return { path: parts.join('/'), rootName }
+  return input.path || input.file.webkitRelativePath || input.file.name
 }
 
-export function shouldSkipLocalImportPath(path: string): boolean {
-  const parts = path.split('/').map((part) => part.toLowerCase())
-  if (parts.some((part) => IGNORED_DIRECTORY_NAMES.has(part))) return true
-  const fileName = parts[parts.length - 1]?.toLowerCase() ?? ''
-  if (fileName === '.env' || fileName.startsWith('.env.')) return true
-  if (SENSITIVE_FILE_NAMES.has(fileName)) return true
-  if (
-    fileName.endsWith('.credentials.json') ||
-    (fileName.includes('service-account') && fileName.endsWith('.json')) ||
-    (parts.includes('.config') && parts.includes('gcloud'))
-  )
-    return true
-  return SENSITIVE_SUFFIXES.some((suffix) => fileName.endsWith(suffix))
+function sharedRoot(paths: string[]): string | null {
+  if (paths.length === 0) return null
+  const split = paths.map((path) => path.split('/'))
+  const root = split[0][0]
+  return split.every((parts) => parts.length > 1 && parts[0] === root)
+    ? root
+    : null
 }
 
-export function prepareLocalImport(files: File[]): LocalImportSelection {
+export function prepareLocalImport(
+  inputs: WorkspaceImportInput[],
+  options: {
+    sourceKind?: LocalImportSelection['sourceKind']
+    sourceLabel?: string
+    skipped?: string[]
+  } = {}
+): LocalImportSelection {
   const accepted: LocalImportFile[] = []
-  const skipped: string[] = []
+  const skipped = [...(options.skipped ?? [])]
   let totalBytes = 0
-  let rootName: string | null = null
+  const normalized = inputs.map((input) => ({
+    file: inputFile(input),
+    originalPath: inputPath(input),
+    path: normalizedWorkspaceImportPath(inputPath(input)),
+  }))
+  const rootName = sharedRoot(
+    normalized
+      .filter(({ path }) => path !== null)
+      .map(({ path }) => path as string)
+  )
+  const seen = new Set<string>()
 
-  for (const file of files) {
-    const normalized = normalizedRelativePath(file)
-    if (!normalized) {
-      skipped.push(file.webkitRelativePath || file.name)
+  for (const candidate of normalized) {
+    if (!candidate.path) {
+      skipped.push(candidate.originalPath)
       continue
     }
-    rootName ??= normalized.rootName
+    const path = rootName
+      ? candidate.path.slice(rootName.length + 1)
+      : candidate.path
     if (
-      shouldSkipLocalImportPath(normalized.path) ||
-      file.size > MAX_LOCAL_IMPORT_FILE_BYTES
+      isSensitiveLocalImportPath(candidate.path) ||
+      shouldSkipLocalImportPath(path) ||
+      candidate.file.size > MAX_LOCAL_IMPORT_FILE_BYTES
     ) {
-      skipped.push(normalized.path)
+      skipped.push(path)
       continue
+    }
+    if (seen.has(path)) {
+      throw new Error(`The selection contains more than one file at “${path}”.`)
     }
     if (accepted.length >= MAX_LOCAL_IMPORT_FILES) {
       throw new Error(
-        `This folder exceeds the ${MAX_LOCAL_IMPORT_FILES.toLocaleString()} file import limit.`
+        `This selection exceeds the ${MAX_LOCAL_IMPORT_FILES.toLocaleString()} file import limit.`
       )
     }
-    if (totalBytes + file.size > MAX_LOCAL_IMPORT_BYTES) {
-      throw new Error('This folder exceeds the 256 MB import limit.')
+    if (totalBytes + candidate.file.size > MAX_LOCAL_IMPORT_BYTES) {
+      throw new Error('This selection exceeds the 256 MB import limit.')
     }
-    totalBytes += file.size
-    accepted.push({ file, path: normalized.path })
+    seen.add(path)
+    totalBytes += candidate.file.size
+    accepted.push({ file: candidate.file, path })
   }
 
   if (accepted.length === 0) {
-    throw new Error('The selected folder contains no importable files.')
+    throw new Error('The selection contains no importable files.')
   }
-  return { accepted, skipped, totalBytes, rootName }
+  return {
+    accepted,
+    skipped,
+    totalBytes,
+    rootName,
+    sourceLabel:
+      options.sourceLabel ??
+      rootName ??
+      (accepted.length === 1
+        ? accepted[0].file.name
+        : `${accepted.length} files`),
+    sourceKind: options.sourceKind ?? 'files',
+  }
+}
+
+function isZip(file: File): boolean {
+  return (
+    file.name.toLowerCase().endsWith('.zip') ||
+    file.type === 'application/zip' ||
+    file.type === 'application/x-zip-compressed'
+  )
+}
+
+function archiveError(cause: unknown): Error {
+  return cause instanceof Error
+    ? cause
+    : new Error('The ZIP archive could not be read.')
+}
+
+async function validateZipCentralDirectory(archiveFile: File): Promise<void> {
+  const tailStart = Math.max(0, archiveFile.size - MAX_ZIP_TRAILER_BYTES)
+  const tail = new Uint8Array(await archiveFile.slice(tailStart).arrayBuffer())
+  const tailView = new DataView(tail.buffer, tail.byteOffset, tail.byteLength)
+  let endOffset = -1
+  for (let offset = tail.byteLength - 22; offset >= 0; offset -= 1) {
+    if (tailView.getUint32(offset, true) !== ZIP_END_SIGNATURE) continue
+    const commentBytes = tailView.getUint16(offset + 20, true)
+    if (offset + 22 + commentBytes === tail.byteLength) {
+      endOffset = offset
+      break
+    }
+  }
+  if (endOffset < 0) {
+    throw new Error('The selected file does not contain a valid ZIP directory.')
+  }
+
+  const disk = tailView.getUint16(endOffset + 4, true)
+  const centralDisk = tailView.getUint16(endOffset + 6, true)
+  const diskEntries = tailView.getUint16(endOffset + 8, true)
+  const totalEntries = tailView.getUint16(endOffset + 10, true)
+  const centralBytes = tailView.getUint32(endOffset + 12, true)
+  const centralOffset = tailView.getUint32(endOffset + 16, true)
+  if (
+    disk !== 0 ||
+    centralDisk !== 0 ||
+    diskEntries !== totalEntries ||
+    totalEntries === 0xffff ||
+    centralBytes === 0xffffffff ||
+    centralOffset === 0xffffffff
+  ) {
+    throw new Error('Multi-disk and ZIP64 archives are not supported.')
+  }
+  if (totalEntries > MAX_LOCAL_IMPORT_FILES) {
+    throw new Error(
+      `This ZIP exceeds the ${MAX_LOCAL_IMPORT_FILES.toLocaleString()} entry import limit.`
+    )
+  }
+  if (centralBytes > MAX_ZIP_CENTRAL_DIRECTORY_BYTES) {
+    throw new Error('The ZIP directory exceeds the 4 MB safety limit.')
+  }
+  const absoluteEndOffset = tailStart + endOffset
+  if (
+    centralOffset > absoluteEndOffset ||
+    centralBytes > absoluteEndOffset - centralOffset
+  ) {
+    throw new Error('The ZIP directory points outside the selected archive.')
+  }
+
+  const central = new Uint8Array(
+    await archiveFile
+      .slice(centralOffset, centralOffset + centralBytes)
+      .arrayBuffer()
+  )
+  const centralView = new DataView(
+    central.buffer,
+    central.byteOffset,
+    central.byteLength
+  )
+  let cursor = 0
+  let expandedBytes = 0
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (
+      cursor + 46 > central.byteLength ||
+      centralView.getUint32(cursor, true) !== ZIP_CENTRAL_ENTRY_SIGNATURE
+    ) {
+      throw new Error('The ZIP central directory is malformed.')
+    }
+    const flags = centralView.getUint16(cursor + 8, true)
+    const method = centralView.getUint16(cursor + 10, true)
+    const compressedBytes = centralView.getUint32(cursor + 20, true)
+    const uncompressedBytes = centralView.getUint32(cursor + 24, true)
+    const nameBytes = centralView.getUint16(cursor + 28, true)
+    const extraBytes = centralView.getUint16(cursor + 30, true)
+    const commentBytes = centralView.getUint16(cursor + 32, true)
+    if ((flags & 1) !== 0) {
+      throw new Error('Encrypted ZIP archives are not supported.')
+    }
+    if (method !== 0 && method !== 8) {
+      throw new Error(`ZIP compression method ${method} is not supported.`)
+    }
+    if (compressedBytes === 0xffffffff || uncompressedBytes === 0xffffffff) {
+      throw new Error('ZIP64 archives are not supported.')
+    }
+    expandedBytes += uncompressedBytes
+    if (expandedBytes > MAX_LOCAL_IMPORT_BYTES) {
+      throw new Error('The expanded ZIP exceeds the 256 MB import limit.')
+    }
+    if (
+      uncompressedBytes > 0 &&
+      (compressedBytes === 0 ||
+        uncompressedBytes / compressedBytes > MAX_ZIP_COMPRESSION_RATIO)
+    ) {
+      throw new Error('The ZIP contains an unsafe compression ratio.')
+    }
+    cursor += 46 + nameBytes + extraBytes + commentBytes
+    if (cursor > central.byteLength) {
+      throw new Error('The ZIP central directory is malformed.')
+    }
+  }
+}
+
+async function extractWorkspaceZip(
+  archiveFile: File,
+  signal?: AbortSignal
+): Promise<{ files: DropFile[]; skipped: string[] }> {
+  signal?.throwIfAborted()
+  if (archiveFile.size > MAX_LOCAL_IMPORT_BYTES) {
+    throw new Error('The ZIP archive exceeds the 256 MB upload limit.')
+  }
+  await validateZipCentralDirectory(archiveFile)
+  signal?.throwIfAborted()
+
+  type WorkerResponse =
+    | {
+        type: 'entry'
+        name: string
+        path: string
+        chunks: ArrayBuffer[]
+      }
+    | { type: 'done'; skipped: string[] }
+    | { type: 'error'; message: string }
+
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(
+      new URL('./workspace-import.worker.ts', import.meta.url),
+      { name: 'temps-workspace-zip-import', type: 'module' }
+    )
+    const files: DropFile[] = []
+    let settled = false
+    const abort = () => fail(signal?.reason ?? new Error('Import cancelled.'))
+    const timeout = globalThis.setTimeout(() => {
+      fail(new Error('ZIP extraction exceeded the 30 second safety limit.'))
+    }, 30_000)
+    const cleanup = () => {
+      globalThis.clearTimeout(timeout)
+      signal?.removeEventListener('abort', abort)
+      worker.terminate()
+    }
+    const fail = (cause: unknown) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(archiveError(cause))
+    }
+
+    worker.onerror = (event) => {
+      fail(new Error(event.message || 'The ZIP archive could not be read.'))
+    }
+    worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+      if (settled) return
+      const message = event.data
+      if (message.type === 'error') {
+        fail(new Error(message.message))
+        return
+      }
+      if (message.type === 'entry') {
+        files.push({
+          file: new File(message.chunks, message.name, {
+            lastModified: archiveFile.lastModified,
+          }),
+          path: message.path,
+        })
+        return
+      }
+      settled = true
+      cleanup()
+      resolve({ files, skipped: message.skipped })
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) {
+      abort()
+      return
+    }
+    worker.postMessage({ archive: archiveFile })
+  })
+}
+
+export async function prepareWorkspaceImport(
+  inputs: DropFile[],
+  options: { skipped?: string[]; signal?: AbortSignal } = {}
+): Promise<LocalImportSelection> {
+  options.signal?.throwIfAborted()
+  if (inputs.length === 0) {
+    throw new Error('Choose a ZIP archive, files, or a folder to import.')
+  }
+  const selected = inputs[0]
+  const selectedPath = selected
+    ? normalizedWorkspaceImportPath(selected.path)
+    : null
+  const isTopLevelArchive =
+    inputs.length === 1 &&
+    selected !== undefined &&
+    isZip(selected.file) &&
+    selectedPath === selected.file.name
+  if (isTopLevelArchive) {
+    const extracted = await extractWorkspaceZip(selected.file, options.signal)
+    options.signal?.throwIfAborted()
+    return prepareLocalImport(extracted.files, {
+      skipped: [...(options.skipped ?? []), ...extracted.skipped],
+      sourceKind: 'zip',
+      sourceLabel: selected.file.name,
+    })
+  }
+  return prepareLocalImport(inputs, { skipped: options.skipped })
 }
 
 export function batchLocalImportFiles(

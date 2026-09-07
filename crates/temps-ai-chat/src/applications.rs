@@ -93,6 +93,8 @@ pub enum ApplicationError {
     WorkspacePathNotFound(String),
     #[error("workspace path '{0}' is not a regular file")]
     WorkspacePathNotFile(String),
+    #[error("workspace file '{path}' exceeds the {max_bytes}-byte download limit")]
+    WorkspaceDownloadTooLarge { path: String, max_bytes: usize },
     #[error("chat attachment is invalid: {0}")]
     InvalidAttachment(String),
     #[error("chat attachment '{0}' was not found in this workspace")]
@@ -240,6 +242,41 @@ impl ApplicationWorkspaceService {
         workspace_id: &str,
         relative_path: &str,
     ) -> Result<WorkspaceFilePreview, ApplicationError> {
+        self.read_file_limited(
+            workspace_id,
+            relative_path,
+            MAX_WORKSPACE_FILE_PREVIEW_BYTES,
+        )
+        .await
+    }
+
+    /// Read one regular workspace file without following symlinks. The caller
+    /// supplies a hard byte ceiling so HTTP downloads cannot consume
+    /// unbounded control-plane memory.
+    pub async fn read_file_download(
+        &self,
+        workspace_id: &str,
+        relative_path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ApplicationError> {
+        let result = self
+            .read_file_limited(workspace_id, relative_path, max_bytes)
+            .await?;
+        if result.truncated {
+            return Err(ApplicationError::WorkspaceDownloadTooLarge {
+                path: relative_path.to_string(),
+                max_bytes,
+            });
+        }
+        Ok(result.bytes)
+    }
+
+    async fn read_file_limited(
+        &self,
+        workspace_id: &str,
+        relative_path: &str,
+        max_bytes: usize,
+    ) -> Result<WorkspaceFilePreview, ApplicationError> {
         validate_workspace_component(workspace_id)?;
         validate_workspace_relative_path(relative_path, false)?;
         let root = self.root.clone();
@@ -248,12 +285,7 @@ impl ApplicationWorkspaceService {
         let error_path = relative_path.clone();
         let task_error_path = self.root.join(&workspace_id);
         tokio::task::spawn_blocking(move || {
-            read_workspace_file_fd_relative(
-                &root,
-                &workspace_id,
-                &relative_path,
-                MAX_WORKSPACE_FILE_PREVIEW_BYTES,
-            )
+            read_workspace_file_fd_relative(&root, &workspace_id, &relative_path, max_bytes)
         })
         .await
         .map_err(|source| ApplicationError::Workspace {
@@ -274,21 +306,70 @@ impl ApplicationWorkspaceService {
         max_workspace_bytes: u64,
         max_workspace_entries: usize,
     ) -> Result<usize, ApplicationError> {
-        validate_workspace_component(application_public_id)?;
         validate_workspace_component(project_slug)?;
+        let prefix = PathBuf::from("projects").join(project_slug);
+        let files = files
+            .into_iter()
+            .map(|(path, contents, mode)| (prefix.join(path), contents, mode))
+            .collect();
+        self.store_workspace_files_bounded(
+            application_public_id,
+            files,
+            max_workspace_bytes,
+            max_workspace_entries,
+        )
+        .await
+    }
+
+    /// Store files at safe workspace-relative paths. This is used by the file
+    /// explorer for both application and global workspaces; every component is
+    /// opened relative to a trusted descriptor with `NOFOLLOW`.
+    pub async fn store_workspace_files_bounded(
+        &self,
+        workspace_id: &str,
+        files: Vec<(PathBuf, Vec<u8>, Option<u32>)>,
+        max_workspace_bytes: u64,
+        max_workspace_entries: usize,
+    ) -> Result<usize, ApplicationError> {
+        use unicode_casefold::UnicodeCaseFold;
+        use unicode_normalization::UnicodeNormalization;
+
+        validate_workspace_component(workspace_id)?;
+        let mut incoming_paths = std::collections::HashSet::with_capacity(files.len());
+        for (path, _, _) in &files {
+            let path = path.to_str().ok_or_else(|| {
+                ApplicationError::InvalidWorkspacePath(path.display().to_string())
+            })?;
+            validate_workspace_relative_path(path, false)?;
+            let portable_path = path
+                .split('/')
+                .map(|component| component.case_fold().nfd().collect::<String>())
+                .collect::<Vec<_>>()
+                .join("/");
+            if !incoming_paths.insert(PathBuf::from(&portable_path)) {
+                return Err(ApplicationError::InvalidWorkspacePath(path.to_string()));
+            }
+        }
+        for path in &incoming_paths {
+            if path
+                .ancestors()
+                .skip(1)
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                .any(|ancestor| incoming_paths.contains(ancestor))
+            {
+                return Err(ApplicationError::InvalidWorkspacePath(
+                    path.display().to_string(),
+                ));
+            }
+        }
         let _import = self.import_lock.lock().await;
         let root = self.root.clone();
-        let application_public_id = application_public_id.to_string();
-        let project_slug = project_slug.to_string();
-        let error_path = root
-            .join(&application_public_id)
-            .join("projects")
-            .join(&project_slug);
+        let workspace_id = workspace_id.to_string();
+        let error_path = root.join(&workspace_id);
         tokio::task::spawn_blocking(move || {
-            store_project_files_fd_relative(
+            store_workspace_files_fd_relative(
                 &root,
-                &application_public_id,
-                &project_slug,
+                &workspace_id,
                 &files,
                 max_workspace_bytes,
                 max_workspace_entries,
@@ -777,17 +858,19 @@ fn ensure_workspace_tree_fd_relative(
 }
 
 #[cfg(unix)]
-fn store_project_files_fd_relative(
+fn store_workspace_files_fd_relative(
     root: &Path,
-    application_public_id: &str,
-    project_slug: &str,
+    workspace_id: &str,
     files: &[(PathBuf, Vec<u8>, Option<u32>)],
     max_workspace_bytes: u64,
     max_workspace_entries: usize,
 ) -> std::io::Result<usize> {
-    use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
+    use nix::dir::Dir;
+    use rustix::fs::{mkdirat, open, openat, statat, AtFlags, FileType, Mode, OFlags};
+    use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::os::fd::{AsFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
 
     fn open_dir(parent: impl AsFd, component: &std::ffi::OsStr) -> std::io::Result<OwnedFd> {
         openat(
@@ -811,48 +894,172 @@ fn store_project_files_fd_relative(
         open_dir(parent, component)
     }
 
+    fn preflight_target(parent: &OwnedFd, relative: &Path) -> std::io::Result<()> {
+        let components = relative.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace import path contains a non-normal component",
+            ));
+        }
+
+        let mut current = parent.try_clone()?;
+        for component in &components[..components.len() - 1] {
+            let std::path::Component::Normal(component) = component else {
+                unreachable!("workspace import components were validated")
+            };
+            match open_dir(&current, component) {
+                Ok(next) => current = next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A missing parent chain is safe and will be created only
+                    // after every target in the batch passes this preflight.
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let std::path::Component::Normal(file_name) = components[components.len() - 1] else {
+            unreachable!("workspace import components were validated")
+        };
+        match openat(
+            &current,
+            file_name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(target) => {
+                let metadata = File::from(target).metadata()?;
+                if !metadata.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "workspace import target is not a regular file",
+                    ));
+                }
+                Ok(())
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            Err(error) => Err(std::io::Error::from_raw_os_error(error.raw_os_error())),
+        }
+    }
+
+    fn open_relative_dir(parent: &OwnedFd, relative: &Path) -> std::io::Result<OwnedFd> {
+        let mut current = parent.try_clone()?;
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workspace quota path contains a non-normal component",
+                ));
+            };
+            current = open_dir(&current, component)?;
+        }
+        Ok(current)
+    }
+
+    fn scan_workspace_quota(
+        workspace: &OwnedFd,
+        max_entries: usize,
+    ) -> std::io::Result<(u64, HashSet<PathBuf>, HashMap<PathBuf, u64>)> {
+        let mut existing_bytes = 0_u64;
+        let mut existing_paths = HashSet::new();
+        let mut existing_file_sizes = HashMap::new();
+        let mut inspected_entries = 0usize;
+        let mut pending = vec![PathBuf::new()];
+
+        while let Some(parent_path) = pending.pop() {
+            let directory_fd = open_relative_dir(workspace, &parent_path)?;
+            let mut directory = Dir::from_fd(directory_fd).map_err(std::io::Error::other)?;
+            let mut names = Vec::new();
+            for entry in directory.iter() {
+                let entry = entry.map_err(std::io::Error::other)?;
+                let name = entry.file_name();
+                if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                    continue;
+                }
+                inspected_entries = inspected_entries
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("workspace entry count overflowed"))?;
+                if inspected_entries > max_entries {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::FileTooLarge,
+                        format!(
+                            "workspace contains more than the {max_entries}-entry aggregate limit"
+                        ),
+                    ));
+                }
+                names.push(name.to_owned());
+            }
+
+            for name in names {
+                let name = std::ffi::OsStr::from_bytes(name.to_bytes());
+                let relative = parent_path.join(name);
+                if relative.to_str().is_some_and(is_sensitive_workspace_path) {
+                    continue;
+                }
+                let stat = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+                let file_type = FileType::from_raw_mode(stat.st_mode);
+                existing_paths.insert(relative.clone());
+                if file_type.is_dir() {
+                    // Queue the relative directory name, not its descriptor.
+                    // This bounds open descriptors even for a very wide tree.
+                    pending.push(relative);
+                } else if file_type.is_file() {
+                    let size = u64::try_from(stat.st_size).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "workspace file has a negative size",
+                        )
+                    })?;
+                    existing_bytes = existing_bytes
+                        .checked_add(size)
+                        .ok_or_else(|| std::io::Error::other("workspace size overflowed"))?;
+                    existing_file_sizes.insert(relative, size);
+                }
+            }
+        }
+
+        Ok((existing_bytes, existing_paths, existing_file_sizes))
+    }
+
     let root_fd = open(
         root,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-    let application_fd = open_dir(&root_fd, std::ffi::OsStr::new(application_public_id))?;
-    let projects_fd = open_dir(&application_fd, std::ffi::OsStr::new("projects"))?;
-    let project_fd = open_dir(&projects_fd, std::ffi::OsStr::new(project_slug))?;
+    let workspace_fd = open_dir(&root_fd, std::ffi::OsStr::new(workspace_id))?;
 
-    let application_path = root.join(application_public_id);
-    let mut existing_bytes = 0_u64;
-    let mut existing_entries = 0_usize;
-    for entry in walkdir::WalkDir::new(&application_path)
-        .min_depth(1)
-        .follow_links(false)
-    {
-        let entry = entry.map_err(std::io::Error::other)?;
-        existing_entries = existing_entries
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("workspace entry count overflowed"))?;
-        if entry.file_type().is_file() {
-            existing_bytes = existing_bytes
-                .checked_add(entry.metadata().map_err(std::io::Error::other)?.len())
-                .ok_or_else(|| std::io::Error::other("workspace size overflowed"))?;
-        }
-    }
+    let (existing_bytes, existing_paths, existing_file_sizes) =
+        scan_workspace_quota(&workspace_fd, max_workspace_entries)?;
     let incoming_bytes = files.iter().try_fold(0_u64, |total, (_, bytes, _)| {
         total
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| std::io::Error::other("workspace import size overflowed"))
     })?;
-    // This deliberately counts every component in every incoming path. It is
-    // a conservative upper bound (shared directories may be counted more than
-    // once) and therefore cannot undercount new zero-byte files or directories.
-    let incoming_entries = files.iter().try_fold(0_usize, |total, (path, _, _)| {
+    let replaced_bytes = files.iter().try_fold(0_u64, |total, (path, _, _)| {
         total
-            .checked_add(path.components().count())
-            .ok_or_else(|| std::io::Error::other("workspace entry count overflowed"))
+            .checked_add(existing_file_sizes.get(path).copied().unwrap_or(0))
+            .ok_or_else(|| std::io::Error::other("workspace replacement size overflowed"))
     })?;
+    let mut incoming_paths = std::collections::HashSet::new();
+    for (path, _, _) in files {
+        let mut candidate = PathBuf::new();
+        for component in path.components() {
+            candidate.push(component.as_os_str());
+            if !existing_paths.contains(&candidate) {
+                incoming_paths.insert(candidate.clone());
+            }
+        }
+    }
     if existing_bytes
-        .checked_add(incoming_bytes)
+        .checked_sub(replaced_bytes)
+        .and_then(|total| total.checked_add(incoming_bytes))
         .is_none_or(|total| total > max_workspace_bytes)
     {
         return Err(std::io::Error::new(
@@ -860,8 +1067,9 @@ fn store_project_files_fd_relative(
             format!("workspace import would exceed the {max_workspace_bytes}-byte aggregate limit"),
         ));
     }
-    if existing_entries
-        .checked_add(incoming_entries)
+    if existing_paths
+        .len()
+        .checked_add(incoming_paths.len())
         .is_none_or(|total| total > max_workspace_entries)
     {
         return Err(std::io::Error::new(
@@ -870,6 +1078,13 @@ fn store_project_files_fd_relative(
                 "workspace import would exceed the {max_workspace_entries}-entry aggregate limit"
             ),
         ));
+    }
+
+    // Validate every descriptor traversal before creating a directory or
+    // truncating a file. This prevents a later ancestor/symlink collision
+    // from leaving the earlier members of the batch partially written.
+    for (relative, _, _) in files {
+        preflight_target(&workspace_fd, relative)?;
     }
 
     for (relative, contents, mode) in files {
@@ -884,7 +1099,7 @@ fn store_project_files_fd_relative(
                 "workspace import path contains a non-normal component",
             ));
         }
-        let mut parent: OwnedFd = project_fd.try_clone()?;
+        let mut parent: OwnedFd = workspace_fd.try_clone()?;
         for component in &components[..components.len() - 1] {
             let std::path::Component::Normal(component) = component else {
                 unreachable!("workspace import components were validated")
@@ -897,13 +1112,20 @@ fn store_project_files_fd_relative(
         let file = openat(
             &parent,
             file_name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             // rustix uses the platform's native mode_t width (u16 on Darwin,
             // u32 on Linux), so let the Mode constructor select that width.
             Mode::from_bits_truncate((mode.unwrap_or(0o644) & 0o777) as _),
         )
         .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
         let mut file = File::from(file);
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace import target is not a regular file",
+            ));
+        }
+        file.set_len(0)?;
         file.write_all(contents)?;
         file.sync_all()?;
     }
@@ -911,10 +1133,9 @@ fn store_project_files_fd_relative(
 }
 
 #[cfg(not(unix))]
-fn store_project_files_fd_relative(
+fn store_workspace_files_fd_relative(
     _root: &Path,
-    _application_public_id: &str,
-    _project_slug: &str,
+    _workspace_id: &str,
     _files: &[(PathBuf, Vec<u8>, Option<u32>)],
     _max_workspace_bytes: u64,
     _max_workspace_entries: usize,
@@ -971,9 +1192,17 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
                     | ".docker"
                     | ".gnupg"
                     | ".kube"
+                    | ".next"
                     | ".pulumi"
                     | ".ssh"
                     | ".terraform"
+                    | ".turbo"
+                    | ".vercel"
+                    | "build"
+                    | "coverage"
+                    | "dist"
+                    | "node_modules"
+                    | "target"
             )
             || lower == ".env"
             || (lower.starts_with(".env.") && lower != ".env.example")
@@ -1174,7 +1403,7 @@ fn read_workspace_file_fd_relative(
     let file = openat(
         &parent,
         file_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
@@ -1342,7 +1571,7 @@ fn chat_attachment_size_fd_relative(
     let file = openat(
         &attachment,
         file_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
@@ -1386,7 +1615,7 @@ fn read_chat_attachment_fd_relative(
     let file = openat(
         &attachment,
         file_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
@@ -3282,6 +3511,271 @@ mod tests {
         assert_eq!(preview.bytes.len(), MAX_WORKSPACE_FILE_PREVIEW_BYTES);
         assert_eq!(preview.size_bytes, large.len() as u64);
         assert!(preview.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_browser_uploads_and_downloads_bounded_files() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+        let workspace = service
+            .ensure("app_safe_123", &[])
+            .await
+            .expect("managed workspace");
+
+        let written = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![(
+                    PathBuf::from("uploads/example.json"),
+                    br#"{"ready":true}"#.to_vec(),
+                    None,
+                )],
+                1_024,
+                10,
+            )
+            .await
+            .expect("workspace upload");
+        assert_eq!(written, 1);
+
+        let generated_dependency = data_dir
+            .path()
+            .join("app_safe_123/node_modules/example/cache.bin");
+        tokio::fs::create_dir_all(
+            generated_dependency
+                .parent()
+                .expect("generated dependency parent"),
+        )
+        .await
+        .expect("generated dependency directory");
+        tokio::fs::write(&generated_dependency, vec![0; 1_024])
+            .await
+            .expect("generated dependency file");
+
+        service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![(PathBuf::from("uploads/example.json"), b"{}".to_vec(), None)],
+                3,
+                10,
+            )
+            .await
+            .expect(
+                "replacements release previous bytes and generated dependencies do not consume import quota",
+            );
+
+        let downloaded = service
+            .read_file_download("app_safe_123", "uploads/example.json", 1_024)
+            .await
+            .expect("workspace download");
+        assert_eq!(downloaded, b"{}");
+
+        let too_large = service
+            .read_file_download("app_safe_123", "uploads/example.json", 1)
+            .await
+            .expect_err("download must enforce its byte ceiling");
+        assert!(matches!(
+            too_large,
+            ApplicationError::WorkspaceDownloadTooLarge { max_bytes: 1, .. }
+        ));
+
+        let sensitive = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![(PathBuf::from(".env"), b"SECRET=value".to_vec(), None)],
+                1_024,
+                10,
+            )
+            .await
+            .expect_err("sensitive paths must not be writable");
+        assert!(matches!(
+            sensitive,
+            ApplicationError::InvalidWorkspacePath(_)
+        ));
+
+        let overlapping = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![
+                    (PathBuf::from("tree"), b"file".to_vec(), None),
+                    (PathBuf::from("tree/child.txt"), b"child".to_vec(), None),
+                ],
+                1_024,
+                10,
+            )
+            .await
+            .expect_err("ancestor and descendant targets must be rejected together");
+        assert!(matches!(
+            overlapping,
+            ApplicationError::InvalidWorkspacePath(_)
+        ));
+
+        tokio::fs::write(workspace.host_work_dir.join("occupied"), b"not a directory")
+            .await
+            .expect("occupied ancestor fixture");
+        let collision = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![
+                    (PathBuf::from("must-not-exist.txt"), b"early".to_vec(), None),
+                    (PathBuf::from("occupied/child.txt"), b"late".to_vec(), None),
+                ],
+                1_024,
+                10,
+            )
+            .await
+            .expect_err("all targets must be preflighted before the first write");
+        assert!(matches!(collision, ApplicationError::Workspace { .. }));
+        assert!(
+            !workspace.host_work_dir.join("must-not-exist.txt").exists(),
+            "a later descriptor collision must not leave earlier files behind"
+        );
+
+        let outside = data_dir.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("outside fixture directory");
+        std::os::unix::fs::symlink(&outside, workspace.host_work_dir.join("linked"))
+            .expect("workspace symlink fixture");
+        let symlink_collision = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![
+                    (
+                        PathBuf::from("must-also-not-exist.txt"),
+                        b"early".to_vec(),
+                        None,
+                    ),
+                    (PathBuf::from("linked/escape.txt"), b"late".to_vec(), None),
+                ],
+                1_024,
+                10,
+            )
+            .await
+            .expect_err("symlink traversal must fail during batch preflight");
+        assert!(matches!(
+            symlink_collision,
+            ApplicationError::Workspace { .. }
+        ));
+        assert!(!workspace
+            .host_work_dir
+            .join("must-also-not-exist.txt")
+            .exists());
+        assert!(!outside.join("escape.txt").exists());
+
+        let case_collision = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![
+                    (PathBuf::from("Tree"), b"file".to_vec(), None),
+                    (PathBuf::from("tree/child.txt"), b"child".to_vec(), None),
+                ],
+                1_024,
+                20,
+            )
+            .await
+            .expect_err("portable case-folded ancestor collisions must be rejected");
+        assert!(matches!(
+            case_collision,
+            ApplicationError::InvalidWorkspacePath(_)
+        ));
+        assert!(!workspace.host_work_dir.join("Tree").exists());
+
+        let duplicate_case = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![
+                    (PathBuf::from("same.txt"), b"first".to_vec(), None),
+                    (PathBuf::from("SAME.txt"), b"second".to_vec(), None),
+                ],
+                1_024,
+                20,
+            )
+            .await
+            .expect_err("portable case-folded duplicate targets must be rejected");
+        assert!(matches!(
+            duplicate_case,
+            ApplicationError::InvalidWorkspacePath(_)
+        ));
+        assert!(!workspace.host_work_dir.join("same.txt").exists());
+
+        for (left, right) in [("Σ.txt", "ς.txt"), ("straße.txt", "STRASSE.txt")] {
+            let unicode_collision = service
+                .store_workspace_files_bounded(
+                    "app_safe_123",
+                    vec![
+                        (PathBuf::from(left), b"first".to_vec(), None),
+                        (PathBuf::from(right), b"second".to_vec(), None),
+                    ],
+                    1_024,
+                    20,
+                )
+                .await
+                .expect_err("Unicode case-folded duplicate targets must be rejected");
+            assert!(matches!(
+                unicode_collision,
+                ApplicationError::InvalidWorkspacePath(_)
+            ));
+            assert!(!workspace.host_work_dir.join(left).exists());
+        }
+
+        let invalid_utf8 = std::ffi::OsString::from_vec(vec![b'n', b'o', b'n', 0xff]);
+        match tokio::fs::write(workspace.host_work_dir.join(invalid_utf8), b"counted").await {
+            Ok(()) => {
+                service
+                    .store_workspace_files_bounded(
+                        "app_safe_123",
+                        vec![(PathBuf::from("after-non-utf8.txt"), b"ok".to_vec(), None)],
+                        1_024,
+                        20,
+                    )
+                    .await
+                    .expect("legal non-UTF-8 names must be counted without blocking uploads");
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(target_os = "macos") && error.raw_os_error() == Some(92)) =>
+            {
+                // Some hermetic macOS runners reject invalid-byte pathnames at
+                // the filesystem boundary. Production Unix filesystems that
+                // accept them exercise the assertion above.
+            }
+            Err(error) => panic!("non-UTF-8 workspace fixture: {error}"),
+        }
+
+        let fifo = workspace.host_work_dir.join("pipe");
+        let fifo_created = nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        );
+        if matches!(fifo_created, Err(nix::errno::Errno::EPERM)) {
+            return;
+        }
+        fifo_created.expect("FIFO fixture");
+        let fifo_preview = service
+            .read_file_preview("app_safe_123", "pipe")
+            .await
+            .expect_err("special files must be rejected without blocking");
+        assert!(matches!(
+            fifo_preview,
+            ApplicationError::WorkspacePathNotFile(_)
+        ));
+        let fifo_collision = service
+            .store_workspace_files_bounded(
+                "app_safe_123",
+                vec![
+                    (PathBuf::from("before-fifo.txt"), b"early".to_vec(), None),
+                    (PathBuf::from("pipe"), b"late".to_vec(), None),
+                ],
+                1_024,
+                20,
+            )
+            .await
+            .expect_err("special targets must fail in preflight");
+        assert!(matches!(fifo_collision, ApplicationError::Workspace { .. }));
+        assert!(!workspace.host_work_dir.join("before-fifo.txt").exists());
     }
 
     #[cfg(unix)]

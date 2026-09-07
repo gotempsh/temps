@@ -55,7 +55,8 @@ use crate::audit::{
     ApplicationWorkspaceSourceImportedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
     ConversationAttachmentUploadedAudit, ConversationCreatedAudit,
     ConversationPermissionModeChangedAudit, ConversationRenamedAudit, ConversationRestoredAudit,
-    GlobalWorkspacePreviewLinkCreatedAudit, PermissionResolvedAudit, ThreadArtifactCreatedAudit,
+    GlobalWorkspaceFilesWrittenAudit, GlobalWorkspacePreviewLinkCreatedAudit,
+    PermissionResolvedAudit, ThreadArtifactCreatedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
 use crate::sensitive::{
@@ -471,6 +472,13 @@ pub struct WriteApplicationWorkspaceFilesRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WriteApplicationWorkspaceFilesResponse {
     pub written: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DownloadWorkspaceFileResponse {
+    pub file_name: String,
+    pub contents_b64: String,
+    pub size_bytes: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1003,6 +1011,11 @@ impl From<ApplicationError> for Problem {
             | ApplicationError::InvalidAttachment(_) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid AI Application Request")
+                    .with_detail(error.to_string())
+            }
+            ApplicationError::WorkspaceDownloadTooLarge { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Workspace File Too Large")
                     .with_detail(error.to_string())
             }
             ApplicationError::ProjectAlreadyLinked { .. } => {
@@ -3191,8 +3204,14 @@ const WORKSPACE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from
 const WORKSPACE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST: usize = 32;
 const WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST: usize = 4 * 1024 * 1024;
+// The request carries file bytes as base64 plus bounded paths and JSON syntax.
+// Keep this route-specific limit above that encoded maximum while retaining a
+// small, explicit cap rather than inheriting Axum's 2 MiB JSON default.
+const WORKSPACE_IMPORT_BODY_LIMIT: usize = 6 * 1024 * 1024;
 const WORKSPACE_IMPORT_MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
 const WORKSPACE_IMPORT_MAX_AGGREGATE_ENTRIES: usize = 5_000;
+const WORKSPACE_DOWNLOAD_MAX_BYTES: usize = 32 * 1024 * 1024;
+type WorkspaceFileWrite = (std::path::PathBuf, Vec<u8>, Option<u32>);
 
 fn validate_workspace_import_path(path: &str) -> Result<(), Problem> {
     if path.is_empty()
@@ -3212,6 +3231,81 @@ fn validate_workspace_import_path(path: &str) -> Result<(), Problem> {
         ));
     }
     Ok(())
+}
+
+fn decode_workspace_file_writes(
+    request: WriteApplicationWorkspaceFilesRequest,
+) -> Result<Vec<WorkspaceFileWrite>, Problem> {
+    if request.files.len() > WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST {
+        return Err(Problem::from(
+            temps_sandbox::error::SandboxError::Validation {
+                message: format!(
+                    "workspace import accepts at most {} files per request",
+                    WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST
+                ),
+            },
+        ));
+    }
+    let mut total_bytes = 0usize;
+    let mut entries = Vec::with_capacity(request.files.len());
+    let mut paths = std::collections::HashSet::with_capacity(request.files.len());
+    for file in request.files {
+        validate_workspace_import_path(&file.path)?;
+        if !paths.insert(file.path.clone()) {
+            return Err(Problem::from(
+                temps_sandbox::error::SandboxError::Validation {
+                    message: format!(
+                        "workspace import contains the duplicate path '{}'",
+                        file.path
+                    ),
+                },
+            ));
+        }
+        let contents = B64.decode(file.contents_b64.as_bytes()).map_err(|error| {
+            Problem::from(temps_sandbox::error::SandboxError::Validation {
+                message: format!(
+                    "contents_b64 for '{}' is not valid base64: {}",
+                    file.path, error
+                ),
+            })
+        })?;
+        total_bytes = total_bytes.checked_add(contents.len()).ok_or_else(|| {
+            Problem::from(temps_sandbox::error::SandboxError::Validation {
+                message: "workspace import byte count overflowed".to_string(),
+            })
+        })?;
+        if total_bytes > WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST {
+            return Err(Problem::from(
+                temps_sandbox::error::SandboxError::Validation {
+                    message: format!(
+                        "workspace import accepts at most {} bytes per request",
+                        WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST
+                    ),
+                },
+            ));
+        }
+        entries.push((FsPath::new(&file.path).to_path_buf(), contents, file.mode));
+    }
+    for path in &paths {
+        let path = FsPath::new(path);
+        if path
+            .ancestors()
+            .skip(1)
+            .filter_map(FsPath::to_str)
+            .filter(|ancestor| !ancestor.is_empty())
+            .any(|ancestor| paths.contains(ancestor))
+        {
+            return Err(Problem::from(
+                temps_sandbox::error::SandboxError::Validation {
+                    message: format!(
+                        "workspace import path '{}' conflicts with another file in the same batch",
+                        path.display()
+                    ),
+                },
+            ));
+        }
+    }
+    Ok(entries)
 }
 
 fn application_project(
@@ -3317,48 +3411,10 @@ pub async fn write_application_workspace_files(
     permission_guard!(auth, ProjectsWrite);
     permission_guard!(auth, SandboxesWrite);
     deny_deployment_token!(auth);
-    if request.files.len() > WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST {
-        return Err(Problem::from(
-            temps_sandbox::error::SandboxError::Validation {
-                message: format!(
-                    "workspace import accepts at most {} files per request",
-                    WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST
-                ),
-            },
-        ));
-    }
     let (application, _sandbox_public_id) =
         application_workspace_sandbox(&state, &auth, &application_public_id).await?;
     let project = application_project(&application, project_id)?;
-    let mut total_bytes = 0usize;
-    let mut entries = Vec::with_capacity(request.files.len());
-    for file in request.files {
-        validate_workspace_import_path(&file.path)?;
-        let contents = B64.decode(file.contents_b64.as_bytes()).map_err(|error| {
-            Problem::from(temps_sandbox::error::SandboxError::Validation {
-                message: format!(
-                    "contents_b64 for '{}' is not valid base64: {}",
-                    file.path, error
-                ),
-            })
-        })?;
-        total_bytes = total_bytes.checked_add(contents.len()).ok_or_else(|| {
-            Problem::from(temps_sandbox::error::SandboxError::Validation {
-                message: "workspace import byte count overflowed".to_string(),
-            })
-        })?;
-        if total_bytes > WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST {
-            return Err(Problem::from(
-                temps_sandbox::error::SandboxError::Validation {
-                    message: format!(
-                        "workspace import accepts at most {} bytes per request",
-                        WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST
-                    ),
-                },
-            ));
-        }
-        entries.push((FsPath::new(&file.path).to_path_buf(), contents, file.mode));
-    }
+    let entries = decode_workspace_file_writes(request)?;
     let written = state
         .application_workspaces
         .store_project_files_bounded(
@@ -3374,11 +3430,194 @@ pub async fn write_application_workspace_files(
         .audit(&ApplicationWorkspaceFilesWrittenAudit {
             context: audit_context(&auth, &metadata),
             application_id: application_public_id,
-            project_id,
+            project_id: Some(project_id),
             file_count: written,
         })
         .await;
     Ok(Json(WriteApplicationWorkspaceFilesResponse { written }))
+}
+
+async fn store_workspace_files(
+    state: &AppState,
+    workspace_id: &str,
+    request: WriteApplicationWorkspaceFilesRequest,
+) -> Result<usize, Problem> {
+    let entries = decode_workspace_file_writes(request)?;
+    state
+        .application_workspaces
+        .store_workspace_files_bounded(
+            workspace_id,
+            entries,
+            WORKSPACE_IMPORT_MAX_AGGREGATE_BYTES,
+            WORKSPACE_IMPORT_MAX_AGGREGATE_ENTRIES,
+        )
+        .await
+        .map_err(Problem::from)
+}
+
+#[utoipa::path(
+    post, tag = "AI Applications",
+    path = "/ai/applications/{application_public_id}/workspace/files",
+    operation_id = "upload_application_workspace_files",
+    summary = "Upload files into an application workspace",
+    description = "Writes at most 32 safe workspace-relative files and 4 MiB per request into the persistent workspace without waking compute.",
+    params(("application_public_id" = String, Path,)),
+    request_body = WriteApplicationWorkspaceFilesRequest,
+    responses((status = 200, body = WriteApplicationWorkspaceFilesResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn upload_application_workspace_files(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(application_public_id): Path<String>,
+    Json(request): Json<WriteApplicationWorkspaceFilesRequest>,
+) -> Result<Json<WriteApplicationWorkspaceFilesResponse>, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    let application = authorized_application_for_permissions(
+        &state,
+        &auth,
+        &application_public_id,
+        "active",
+        &[Permission::ProjectsWrite, Permission::SandboxesWrite],
+    )
+    .await?;
+    state
+        .application_workspaces
+        .ensure(&application.application.public_id, &application.projects)
+        .await?;
+    let written =
+        store_workspace_files(&state, &application.application.public_id, request).await?;
+    state
+        .audit(&ApplicationWorkspaceFilesWrittenAudit {
+            context: audit_context(&auth, &metadata),
+            application_id: application_public_id,
+            project_id: None,
+            file_count: written,
+        })
+        .await;
+    Ok(Json(WriteApplicationWorkspaceFilesResponse { written }))
+}
+
+#[utoipa::path(
+    post, tag = "AI Chat",
+    path = "/ai/workspace/files",
+    operation_id = "upload_global_workspace_files",
+    summary = "Upload files into the global AI workspace",
+    description = "Writes at most 32 safe workspace-relative files and 4 MiB per request into the user's persistent global workspace without waking compute.",
+    request_body = WriteApplicationWorkspaceFilesRequest,
+    responses((status = 200, body = WriteApplicationWorkspaceFilesResponse), (status = 400), (status = 401), (status = 403), (status = 413), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn upload_global_workspace_files(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<WriteApplicationWorkspaceFilesRequest>,
+) -> Result<Json<WriteApplicationWorkspaceFilesResponse>, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, SandboxesWrite);
+    deny_deployment_token!(auth);
+    let workspace_id = global_workspace_context_id(auth.user_id());
+    state
+        .application_workspaces
+        .ensure(&workspace_id, &[])
+        .await?;
+    let written = store_workspace_files(&state, &workspace_id, request).await?;
+    state
+        .audit(&GlobalWorkspaceFilesWrittenAudit {
+            context: audit_context(&auth, &metadata),
+            workspace_id,
+            file_count: written,
+        })
+        .await;
+    Ok(Json(WriteApplicationWorkspaceFilesResponse { written }))
+}
+
+async fn workspace_file_download_response(
+    state: &AppState,
+    workspace_id: &str,
+    path: String,
+) -> Result<DownloadWorkspaceFileResponse, Problem> {
+    let bytes = state
+        .application_workspaces
+        .read_file_download(workspace_id, &path, WORKSPACE_DOWNLOAD_MAX_BYTES)
+        .await?;
+    let file_name = FsPath::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace-file")
+        .to_string();
+    Ok(DownloadWorkspaceFileResponse {
+        file_name,
+        size_bytes: bytes.len(),
+        contents_b64: B64.encode(bytes),
+    })
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications",
+    path = "/ai/applications/{application_public_id}/workspace/file/download",
+    operation_id = "download_application_workspace_file",
+    summary = "Download one application workspace file",
+    params(("application_public_id" = String, Path,), ("path" = String, Query,)),
+    responses((status = 200, body = DownloadWorkspaceFileResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn download_application_workspace_file(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(application_public_id): Path<String>,
+    Query(query): Query<ApplicationWorkspaceFileQuery>,
+) -> Result<Json<DownloadWorkspaceFileResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesRead);
+    deny_deployment_token!(auth);
+    let application = authorized_application_for_permissions(
+        &state,
+        &auth,
+        &application_public_id,
+        "active",
+        &[Permission::ProjectsRead, Permission::SandboxesRead],
+    )
+    .await?;
+    state
+        .application_workspaces
+        .ensure(&application.application.public_id, &application.projects)
+        .await?;
+    Ok(Json(
+        workspace_file_download_response(&state, &application.application.public_id, query.path)
+            .await?,
+    ))
+}
+
+#[utoipa::path(
+    get, tag = "AI Chat",
+    path = "/ai/workspace/file/download",
+    operation_id = "download_global_workspace_file",
+    summary = "Download one global AI workspace file",
+    params(("path" = String, Query,)),
+    responses((status = 200, body = DownloadWorkspaceFileResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn download_global_workspace_file(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ApplicationWorkspaceFileQuery>,
+) -> Result<Json<DownloadWorkspaceFileResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesRead);
+    deny_deployment_token!(auth);
+    let workspace_id = global_workspace_context_id(auth.user_id());
+    state
+        .application_workspaces
+        .ensure(&workspace_id, &[])
+        .await?;
+    Ok(Json(
+        workspace_file_download_response(&state, &workspace_id, query.path).await?,
+    ))
 }
 
 fn parse_workspace_status(value: &str) -> Vec<ApplicationWorkspaceFileResponse> {
@@ -3766,7 +4005,14 @@ pub async fn get_application_workspace_directory(
     permission_guard!(auth, ProjectsRead);
     permission_guard!(auth, SandboxesRead);
     deny_deployment_token!(auth);
-    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    let application = authorized_application_for_permissions(
+        &state,
+        &auth,
+        &application_public_id,
+        "active",
+        &[Permission::ProjectsRead, Permission::SandboxesRead],
+    )
+    .await?;
     state
         .application_workspaces
         .ensure(&application.application.public_id, &application.projects)
@@ -3820,7 +4066,14 @@ pub async fn get_application_workspace_file(
     permission_guard!(auth, ProjectsRead);
     permission_guard!(auth, SandboxesRead);
     deny_deployment_token!(auth);
-    let application = authorized_application(&state, &auth, &application_public_id).await?;
+    let application = authorized_application_for_permissions(
+        &state,
+        &auth,
+        &application_public_id,
+        "active",
+        &[Permission::ProjectsRead, Permission::SandboxesRead],
+    )
+    .await?;
     state
         .application_workspaces
         .ensure(&application.application.public_id, &application.projects)
@@ -4870,24 +5123,44 @@ async fn authorized_application_with_status(
     application_public_id: &str,
     status: &str,
 ) -> Result<crate::applications::ApplicationWithProjects, Problem> {
+    authorized_application_for_permissions(
+        state,
+        auth,
+        application_public_id,
+        status,
+        &[Permission::ProjectsRead],
+    )
+    .await
+}
+
+async fn authorized_application_for_permissions(
+    state: &AppState,
+    auth: &AuthContext,
+    application_public_id: &str,
+    status: &str,
+    required_permissions: &[Permission],
+) -> Result<crate::applications::ApplicationWithProjects, Problem> {
     let application = state
         .applications
         .get_with_status(auth.user_id(), application_public_id, status)
         .await?;
-    if let Err(problem) = ensure_application_project_permission(
-        auth,
-        &state.project_access_checker,
-        &application
-            .projects
-            .iter()
-            .map(|project| project.id)
-            .collect::<Vec<_>>(),
-        &Permission::ProjectsRead,
-    )
-    .await
-    {
-        quarantine_application_workspace(state, auth.user_id(), application_public_id).await;
-        return Err(problem);
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    for required in required_permissions {
+        if let Err(problem) = ensure_application_project_permission(
+            auth,
+            &state.project_access_checker,
+            &project_ids,
+            required,
+        )
+        .await
+        {
+            quarantine_application_workspace(state, auth.user_id(), application_public_id).await;
+            return Err(problem);
+        }
     }
     Ok(application)
 }
@@ -7815,6 +8088,15 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             get(get_global_workspace_directory),
         )
         .route("/ai/workspace/file", get(get_global_workspace_file))
+        .route(
+            "/ai/workspace/file/download",
+            get(download_global_workspace_file),
+        )
+        .route(
+            "/ai/workspace/files",
+            post(upload_global_workspace_files)
+                .layer(DefaultBodyLimit::max(WORKSPACE_IMPORT_BODY_LIMIT)),
+        )
         .route("/ai/workspace/diff", get(get_global_workspace_diff))
         .route(
             "/ai/applications",
@@ -7862,7 +8144,13 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/ai/applications/{application_public_id}/projects/{project_id}/workspace/files",
-            post(write_application_workspace_files),
+            post(write_application_workspace_files)
+                .layer(DefaultBodyLimit::max(WORKSPACE_IMPORT_BODY_LIMIT)),
+        )
+        .route(
+            "/ai/applications/{application_public_id}/workspace/files",
+            post(upload_application_workspace_files)
+                .layer(DefaultBodyLimit::max(WORKSPACE_IMPORT_BODY_LIMIT)),
         )
         .route(
             "/ai/applications/{application_public_id}/workspace/changes",
@@ -7875,6 +8163,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/ai/applications/{application_public_id}/workspace/file",
             get(get_application_workspace_file),
+        )
+        .route(
+            "/ai/applications/{application_public_id}/workspace/file/download",
+            get(download_application_workspace_file),
         )
         .route(
             "/ai/applications/{application_public_id}/workspace/diff",
@@ -8051,6 +8343,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_global_workspace_directory,
         get_application_workspace_file,
         get_global_workspace_file,
+        download_application_workspace_file,
+        download_global_workspace_file,
         get_application_workspace_diff,
         get_global_workspace_diff,
         get_application_workspace,
@@ -8058,6 +8352,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         control_application_workspace,
         import_application_workspace_git,
         write_application_workspace_files,
+        upload_application_workspace_files,
+        upload_global_workspace_files,
         list_application_conversations,
         create_application_conversation,
         list_thread_artifacts,
@@ -8111,6 +8407,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ApplicationWorkspaceFileWrite,
         WriteApplicationWorkspaceFilesRequest,
         WriteApplicationWorkspaceFilesResponse,
+        DownloadWorkspaceFileResponse,
         CreateApplicationRequest,
         CreateApplicationProjectRequest,
         DeployApplicationProjectRequest,
@@ -8153,6 +8450,101 @@ mod tests {
     use super::*;
     use crate::PendingPermissionEntry;
     use axum::http::{StatusCode, Uri};
+
+    #[test]
+    fn workspace_import_body_limit_fits_the_bounded_base64_request() {
+        let encoded_file_bytes = WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST.div_ceil(3) * 4;
+        let maximum_path_and_json_overhead =
+            WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST * (512 + 64) + 32;
+
+        assert!(
+            WORKSPACE_IMPORT_BODY_LIMIT >= encoded_file_bytes + maximum_path_and_json_overhead,
+            "route body limit must fit the maximum decoded batch after base64 encoding"
+        );
+        const {
+            assert!(
+                WORKSPACE_IMPORT_BODY_LIMIT <= 8 * 1024 * 1024,
+                "workspace import route must retain an explicit bounded JSON body"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_file_upload_decodes_only_safe_bounded_paths() {
+        let decoded = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
+            files: vec![ApplicationWorkspaceFileWrite {
+                path: "projects/demo/README.md".to_string(),
+                contents_b64: B64.encode("hello"),
+                mode: Some(0o644),
+            }],
+        })
+        .expect("safe workspace upload");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, FsPath::new("projects/demo/README.md"));
+        assert_eq!(decoded[0].1, b"hello");
+        assert_eq!(decoded[0].2, Some(0o644));
+
+        let error = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
+            files: vec![ApplicationWorkspaceFileWrite {
+                path: "projects/demo/.env".to_string(),
+                contents_b64: B64.encode("SECRET=value"),
+                mode: None,
+            }],
+        })
+        .expect_err("sensitive workspace paths must be rejected");
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let duplicate = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
+            files: vec![
+                ApplicationWorkspaceFileWrite {
+                    path: "projects/demo/README.md".to_string(),
+                    contents_b64: B64.encode("first"),
+                    mode: None,
+                },
+                ApplicationWorkspaceFileWrite {
+                    path: "projects/demo/README.md".to_string(),
+                    contents_b64: B64.encode("second"),
+                    mode: None,
+                },
+            ],
+        })
+        .expect_err("duplicate workspace paths must not overwrite implicitly");
+        assert_eq!(duplicate.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let overlapping = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
+            files: vec![
+                ApplicationWorkspaceFileWrite {
+                    path: "projects/demo/tree".to_string(),
+                    contents_b64: B64.encode("file"),
+                    mode: None,
+                },
+                ApplicationWorkspaceFileWrite {
+                    path: "projects/demo/tree/child.txt".to_string(),
+                    contents_b64: B64.encode("child"),
+                    mode: None,
+                },
+            ],
+        })
+        .expect_err("ancestor and descendant paths must be rejected before writing");
+        assert_eq!(
+            overlapping.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn oversized_workspace_download_maps_to_payload_too_large() {
+        let error = Problem::from(ApplicationError::WorkspaceDownloadTooLarge {
+            path: "large.bin".to_string(),
+            max_bytes: WORKSPACE_DOWNLOAD_MAX_BYTES,
+        });
+
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
 
     #[test]
     fn application_list_query_deserializes_numeric_pagination() {
@@ -8860,7 +9252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn application_attachment_upload_requires_scoped_sandbox_and_project_write() {
+    async fn application_workspace_upload_requires_scoped_sandbox_and_project_write() {
         let auth = custom_auth(vec![
             Permission::ProjectsRead,
             Permission::ProjectsWrite,
@@ -8882,7 +9274,7 @@ mod tests {
             &Permission::SandboxesWrite,
         )
         .await
-        .expect_err("attachment bytes must not enter a sandbox without scoped sandbox write");
+        .expect_err("workspace bytes must not enter a sandbox without scoped sandbox write");
         assert_eq!(error.status_code, StatusCode::FORBIDDEN);
 
         let missing_project_write: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
@@ -8901,7 +9293,7 @@ mod tests {
             &Permission::ProjectsWrite,
         )
         .await
-        .expect_err("application attachment mutation also requires scoped project write");
+        .expect_err("application workspace mutation also requires scoped project write");
         assert_eq!(error.status_code, StatusCode::FORBIDDEN);
 
         let allowed: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
@@ -8916,10 +9308,46 @@ mod tests {
             }));
         ensure_application_project_permission(&auth, &allowed, &[7], &Permission::SandboxesWrite)
             .await
-            .expect("scoped sandbox write allows the attachment workspace mutation");
+            .expect("scoped sandbox write allows the workspace mutation");
         ensure_application_project_permission(&auth, &allowed, &[7], &Permission::ProjectsWrite)
             .await
             .expect("scoped project write allows the application mutation");
+    }
+
+    #[tokio::test]
+    async fn application_workspace_reads_require_scoped_project_and_sandbox_read() {
+        let auth = custom_auth(vec![Permission::ProjectsRead, Permission::SandboxesRead]);
+        let projects_only: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![Permission::ProjectsRead.to_string()]),
+                member: true,
+                denied_project_id: None,
+            }));
+        let error = ensure_application_project_permission(
+            &auth,
+            &projects_only,
+            &[7],
+            &Permission::SandboxesRead,
+        )
+        .await
+        .expect_err("workspace contents require scoped sandbox read");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+
+        let allowed: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(EffectivePermissionChecker {
+                permissions: Some(vec![
+                    Permission::ProjectsRead.to_string(),
+                    Permission::SandboxesRead.to_string(),
+                ]),
+                member: true,
+                denied_project_id: None,
+            }));
+        ensure_application_project_permission(&auth, &allowed, &[7], &Permission::ProjectsRead)
+            .await
+            .expect("scoped project read allows workspace metadata access");
+        ensure_application_project_permission(&auth, &allowed, &[7], &Permission::SandboxesRead)
+            .await
+            .expect("scoped sandbox read allows workspace content access");
     }
 
     #[tokio::test]
