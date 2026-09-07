@@ -159,6 +159,13 @@ const DEFAULT_MAX_LOAD_THRESHOLD: f64 = 0.90;
 /// deployment per architecture with target nodes/labels is the right answer.
 const MAX_CROSS_BUILD_PLATFORMS: usize = 4;
 
+/// Synthetic node ID used by the API and console for the control plane.
+///
+/// Worker nodes are persisted with positive serial IDs. The control plane is
+/// not a row in `nodes`, so placement selectors use `0` to name the local
+/// Docker daemon explicitly.
+pub const CONTROL_PLANE_NODE_ID: i32 = 0;
+
 /// Schedules replicas across available nodes using resource-aware placement.
 ///
 /// Default strategy is `LeastLoaded`: each replica is assigned to the node
@@ -405,7 +412,8 @@ impl NodeScheduler {
     /// Returns a Vec of `NodeAssignment` — one per replica.
     ///
     /// **Behavior:**
-    /// - If `target_node_ids` is set → only schedule on those nodes (error if none are active)
+    /// - If `target_node_ids` is set → only schedule on those nodes (ID `0`
+    ///   explicitly selects the control plane; error if no selected target is eligible)
     /// - If `labels` is set → filter nodes by label matching:
     ///   - **Same key with array value** → OR (node must match any value)
     ///   - **Different keys** → AND (node must satisfy all keys)
@@ -456,6 +464,8 @@ impl NodeScheduler {
         image_platforms: &[String],
     ) -> Result<SchedulingOutcome, NodeError> {
         let target_node_ids = placement_node_ids(target_node_ids);
+        let targets_control_plane =
+            target_node_ids.is_some_and(|ids| ids.contains(&CONTROL_PLANE_NODE_ID));
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
@@ -569,7 +579,17 @@ impl NodeScheduler {
             exclusions.iter().filter(|e| e.excluded).collect();
         let has_node_constraints = target_node_ids.is_some()
             || selector_map.is_some_and(|selector_map| !selector_map.is_empty());
-        if has_node_constraints && eligible_nodes.is_empty() {
+        // The control plane is represented by synthetic node ID 0 in the API,
+        // but it has no row in `nodes`. An explicit `[0]` target therefore
+        // selects Local rather than producing an empty worker set. Label
+        // selectors still exclude Local because the synthetic control-plane
+        // node currently has no operator labels.
+        let has_label_constraints = selector_map.is_some_and(|map| !map.is_empty());
+        let local_matches_constraints =
+            !has_label_constraints && target_node_ids.is_none_or(|_| targets_control_plane);
+        let include_local = local_compatible && local_matches_constraints;
+
+        if has_node_constraints && eligible_nodes.is_empty() && !include_local {
             let excluded = if architecture_exclusions.is_empty() {
                 "no active node matched the requested node IDs or labels".to_string()
             } else {
@@ -581,10 +601,6 @@ impl NodeScheduler {
             };
             return Err(NodeError::PlacementConstraintsUnsatisfied { excluded });
         }
-        // The control plane has no node ID or worker labels, so it can never
-        // satisfy an explicit worker constraint. Include it only for
-        // unconstrained scheduling.
-        let include_local = local_compatible && !has_node_constraints;
         let compatible_slots = usize::from(include_local) + eligible_nodes.len();
         if anti_affinity
             && !architecture_exclusions.is_empty()
@@ -602,10 +618,11 @@ impl NodeScheduler {
         }
 
         if eligible_nodes.is_empty() {
-            if !local_compatible {
+            if !include_local {
                 // Nowhere to put this: the control plane can't run the image
-                // and no worker that can is available. Failing here beats
-                // deploying a container that will never start.
+                // or does not satisfy the explicit placement constraint, and
+                // no compatible worker is available. Failing here beats
+                // silently violating placement or starting an invalid image.
                 return Err(NodeError::NoCompatibleNode {
                     image_platforms: image_platforms.join(", "),
                     local_platform: self
@@ -1336,6 +1353,61 @@ mod tests {
             err,
             NodeError::PlacementConstraintsUnsatisfied { .. }
         ));
+    }
+
+    /// The node API exposes the control plane as synthetic node ID 0. Selecting
+    /// it in the environment placement UI must produce a Local assignment,
+    /// even while worker nodes are registered in the cluster.
+    #[tokio::test]
+    async fn test_control_plane_target_id_schedules_locally() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(
+                2,
+                None,
+                Some(&[CONTROL_PLANE_NODE_ID]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("explicitly selecting the control plane must be supported");
+
+        assert_eq!(outcome.assignments.len(), 2);
+        assert!(outcome.assignments.iter().all(NodeAssignment::is_local));
+    }
+
+    /// A mixed explicit selection may include both the synthetic control plane
+    /// and persisted worker IDs. Both are valid scheduling slots.
+    #[tokio::test]
+    async fn test_control_plane_and_worker_targets_share_the_pool() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(
+                2,
+                None,
+                Some(&[CONTROL_PLANE_NODE_ID, 1]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("both explicitly selected targets are eligible");
+
+        assert_eq!(outcome.assignments.len(), 2);
+        assert!(outcome.assignments.iter().any(NodeAssignment::is_local));
+        assert!(outcome
+            .assignments
+            .iter()
+            .any(|assignment| { matches!(assignment, NodeAssignment::Remote { node_id: 1, .. }) }));
     }
 
     /// A cluster that simply has fewer nodes than replicas keeps the

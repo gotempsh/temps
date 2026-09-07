@@ -147,9 +147,12 @@ impl BackupEngine for PostgresClusterEngine {
                 reason: format!("decrypt secret key: {}", e),
             })?;
 
+        let session_token = v2_common::decrypt_session_token(&s3_source, &deps.encryption_service)?;
+
         let container_endpoint = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -174,6 +177,10 @@ impl BackupEngine for PostgresClusterEngine {
             "WALG_UPLOAD_QUEUE=2".to_string(),
             "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
         ];
+        // Absent unless this source holds a temporary credential.
+        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
+            session_token.as_deref(),
+        ));
         walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
         if let Some(ep) = container_endpoint {
             let url = if ep.starts_with("http") {

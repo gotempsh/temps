@@ -11,6 +11,7 @@
 use crate::config::{NetworkConfig, NodeAlloc, Peer, Transport};
 use crate::diff::{PeerDiff, RouteDiff};
 use crate::error::NetworkError;
+use std::net::IpAddr;
 use tracing::{debug, info};
 
 pub mod bridge;
@@ -81,7 +82,7 @@ pub async fn bootstrap(
         }
     }
 
-    firewall::install_baseline(config, alloc).await?;
+    firewall::install_baseline(config, alloc, peers).await?;
 
     info!(
         bridge = %config.bridge_name,
@@ -102,8 +103,17 @@ pub async fn reconcile_peers(
 ) -> crate::Result<bool> {
     let peer_diff = PeerDiff::compute(current, desired);
     let route_diff = RouteDiff::compute(current, desired);
+
     if peer_diff.is_noop() && route_diff.is_noop() {
-        debug!("reconcile_peers: nothing to do");
+        // Do not rewrite nftables every five seconds in production. The
+        // generation marker lets us cheaply detect a flushed/replaced owned
+        // table and atomically restore it only when drift occurred.
+        if !firewall::baseline_is_current(config, alloc, desired).await? {
+            firewall::install_baseline(config, alloc, desired).await?;
+            info!("reconcile_peers repaired firewall drift");
+        } else {
+            debug!("reconcile_peers: nothing to do");
+        }
         return Ok(false);
     }
 
@@ -155,6 +165,8 @@ pub async fn reconcile_peers(
         }
     }
 
+    firewall::install_baseline(config, alloc, desired).await?;
+
     info!(
         added = peer_diff.to_add.len(),
         removed = peer_diff.fdb_to_remove.len(),
@@ -182,6 +194,125 @@ pub async fn teardown(config: &NetworkConfig) -> crate::Result<()> {
     bridge::remove(&handle, &config.bridge_name).await?;
 
     info!(bridge = %config.bridge_name, "linux network torn down");
+    Ok(())
+}
+
+/// Auto-detect the underlay device from the host's IPv4 default route. See
+/// [`route::default_route_device`] for why this replaces a hardcoded
+/// `eth0` guess.
+pub async fn detect_underlay_device() -> crate::Result<String> {
+    let (handle, _conn) = open_handle().await?;
+    route::default_route_device(&handle).await
+}
+
+/// Read the MTU advertised by the selected underlay link. The agent uses
+/// this as the upper bound for its overlay instead of assuming Ethernet's
+/// usual 1500-byte MTU; VLANs, WireGuard, and provider private networks often
+/// expose a smaller value.
+pub async fn detect_underlay_mtu(device: &str) -> crate::Result<u32> {
+    let (handle, _conn) = open_handle().await?;
+    bridge::link_mtu_by_name(&handle, device)
+        .await?
+        .ok_or_else(|| NetworkError::UnderlayMtuDetection {
+            device: device.to_string(),
+            reason: "interface does not exist or did not publish an MTU".to_string(),
+        })
+}
+
+/// Resolve the Linux interface that owns `address`. `ip -o addr` is used
+/// deliberately: it handles VLAN, bond and WireGuard interfaces uniformly,
+/// while default-route discovery selects the public NIC on many hosts.
+pub async fn detect_device_for_address(address: IpAddr) -> crate::Result<String> {
+    let output = tokio::process::Command::new("ip")
+        .args(["-o", "addr", "show"])
+        .output()
+        .await
+        .map_err(|error| NetworkError::Io {
+            op: "ip -o addr show",
+            path: "ip".into(),
+            reason: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(NetworkError::UnderlayDetection {
+            reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let needle = address.to_string();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 {
+            continue;
+        }
+        let owns_address = fields
+            .iter()
+            .any(|field| field.split('/').next() == Some(needle.as_str()));
+        if owns_address {
+            return Ok(fields[1]
+                .trim_end_matches(':')
+                .split('@')
+                .next()
+                .unwrap_or(fields[1])
+                .to_owned());
+        }
+    }
+    Err(NetworkError::UnderlayDetection {
+        reason: format!("no interface owns configured address {address}"),
+    })
+}
+
+/// Reject an overlay pool that would shadow an existing host/VLAN/VPN route.
+/// Routes owned by the configured Temps bridge/VXLAN are accepted so an
+/// idempotent restart can reconcile an already-running overlay.
+pub async fn preflight_compute_pool_routes(
+    config: &NetworkConfig,
+    pool: ipnet::Ipv4Net,
+) -> crate::Result<()> {
+    use std::str::FromStr;
+
+    let output = tokio::process::Command::new("ip")
+        .args(["-4", "route", "show", "table", "all"])
+        .output()
+        .await
+        .map_err(|error| NetworkError::Io {
+            op: "ip -4 route show table all",
+            path: "ip".into(),
+            reason: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(NetworkError::UnderlayDetection {
+            reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some(destination) = fields.first() else {
+            continue;
+        };
+        let Ok(existing) = ipnet::Ipv4Net::from_str(destination) else {
+            // `default`, `local`, `broadcast`, and `unreachable` entries do
+            // not put a CIDR in the first field and are not connected routes.
+            continue;
+        };
+        let device = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "dev").then_some(pair[1]))
+            .unwrap_or("unknown");
+        if device == config.bridge_name || device == config.vxlan_dev_name {
+            continue;
+        }
+        if pool.contains(&existing.network())
+            || pool.contains(&existing.broadcast())
+            || existing.contains(&pool.network())
+            || existing.contains(&pool.broadcast())
+        {
+            return Err(NetworkError::HostRouteCollision {
+                pool,
+                existing_cidr: existing,
+                device: device.to_owned(),
+            });
+        }
+    }
     Ok(())
 }
 

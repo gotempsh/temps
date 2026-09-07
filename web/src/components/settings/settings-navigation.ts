@@ -9,6 +9,7 @@ import {
   Bot,
   Boxes,
   Clock,
+  Cloud,
   Gauge,
   HardDrive,
   Key,
@@ -50,6 +51,7 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
       { title: 'Platform', url: '/settings', icon: Settings2 },
       { title: 'Version', url: '/settings/version', icon: ArrowUpCircle },
       { title: 'Notifications', url: '/settings/notifications', icon: Bell },
+      { title: 'Temps Cloud', url: '/settings/cloud', icon: Cloud },
     ],
   },
   {

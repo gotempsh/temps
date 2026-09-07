@@ -137,6 +137,13 @@ pub async fn exec_stream_stdout_to_file(
 /// Binlog coordinates captured at base-backup time. These anchor PITR: replay
 /// starts from `(file, position)` (or `gtid`) and runs forward to the
 /// recovery target.
+///
+/// Captured by querying `SHOW BINLOG STATUS` directly against the live
+/// server (see `mariadb_physical::query_binlog_status`), not by parsing
+/// `mariadb-backup`'s own stderr: WAL-G's `WALG_STREAM_CREATE_COMMAND` runs
+/// `mariadb-backup` as a subprocess and does not forward that subprocess's
+/// stderr into WAL-G's own captured output, so the position line it prints
+/// never reaches the exec result this crate captures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinlogCoord {
     pub file: String,
@@ -144,75 +151,4 @@ pub struct BinlogCoord {
     /// MariaDB GTID (`domain-server-seq`, e.g. `0-1-12`). Empty if the source
     /// has GTID disabled.
     pub gtid: String,
-}
-
-/// Parse the binlog-position line `mariadb-backup` prints to stderr at the end
-/// of a successful `--backup`. Format (MariaDB 10.x–12.x):
-///
-/// ```text
-/// mariabackup: MySQL binlog position: filename 'mysql-bin.000003', position '342', GTID of the last change '0-1-12'
-/// ```
-///
-/// Older builds omit the GTID clause. Returns `None` if no position line is
-/// present (e.g. binary logging disabled on the source).
-pub fn parse_binlog_position(stderr: &str) -> Option<BinlogCoord> {
-    // Anchor on "binlog position:" so we don't mismatch the bare word
-    // "position" elsewhere in the log.
-    let anchor = stderr.find("binlog position:")?;
-    let tail = &stderr[anchor..];
-    let file = extract_quoted_after(tail, "filename", 0)?;
-    // Search for "position '" strictly after the filename match so the
-    // "binlog position:" header (which has no quote) is skipped.
-    let pos_key = tail.find("position '")?;
-    let position = extract_quoted_after(tail, "position", pos_key)?;
-    let gtid = tail
-        .find("GTID of the last change")
-        .and_then(|idx| extract_quoted_after(tail, "GTID of the last change", idx))
-        .unwrap_or_default();
-    Some(BinlogCoord {
-        file,
-        position,
-        gtid,
-    })
-}
-
-/// Find `key` at/after `from`, then return the next single-quoted value.
-fn extract_quoted_after(hay: &str, key: &str, from: usize) -> Option<String> {
-    let key_idx = hay.get(from..)?.find(key)? + from;
-    let after = &hay[key_idx + key.len()..];
-    let open = after.find('\'')?;
-    let rest = &after[open + 1..];
-    let close = rest.find('\'')?;
-    Some(rest[..close].to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_full_binlog_position_with_gtid() {
-        let stderr = "[00] 2024-06-23 mariabackup: MySQL binlog position: \
-             filename 'mysql-bin.000003', position '342', GTID of the last change '0-1-12'\n";
-        let c = parse_binlog_position(stderr).expect("should parse");
-        assert_eq!(c.file, "mysql-bin.000003");
-        assert_eq!(c.position, "342");
-        assert_eq!(c.gtid, "0-1-12");
-    }
-
-    #[test]
-    fn parses_binlog_position_without_gtid() {
-        let stderr =
-            "mariabackup: MySQL binlog position: filename 'mariadb-bin.000007', position '15201'\n";
-        let c = parse_binlog_position(stderr).expect("should parse");
-        assert_eq!(c.file, "mariadb-bin.000007");
-        assert_eq!(c.position, "15201");
-        assert_eq!(c.gtid, "");
-    }
-
-    #[test]
-    fn returns_none_when_binlog_disabled() {
-        let stderr = "mariabackup: completed OK!\n";
-        assert!(parse_binlog_position(stderr).is_none());
-    }
 }

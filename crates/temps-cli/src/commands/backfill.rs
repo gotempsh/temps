@@ -10,7 +10,14 @@
 //!                           [--batch-size N] [--chunk-days N]
 //!                           [--rate-limit-events-per-sec N]
 //!                           [--apply-migrations] [--dry-run] [--resume]
+//!
+//! temps backfill cloud-telemetry --project <id> --from <ts> --to <ts>
+//!                                [--batch-size N] [--chunk-days N]
+//!                                [--rate-limit-spans-per-sec N]
+//!                                [--dry-run] [--resume]
 //! ```
+//!
+//! See `cloud_telemetry_backfill` for the second one (ADR-040).
 //!
 //! It walks the PostgreSQL `events` hypertable in `(timestamp, id)` keyset
 //! order and pushes rows into ClickHouse using the same `ChEventRow` shape
@@ -53,6 +60,18 @@ pub enum BackfillTarget {
     /// Safe to run while `temps serve` is live — does not touch the
     /// outbox and does not write back to the primary.
     Clickhouse(ClickhouseBackfillArgs),
+
+    /// Re-send historical spans for one project to Temps Cloud at that
+    /// project's current telemetry fidelity (ADR-040).
+    ///
+    /// Raising `cloud_telemetry_fidelity` to `queryable` only affects spans
+    /// ingested afterwards; this fills the gap from local storage. Use
+    /// `--dry-run` first — it reports the row count, the estimated metered
+    /// bytes, and one fully projected example record, and sends nothing.
+    ///
+    /// Run this with `temps serve` stopped: it drives the same Cloud link
+    /// state file the live mirror uses.
+    CloudTelemetry(crate::commands::cloud_telemetry_backfill::CloudTelemetryBackfillArgs),
 }
 
 /// Which observability domain to copy from TimescaleDB into ClickHouse.
@@ -184,6 +203,9 @@ impl BackfillCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         match self.target {
             BackfillTarget::Clickhouse(args) => run_clickhouse(args),
+            BackfillTarget::CloudTelemetry(args) => {
+                crate::commands::cloud_telemetry_backfill::run(args)
+            }
         }
     }
 }

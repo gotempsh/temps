@@ -119,7 +119,7 @@ function PresetGroup({
             <p className="font-medium">Point-in-time recovery not available</p>
             <p className="text-xs">
               This image does not include WAL-G. Backups will be basic snapshots
-              — you won’t be able to restore to a specific timestamp.
+              — you won&apos;t be able to restore to a specific timestamp.
               {pitrManagedImage && (
                 <>
                   {' '}
@@ -184,16 +184,24 @@ export function useServiceTypePreset(serviceType: string | null): PresetState {
 }
 
 // -----------------------------------------------------------------------------
-// MariaDB preset — official MariaDB LTS image + custom.
+// MariaDB preset — managed WAL-G image + custom.
 // -----------------------------------------------------------------------------
 
-const MARIADB_MANAGED_IMAGE = 'mariadb:lts'
+// KNOWN GAP: this mutable tag currently fails backend validation
+// (`validate_immutable_mariadb_image` in mariadb.rs requires a pinned
+// `repository@sha256:<digest>` for any non-default MariaDB image). The image
+// itself hasn't been published yet — `.github/workflows/mariadb-walg-image.yml`
+// only runs `if: github.ref == 'refs/heads/main'`, so it can't produce a real
+// digest until this branch (PR #562) merges. Once it does, that workflow's
+// first run prints the real digest to its job summary — paste it in here as
+// `ghcr.io/gotempsh/mariadb-walg@sha256:<digest>` to make this preset work.
+const MARIADB_MANAGED_IMAGE = 'ghcr.io/gotempsh/mariadb-walg:11.4'
 
 const MARIADB_OPTIONS: PresetOption[] = [
   {
     id: 'managed',
-    title: 'MariaDB LTS',
-    subtitle: 'Official image',
+    title: 'MariaDB 11.4',
+    subtitle: 'Managed + WAL-G',
     value: MARIADB_MANAGED_IMAGE,
   },
   {

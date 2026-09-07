@@ -112,58 +112,70 @@ impl GatewayAiService {
             .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await
-            .ok()??;
-        if let Some(m) = key
-            .default_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let catalog_is_empty = temps_entities::ai_provider_models::Entity::find()
-                .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-                .one(self.db.as_ref())
-                .await
-                .ok()?
-                .is_none();
-            if catalog_is_empty {
-                return Some(m.to_string());
+            .ok()
+            .flatten();
+        if let Some(key) = key {
+            if let Some(m) = key
+                .default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let catalog_is_empty = temps_entities::ai_provider_models::Entity::find()
+                    .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+                    .one(self.db.as_ref())
+                    .await
+                    .ok()?
+                    .is_none();
+                if catalog_is_empty {
+                    return Some(m.to_string());
+                }
+                let pinned_is_enabled = temps_entities::ai_provider_models::Entity::find()
+                    .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+                    .filter(temps_entities::ai_provider_models::Column::ModelId.eq(m))
+                    .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
+                    .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
+                    .one(self.db.as_ref())
+                    .await
+                    .ok()?
+                    .is_some();
+                if pinned_is_enabled {
+                    return Some(m.to_string());
+                }
             }
-            let pinned_is_enabled = temps_entities::ai_provider_models::Entity::find()
+            let catalog_models = temps_entities::ai_provider_models::Entity::find()
                 .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-                .filter(temps_entities::ai_provider_models::Column::ModelId.eq(m))
                 .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
                 .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
-                .one(self.db.as_ref())
+                .filter(
+                    temps_entities::ai_provider_models::Column::ModelId
+                        .not_like("text-embedding-%"),
+                )
+                .order_by_asc(temps_entities::ai_provider_models::Column::ModelId)
+                .all(self.db.as_ref())
                 .await
-                .ok()?
-                .is_some();
-            if pinned_is_enabled {
-                return Some(m.to_string());
+                .ok()?;
+            if catalog_models.is_empty() {
+                if let Some(model) = default_model_for_provider(&key.provider) {
+                    return Some(model);
+                }
+            }
+            if let Some(preferred) = default_model_for_provider(&key.provider) {
+                if catalog_models
+                    .iter()
+                    .any(|model| model.model_id == preferred)
+                {
+                    return Some(preferred);
+                }
+            }
+            if let Some(model) = catalog_models.into_iter().next() {
+                return Some(model.model_id);
             }
         }
-        let catalog_models = temps_entities::ai_provider_models::Entity::find()
-            .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-            .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
-            .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
-            .filter(
-                temps_entities::ai_provider_models::Column::ModelId.not_like("text-embedding-%"),
-            )
-            .order_by_asc(temps_entities::ai_provider_models::Column::ModelId)
-            .all(self.db.as_ref())
+        self.gateway
+            .managed_model()
             .await
-            .ok()?;
-        if let Some(preferred) = default_model_for_provider(&key.provider) {
-            if catalog_models
-                .iter()
-                .any(|model| model.model_id == preferred)
-            {
-                return Some(preferred);
-            }
-        }
-        if let Some(model) = catalog_models.into_iter().next() {
-            return Some(model.model_id);
-        }
-        default_model_for_provider(&key.provider)
+            .map(|_| "temps-cloud".to_string())
     }
 }
 
@@ -1311,5 +1323,91 @@ mod tests {
         assert_eq!(j["role"], "user");
         assert_eq!(j["content"], "hi");
         assert!(j.get("tool_calls").is_none());
+    }
+
+    /// When no BYOK provider key resolves a model but the instance has an active
+    /// Cloud link that advertises a managed AI capability, `resolve_model` must
+    /// return `Some("temps-cloud")` — the new fallback branch added in PR #562.
+    ///
+    /// The previous `test_resolve_model_none_when_no_active_key` exercises the
+    /// same code path but constructs the service *without* a cloud_link, so
+    /// `managed_model()` trivially returns `None` and the branch was never hit.
+    #[tokio::test]
+    async fn test_resolve_model_returns_temps_cloud_when_cloud_link_configured() {
+        // Spin up a minimal stub that serves the enroll handshake and the AI
+        // capability query.  Skip gracefully when the test sandbox blocks TCP.
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping Cloud AI fallback test");
+                return;
+            }
+            Err(e) => panic!("bind Cloud stub: {e}"),
+        };
+        let address = listener.local_addr().expect("Cloud stub address");
+        let app = axum::Router::new()
+            .route(
+                "/v1/enroll",
+                axum::routing::post(|| async {
+                    axum::Json(temps_cloud_protocol::EnrollResponse {
+                        tenant_id: uuid::Uuid::new_v4(),
+                        account_email: Some("operator@example.com".into()),
+                        instance_token: "instance-token".into(),
+                        capabilities: Vec::new(),
+                    })
+                }),
+            )
+            .route(
+                "/v1/ai/capability",
+                axum::routing::get(|| async {
+                    axum::Json(temps_cloud_protocol::ManagedAiCapability {
+                        configured: true,
+                        managed_provider: Some("anthropic".into()),
+                        managed_model: Some("claude-haiku-4-5".into()),
+                        destination_origin: None,
+                        inference_region: None,
+                        reason: None,
+                        setup_path: "/settings/ai".into(),
+                    })
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve Cloud stub");
+        });
+        let temp = tempfile::tempdir().expect("temporary Cloud state");
+        let link = Arc::new(
+            temps_cloud_client::CloudLink::load_for_loopback_development(
+                temp.path().to_path_buf(),
+                "test-agent",
+            ),
+        );
+        link.configure(
+            temps_cloud_client::BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback Cloud URL"),
+        )
+        .expect("configure Cloud link");
+        link.enroll("TEST-CODE")
+            .await
+            .expect("enroll test instance");
+
+        // DB has no gateway-config rows and no active provider keys, so
+        // resolution falls through to the managed_model() cloud-link branch.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
+                .append_query_results(vec![Vec::<temps_entities::ai_provider_keys::Model>::new()])
+                .into_connection(),
+        );
+        let encryption =
+            Arc::new(EncryptionService::new("01234567890123456789012345678901").unwrap());
+        let provider_keys = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway = Arc::new(GatewayService::new(provider_keys).with_cloud_link(Some(link)));
+        let svc = GatewayAiService::new(gateway, db);
+
+        assert_eq!(
+            svc.resolve_model(None, None).await,
+            Some("temps-cloud".to_string()),
+        );
+        drop(temp); // keep tempdir alive past the assertion
     }
 }

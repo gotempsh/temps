@@ -40,6 +40,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   CheckCircle2,
   ChevronRight,
+  Cloud,
   Database,
   EllipsisVertical,
   Pencil,
@@ -447,9 +448,8 @@ export function S3SourcesManagement() {
         <div className="overflow-hidden rounded-lg border">
           <ul role="list" className="divide-y">
             {sources.map((source) => {
-              const isDefault =
-                (source as S3SourceResponse & { is_default?: boolean })
-                  .is_default === true
+              const isDefault = source.is_default === true
+              const isManagedByCloud = source.managed_by_cloud === true
               const isTestingThis =
                 testConnectionMutation.isPending &&
                 testConnectionMutation.variables === source.id
@@ -489,6 +489,15 @@ export function S3SourcesManagement() {
                               Default
                             </Badge>
                           )}
+                          {isManagedByCloud && (
+                            <Badge
+                              variant="outline"
+                              className="gap-1 border-sky-400/40 text-sky-600 dark:text-sky-300"
+                            >
+                              <Cloud className="size-3 fill-current" />
+                              Managed by Temps Cloud
+                            </Badge>
+                          )}
                         </div>
                         <p className="mt-0.5 truncate text-xs text-muted-foreground">
                           {source.region}
@@ -506,15 +515,17 @@ export function S3SourcesManagement() {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            handleEditSource(source)
-                          }}
-                        >
-                          <Pencil className="mr-2 h-4 w-4" />
-                          Edit
-                        </DropdownMenuItem>
+                        {!isManagedByCloud && (
+                          <DropdownMenuItem
+                            onSelect={(e) => {
+                              e.preventDefault()
+                              handleEditSource(source)
+                            }}
+                          >
+                            <Pencil className="mr-2 h-4 w-4" />
+                            Edit
+                          </DropdownMenuItem>
+                        )}
                         <DropdownMenuItem
                           onSelect={(e) => {
                             e.preventDefault()
@@ -556,18 +567,22 @@ export function S3SourcesManagement() {
                             Set as default
                           </DropdownMenuItem>
                         )}
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            setSourceToDelete(source)
-                          }}
-                          className="text-destructive"
-                          disabled={deleteMutation.isPending}
-                        >
-                          <Trash2 className="mr-2 h-4 w-4" />
-                          Delete
-                        </DropdownMenuItem>
+                        {!isManagedByCloud && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onSelect={(e) => {
+                                e.preventDefault()
+                                setSourceToDelete(source)
+                              }}
+                              className="text-destructive"
+                              disabled={deleteMutation.isPending}
+                            >
+                              <Trash2 className="mr-2 h-4 w-4" />
+                              Delete
+                            </DropdownMenuItem>
+                          </>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>

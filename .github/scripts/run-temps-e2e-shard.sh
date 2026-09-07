@@ -54,7 +54,8 @@ case "$SHARD" in
     run_scenario redis-restore-scenario --registry "$REGISTRY"
     run_scenario mongodb-restore-scenario
     run_scenario s3-restore-scenario
-    run_scenario mariadb-restore-scenario
+    run_scenario mariadb-restore-scenario \
+      --mariadb-image "${TEMPS_E2E_MARIADB_IMAGE:?recovery shard requires TEMPS_E2E_MARIADB_IMAGE}"
     run_scenario mariadb-pitr-scenario
     run_scenario pg-upgrade-scenario --registry "$REGISTRY" --upgrade-timeout 900000
     ;;

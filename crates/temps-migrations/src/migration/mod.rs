@@ -182,6 +182,7 @@ mod m20260806_000001_index_permission_denied_retention;
 pub mod m20260806_000001_sandbox_workspace_lifecycle;
 mod m20260809_000001_ai_gateway_config_provider_type;
 mod m20260810_000001_add_cli_session_id_to_ai_conversations;
+mod m20260810_000001_create_cloud_backup_mirror_states;
 pub mod m20260810_000001_create_sandbox_snapshots;
 mod m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config;
 mod m20260810_000003_pin_ai_provider_to_conversations;
@@ -204,11 +205,14 @@ mod m20260819_000001_create_session_replay_ingest_batches;
 mod m20260821_000001_add_email_retry_tracking;
 mod m20260824_000001_create_otel_ingest_errors;
 mod m20260825_000001_add_dns_resolver_health_to_nodes;
+mod m20260827_000001_add_control_plane_overlay_allocation;
 mod m20260827_000001_create_notification_routes;
+mod m20260827_000002_add_control_plane_setup_generation;
 mod m20260828_000001_alarms_nullable_project;
 mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
+mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
 mod m20260830_000001_create_traefik_discovered_routes;
 // Module declarations are kept lexically sorted by rustfmt. Migration execution
 // order is defined by Migrator::migrations below, where all mainline migrations
@@ -218,16 +222,37 @@ mod m20260831_000001_create_analytics_ingest_keys;
 mod m20260831_000001_create_traefik_route_certificates;
 mod m20260831_000002_add_managed_status_monitors;
 mod m20260831_000002_backfill_acme_verification_method;
+mod m20260901_000001_add_cloud_telemetry_fidelity;
 mod m20260901_000001_persist_ai_turn_state;
+mod m20260901_000002_create_cloud_telemetry_backfills;
 mod m20260901_000002_user_owned_ai_conversations;
+mod m20260901_000003_constrain_cloud_telemetry_fidelity;
+mod m20260901_000004_create_cloud_span_outbox;
+mod m20260901_000005_add_cloud_telemetry_write_mode;
+mod m20260901_000006_create_telemetry_write_ledger;
+mod m20260901_000007_create_cloud_telemetry_bulk_jobs;
+// This branch and main each shipped a migration with the same date and
+// sequence stamp. Preserve that upgrade history rather than renumbering.
+mod m20260902_000001_add_session_token_to_s3_sources;
 mod m20260902_000001_backup_safety_and_provenance;
+// Three migrations share this date and sequence stamp across this branch
+// and main. Preserve that upgrade history rather than renumbering.
 mod m20260903_000001_add_service_project_identity;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
 mod m20260903_000001_application_workspace_topology;
+mod m20260903_000001_generalize_cloud_telemetry_outbox;
+mod m20260903_000002_add_signal_group_to_write_intervals;
 mod m20260903_000002_harden_application_workspaces;
+mod m20260903_000003_add_cloud_analytics_write_mode;
 mod m20260903_000003_application_workspace_quarantine;
+mod m20260903_000004_add_target_table_and_payload_row_to_outbox;
 mod m20260903_000004_repair_application_primary_projects;
+// This branch and main each shipped a migration with the same date and
+// sequence stamp. Preserve that upgrade history rather than renumbering.
+mod m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources;
 mod m20260904_000001_reset_ambiguous_managed_status_monitors;
+mod m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources;
+mod m20260904_000003_add_continuous_archive_source_to_external_services;
 mod m20260907_000001_add_mfa_pending_origin_to_sessions;
 
 pub struct Migrator;
@@ -430,6 +455,7 @@ impl MigratorTrait for Migrator {
             Box::new(
                 m20260810_000001_add_cli_session_id_to_ai_conversations::Migration,
             ),
+            Box::new(m20260810_000001_create_cloud_backup_mirror_states::Migration),
             Box::new(
                 m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config::Migration,
             ),
@@ -467,7 +493,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260821_000001_add_email_retry_tracking::Migration),
             Box::new(m20260824_000001_create_otel_ingest_errors::Migration),
             Box::new(m20260825_000001_add_dns_resolver_health_to_nodes::Migration),
+            Box::new(m20260827_000001_add_control_plane_overlay_allocation::Migration),
             Box::new(m20260827_000001_create_notification_routes::Migration),
+            Box::new(m20260827_000002_add_control_plane_setup_generation::Migration),
             Box::new(m20260828_000001_alarms_nullable_project::Migration),
             Box::new(m20260828_000002_add_alarms_silenced_until::Migration),
             Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
@@ -475,6 +503,7 @@ impl MigratorTrait for Migrator {
             // stamp as the discovered-routes migration below. Preserve that
             // upgrade history.
             Box::new(m20260830_000001_add_external_service_creator::Migration),
+            Box::new(m20260830_000001_add_managed_by_cloud_to_s3_sources::Migration),
             Box::new(m20260830_000001_create_traefik_discovered_routes::Migration),
             // Main shipped this migration first with the same date and sequence
             // stamp as the certificates migration below. Preserve that upgrade
@@ -485,16 +514,49 @@ impl MigratorTrait for Migrator {
             // ADR-041 §7a step (b): backfill "acme"/"http" → "http-01" so the renewal
             // scheduler can dispatch them; "manual" is intentionally left untouched.
             Box::new(m20260831_000002_backfill_acme_verification_method::Migration),
+            Box::new(m20260831_000002_add_managed_status_monitors::Migration),
+            Box::new(m20260901_000001_add_cloud_telemetry_fidelity::Migration),
+            Box::new(m20260901_000002_create_cloud_telemetry_backfills::Migration),
+            Box::new(m20260901_000003_constrain_cloud_telemetry_fidelity::Migration),
+            Box::new(m20260901_000004_create_cloud_span_outbox::Migration),
+            Box::new(m20260901_000005_add_cloud_telemetry_write_mode::Migration),
+            Box::new(m20260901_000006_create_telemetry_write_ledger::Migration),
+            Box::new(m20260901_000007_create_cloud_telemetry_bulk_jobs::Migration),
+            // This branch and main each shipped a migration with the same date
+            // and sequence stamp. Preserve that upgrade history.
+            Box::new(m20260902_000001_add_session_token_to_s3_sources::Migration),
             Box::new(m20260902_000001_backup_safety_and_provenance::Migration),
+            // Three migrations share this date and sequence stamp across this
+            // branch and main. Preserve that upgrade history.
+            Box::new(
+                m20260903_000001_generalize_cloud_telemetry_outbox::Migration,
+            ),
+            Box::new(m20260903_000001_add_service_project_identity::Migration),
             Box::new(
                 m20260903_000001_add_vulnerability_scanning_enabled_to_projects::Migration,
             ),
-            Box::new(m20260831_000002_add_managed_status_monitors::Migration),
-            Box::new(m20260903_000001_add_service_project_identity::Migration),
+            Box::new(
+                m20260903_000002_add_signal_group_to_write_intervals::Migration,
+            ),
+            Box::new(m20260903_000003_add_cloud_analytics_write_mode::Migration),
+            Box::new(
+                m20260903_000004_add_target_table_and_payload_row_to_outbox::Migration,
+            ),
+            // This branch and main each shipped a migration with the same date
+            // and sequence stamp. Preserve that upgrade history.
+            Box::new(
+                m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources::Migration,
+            ),
             Box::new(m20260904_000001_reset_ambiguous_managed_status_monitors::Migration),
-            // Keep the canonical main-branch migration before feature-branch
-            // migrations so existing main upgrade history remains a stable prefix.
+            Box::new(
+                m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources::Migration,
+            ),
+            Box::new(
+                m20260904_000003_add_continuous_archive_source_to_external_services::Migration,
+            ),
             Box::new(m20260907_000001_add_mfa_pending_origin_to_sessions::Migration),
+            // Keep the canonical main-branch migrations before feature-branch
+            // migrations so existing main upgrade history remains a stable prefix.
             Box::new(m20260831_000001_ai_first_applications::Migration),
             Box::new(m20260901_000001_persist_ai_turn_state::Migration),
             Box::new(m20260901_000002_user_owned_ai_conversations::Migration),

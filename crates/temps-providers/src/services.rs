@@ -3,7 +3,7 @@
 
 use crate::externalsvc::{
     legacy_managed_instance_names, managed_instance_name,
-    mariadb::{MariaDbService, MariaDbSizeProfile},
+    mariadb::{validate_mariadb_image, MariaDbService, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     mongodb::MongodbService,
     postgres::PostgresService,
     postgres_cluster::PostgresClusterService,
@@ -33,7 +33,7 @@ use std::sync::Arc;
 use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_backups,
     external_service_health_checks, external_services, nodes, postgres_major_upgrades,
-    project_services, projects, service_members,
+    project_services, projects, service_members, settings,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -209,6 +209,35 @@ pub enum ExternalServiceError {
 
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
+
+    /// `repoint_continuous_archive_source` physically repoints the
+    /// container's `archive_command` before persisting the new pin -- if the
+    /// persist step then fails (after retrying), the live WAL destination
+    /// and the recorded pin disagree, and every later mirror/restore
+    /// decision keyed on the pin (`temps-cloud`'s `backup_mirror.rs`) is
+    /// wrong until this is reconciled. Kept distinct from `DatabaseError` so
+    /// this specific, actionable state is never mistaken for an ordinary
+    /// transient failure that left nothing inconsistent behind.
+    ///
+    /// `message` is computed at construction time to produce an engine-accurate
+    /// description. Postgres/Timescale physically repoints WAL-G's
+    /// `archive_command` before persisting, so a DB failure creates a genuine
+    /// live desync. MariaDB's shipper re-reads the pin every tick, so if the
+    /// DB persist fails there is no live desync — archiving has not moved.
+    #[error("{message}")]
+    ArchiveSourceDesynced {
+        service_id: i32,
+        new_s3_source_id: i32,
+        attempts: u32,
+        reason: String,
+        /// `true` when the container-side archive was physically repointed
+        /// before the DB persist failed (Postgres/Timescale: WAL-G
+        /// `archive_command` already rewritten). `false` for MariaDB: the pin
+        /// update is the entire repoint, so nothing changed on the container.
+        physical_repoint_occurred: bool,
+        /// Engine-accurate error text derived from `physical_repoint_occurred`.
+        message: String,
+    },
 
     #[error("Parameter validation failed for service {service_id}: {reason}")]
     ParameterValidationFailed { service_id: i32, reason: String },
@@ -999,6 +1028,18 @@ fn build_walg_env(
         // override via service parameters in a follow-up.
         "export WALG_COMPRESSION_METHOD='lz4'".to_string(),
     ];
+    // Only for a temporary (STS-style) credential. A long-lived
+    // operator-configured credential emits no AWS_SESSION_TOKEN at all —
+    // exporting an empty one would be signed and rejected. The empty-string
+    // filter is what makes that true for `Some("")` as well, matching
+    // `aws_session_token_env` and `mc_host_credential`.
+    if let Some(session_token) = creds
+        .session_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    {
+        env.push(export("AWS_SESSION_TOKEN", session_token)?);
+    }
     if let Some(endpoint) = resolved_endpoint {
         env.push(export("AWS_ENDPOINT", endpoint)?);
     }
@@ -1439,7 +1480,70 @@ impl ExternalServiceManager {
                     })
             })?;
 
-        RemoteServiceClient::new(node.address.clone(), token, node.name.clone())
+        if node.address.starts_with("https://") {
+            let settings_row = settings::Entity::find_by_id(1)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): application settings row is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let app_settings = temps_core::AppSettings::from_json(settings_row.data);
+            let ca_cert = app_settings.multi_node.cluster_ca_cert_pem.ok_or_else(|| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): cluster CA certificate is missing",
+                        node_id, node.name
+                    ),
+                }
+            })?;
+            let encrypted_ca_key = app_settings
+                .multi_node
+                .cluster_ca_key_encrypted
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): encrypted cluster CA key is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let ca_key = self
+                .encryption_service
+                .decrypt_string(&encrypted_ca_key)
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): failed to decrypt cluster CA key: {}",
+                        node_id, node.name, e
+                    ),
+                })?;
+            let csr = temps_core::node_pki::generate_node_keypair_csr(
+                "temps-control-plane",
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to generate control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let signed = temps_core::node_pki::sign_node_csr(
+                &ca_cert,
+                &ca_key,
+                &csr.csr_pem,
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to sign control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let identity_pem = format!("{}\n{}", signed.cert_pem, csr.key_pem);
+            RemoteServiceClient::new_mtls(node.address, token, node.name, &identity_pem, &ca_cert)
+        } else {
+            RemoteServiceClient::new(node.address, token, node.name)
+        }
     }
 
     async fn resolve_remote_container_name(
@@ -1513,7 +1617,13 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "mariadb:lts".to_string());
+                    .unwrap_or_else(|| MARIADB_DEFAULT_IMAGE.to_string());
+                validate_mariadb_image(&image).map_err(|reason| {
+                    ExternalServiceError::ParameterValidationFailed {
+                        service_id: 0,
+                        reason,
+                    }
+                })?;
                 let size_profile = parameters
                     .get("size_profile")
                     .and_then(|value| MariaDbSizeProfile::parse(value))
@@ -2979,6 +3089,238 @@ impl ExternalServiceManager {
                 Ok(None)
             }
         }
+    }
+
+    /// Deliberately, explicitly move a service's continuous archiving to a
+    /// different S3 source.
+    ///
+    /// For Postgres/Timescale this physically re-points `archive_command`
+    /// (not just the pin's bookkeeping columns — see
+    /// `crates/temps-providers/src/externalsvc/postgres.rs`'s
+    /// `force_reenable_continuous_archiving`), since WAL-G bakes its
+    /// destination into the container's environment. For MariaDB there is no
+    /// equivalent container-side config to rewrite: the binlog shipper
+    /// (`ExternalServiceHealthMonitor::maybe_archive_mariadb_binlogs`) reads
+    /// `continuous_archive_s3_source_id` fresh every tick, so updating the
+    /// pin alone is sufficient to redirect the next shipment.
+    ///
+    /// Only ever call this on purpose, and only when you accept that data
+    /// archived before this call (WAL segments, binlog segments) lives under
+    /// the *old* source and will never be visible under the new one again —
+    /// Cloud's Postgres mirror (or any WAL-G/MariaDB PITR restore) can no
+    /// longer verify or replay it going forward. `continuous_archive_pinned_at`
+    /// records the moment of the switch so `crates/temps-cloud/src/backup_mirror.rs`
+    /// can tell those backups apart from ones taken after the switch, which
+    /// are expected to resolve normally as archiving catches up.
+    pub async fn repoint_continuous_archive_source(
+        &self,
+        service_id: i32,
+        new_s3_source_id: i32,
+    ) -> Result<external_services::Model, ExternalServiceError> {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let service = self.get_service(service_id).await?;
+        let service_type = service.service_type.to_ascii_lowercase();
+        if !matches!(
+            service_type.as_str(),
+            "postgres" | "postgresql" | "timescale" | "timescaledb" | "mariadb" | "mysql"
+        ) {
+            return Err(ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            });
+        }
+
+        let s3_source = temps_entities::s3_sources::Entity::find_by_id(new_s3_source_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| ExternalServiceError::DatabaseError {
+                reason: format!("looking up S3 source {}: {}", new_s3_source_id, e),
+            })?
+            .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!("S3 source {} does not exist", new_s3_source_id),
+            })?;
+
+        // Captured *before* the physical repoint below, not after it
+        // succeeds. `backup_mirror.rs` uses this timestamp as the cutoff for
+        // "this backup's WAL predates the switch, so it can never appear
+        // under the new prefix" -- if it were captured after the physical
+        // change instead, any backup whose base snapshot started in the gap
+        // between "container actually repointed" and "DB write observed"
+        // would be a false positive: its WAL is correctly landing in the new
+        // source already, but it would still get permanently marked
+        // unsupported because its `started_at` predates that later
+        // timestamp. Capturing it first makes it a safe lower bound on the
+        // real switch instant instead.
+        let pin_started_at = chrono::Utc::now();
+
+        // Postgres/Timescale needs `archive_command` physically rewritten —
+        // WAL-G bakes its destination into the container's environment, so
+        // updating the pin alone would be a lie about where archiving
+        // actually writes. MariaDB's shipper has no equivalent container
+        // state to rewrite: it reads the pin fresh every tick (see
+        // `ExternalServiceHealthMonitor::maybe_archive_mariadb_binlogs`), so
+        // updating the pin below is the entire repoint for that engine.
+        //
+        // Captured before the conditional so `ArchiveSourceDesynced` can
+        // produce an engine-accurate message if the DB persist fails below.
+        let physical_repoint_occurred = matches!(
+            service_type.as_str(),
+            "postgres" | "postgresql" | "timescale" | "timescaledb"
+        );
+        if physical_repoint_occurred {
+            let access_key = self
+                .encryption_service
+                .decrypt_string(&s3_source.access_key_id)
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "access_key_id".to_string(),
+                    reason: e.to_string(),
+                })?;
+            let secret_key = self
+                .encryption_service
+                .decrypt_string(&s3_source.secret_key)
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "secret_key".to_string(),
+                    reason: e.to_string(),
+                })?;
+            let session_token = s3_source
+                .session_token
+                .as_deref()
+                .map(|token| self.encryption_service.decrypt_string(token))
+                .transpose()
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "session_token".to_string(),
+                    reason: e.to_string(),
+                })?;
+
+            let s3_credentials = crate::S3Credentials {
+                access_key_id: access_key,
+                secret_key,
+                session_token,
+                region: s3_source.region.clone(),
+                endpoint: s3_source.endpoint.clone(),
+                bucket_name: s3_source.bucket_name.clone(),
+                bucket_path: s3_source.bucket_path.clone(),
+                force_path_style: s3_source.force_path_style.unwrap_or(true),
+            };
+
+            // Layout must match `crates/temps-backup/src/engines/postgres_walg.rs`
+            // exactly: WAL-G requires a base backup and the WAL segments covering
+            // its start/end LSN under the same prefix to be restorable.
+            let subpath_root = format!("external_services/postgres/{}", service.name);
+            let bucket_path_clean = s3_source.bucket_path.trim_matches('/');
+            let walg_prefix = if bucket_path_clean.is_empty() {
+                format!(
+                    "s3://{}/{}/walg",
+                    s3_source.bucket_name,
+                    subpath_root.trim_matches('/'),
+                )
+            } else {
+                format!(
+                    "s3://{}/{}/{}/walg",
+                    s3_source.bucket_name,
+                    bucket_path_clean,
+                    subpath_root.trim_matches('/'),
+                )
+            };
+
+            let config_json = service
+                .config
+                .as_deref()
+                .map(|encrypted| self.encryption_service.decrypt_string(encrypted))
+                .transpose()
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "config".to_string(),
+                    reason: e.to_string(),
+                })?
+                .unwrap_or_else(|| "{}".to_string());
+            let service_config = crate::externalsvc::ServiceConfig {
+                name: service.name.clone(),
+                service_type: crate::externalsvc::ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null),
+            };
+
+            let postgres = crate::externalsvc::postgres::PostgresService::new(
+                service.name.clone(),
+                Arc::clone(&self.docker),
+            );
+            postgres
+                .force_reenable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
+                .await
+                .map_err(|e| ExternalServiceError::DockerError {
+                    id: service_id,
+                    reason: format!("failed to repoint WAL archiving: {}", e),
+                })?;
+        }
+
+        // The container (when Postgres/Timescale) has already been
+        // physically repointed above -- WAL is now landing in
+        // `new_s3_source_id` regardless of whether this persists. A single
+        // transient DB hiccup right here must not leave that live change
+        // unrecorded, so retry before surfacing the desync as a distinct,
+        // actionable error instead of an ordinary `DatabaseError`.
+        let retry = temps_core::retry::RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::from_millis(200))
+            .with_max_delay(std::time::Duration::from_secs(2));
+        let persisted = retry
+            .retry(|| async {
+                external_services::ActiveModel {
+                    id: Set(service.id),
+                    continuous_archive_s3_source_id: Set(Some(new_s3_source_id)),
+                    continuous_archive_pinned_at: Set(Some(pin_started_at)),
+                    ..Default::default()
+                }
+                .update(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await;
+
+        if let Err(reason) = persisted {
+            let attempts = retry.max_attempts;
+            let message = if physical_repoint_occurred {
+                // Postgres/Timescale: WAL-G archive_command was already
+                // rewritten in the container, so archiving really is landing
+                // in the new source. The DB still records the old one.
+                // Genuine live desync — operator must repoint again once
+                // the database is reachable.
+                format!(
+                    "Service {service_id} archiving now writes to S3 source \
+                     {new_s3_source_id}, but the database still records the previous \
+                     source because persisting the pin failed after {attempts} \
+                     attempt(s): {reason}. The live WAL destination and the recorded \
+                     pin are now out of sync — repoint to the same source again to \
+                     reconcile, or fix the underlying database issue first."
+                )
+            } else {
+                // MariaDB: no container-side change occurred. The shipper
+                // re-reads the pin every tick, so archiving has not moved.
+                // No live desync — operator just needs to retry once the
+                // database is reachable.
+                format!(
+                    "Service {service_id}: persisting the continuous archive source \
+                     pin to S3 source {new_s3_source_id} failed after {attempts} \
+                     attempt(s): {reason}. The archiving source was not changed — \
+                     retry to apply the change once the database issue is resolved."
+                )
+            };
+            return Err(ExternalServiceError::ArchiveSourceDesynced {
+                service_id,
+                new_s3_source_id,
+                attempts,
+                reason,
+                physical_repoint_occurred,
+                message,
+            });
+        }
+
+        self.get_service(service_id).await
     }
 
     async fn get_service_info(
@@ -9064,30 +9406,15 @@ echo "[restore] Pre-seed complete"
     /// never need a cross-node address in the first place.
     async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
         let overlay = Self::overlay_network_name();
-
-        let overlay_exists = match self
-            .docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
+        let network_config = temps_network::NetworkConfig::default();
+        if let Err(error) =
+            temps_network::docker::validate_owned_network(&self.docker, &network_config).await
         {
-            Ok(networks) => networks
-                .iter()
-                .any(|n| n.name.as_deref() == Some(overlay.as_str())),
-            Err(e) => {
-                debug!(
-                    container = container_ref,
-                    overlay = %overlay,
-                    error = %e,
-                    "Could not list docker networks; skipping overlay attach"
-                );
-                return None;
-            }
-        };
-        if !overlay_exists {
             debug!(
                 container = container_ref,
                 overlay = %overlay,
-                "Overlay network not present on this host; skipping attach"
+                error = %error,
+                "Temps-owned overlay network is unavailable; skipping attach"
             );
             return None;
         }
@@ -11802,8 +12129,17 @@ mod tests {
                 Some(DEFAULT_RUSTFS_IMAGE),
             ),
         ] {
+            let parameters = if service_type == ServiceType::Mariadb {
+                HashMap::from([(
+                    "docker_image".to_string(),
+                    "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )])
+            } else {
+                HashMap::new()
+            };
             let params = manager
-                .build_remote_create_params("orders", &service_type, &HashMap::new())
+                .build_remote_create_params("orders", &service_type, &parameters)
                 .expect("default remote service parameters should be valid");
             assert_eq!(params.name, expected_name, "wrong name for {service_type}");
             if let Some(expected_image) = expected_image {
@@ -12315,6 +12651,7 @@ mod tests {
         crate::S3Credentials {
             access_key_id: "key'quoted".to_string(),
             secret_key: "secret'quoted".to_string(),
+            session_token: None,
             region: "us-east-1".to_string(),
             endpoint: Some("https://s3.example.test".to_string()),
             bucket_name: "backups".to_string(),
@@ -12346,6 +12683,52 @@ mod tests {
         let error = build_walg_env(&credentials, "s3://backups/repo", None)
             .expect_err("line breaks must be rejected before heredoc interpolation");
         assert!(error.contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    /// A long-lived, operator-configured credential must produce no
+    /// `AWS_SESSION_TOKEN` export whatsoever — not an empty one, which the
+    /// AWS SDKs would sign and the provider would then reject.
+    #[test]
+    fn walg_env_file_omits_the_session_token_for_a_long_lived_credential() {
+        let env = build_walg_env(&test_s3_credentials(), "s3://backups/repo", None)
+            .expect("long-lived credentials still build an env file");
+        assert!(!env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")));
+    }
+
+    #[test]
+    fn walg_env_file_exports_and_escapes_a_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token'quoted".to_string());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("a session token is escaped like every other value");
+        assert!(env
+            .iter()
+            .any(|line| line == "export AWS_SESSION_TOKEN='token'\\''quoted'"));
+    }
+
+    /// Parity with `aws_session_token_env` and `mc_host_credential`, which
+    /// already filter this: `export AWS_SESSION_TOKEN=''` is worse than no
+    /// export at all, because WAL-G signs the empty token and the provider
+    /// rejects every request.
+    #[test]
+    fn walg_env_file_omits_an_empty_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some(String::new());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("an empty session token still builds an env file");
+        assert!(
+            !env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")),
+            "an empty session token must be absent, never exported as ''"
+        );
+    }
+
+    #[test]
+    fn walg_env_file_rejects_line_break_injection_through_the_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token\nWALG_RESTORE_EOF\nid".to_string());
+        let error = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect_err("line breaks must be rejected before heredoc interpolation");
+        assert!(error.contains("AWS_SESSION_TOKEN"));
     }
 
     // ── Container stats helpers ──────────────────────────────────────────────
@@ -13822,6 +14205,8 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         }
     }
 
@@ -13871,6 +14256,10 @@ mod tests {
             cross_project_trace_sharing: false,
             ai_api_traffic_summary_enabled: None,
             image_retention_hours: None,
+            cloud_telemetry_fidelity: Default::default(),
+            cloud_telemetry_attribute_allowlist: Vec::new(),
+            cloud_telemetry_write_mode: Default::default(),
+            cloud_analytics_write_mode: Default::default(),
         }
     }
 
@@ -16036,5 +16425,167 @@ mod tests {
             select_remote_container_name(None, "postgres-orders", false, "orders", false),
             "postgres-orders"
         );
+    }
+
+    // ── repoint_continuous_archive_source ───────────────────────────────────
+
+    /// Minimal external_services model suitable for repoint tests. No config
+    /// encryption needed: the fields read by `repoint_continuous_archive_source`
+    /// before the Postgres-specific decryption branch are only `service_type`,
+    /// `id`, and `name`.
+    fn repoint_test_service(id: i32, service_type: &str) -> external_services::Model {
+        let now = Utc::now();
+        external_services::Model {
+            id,
+            name: format!("test-{service_type}-{id}"),
+            service_type: service_type.to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    fn repoint_test_s3_source(id: i32) -> temps_entities::s3_sources::Model {
+        let now = Utc::now();
+        temps_entities::s3_sources::Model {
+            id,
+            backing_service_id: None,
+            name: format!("test-source-{id}"),
+            bucket_name: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "ciphertext-key".to_string(),
+            secret_key: "ciphertext-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn repoint_rejects_unsupported_service_type() {
+        // Redis has no continuous archive mechanism; repoint must fail fast.
+        let service = repoint_test_service(100, "redis");
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .repoint_continuous_archive_source(100, 5)
+            .await
+            .expect_err("redis service type must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::InvalidServiceType { id: 100, .. }
+            ),
+            "expected InvalidServiceType(100), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repoint_rejects_nonexistent_s3_source() {
+        // Valid service type (mariadb) but the requested S3 source ID does not exist.
+        let service = repoint_test_service(101, "mariadb");
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                // Empty result for `s3_sources::Entity::find_by_id(999)`.
+                .append_query_results([Vec::<temps_entities::s3_sources::Model>::new()])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .repoint_continuous_archive_source(101, 999)
+            .await
+            .expect_err("unknown S3 source must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::ParameterValidationFailed {
+                    service_id: 101,
+                    ..
+                }
+            ),
+            "expected ParameterValidationFailed(101), got {err:?}"
+        );
+    }
+
+    /// Exercises the retry-exhausted path for MariaDB, which has no
+    /// container-side physical repoint (`physical_repoint_occurred = false`).
+    /// The DB persist is attempted `max_attempts` (3) times and all fail; the
+    /// returned error must carry the correct attempt count and a message that
+    /// does NOT imply a live desync (archiving was never redirected).
+    #[tokio::test]
+    async fn repoint_mariadb_desynced_error_after_all_persist_attempts_fail() {
+        let service = repoint_test_service(102, "mariadb");
+        let s3_source = repoint_test_s3_source(7);
+        // 3 exec errors: one per retry attempt (RetryConfig::new(3)).
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service]])
+            .append_query_results([vec![s3_source]])
+            .append_exec_errors([
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+            ])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let err = manager
+            .repoint_continuous_archive_source(102, 7)
+            .await
+            .expect_err("persist failure after all retries must be surfaced");
+
+        match err {
+            ExternalServiceError::ArchiveSourceDesynced {
+                service_id: 102,
+                new_s3_source_id: 7,
+                attempts,
+                physical_repoint_occurred: false,
+                ref message,
+                ..
+            } => {
+                assert_eq!(attempts, 3, "must report the configured retry count");
+                assert!(
+                    message.contains("was not changed"),
+                    "MariaDB message must say the archiving source was not changed; got: {message}"
+                );
+                assert!(
+                    !message.contains("now writes to"),
+                    "MariaDB message must not imply archiving moved to the new source; got: {message}"
+                );
+            }
+            other => panic!("expected ArchiveSourceDesynced(102, 7, false), got: {other:?}"),
+        }
     }
 }

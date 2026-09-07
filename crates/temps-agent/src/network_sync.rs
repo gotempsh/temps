@@ -86,6 +86,10 @@ pub type SharedDnsHealth = Arc<std::sync::RwLock<Option<DnsResolverHeartbeat>>>;
 /// in the worker build.
 #[derive(Debug, Clone, Deserialize)]
 struct WirePeerListResponse {
+    /// Authoritative cluster-wide pool. Optional only for rolling upgrades
+    /// from older control planes.
+    #[serde(default)]
+    network: Option<WireNetworkPool>,
     #[serde(default)]
     alloc: Option<WireAlloc>,
     #[serde(default)]
@@ -97,6 +101,12 @@ struct WirePeerListResponse {
     /// Docker's embedded DNS.
     #[serde(default)]
     cluster_dns_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WireNetworkPool {
+    compute_pool_cidr: String,
+    subnet_prefix_len: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,7 +192,35 @@ async fn run(
         config.node_id
     );
 
-    let net_config = NetworkConfig::default();
+    let mut net_config = NetworkConfig::default();
+    match &config.underlay_dev {
+        Some(dev) => {
+            info!(underlay_dev = %dev, "using operator-configured underlay device");
+            net_config.underlay_dev = dev.clone();
+        }
+        None => match temps_network::detect_underlay_device().await {
+            Ok(dev) => {
+                info!(underlay_dev = %dev, "auto-detected underlay device from default route");
+                net_config.underlay_dev = dev;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    fallback = %net_config.underlay_dev,
+                    "could not auto-detect underlay device; falling back to default. \
+                     Set AgentConfig.underlay_dev (or 'temps join --underlay-dev') to override"
+                );
+            }
+        },
+    }
+    net_config.underlay_mtu =
+        resolve_underlay_mtu(&net_config.underlay_dev, config.underlay_mtu).await?;
+    info!(
+        underlay_dev = %net_config.underlay_dev,
+        underlay_mtu = net_config.underlay_mtu,
+        overlay_mtu = net_config.transport.bridge_mtu(net_config.underlay_mtu),
+        "resolved overlay MTU from underlay device"
+    );
     let manager = match NetworkManager::new(net_config) {
         Ok(m) => m,
         Err(e) => {
@@ -234,6 +272,47 @@ async fn run(
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn resolve_underlay_mtu(device: &str, configured_mtu: Option<u32>) -> Result<u32, SyncError> {
+    match temps_network::detect_underlay_mtu(device).await {
+        Ok(detected_mtu) => {
+            let effective_mtu = effective_underlay_mtu(detected_mtu, configured_mtu);
+            if let Some(configured_mtu) = configured_mtu {
+                if configured_mtu > detected_mtu {
+                    warn!(
+                        underlay_dev = %device,
+                        configured_mtu,
+                        detected_mtu,
+                        effective_mtu,
+                        "configured underlay MTU exceeds the device MTU; clamping to the device"
+                    );
+                }
+            }
+            Ok(effective_mtu)
+        }
+        Err(error) => match configured_mtu {
+            Some(configured_mtu) => {
+                warn!(
+                    underlay_dev = %device,
+                    configured_mtu,
+                    error = %error,
+                    "could not detect underlay MTU; using the explicit MTU ceiling"
+                );
+                Ok(configured_mtu)
+            }
+            None => Err(SyncError::UnderlayMtu {
+                device: device.to_owned(),
+                reason: error.to_string(),
+            }),
+        },
+    }
+}
+
+fn effective_underlay_mtu(detected_mtu: u32, configured_mtu: Option<u32>) -> u32 {
+    configured_mtu
+        .map(|configured_mtu| configured_mtu.min(detected_mtu))
+        .unwrap_or(detected_mtu)
 }
 
 async fn poll_once(
@@ -291,6 +370,10 @@ async fn apply(
     let alloc = parse_alloc(&alloc_wire)?;
     let peers: Result<Vec<Peer>, _> = payload.peers.iter().map(parse_peer).collect();
     let peers = peers?;
+    let authoritative_pool = match payload.network.as_ref() {
+        Some(network) => validate_cluster_topology(network, &alloc, &peers)?,
+        None => alloc.compute_cidr,
+    };
     // Captured before `bootstrap()` consumes `alloc` below. Needed every
     // tick (not just the first) since resolver reconciliation now runs
     // unconditionally — see the `reconcile_resolver` call at the bottom.
@@ -303,13 +386,15 @@ async fn apply(
         IpAddr::V6(_) => return Ok(()),
     };
 
-    // Publish the latest peer list before driving any kernel changes.
-    // Container-attach handlers read this slot to install per-peer
-    // overlay routes inside the container's netns — they need the
-    // same view the kernel data plane is about to apply.
-    if let Ok(mut slot) = slots.shared_peers.write() {
-        *slot = peers.clone();
-    }
+    // Re-check the complete authoritative pool on every snapshot, not only
+    // initial bootstrap. A local Docker network or route created later must
+    // be rejected before a newly allocated peer route can be installed.
+    let alloc_for_docker = alloc.clone();
+    temps_network::preflight_compute_pool_routes(manager.config(), authoritative_pool)
+        .await
+        .map_err(|error| SyncError::Bootstrap(format!("host route preflight: {error}")))?;
+    preflight_overlay_docker_network(manager.config(), &alloc_for_docker, authoritative_pool)
+        .await?;
 
     if !*bootstrapped {
         info!(
@@ -317,14 +402,13 @@ async fn apply(
             peers = peers.len(),
             "bringing up multi-host overlay"
         );
-        // Clone before bootstrap consumes alloc — we need it for the
-        // Docker network creation step right after.
-        let alloc_for_docker = alloc.clone();
+        // Refuse address-space collisions before mutating kernel state. The
+        // control plane allocation remains authoritative; this node must fix
+        // its local Docker pools rather than silently choosing another CIDR.
         manager
             .bootstrap(alloc, peers.clone())
             .await
             .map_err(|e| SyncError::Bootstrap(e.to_string()))?;
-        *bootstrapped = true;
 
         // Create the Docker bridge network pinned to the kernel bridge
         // we just brought up. `temps-network::linux::bootstrap` only
@@ -333,14 +417,12 @@ async fn apply(
         // created here so the deployer + service handlers can attach
         // containers to it. Without this, `compute_ip` is always None
         // and the DNS registry never gets per-container records.
-        if let Err(e) = ensure_overlay_docker_network(&alloc_for_docker).await {
-            warn!(
-                error = %e,
-                "Failed to create overlay Docker network; containers \
-                 won't have cross-node IPs (continuing single-host)"
-            );
-        }
+        ensure_overlay_docker_network(manager.config(), &alloc_for_docker, authoritative_pool)
+            .await?;
+        *bootstrapped = true;
     } else {
+        ensure_overlay_docker_network(manager.config(), &alloc_for_docker, authoritative_pool)
+            .await?;
         let changed = manager
             .reconcile_peers(peers.clone())
             .await
@@ -348,6 +430,12 @@ async fn apply(
         if changed {
             info!("multi-host peer list updated");
         }
+    }
+
+    // Publish only the peer view that the host data plane accepted. Container
+    // attachment handlers must never observe routes from a rejected payload.
+    if let Ok(mut slot) = slots.shared_peers.write() {
+        *slot = peers.clone();
     }
 
     // Reconcile the per-node DNS resolver (ADR-024) against the control
@@ -379,6 +467,75 @@ async fn apply(
     }
 
     Ok(())
+}
+
+fn validate_cluster_topology(
+    network: &WireNetworkPool,
+    alloc: &NodeAlloc,
+    peers: &[Peer],
+) -> Result<Ipv4Net, SyncError> {
+    let pool = Ipv4Net::from_str(&network.compute_pool_cidr)
+        .map_err(|error| SyncError::WireParse(format!("network.compute_pool_cidr: {error}")))?;
+    let mut cidrs = Vec::with_capacity(peers.len() + 1);
+    cidrs.push(("local allocation".to_owned(), alloc.compute_cidr));
+    cidrs.extend(
+        peers
+            .iter()
+            .map(|peer| (format!("peer {}", peer.node_id), peer.compute_cidr)),
+    );
+    for (label, cidr) in &cidrs {
+        if cidr.prefix_len() != network.subnet_prefix_len
+            || !pool.contains(&cidr.network())
+            || !pool.contains(&cidr.broadcast())
+        {
+            return Err(SyncError::WireParse(format!(
+                "{label} uses {cidr} but authoritative pool is {pool} with /{} per node; refusing inconsistent routes",
+                network.subnet_prefix_len
+            )));
+        }
+    }
+    for left in 0..cidrs.len() {
+        for right in (left + 1)..cidrs.len() {
+            if cidrs[left].1.contains(&cidrs[right].1.network())
+                || cidrs[right].1.contains(&cidrs[left].1.network())
+            {
+                return Err(SyncError::WireParse(format!(
+                    "{} {} overlaps {} {}; refusing ambiguous routes",
+                    cidrs[left].0, cidrs[left].1, cidrs[right].0, cidrs[right].1
+                )));
+            }
+        }
+    }
+    for peer in peers {
+        if let IpAddr::V4(address) = peer.underlay_address {
+            if pool.contains(&address) {
+                return Err(SyncError::WireParse(format!(
+                    "peer {} underlay {} is inside compute pool {}; refusing a self-shadowing overlay",
+                    peer.node_id, address, pool
+                )));
+            }
+        }
+    }
+    if let IpAddr::V4(address) = alloc.underlay_address {
+        if pool.contains(&address) {
+            return Err(SyncError::WireParse(format!(
+                "local underlay {address} is inside compute pool {pool}; refusing a self-shadowing overlay"
+            )));
+        }
+    }
+    Ok(pool)
+}
+
+async fn preflight_overlay_docker_network(
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+    authoritative_pool: Ipv4Net,
+) -> Result<(), SyncError> {
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|error| SyncError::DockerConnect(error.to_string()))?;
+    temps_network::docker::preflight_network_for_pool(&docker, config, alloc, authoritative_pool)
+        .await
+        .map_err(|error| SyncError::Bootstrap(format!("docker network preflight: {error}")))
 }
 
 /// Walk every container currently attached to `temps0` and re-install
@@ -644,15 +801,18 @@ fn publish_dns_health(
 /// in the agent and not in `linux::bootstrap` itself: keeping the
 /// kernel-level bootstrap pure of bollard means the integration tests in
 /// `temps-network/tests/it_kernel.rs` don't need a real Docker daemon.
-async fn ensure_overlay_docker_network(alloc: &NodeAlloc) -> Result<(), SyncError> {
+async fn ensure_overlay_docker_network(
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+    authoritative_pool: Ipv4Net,
+) -> Result<(), SyncError> {
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| SyncError::DockerConnect(e.to_string()))?;
-    let cfg = NetworkConfig::default();
-    temps_network::docker::ensure_network(&docker, &cfg, alloc)
+    temps_network::docker::ensure_network_for_pool(&docker, config, alloc, authoritative_pool)
         .await
         .map_err(|e| SyncError::Bootstrap(format!("docker network: {}", e)))?;
     info!(
-        network = %cfg.docker_network_name,
+        network = %config.docker_network_name,
         cidr = %alloc.compute_cidr,
         "overlay Docker network ready"
     );
@@ -690,6 +850,9 @@ enum SyncError {
 
     #[error("failed to construct NetworkManager: {0}")]
     ManagerConstruct(String),
+
+    #[error("failed to resolve MTU for underlay device '{device}': {reason}")]
+    UnderlayMtu { device: String, reason: String },
 
     #[error("http error: {0}")]
     Http(String),
@@ -738,6 +901,26 @@ mod tests {
     }
 
     #[test]
+    fn detected_vlan_mtu_drives_vxlan_mtu() {
+        let underlay_mtu = effective_underlay_mtu(1400, None);
+        assert_eq!(underlay_mtu, 1400);
+        assert_eq!(
+            NetworkConfig::default().transport.bridge_mtu(underlay_mtu),
+            1350
+        );
+    }
+
+    #[test]
+    fn explicit_mtu_can_lower_detected_device_mtu() {
+        assert_eq!(effective_underlay_mtu(1500, Some(1400)), 1400);
+    }
+
+    #[test]
+    fn explicit_mtu_cannot_exceed_detected_device_mtu() {
+        assert_eq!(effective_underlay_mtu(1400, Some(1500)), 1400);
+    }
+
+    #[test]
     fn parse_alloc_ok() {
         let a = parse_alloc(&wire_alloc()).unwrap();
         assert_eq!(a.compute_cidr.to_string(), "172.20.5.0/24");
@@ -759,6 +942,56 @@ mod tests {
         w.node_id = "not-a-uuid".into();
         let err = parse_alloc(&w).unwrap_err();
         assert!(matches!(err, SyncError::WireParse(_)));
+    }
+
+    #[test]
+    fn authoritative_pool_rejects_allocation_from_another_cluster_cidr() {
+        let alloc = parse_alloc(&wire_alloc()).unwrap();
+        let network = WireNetworkPool {
+            compute_pool_cidr: "10.240.0.0/16".into(),
+            subnet_prefix_len: 24,
+        };
+        let error = validate_cluster_topology(&network, &alloc, &[]).unwrap_err();
+        assert!(
+            matches!(error, SyncError::WireParse(message) if message.contains("refusing inconsistent routes"))
+        );
+    }
+
+    #[test]
+    fn authoritative_pool_accepts_matching_node_allocation() {
+        let alloc = parse_alloc(&wire_alloc()).unwrap();
+        let network = WireNetworkPool {
+            compute_pool_cidr: "172.20.0.0/16".into(),
+            subnet_prefix_len: 24,
+        };
+        assert_eq!(
+            validate_cluster_topology(&network, &alloc, &[]).unwrap(),
+            "172.20.0.0/16".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn authoritative_pool_rejects_peer_outside_pool() {
+        let alloc = parse_alloc(&wire_alloc()).unwrap();
+        let network = WireNetworkPool {
+            compute_pool_cidr: "172.20.0.0/16".into(),
+            subnet_prefix_len: 24,
+        };
+        let mut peer = parse_peer(&wire_peer()).unwrap();
+        peer.compute_cidr = "10.99.0.0/24".parse().unwrap();
+        assert!(validate_cluster_topology(&network, &alloc, &[peer]).is_err());
+    }
+
+    #[test]
+    fn authoritative_pool_rejects_duplicate_peer_allocation() {
+        let alloc = parse_alloc(&wire_alloc()).unwrap();
+        let network = WireNetworkPool {
+            compute_pool_cidr: "172.20.0.0/16".into(),
+            subnet_prefix_len: 24,
+        };
+        let mut peer = parse_peer(&wire_peer()).unwrap();
+        peer.compute_cidr = alloc.compute_cidr;
+        assert!(validate_cluster_topology(&network, &alloc, &[peer]).is_err());
     }
 
     #[test]

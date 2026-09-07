@@ -84,6 +84,10 @@ pub enum Permission {
     // Settings permissions
     SettingsRead,
     SettingsWrite,
+    /// Replace the cluster certificate authority and invalidate worker trust.
+    /// This is deliberately separate from `SettingsWrite` and is granted only
+    /// to the full administrator role by default.
+    ClusterCaRotate,
 
     // DNS provider and unattended automation permissions
     DnsProvidersRead,
@@ -337,6 +341,7 @@ impl fmt::Display for Permission {
             Permission::WebSocketProxyConnect => "websocket_proxy:connect",
             Permission::SettingsRead => "settings:read",
             Permission::SettingsWrite => "settings:write",
+            Permission::ClusterCaRotate => "cluster_ca:rotate",
             Permission::DnsProvidersRead => "dns_providers:read",
             Permission::DnsProvidersWrite => "dns_providers:write",
             Permission::DnsAutomationWrite => "dns_automation:write",
@@ -455,6 +460,7 @@ impl Permission {
             "external_services:create" => Some(Permission::ExternalServicesCreate),
             "settings:read" => Some(Permission::SettingsRead),
             "settings:write" => Some(Permission::SettingsWrite),
+            "cluster_ca:rotate" => Some(Permission::ClusterCaRotate),
             "dns_providers:read" => Some(Permission::DnsProvidersRead),
             "dns_providers:write" => Some(Permission::DnsProvidersWrite),
             "dns_automation:write" => Some(Permission::DnsAutomationWrite),
@@ -605,6 +611,7 @@ impl Permission {
             Permission::ExternalServicesCreate,
             Permission::SettingsRead,
             Permission::SettingsWrite,
+            Permission::ClusterCaRotate,
             Permission::DnsProvidersRead,
             Permission::DnsProvidersWrite,
             Permission::DnsAutomationWrite,
@@ -834,6 +841,7 @@ impl Role {
                 Permission::SessionMetricsRead,
                 Permission::SettingsRead,
                 Permission::SettingsWrite,
+                Permission::ClusterCaRotate,
                 Permission::DnsProvidersRead,
                 Permission::DnsProvidersWrite,
                 Permission::DnsAutomationWrite,
@@ -1360,6 +1368,27 @@ mod tests {
             assert!(Role::PlatformAdmin.has_permission(&permission));
             assert!(!Role::User.has_permission(&permission));
             assert!(!Role::Reader.has_permission(&permission));
+        }
+    }
+
+    #[test]
+    fn cluster_ca_rotation_permission_round_trips_and_stays_admin_only() {
+        let permission = Permission::ClusterCaRotate;
+        assert_eq!(permission.to_string(), "cluster_ca:rotate");
+        assert_eq!(Permission::from_str("cluster_ca:rotate"), Some(permission));
+        assert!(Permission::all().contains(&permission));
+        assert!(Role::Admin.has_permission(&permission));
+        for role in [
+            Role::PlatformAdmin,
+            Role::User,
+            Role::Reader,
+            Role::ApiReader,
+            Role::MetricsIngest,
+        ] {
+            assert!(
+                !role.has_permission(&permission),
+                "role {role:?} must not rotate the cluster CA by default"
+            );
         }
     }
 

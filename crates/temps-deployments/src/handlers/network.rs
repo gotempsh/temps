@@ -84,9 +84,19 @@ impl From<NodeAllocPersisted> for AllocEntry {
     }
 }
 
+/// Cluster-wide pool which every node must use. This is intentionally sent
+/// alongside the local allocation so operators and agents can detect stale or
+/// independently configured nodes before routes are changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NetworkPoolEntry {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+}
+
 /// Response body for `GET /internal/nodes/{node_id}/network/peers`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PeerListResponse {
+    pub network: NetworkPoolEntry,
     /// Caller's own allocation, or `null` if multi-host networking has
     /// not been enabled for this node yet.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +148,12 @@ pub async fn list_peers(
 
     // ----- 2. Self-alloc + peers -----
     let allocator = PostgresAllocator::new(app_state.db.clone());
+    let cluster_config = allocator.cluster_config().await.map_err(|error| {
+        error!(node_id, "cluster network config failed: {error}");
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Allocator Error")
+            .with_detail(error.to_string())
+    })?;
     let alloc = match allocator.get_alloc(node_id).await {
         Ok(a) => a.map(AllocEntry::from),
         Err(AllocatorError::NodeNotFound { .. }) => {
@@ -184,6 +200,10 @@ pub async fn list_peers(
     };
 
     Ok(Json(PeerListResponse {
+        network: NetworkPoolEntry {
+            compute_pool_cidr: cluster_config.compute_pool_cidr.to_string(),
+            subnet_prefix_len: cluster_config.subnet_prefix_len,
+        },
         alloc,
         peers,
         cluster_dns_enabled,
@@ -276,6 +296,10 @@ mod tests {
     #[test]
     fn response_omits_alloc_when_none() {
         let resp = PeerListResponse {
+            network: NetworkPoolEntry {
+                compute_pool_cidr: "172.20.0.0/16".into(),
+                subnet_prefix_len: 24,
+            },
             alloc: None,
             peers: vec![],
             cluster_dns_enabled: false,
@@ -288,6 +312,10 @@ mod tests {
     #[test]
     fn response_includes_alloc_when_present() {
         let resp = PeerListResponse {
+            network: NetworkPoolEntry {
+                compute_pool_cidr: "172.20.0.0/16".into(),
+                subnet_prefix_len: 24,
+            },
             alloc: Some(AllocEntry {
                 node_id: "abc".into(),
                 compute_cidr: "172.20.1.0/24".into(),
@@ -307,6 +335,10 @@ mod tests {
         // The field must always be present in the JSON (never skip_serializing_if)
         // so older workers that don't know about it default to `false` safely.
         let resp_disabled = PeerListResponse {
+            network: NetworkPoolEntry {
+                compute_pool_cidr: "172.20.0.0/16".into(),
+                subnet_prefix_len: 24,
+            },
             alloc: None,
             peers: vec![],
             cluster_dns_enabled: false,
@@ -319,6 +351,10 @@ mod tests {
         );
 
         let resp_enabled = PeerListResponse {
+            network: NetworkPoolEntry {
+                compute_pool_cidr: "172.20.0.0/16".into(),
+                subnet_prefix_len: 24,
+            },
             alloc: None,
             peers: vec![],
             cluster_dns_enabled: true,

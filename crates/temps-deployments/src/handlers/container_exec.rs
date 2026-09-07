@@ -8,23 +8,16 @@
 //! the project must have `container_exec_enabled` set to true.
 
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
-    },
+    extract::{ws::WebSocketUpgrade, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
-use bollard::exec::StartExecResults;
-use bytes::Bytes;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
-use tokio::io::AsyncWriteExt;
-use tracing::{debug, error, info, warn};
+use tracing::info;
 use utoipa::ToSchema;
 
 use super::types::AppState;
@@ -153,119 +146,30 @@ pub async fn exec_command(
     )
     .await?;
 
-    // Use the verified container ID from the database record
-    let verified_container_id = &container_record.container_id;
-
+    let verified_container_id = container_record.container_id;
     let timeout = std::cmp::min(request.timeout_seconds.unwrap_or(30), 300);
-
-    // Route to the worker that owns this container. Local containers
-    // (`node_id IS NULL`) run on the CP's own dockerd — keep the inline
-    // bollard path. Remote containers go through the agent's
-    // `/agent/containers/{id}/exec` endpoint, which runs identical bollard
-    // logic on the worker.
-    if let Some(node_id) = container_record.node_id {
-        let result = state
-            .deployment_service
-            .exec_command_remote(
-                node_id,
-                verified_container_id,
-                request.command.clone(),
-                Some(timeout),
-            )
-            .await
-            .map_err(|e| {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Exec Failed")
-                    .with_detail(e.to_string())
-            })?;
-
-        info!(
-            container_id = %container_id,
-            node_id,
-            exit_code = ?result.exit_code,
-            "Remote container exec completed"
-        );
-
-        return Ok(Json(ExecResponse {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        }));
-    }
-
-    let docker = &state.docker;
-
-    // Create exec instance
-    let exec_config = bollard::models::ExecConfig {
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        cmd: Some(request.command.clone()),
-        ..Default::default()
-    };
-
-    let exec = docker
-        .create_exec(verified_container_id, exec_config)
+    let operations = state
+        .deployment_service
+        .container_operations_for_node(container_record.node_id)
         .await
-        .map_err(|e| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Exec Failed")
-                .with_detail(format!("Failed to create exec: {}", e))
-        })?;
+        .map_err(Problem::from)?;
+    let result = operations
+        .exec(&verified_container_id, request.command, timeout)
+        .await
+        .map_err(Problem::from)?;
 
-    // Start exec and collect output
-    let start_config = bollard::exec::StartExecOptions {
-        detach: false,
-        ..Default::default()
-    };
+    info!(
+        container_id = %container_id,
+        node_id = ?container_record.node_id,
+        exit_code = ?result.exit_code,
+        "Container exec completed"
+    );
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), async {
-        let output = docker.start_exec(&exec.id, Some(start_config)).await?;
-
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-
-        if let StartExecResults::Attached { mut output, .. } = output {
-            while let Some(Ok(msg)) = output.next().await {
-                match msg {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok::<_, bollard::errors::Error>((stdout, stderr))
-    })
-    .await;
-
-    match result {
-        Ok(Ok((stdout, stderr))) => {
-            let inspect = docker.inspect_exec(&exec.id).await.ok();
-            let exit_code = inspect.and_then(|i| i.exit_code);
-
-            info!(
-                container_id = %container_id,
-                exit_code = ?exit_code,
-                "Container exec completed"
-            );
-
-            Ok(Json(ExecResponse {
-                exit_code,
-                stdout,
-                stderr,
-            }))
-        }
-        Ok(Err(e)) => Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Exec Failed")
-            .with_detail(format!("Exec error: {}", e))),
-        Err(_) => Err(problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-            .with_title("Exec Timeout")
-            .with_detail(format!("Command timed out after {} seconds", timeout))),
-    }
+    Ok(Json(ExecResponse {
+        exit_code: result.exit_code,
+        stdout: result.stdout,
+        stderr: result.stderr,
+    }))
 }
 
 /// Persistent terminal session via WebSocket (xterm.js compatible)
@@ -320,300 +224,17 @@ pub async fn container_terminal(
         "Terminal session requested"
     );
 
-    // Remote container — proxy bytes 1:1 between the browser WS and the
-    // agent WS. Resolve URL+token before the upgrade so we can fail fast
-    // with a Problem instead of a half-open WebSocket.
-    if let Some(nid) = node_id {
-        let remote = state
-            .deployment_service
-            .resolve_remote_terminal(nid, &verified_container_id)
-            .await
-            .map_err(|e| {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Terminal Setup Failed")
-                    .with_detail(e.to_string())
-            })?;
-        // For wss:// (mTLS-enforcing) nodes, build the rustls connector that
-        // presents the CP's cluster-CA-signed identity. Fail fast here rather
-        // than mid-upgrade so the caller gets a clean Problem.
-        let connector = if remote.ws_url.starts_with("wss://") {
-            let cfg = crate::cluster_ca::cp_ws_client_config(
-                state.config_service.as_ref(),
-                state.encryption_service.as_ref(),
-            )
-            .await
-            .map_err(|e| {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Terminal Setup Failed")
-                    .with_detail(format!("Failed to build mTLS client for agent: {}", e))
-            })?;
-            Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
-        } else {
-            None
-        };
-        return Ok(ws.on_upgrade(move |socket| {
-            handle_remote_terminal_proxy(socket, remote.ws_url, remote.token, connector)
-        }));
-    }
+    let operations = state
+        .deployment_service
+        .container_operations_for_node(node_id)
+        .await
+        .map_err(Problem::from)?;
 
-    let docker = state.docker.clone();
-    Ok(ws.on_upgrade(move |socket| handle_terminal_session(socket, docker, verified_container_id)))
-}
-
-/// Bidirectionally proxy a browser WebSocket to a worker agent's terminal
-/// WebSocket. Each side forwards binary, text, and close frames verbatim.
-/// The agent speaks the same xterm.js-friendly protocol the browser
-/// expects, so no translation happens here.
-async fn handle_remote_terminal_proxy(
-    mut browser_socket: WebSocket,
-    agent_ws_url: String,
-    agent_token: String,
-    connector: Option<tokio_tungstenite::Connector>,
-) {
-    use futures::SinkExt as _;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-    use tokio_tungstenite::tungstenite::protocol::Message as TMessage;
-
-    let mut req = match agent_ws_url.as_str().into_client_request() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(url = %agent_ws_url, "Invalid agent terminal URL: {}", e);
-            let _ = browser_socket.close().await;
-            return;
-        }
-    };
-    req.headers_mut().insert(
-        AUTHORIZATION,
-        match format!("Bearer {}", agent_token).parse() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Invalid agent token header: {}", e);
-                let _ = browser_socket.close().await;
-                return;
-            }
-        },
-    );
-
-    // mTLS connector for wss:// nodes (ADR-020 WS-2.1); plain dial otherwise.
-    let connect = tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector);
-    let (agent_stream, _resp) = match connect.await {
-        Ok(ok) => ok,
-        Err(e) => {
-            tracing::error!(url = %agent_ws_url, "Agent terminal connect failed: {}", e);
-            let _ = browser_socket.close().await;
-            return;
-        }
-    };
-
-    let (mut agent_tx, mut agent_rx) = agent_stream.split();
-    let (mut browser_tx, mut browser_rx) = browser_socket.split();
-
-    // browser -> agent
-    let b2a = tokio::spawn(async move {
-        while let Some(Ok(msg)) = browser_rx.next().await {
-            let out = match msg {
-                Message::Binary(b) => TMessage::Binary(b),
-                Message::Text(t) => TMessage::Text(t.to_string().into()),
-                Message::Close(_) => TMessage::Close(None),
-                Message::Ping(p) => TMessage::Ping(p),
-                Message::Pong(p) => TMessage::Pong(p),
-            };
-            if agent_tx.send(out).await.is_err() {
-                break;
-            }
-        }
-        let _ = agent_tx.close().await;
-    });
-
-    // agent -> browser
-    let a2b = tokio::spawn(async move {
-        while let Some(Ok(msg)) = agent_rx.next().await {
-            let out = match msg {
-                TMessage::Binary(b) => Message::Binary(b.to_vec().into()),
-                TMessage::Text(t) => Message::Text(t.to_string().into()),
-                TMessage::Close(_) => {
-                    let _ = browser_tx.close().await;
-                    return;
-                }
-                TMessage::Ping(p) => Message::Ping(p.to_vec().into()),
-                TMessage::Pong(p) => Message::Pong(p.to_vec().into()),
-                TMessage::Frame(_) => continue,
-            };
-            if browser_tx.send(out).await.is_err() {
-                break;
-            }
-        }
-        let _ = browser_tx.close().await;
-    });
-
-    // First side that finishes ends the session.
-    tokio::select! {
-        _ = b2a => {}
-        _ = a2b => {}
-    }
-}
-
-/// Handle a persistent terminal WebSocket session
-async fn handle_terminal_session(
-    socket: WebSocket,
-    docker: Arc<bollard::Docker>,
-    container_id: String,
-) {
-    debug!(container_id = %container_id, "Terminal session started");
-
-    // Create exec with TTY — try bash, fall back to sh
-    let exec_config = bollard::models::ExecConfig {
-        attach_stdin: Some(true),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        tty: Some(true),
-        cmd: Some(vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi".to_string(),
-        ]),
-        ..Default::default()
-    };
-
-    let exec = match docker.create_exec(&container_id, exec_config).await {
-        Ok(e) => e,
-        Err(e) => {
-            error!(error = %e, "Failed to create exec for terminal");
-            return;
-        }
-    };
-
-    let exec_id = exec.id.clone();
-
-    // Start exec attached with TTY
-    let start_config = bollard::exec::StartExecOptions {
-        detach: false,
-        tty: true,
-        ..Default::default()
-    };
-
-    let (mut docker_output, mut docker_input) =
-        match docker.start_exec(&exec_id, Some(start_config)).await {
-            Ok(StartExecResults::Attached { output, input }) => (output, input),
-            Ok(StartExecResults::Detached) => {
-                error!("Exec started in detached mode unexpectedly");
-                return;
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to start exec for terminal");
-                return;
-            }
-        };
-
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-
-    // Spawn task: Docker PTY output -> WebSocket binary frames for xterm.js
-    let exec_id_for_output = exec_id.clone();
-    let docker_for_output = docker.clone();
-    let output_task = tokio::spawn(async move {
-        use futures::SinkExt;
-
-        while let Some(Ok(msg)) = docker_output.next().await {
-            let bytes: Bytes = match msg {
-                bollard::container::LogOutput::StdOut { message } => message,
-                bollard::container::LogOutput::StdErr { message } => message,
-                bollard::container::LogOutput::Console { message } => message,
-                _ => continue,
-            };
-
-            if ws_sender
-                .send(Message::Binary(bytes.to_vec().into()))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-
-        // Send exit message
-        let exit_code = docker_for_output
-            .inspect_exec(&exec_id_for_output)
-            .await
-            .ok()
-            .and_then(|i| i.exit_code)
-            .unwrap_or(-1);
-
-        let exit_msg = format!(r#"{{"type":"exit","code":{}}}"#, exit_code);
-        let _ = ws_sender.send(Message::Text(exit_msg.into())).await;
-        let _ = ws_sender.close().await;
-    });
-
-    // Main loop: WebSocket input -> Docker PTY stdin
-    let idle_timeout = tokio::time::Duration::from_secs(15 * 60); // 15 min
-    loop {
-        let msg = tokio::time::timeout(idle_timeout, ws_receiver.next()).await;
-
-        match msg {
-            Ok(Some(Ok(Message::Binary(data)))) => {
-                // Raw keyboard input from xterm.js
-                if docker_input.write_all(&data).await.is_err() {
-                    break;
-                }
-                if docker_input.flush().await.is_err() {
-                    break;
-                }
-            }
-            Ok(Some(Ok(Message::Text(text)))) => {
-                // Control messages (resize) or text input
-                if let Ok(ctrl) = serde_json::from_str::<TerminalControl>(&text) {
-                    match ctrl.r#type.as_str() {
-                        "resize" => {
-                            if let (Some(cols), Some(rows)) = (ctrl.cols, ctrl.rows) {
-                                let resize_opts = bollard::exec::ResizeExecOptions {
-                                    width: cols,
-                                    height: rows,
-                                };
-                                if let Err(e) = docker.resize_exec(&exec_id, resize_opts).await {
-                                    warn!(error = %e, "Failed to resize terminal");
-                                }
-                            }
-                        }
-                        "input" => {
-                            if let Some(data) = ctrl.data {
-                                if docker_input.write_all(data.as_bytes()).await.is_err() {
-                                    break;
-                                }
-                                let _ = docker_input.flush().await;
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Plain text input fallback
-                    if docker_input.write_all(text.as_bytes()).await.is_err() {
-                        break;
-                    }
-                    let _ = docker_input.flush().await;
-                }
-            }
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
-                debug!(container_id = %container_id, "Terminal closed by client");
-                break;
-            }
-            Err(_) => {
-                info!(container_id = %container_id, "Terminal timed out (15 min idle)");
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    output_task.abort();
-    info!(container_id = %container_id, "Terminal session ended");
-}
-
-#[derive(Deserialize)]
-struct TerminalControl {
-    r#type: String,
-    cols: Option<u16>,
-    rows: Option<u16>,
-    data: Option<String>,
+    Ok(ws.on_upgrade(move |socket| async move {
+        operations
+            .serve_terminal(socket, verified_container_id)
+            .await;
+    }))
 }
 
 #[cfg(test)]

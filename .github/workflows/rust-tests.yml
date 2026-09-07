@@ -291,6 +291,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
+      - name: Test worker agent service installer
+        run: scripts/test-install-agent-service.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -1024,8 +1027,11 @@ jobs:
       - name: Pull E2E images
         run: |
           timeout 10m docker pull minio/minio:latest
-          timeout 10m docker pull mariadb:lts
-          docker image ls | grep -E '^(minio/minio|mariadb)\s' || true
+          timeout 10m docker build --pull \
+            --build-arg MARIADB_VERSION=11.4 \
+            --tag ghcr.io/gotempsh/mariadb-walg:11.4 \
+            images/mariadb-walg
+          docker image ls | grep -E '^(minio/minio|ghcr.io/gotempsh/mariadb-walg)\s' || true
 
       - name: Run MariaDB PITR E2E
         env:

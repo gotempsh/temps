@@ -1,6 +1,7 @@
 {
   "name": "@temps-sdk/console",
   "private": true,
+  "workspaces": ["packages/*"],
   "version": "1.0.0",
   "description": "The Temps console — the full OSS web app, also exported as <TempsConsole> for downstream editions to consume whole.",
   "engines": {
