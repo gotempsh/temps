@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { RegistryPlugin } from '@/api/client/types.gen'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -10,12 +12,23 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { usePlugins, useReloadPlugins } from '@/hooks/usePlugins'
+import {
+  useInstallPlugin,
+  usePluginCatalog,
+  usePlugins,
+  useReloadPlugins,
+} from '@/hooks/usePlugins'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import {
+  pluginInstallAction,
+  safeRegistryNavigationUrl,
+} from '@/lib/plugin-registry'
+import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import {
   AlertCircle,
-  Copy,
   ExternalLink,
   Loader2,
   Puzzle,
@@ -24,12 +37,19 @@ import {
 import { useEffect } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 
 export function PluginsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: plugins = [], isLoading, error } = usePlugins()
+  const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
+  const {
+    data: catalog,
+    isLoading: catalogLoading,
+    error: catalogError,
+  } = usePluginCatalog()
+  const installPlugin = useInstallPlugin()
   const reloadPlugins = useReloadPlugins()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   useEffect(() => {
     setBreadcrumbs([
@@ -43,40 +63,44 @@ export function PluginsPage() {
   const handleReload = async () => {
     try {
       const result = await reloadPlugins.mutateAsync()
-      toast.success(result.message)
-    } catch {
-      toast.error('Failed to reload plugins')
+      if (result.failures.length > 0) {
+        toast.warning(result.message)
+      } else {
+        toast.success(result.message)
+      }
+    } catch (error) {
+      if (handleSensitiveActionError(error, () => void handleReload())) return
+      toast.error(
+        sensitiveActionErrorMessage(error, 'Failed to reload plugins.')
+      )
     }
   }
 
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <Loader2 className="h-8 w-8 animate-spin" />
-      </div>
-    )
-  }
-
-  if (error) {
-    return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load plugins.</AlertDescription>
-      </Alert>
-    )
+  const handleInstall = async (name: string) => {
+    try {
+      const result = await installPlugin.mutateAsync(name)
+      toast.success(result.message)
+    } catch (error) {
+      if (handleSensitiveActionError(error, () => void handleInstall(name))) {
+        return
+      }
+      toast.error(
+        sensitiveActionErrorMessage(error, `Failed to install ${name}.`)
+      )
+    }
   }
 
   return (
     <div className="space-y-6">
+      {verificationDialog}
       <Card>
         <CardHeader>
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <CardTitle>External Plugins</CardTitle>
               <CardDescription>
-                Manage external plugin binaries. Plugins are discovered from the
-                plugins directory on startup or reload.
+                Install signed, platform-specific releases from the trusted
+                Temps registry.
               </CardDescription>
             </div>
             <Button
@@ -94,254 +118,290 @@ export function PluginsPage() {
             </Button>
           </div>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <PluginSetupHelp />
-          {plugins.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-center">
-              <Puzzle className="h-12 w-12 text-muted-foreground mb-4" />
-              <p className="text-sm font-medium">No plugins installed</p>
-              <p className="text-sm text-muted-foreground mt-1">
-                Place plugin binaries in the plugins directory and click Reload.
-              </p>
+        <CardContent className="space-y-6">
+          <RegistryCatalog
+            catalog={catalog}
+            error={catalogError}
+            isLoading={catalogLoading}
+            installedVersions={
+              new Map(plugins.map((plugin) => [plugin.name, plugin.version]))
+            }
+            installingName={
+              installPlugin.isPending ? installPlugin.variables : undefined
+            }
+            onInstall={(name) => void handleInstall(name)}
+          />
+
+          <section
+            className="space-y-3"
+            aria-labelledby="running-plugins-title"
+          >
+            <div className="flex items-baseline justify-between gap-4 border-b pb-3">
+              <div>
+                <h2 id="running-plugins-title" className="font-semibold">
+                  Running
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Verified plugins currently loaded by Temps.
+                </p>
+              </div>
+              <span className="shrink-0 text-sm text-muted-foreground">
+                {plugins.length} {plugins.length === 1 ? 'plugin' : 'plugins'}
+              </span>
             </div>
-          ) : (
-            <div className="space-y-3">
-              {plugins.map((plugin) => (
-                <div
-                  key={plugin.name}
-                  className="flex items-center justify-between rounded-lg border p-4"
-                >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted">
-                      <Puzzle className="h-4 w-4" />
-                    </div>
+
+            {pluginsLoading ? (
+              <RunningPluginsSkeleton />
+            ) : plugins.length === 0 ? (
+              <div className="rounded-lg border border-dashed px-4 py-8 text-center">
+                <Puzzle className="mx-auto size-5 text-muted-foreground" />
+                <p className="mt-3 font-medium">
+                  No verified plugins are running.
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Install a registry release above to add one.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {plugins.map((plugin) => (
+                  <div
+                    key={plugin.name}
+                    className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between"
+                  >
                     <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <p className="text-sm font-medium truncate">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-medium">
                           {plugin.display_name || plugin.name}
                         </p>
-                        <Badge variant="secondary" className="text-xs shrink-0">
-                          v{plugin.version}
+                        <Badge variant="secondary">v{plugin.version}</Badge>
+                        <Badge className="border-green-500/20 bg-green-500/15 text-green-700 hover:bg-green-500/20 dark:text-green-400">
+                          Running
                         </Badge>
                       </div>
                       {plugin.description && (
-                        <p className="text-xs text-muted-foreground truncate mt-0.5">
+                        <p className="mt-1 text-sm text-muted-foreground">
                           {plugin.description}
                         </p>
                       )}
                     </div>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0 ml-4">
-                    {plugin.ui && (
-                      <Badge variant="outline" className="text-xs">
-                        UI
-                      </Badge>
-                    )}
-                    {plugin.requires_db && (
-                      <Badge variant="outline" className="text-xs">
-                        DB
-                      </Badge>
-                    )}
-                    <Badge
-                      variant="default"
-                      className="bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20 text-xs"
-                    >
-                      Running
-                    </Badge>
-                    {/* A plugin listed here with no way to reach it sends the
-                        user hunting through the sidebar.
-
-                        Gated on the nav entry, not on `plugin.ui`: that field
-                        describes a *declared* bundle, and a plugin can serve
-                        its UI from `/ui/` without one (some plugins do, and
-                        reports `ui: null`). What actually makes a plugin
-                        reachable is a platform/settings nav entry — those are
-                        what `/plugins/:pluginName` routes to. Project-scoped
-                        entries live under a project and have no address from
-                        here. */}
-                    {plugin.nav.some((e) => e.section !== 'project') && (
+                    {plugin.nav.some(
+                      (entry) => entry.section !== 'project'
+                    ) && (
                       <Button asChild variant="outline" size="sm">
                         <Link to={`/plugins/${plugin.name}`}>Open</Link>
                       </Button>
                     )}
                   </div>
-                </div>
-              ))}
-            </div>
-          )}
+                ))}
+              </div>
+            )}
+          </section>
         </CardContent>
       </Card>
-
-      <PluginExamples />
     </div>
   )
 }
 
-const PLUGINS_REPO_URL = 'https://github.com/gotempsh/plugins'
+interface RegistryCatalogProps {
+  catalog?: {
+    available: boolean
+    plugins: RegistryPlugin[]
+    reason?: string | null
+    source: string
+  }
+  error: Error | null
+  installedVersions: Map<string, string>
+  installingName?: string
+  isLoading: boolean
+  onInstall: (name: string) => void
+}
 
-const EXAMPLE_PLUGINS: Array<{
-  name: string
-  description: string
-  path: string
-}> = [
-  {
-    name: 'example-plugin',
-    description:
-      'Minimal "hello world" plugin — the shortest path to understanding the plugin protocol and UI bundle layout.',
-    path: 'example-plugin',
-  },
-  {
-    name: 'lighthouse-plugin',
-    description:
-      'Runs Lighthouse audits after deployments and tracks Core Web Vitals over time.',
-    path: 'lighthouse-plugin',
-  },
-  {
-    name: 'indexnow-plugin',
-    description:
-      'Automatically submits deployed URLs to Bing, Yandex, and other IndexNow-supporting search engines.',
-    path: 'indexnow-plugin',
-  },
-  {
-    name: 'google-indexing-plugin',
-    description:
-      'Notifies the Google Indexing API when pages are published or removed.',
-    path: 'google-indexing-plugin',
-  },
-]
-
-function PluginExamples() {
+function RegistryCatalog({
+  catalog,
+  error,
+  installedVersions,
+  installingName,
+  isLoading,
+  onInstall,
+}: RegistryCatalogProps) {
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-            <CardTitle>Example Plugins</CardTitle>
-            <CardDescription>
-              Official plugins maintained in{' '}
-              <a
-                href={PLUGINS_REPO_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="font-medium text-primary hover:underline"
-              >
-                gotempsh/plugins
-              </a>
-              . Clone the repo, run <code>cargo build --release</code>, and
-              copy the binary into your plugins directory.
-            </CardDescription>
+    <section className="space-y-3" aria-labelledby="plugin-registry-title">
+      <div className="flex flex-col gap-2 border-b pb-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h2 id="plugin-registry-title" className="font-semibold">
+            Registry
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Releases are selected for this server, hash-verified, and installed
+            atomically.
+          </p>
+        </div>
+        <a
+          href="https://temps.sh/docs/plugins"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
+        >
+          Plugin documentation
+          <ExternalLink className="size-3.5" />
+        </a>
+      </div>
+
+      {isLoading ? (
+        <CatalogSkeleton />
+      ) : error ? (
+        <Alert variant="destructive">
+          <AlertCircle className="size-4" />
+          <AlertTitle>Could not load the plugin registry</AlertTitle>
+          <AlertDescription>
+            {sensitiveActionErrorMessage(error, 'Try again in a moment.')}
+          </AlertDescription>
+        </Alert>
+      ) : catalog?.available === false ? (
+        <Alert>
+          <AlertCircle className="size-4" />
+          <AlertTitle>Plugin registry is not configured</AlertTitle>
+          <AlertDescription>
+            {catalog.reason ||
+              'Configure the registry URL and trusted signing key, then restart Temps.'}
+          </AlertDescription>
+        </Alert>
+      ) : catalog?.plugins.length === 0 ? (
+        <div className="rounded-lg border border-dashed px-4 py-8 text-center">
+          <Puzzle className="mx-auto size-5 text-muted-foreground" />
+          <p className="mt-3 font-medium">The registry has no plugins yet.</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Published releases will appear here automatically.
+          </p>
+        </div>
+      ) : (
+        <div className="@container">
+          <div className="grid gap-3 @2xl:grid-cols-2">
+            {catalog?.plugins.map((plugin) => (
+              <RegistryPluginCard
+                key={plugin.name}
+                plugin={plugin}
+                installedVersion={installedVersions.get(plugin.name)}
+                installing={installingName === plugin.name}
+                installDisabled={installingName !== undefined}
+                onInstall={onInstall}
+              />
+            ))}
           </div>
-          <a
-            href={`${PLUGINS_REPO_URL}/releases/latest`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
-          >
-            Prebuilt binaries
-            <ExternalLink className="h-3 w-3" />
-          </a>
         </div>
-      </CardHeader>
-      <CardContent>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {EXAMPLE_PLUGINS.map((plugin) => (
-            <a
-              key={plugin.name}
-              href={`${PLUGINS_REPO_URL}/tree/main/${plugin.path}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="group rounded-lg border p-4 transition-colors hover:bg-accent"
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <Puzzle className="h-4 w-4 shrink-0 text-muted-foreground" />
-                  <p className="text-sm font-medium truncate">{plugin.name}</p>
-                </div>
-                <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
-              </div>
-              <p className="mt-2 text-xs text-muted-foreground">
-                {plugin.description}
-              </p>
-            </a>
-          ))}
-        </div>
-      </CardContent>
-    </Card>
+      )}
+    </section>
   )
 }
 
-function PluginSetupHelp() {
-  const pluginsDir = '~/.temps/plugins'
+interface RegistryPluginCardProps {
+  installDisabled: boolean
+  installedVersion?: string
+  installing: boolean
+  onInstall: (name: string) => void
+  plugin: RegistryPlugin
+}
 
-  const handleCopy = (value: string) => {
-    navigator.clipboard.writeText(value)
-    toast.success('Copied to clipboard')
-  }
+function RegistryPluginCard({
+  installDisabled,
+  installedVersion,
+  installing,
+  onInstall,
+  plugin,
+}: RegistryPluginCardProps) {
+  const repositoryUrl = safeRegistryNavigationUrl(plugin.repository)
+  const action = pluginInstallAction(installedVersion, plugin.version)
+  const installed = action === 'installed'
+  let actionLabel = action === 'upgrade' ? 'Upgrade' : 'Install'
+  if (installed) actionLabel = 'Installed'
+  if (installing)
+    actionLabel = action === 'upgrade' ? 'Upgrading' : 'Installing'
 
   return (
-    <div className="rounded-lg border border-dashed bg-muted/30 p-4">
-      <div className="flex items-start gap-3">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-background">
-          <Puzzle className="h-4 w-4 text-muted-foreground" />
-        </div>
-        <div className="min-w-0 flex-1 space-y-3">
-          <div>
-            <p className="text-sm font-medium">How to install a plugin</p>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              Temps loads executable binaries from the plugins directory over
-              stdin/stdout. Drop a binary in, click Reload, and it shows up
-              below.
-            </p>
+    <article className="flex min-h-44 flex-col rounded-lg border p-4 transition-colors hover:bg-muted/30">
+      <div className="flex min-w-0 items-start gap-3">
+        <Puzzle className="mt-1 size-5 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="font-semibold">{plugin.title}</h3>
+            <Badge variant="secondary">v{plugin.version}</Badge>
+            <Badge variant="outline">{plugin.category}</Badge>
           </div>
-
-          <ol className="space-y-2 text-xs text-muted-foreground">
-            <li className="flex gap-2">
-              <span className="font-medium text-foreground">1.</span>
-              <div className="flex-1 min-w-0">
-                <p>
-                  Place the plugin binary in the plugins directory (override
-                  with <code>TEMPS_DATA_DIR</code>):
-                </p>
-                <div className="mt-1 flex items-center gap-2 rounded-md bg-background px-3 py-2 font-mono text-xs">
-                  <span className="flex-1 overflow-x-auto">{pluginsDir}</span>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6 shrink-0"
-                    onClick={() => handleCopy(pluginsDir)}
-                  >
-                    <Copy className="h-3 w-3" />
-                  </Button>
-                </div>
-              </div>
-            </li>
-            <li className="flex gap-2">
-              <span className="font-medium text-foreground">2.</span>
-              <p className="flex-1">
-                Ensure the file is executable (
-                <code>chmod +x ./my-plugin</code>).
-              </p>
-            </li>
-            <li className="flex gap-2">
-              <span className="font-medium text-foreground">3.</span>
-              <p className="flex-1">
-                Click <span className="font-medium">Reload Plugins</span> above
-                to discover and start it.
-              </p>
-            </li>
-          </ol>
-
-          <a
-            href="https://temps.sh/docs/plugins"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
-          >
-            Read the plugin system docs
-            <ExternalLink className="h-3 w-3" />
-          </a>
+          <p className="mt-1 font-mono text-sm text-muted-foreground">
+            {plugin.name}
+          </p>
         </div>
       </div>
+
+      <p className="mt-3 flex-1 text-sm text-muted-foreground">
+        {plugin.summary}
+      </p>
+
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-3">
+        <span className="text-sm text-muted-foreground">
+          By {plugin.author}
+        </span>
+        <div className="flex items-center gap-2">
+          {repositoryUrl && (
+            <Button asChild variant="ghost" size="sm">
+              <a href={repositoryUrl} target="_blank" rel="noopener noreferrer">
+                Source
+                <ExternalLink className="size-3.5" />
+              </a>
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={installed || installDisabled}
+            onClick={() => onInstall(plugin.name)}
+          >
+            {installing && <Loader2 className="size-4 animate-spin" />}
+            {actionLabel}
+          </Button>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+function CatalogSkeleton() {
+  return (
+    <div className="grid gap-3 lg:grid-cols-2" aria-hidden="true">
+      {[0, 1].map((item) => (
+        <div key={item} className="space-y-4 rounded-lg border p-4">
+          <div className="flex items-center gap-3">
+            <Skeleton className="size-9" />
+            <div className="flex-1 space-y-2">
+              <Skeleton className="h-4 w-36" />
+              <Skeleton className="h-3 w-24" />
+            </div>
+          </div>
+          <Skeleton className="h-4 w-full" />
+          <Skeleton className="h-4 w-3/4" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function RunningPluginsSkeleton() {
+  return (
+    <div className="space-y-2" aria-hidden="true">
+      {[0, 1].map((item) => (
+        <div
+          key={item}
+          className="flex items-center gap-3 rounded-lg border p-4"
+        >
+          <Skeleton className="size-8" />
+          <div>
+            <Skeleton className="h-4 w-40" />
+            <Skeleton className="mt-2 h-3 w-64 max-w-full" />
+          </div>
+        </div>
+      ))}
     </div>
   )
 }

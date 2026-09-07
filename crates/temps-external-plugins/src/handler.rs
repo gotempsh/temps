@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -78,9 +79,55 @@ async fn record_audit(
     state: &ExternalPluginsAppState,
     operation: &dyn temps_core::audit::AuditOperation,
 ) {
-    if let Err(error) = state.audit_service.create_audit_log(operation).await {
-        tracing::error!(operation = %operation.operation_type(), error = %error, "Failed to record external-plugin write audit");
+    if state
+        .audit_service
+        .create_audit_log(operation)
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            operation = %operation.operation_type(),
+            "Failed to record external-plugin write audit"
+        );
     }
+}
+
+async fn record_required_audit(
+    state: &ExternalPluginsAppState,
+    operation: &dyn temps_core::audit::AuditOperation,
+) -> Result<(), Problem> {
+    state
+        .audit_service
+        .create_audit_log(operation)
+        .await
+        .map_err(|_error| {
+            tracing::error!(
+                operation = %operation.operation_type(),
+                "Required external-plugin security audit could not be recorded"
+            );
+            temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Plugin Installation Audit Unavailable")
+                .with_detail(
+                    "Plugin installation cannot continue until the security audit log is available",
+                )
+        })
+}
+
+fn install_request_problem(rejection: JsonRejection) -> Problem {
+    let status = rejection.status();
+    let detail = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "The plugin install request body is too large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            "The plugin install request must use the application/json content type"
+        }
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            "The plugin install request does not match the required JSON schema"
+        }
+        _ => "The plugin install request body is not valid JSON",
+    };
+    temps_core::problemdetails::new(status)
+        .with_title("Invalid Plugin Install Request")
+        .with_detail(detail)
 }
 
 /// List all running external plugins and their manifests.
@@ -374,7 +421,11 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
     tag = "External Plugins",
     get,
     path = "/x/plugins/catalog",
-    responses((status = 200, body = PluginCatalogResponse)),
+    responses(
+        (status = 200, description = "Signed plugin catalogue, or an unavailable state when registry trust is not configured", body = PluginCatalogResponse),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+    ),
     security(("bearer_auth" = []))
 )]
 async fn list_plugin_catalog(
@@ -404,15 +455,29 @@ async fn list_plugin_catalog(
     post,
     path = "/x/plugins/install",
     request_body = InstallPluginRequest,
-    responses((status = 200, body = InstallPluginResponse)),
+    responses(
+        (status = 200, description = "Plugin verified, installed, and started", body = InstallPluginResponse),
+        (status = 400, description = "Invalid plugin name or registry release", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 409, description = "Registry rollback refused", body = temps_core::ProblemDetails),
+        (status = 413, description = "Request body exceeds the configured limit", body = temps_core::ProblemDetails),
+        (status = 415, description = "Request content type is not application/json", body = temps_core::ProblemDetails),
+        (status = 422, description = "Request JSON does not match the install schema", body = temps_core::ProblemDetails),
+        (status = 428, description = "Recent sensitive-action verification required", body = temps_core::ProblemDetails),
+        (status = 500, description = "Local plugin installation failed", body = temps_core::ProblemDetails),
+        (status = 502, description = "Registry, artifact, or plugin startup verification failed", body = temps_core::ProblemDetails),
+        (status = 503, description = "Registry trust, plugin service, or security audit unavailable", body = temps_core::ProblemDetails),
+    ),
     security(("bearer_auth" = []))
 )]
 async fn install_plugin(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
-    Json(request): Json<InstallPluginRequest>,
+    request: Result<Json<InstallPluginRequest>, JsonRejection>,
 ) -> Result<Json<InstallPluginResponse>, Problem> {
+    let Json(request) = request.map_err(install_request_problem)?;
     permission_guard!(auth, SystemAdmin);
     temps_auth::require_sensitive_action(
         state.sensitive_action_authorizer.as_ref(),
@@ -460,7 +525,7 @@ async fn install_plugin(
         }
     };
     let identity = selected.identity.clone();
-    record_audit(
+    record_required_audit(
         &state,
         &ExternalPluginWriteAudit {
             context: context.clone(),
@@ -474,7 +539,7 @@ async fn install_plugin(
             failure: None,
         },
     )
-    .await;
+    .await?;
     let outcome = match state.service.install_selected(selected).await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -528,7 +593,12 @@ async fn install_plugin(
     get,
     path = "/x/plugins/{name}/status",
     params(("name" = String, Path)),
-    responses((status = 200, body = PluginStatusResponse)),
+    responses(
+        (status = 200, description = "Verified active plugin status", body = PluginStatusResponse),
+        (status = 400, description = "Invalid plugin name", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+    ),
     security(("bearer_auth" = []))
 )]
 async fn get_plugin_status(
@@ -583,6 +653,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             InstallPluginResponse,
             PluginCatalogResponse,
             PluginStatusResponse,
+            temps_core::ProblemDetails,
         )
     ),
     tags(
@@ -595,14 +666,65 @@ pub struct ExternalPluginsApiDoc;
 mod tests {
     use super::*;
 
-    use chrono::Utc;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use axum::body::Body;
+    use axum::http::{header::CONTENT_TYPE, Request};
+    use base64::Engine as _;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use ed25519_dalek::{Signer as _, SigningKey};
     use temps_auth::context::AuthContext;
     use temps_auth::permissions::Role;
     use temps_entities::users;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
 
     use crate::manager::ExternalPluginConfig;
 
     struct NoopAuditLogger;
+
+    struct RejectingAuditLogger;
+
+    #[derive(Clone, Default)]
+    struct CapturedAuditEvents(Arc<Mutex<Vec<String>>>);
+
+    struct EventFieldVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for EventFieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write as _;
+
+            let _ = write!(self.0, " {}={value}", field.name());
+        }
+    }
+
+    impl<S> Layer<S> for CapturedAuditEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = String::new();
+            event.record(&mut EventFieldVisitor(&mut fields));
+            self.0
+                .lock()
+                .expect("captured audit-event lock")
+                .push(fields);
+        }
+    }
 
     struct AllowSensitiveActions;
     struct RequireSensitiveVerification;
@@ -647,6 +769,18 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RejectingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!(
+                "audit backend unavailable: private-audit-detail-must-not-leak"
+            ))
+        }
+    }
+
     #[derive(Default)]
     struct RecordingAuditLogger {
         operations: std::sync::Mutex<Vec<String>>,
@@ -688,6 +822,105 @@ mod tests {
         let mut state = test_state();
         state.audit_service = audit_service;
         state
+    }
+
+    async fn test_state_with_signed_registry(
+        audit_service: Arc<dyn temps_core::AuditLogger>,
+    ) -> (
+        tempfile::TempDir,
+        ExternalPluginsAppState,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind signed registry fixture");
+        let address = listener.local_addr().expect("signed registry address");
+        let signing_key = SigningKey::from_bytes(&[19; 32]);
+        let key_id = "handler-audit-test";
+        let document = crate::catalog::RegistryDocument {
+            schema_version: 1,
+            revision: 1,
+            issued_at: Utc::now() - ChronoDuration::minutes(1),
+            expires_at: Utc::now() + ChronoDuration::hours(1),
+            plugins: vec![crate::catalog::RegistryPlugin {
+                name: "safe-plugin".to_string(),
+                title: "Safe plugin".to_string(),
+                summary: "Audit boundary fixture".to_string(),
+                description: "Must never reach the artifact download".to_string(),
+                author: "Temps".to_string(),
+                category: "Testing".to_string(),
+                keywords: Vec::new(),
+                logo_url: None,
+                repository: None,
+                docs_url: None,
+                version: "1.0.0".to_string(),
+                platforms: BTreeMap::from([(
+                    crate::install::platform_target().expect("supported test platform"),
+                    crate::catalog::PlatformRelease {
+                        url: format!("http://{address}/artifact"),
+                        sha256: "00".repeat(32),
+                    },
+                )]),
+            }],
+        };
+        let payload = serde_json::to_vec(&document).expect("serialize registry fixture");
+        let envelope = crate::catalog::RegistryEnvelope {
+            key_id: key_id.to_string(),
+            payload: base64::engine::general_purpose::STANDARD.encode(&payload),
+            signature: base64::engine::general_purpose::STANDARD
+                .encode(signing_key.sign(&payload).to_bytes()),
+        };
+        let registry_body = serde_json::to_vec(&envelope).expect("serialize registry envelope");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
+            {
+                let mut request = [0u8; 2048];
+                let read = stream
+                    .read(&mut request)
+                    .await
+                    .expect("read fixture request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let body = if request.starts_with("GET /api/plugins ") {
+                    registry_body.as_slice()
+                } else {
+                    b"artifact-must-not-be-requested"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write fixture response headers");
+                stream
+                    .write_all(body)
+                    .await
+                    .expect("write fixture response body");
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("plugin handler tempdir");
+        let mut config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        config.registry = crate::catalog::RegistryConfig::local(
+            format!("http://{address}/api/plugins"),
+            key_id,
+            signing_key.verifying_key().to_bytes(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service,
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        (temp, state, requests, server)
     }
 
     fn metadata() -> Extension<temps_core::RequestMetadata> {
@@ -840,9 +1073,9 @@ mod tests {
             user_auth(Role::User),
             State(state),
             metadata(),
-            Json(InstallPluginRequest {
+            Ok(Json(InstallPluginRequest {
                 name: "safe-plugin".to_string(),
-            }),
+            })),
         )
         .await
         .expect_err("install must require system administration");
@@ -897,9 +1130,9 @@ mod tests {
             user_auth(Role::PlatformAdmin),
             State(state),
             metadata(),
-            Json(InstallPluginRequest {
+            Ok(Json(InstallPluginRequest {
                 name: "../../escape".to_string(),
-            }),
+            })),
         )
         .await
         .expect_err("unsafe plugin name must fail");
@@ -922,9 +1155,9 @@ mod tests {
             user_auth(Role::PlatformAdmin),
             State(state),
             metadata(),
-            Json(InstallPluginRequest {
+            Ok(Json(InstallPluginRequest {
                 name: "safe".to_string(),
-            }),
+            })),
         )
         .await
         .expect_err("step-up verification must be required");
@@ -937,6 +1170,132 @@ mod tests {
                 .is_empty(),
             "install audit must not claim an attempt before authorization succeeds"
         );
+    }
+
+    #[tokio::test]
+    async fn install_stops_before_artifact_download_when_release_audit_fails() {
+        // Arrange: the first request authenticates the signed registry. Any
+        // second request would be the artifact download and therefore native
+        // code crossing the pre-execution audit boundary.
+        let (_temp, state, requests, server) =
+            test_state_with_signed_registry(Arc::new(RejectingAuditLogger)).await;
+
+        // Act
+        let error = install_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Ok(Json(InstallPluginRequest {
+                name: "safe-plugin".to_string(),
+            })),
+        )
+        .await
+        .expect_err("a failed release audit must stop installation");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.body.get("title").and_then(serde_json::Value::as_str),
+            Some("Plugin Installation Audit Unavailable")
+        );
+        let serialized = serde_json::to_string(&error.body).expect("serialize public problem");
+        assert!(!serialized.contains("private-audit-detail"));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the handler may fetch the signed registry but must not request the artifact"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_audit_logs_do_not_expose_backend_error_details() {
+        let state = test_state_with_audit(Arc::new(RejectingAuditLogger));
+        let captured = CapturedAuditEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let operation = ExternalPluginWriteAudit {
+            context: audit_context(&user_auth(Role::PlatformAdmin).0, &metadata().0),
+            operation: "EXTERNAL_PLUGIN_INSTALL_REQUESTED".to_string(),
+            plugin_name: Some("safe-plugin".to_string()),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: None,
+        };
+
+        record_audit(&state, &operation)
+            .with_subscriber(subscriber)
+            .await;
+
+        let logs = captured
+            .0
+            .lock()
+            .expect("captured audit-event lock")
+            .join("\n");
+        assert!(logs.contains("EXTERNAL_PLUGIN_INSTALL_REQUESTED"));
+        assert!(!logs.contains("private-audit-detail"));
+    }
+
+    #[tokio::test]
+    async fn malformed_install_bodies_return_documented_problem_details() {
+        let app = configure_routes()
+            .with_state(test_state())
+            .layer(Extension(metadata().0))
+            .layer(Extension(user_auth(Role::PlatformAdmin).0));
+        let oversized_body = format!(r#"{{"name":"{}"}}"#, "a".repeat(2 * 1024 * 1024));
+
+        for (body, content_type, expected_status) in [
+            (
+                "{".to_string(),
+                Some("application/json"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"name":"safe-plugin"}"#.to_string(),
+                None,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                r#"{"name":42}"#.to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                oversized_body,
+                Some("application/json"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let mut request = Request::builder().method("POST").uri("/x/plugins/install");
+            if let Some(content_type) = content_type {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).expect("install request"))
+                .await
+                .expect("install response");
+
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/problem+json")
+            );
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("collect problem body")
+                .to_bytes();
+            let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+            assert_eq!(
+                problem.get("title").and_then(serde_json::Value::as_str),
+                Some("Invalid Plugin Install Request")
+            );
+        }
     }
 
     #[test]
@@ -984,6 +1343,46 @@ mod tests {
             "/x/plugins/{name}/status",
         ] {
             assert!(spec.paths.paths.contains_key(path), "missing {path}");
+        }
+    }
+
+    #[test]
+    fn openapi_spec_documents_plugin_management_errors() {
+        let spec = serde_json::to_value(ExternalPluginsApiDoc::openapi())
+            .expect("serialize external plugin OpenAPI document");
+        let paths = spec
+            .get("paths")
+            .and_then(serde_json::Value::as_object)
+            .expect("OpenAPI paths");
+
+        for (path, method, expected_statuses) in [
+            ("/x/plugins/catalog", "get", &["200", "401", "403"][..]),
+            (
+                "/x/plugins/install",
+                "post",
+                &[
+                    "200", "400", "401", "403", "409", "413", "415", "422", "428", "500", "502",
+                    "503",
+                ][..],
+            ),
+            (
+                "/x/plugins/{name}/status",
+                "get",
+                &["200", "400", "401", "403"][..],
+            ),
+        ] {
+            let responses = paths
+                .get(path)
+                .and_then(|item| item.get(method))
+                .and_then(|operation| operation.get("responses"))
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("missing responses for {method} {path}"));
+            for status in expected_statuses {
+                assert!(
+                    responses.contains_key(*status),
+                    "missing {status} response for {method} {path}"
+                );
+            }
         }
     }
 
