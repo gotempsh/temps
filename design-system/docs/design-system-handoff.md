@@ -813,11 +813,57 @@ still goes to the page's query bar and never into the panel; and focus enters
 the panel only with Tab, so opening it does not take the list away from the
 reader.
 
-## 7. The three page templates
+### Article, CodeBlock, ImageFigure
 
-`src/components/op/templates.tsx`. Every console screen is one of these. A
-screen that does not fit is a reason to extend a template, not to start from a
-blank div.
+`src/article.tsx`. The three pieces a page that is *read* needs, and the only
+three: everything else on such a page is `.op-prose` or a primitive that
+already exists.
+
+**Article** is the fourth page template — see §7. `title` is the one display
+line, `lede` the sentence under it at the lead size (`.op-lede`), and the
+byline is `author.mark` · `author.name` · the absolute date (`fmtAbsolute`,
+`time: false` — a published date is a day, and `00:00` beside it is a time
+nobody measured) · `readingMinutes`, as one mono line. `toc` builds the right
+rail from the body's **rendered** h2/h3 rather than from a list the author
+keeps by hand: a second list goes stale on the first edit and takes the reader
+to the wrong place. Headings with no id get one, the rail is sticky, the
+current section is ink, and every entry is a real link, so it works from the
+keyboard and every heading is addressable. Under two headings the rail does
+not draw: it would be furniture. `aside` adds to the rail, `footer` is what
+sits under the closing rule, and `backHref` / `backLabel` are the "back to all
+posts" link — a typed destination, never `#`.
+
+**CodeBlock** is a fence with a label row: the language, the filename when the
+code belongs to one, and `copy` on the right. Code in a document exists to be
+run, so it is copyable by default and the copy is a `CopyAction` that answers
+on the button — never a toast that says copied whether or not anything
+reached the clipboard. The pane is the inset tone, mono at 12px, and it
+scrolls sideways rather than wrapping a command across two lines.
+
+**ImageFigure** is a picture: one 1px ink frame, no rounding, no shadow, and
+always an `alt` **and** a `caption`. It takes `src` and `dark` and swaps them
+with the theme, because a screenshot taken on paper is unreadable on night
+and a page that ships one is broken in half its states. `width` and `height`
+are the intrinsic pixels, so the text under the figure does not jump when the
+image lands. The caption is numbered by `.op-prose`'s figure counter
+(`fig. 3 · …`), so the prose can point at a picture by number.
+
+`.op-prose` is the skin under all of it: measure, headings on the type
+ladder, lists with square bullets and tabular ordinals, GFM task lists,
+blockquote as an ink rule, inset code panes, ledger tables (`data-align="end"`
+for a numeric column), framed figures with counted captions, `kbd`,
+`details`, footnotes, and `mark` as an ink underline rather than a yellow
+wash. A live block dropped into a document is a component, not prose: wrap it
+in `.op-raw`. See `docs/content-pages.md`.
+
+---
+
+## 7. The page templates
+
+`src/components/op/templates.tsx`. Every console screen is one of the first
+three. A screen that does not fit is a reason to extend a template, not to
+start from a blank div. The fourth, `Article` (`src/article.tsx`), is not a
+console screen at all: it is a page that is read top to bottom.
 
 Changing a tab or a facet never moves the document; only the content below the
 strip changes. The strip reveals its own active tab sideways (`revealInRow`),
@@ -1050,6 +1096,33 @@ asks for a moment or a length uses the `datetime.tsx` fields rather than an
 `Input` with the unit in the hint: API key expiry is a `DateField` with "never"
 as an option word, retention is a `DurationField`, and a backup window is a
 `ScheduleField` that prints its next three runs.
+
+**Article — a page that is read top to bottom**. The fourth template, and
+the only one that is not about operating something: a blog post, a docs page,
+a changelog entry, a compare page. A console screen answers "what is wrong and
+what do I do"; a content page answers a question somebody typed into a search
+box and then has to keep them reading for four minutes.
+
+The shape is one column at the measure, with a rail: title on the display
+ladder → `lede` → byline (mark · name · date · reading time) → the body in
+`.op-prose` → a rule → "back to all posts". The right rail is the table of
+contents, built from the body's own h2/h3, sticky, the current section in ink;
+below `lg` it moves above the body. Headings are the joints, and the measure
+is capped inside the frame (`--op-measure`) while figures, tables and code
+panes are allowed past it — the frame keeps the page's edge (brand §6).
+
+Pictures come from one vocabulary and no other: a framed, captioned
+screenshot in both grounds (`ImageFigure`), an ink diagram, a chart drawn with
+the console's own primitives, or a live block wrapped in `.op-raw`. Never a
+hero illustration, stock photography, a drop shadow, a browser-chrome mockup,
+an image with no alt or no caption, or a screenshot carrying a fact the text
+does not.
+
+The worked example is `design-system/content/sample-post.md`, rendered at
+`/article` (as it would ship, under the landing's own header) and at
+`/v1-article` (inside the sandbox). The landing's `Blog` nav item points at
+it. The rules are `docs/content-pages.md`, rendered at `/guide#content-pages`
+with the page live beside them.
 
 ### Record page checklist (enforced)
 

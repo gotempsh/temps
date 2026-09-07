@@ -103,6 +103,8 @@ const BLOCKS: readonly string[] = [
   'genui-ledger', 'genui-provenance', 'genui-proposal', 'genui-streaming',
   'genui-question', 'genui-wrong',
   'content-error', 'content-time', 'content-fmt',
+  // The long-form pair: the prose skin, and the template that carries it.
+  'prose', 'article',
   'tokens-table', 'motion-tiers', 'icons-vocabulary',
 ]
 
@@ -164,6 +166,9 @@ const RECORDS: ReadonlyArray<{ label: string; path: string }> = [
   // The logs screen, on the chrome-free console route: query bar, histogram,
   // level toggles and the line list in one shot.
   { label: 'console-logs', path: '/console?p=logs' },
+  // The fourth template carrying a real post: the prose skin, the byline,
+  // the table of contents rail, a figure pair, two code blocks and a chart.
+  { label: 'article', path: '/article' },
 ]
 
 for (const { label, path } of RECORDS) {

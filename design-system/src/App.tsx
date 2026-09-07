@@ -11,6 +11,7 @@ import { GuidePage } from '@/sections/Guide'
 import { KitchenSinkPage } from '@/sections/KitchenSink'
 import { ConsoleV1Page } from '@/sections/ConsoleV1'
 import { InkLandingV1Page } from '@/sections/InkLandingV1'
+import { ArticleV1Page } from '@/sections/ArticleV1'
 import { OpComponentsPage } from '@/sections/OpComponents'
 import { AgentChatPage } from '@/sections/AgentChat'
 import { PatternsPage } from '@/sections/Patterns'
@@ -21,6 +22,8 @@ export default function App() {
       {/* The product with no sandbox around it: what a user would actually see. */}
       <Route path="/console" element={<ConsoleV1Page full />} />
       <Route path="/landing" element={<InkLandingV1Page full />} />
+      {/* A page that is read top to bottom: the fourth template, chrome-free. */}
+      <Route path="/article" element={<ArticleV1Page full />} />
       <Route path="/status" element={<StatusPage full />} />
       {/* Everything else is documentation, and documentation has one chrome. */}
       <Route path="*" element={
@@ -36,6 +39,7 @@ export default function App() {
             <Route path="/kitchen-sink" element={<KitchenSinkPage />} />
             <Route path="/v1" element={<ConsoleV1Page />} />
             <Route path="/v1-landing" element={<InkLandingV1Page />} />
+            <Route path="/v1-article" element={<ArticleV1Page />} />
             <Route path="/status-page" element={<StatusPage />} />
             <Route path="/agent" element={<AgentChatPage />} />
           </Routes>

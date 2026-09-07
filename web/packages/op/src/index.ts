@@ -43,5 +43,8 @@ export { ToolRow, Proposal, Provenance, StreamBlock, AgentQuestion, AgentSources
 /* Inspect a ledger row beside the list: a tool screen inspects in a panel,
    a record is a page. See design-system/docs/design-system-handoff.md §6. */
 export { Inspector, type InspectorAnchor } from './inspector'
+/* The fourth page template: a page that is read top to bottom (a post, a docs
+   page, a changelog entry). See design-system/docs/content-pages.md. */
+export { Article, CodeBlock, ImageFigure, type ArticleAuthor, type ArticleHeading } from './article'
 /* A copy answers on the control it was pressed on. See notifications.md. */
 export { CopyAction, useCopy, CopyIcon, COPY_HOLD_MS, type CopyState } from './copy'

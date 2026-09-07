@@ -46,6 +46,9 @@ promptfoo-output/
 
 # Content / blog drafts
 content/
+# ...except the design system's worked long-form example, which is the
+# fixture the Article template and the visual baselines are built on.
+!design-system/content/
 
 __pycache__
 

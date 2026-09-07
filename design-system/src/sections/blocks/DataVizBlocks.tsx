@@ -23,7 +23,8 @@ function Block({ id, title, rule, api, children }: { id: string; title: string; 
       <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
         <div className="min-w-0">
           <h2 className="op-h2">{title}</h2>
-          <div className="op-prose mt-2 space-y-2 text-sm text-muted-foreground">{rule}</div>
+          {/* The prose face, but not a prose body: `.op-raw` keeps the long-form rules off a doc block. */}
+          <div className="op-prose op-raw mt-2 space-y-2 text-sm text-muted-foreground">{rule}</div>
           <pre tabIndex={0} className="op-inset mt-4 overflow-auto border p-3 font-mono text-[11px] leading-5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">{api}</pre>
         </div>
         <div className="min-w-0 space-y-4">{children}</div>

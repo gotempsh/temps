@@ -48,6 +48,10 @@ const PAGES: ReadonlyArray<{ label: string; path: string }> = [
   { label: '/v1?p=settings', path: v1('settings') },
   { label: '/v1?p=settings:cluster', path: v1('settings:cluster') },
   { label: '/status?project=acme-storefront', path: '/status?project=acme-storefront' },
+  // A page that is read: the prose skin, the table of contents and the
+  // figure pair are all contrast decisions, so both grounds are audited.
+  { label: '/article', path: '/article' },
+  { label: '/v1-article', path: '/v1-article' },
 ]
 
 const THEMES = ['light', 'dark'] as const

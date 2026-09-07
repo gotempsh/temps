@@ -13,7 +13,8 @@ import { Kbd, KbdPair } from './kbd'
 import { GLYPH, GLYPH_CLASS, Status, type State } from './status'
 
 /* ────────────────────────────────────────────────────────────────────────
-   The three page templates. Every console screen is one of these. A screen
+   The three console page templates. Every console screen is one of these
+   (the fourth template, `Article`, is a page that is read: `article.tsx`). A screen
    that does not fit is a reason to extend a template, not to start from a
    blank div.
 

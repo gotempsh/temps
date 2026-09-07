@@ -134,11 +134,26 @@ const DATE = (d: Date | string | number): Date => (d instanceof Date ? d : new D
  * fmtAbsolute('2026-09-06T20:33:00Z')                  // "Sep 6 at 20:33"
  * fmtAbsolute('2026-09-06T20:33:00Z', { tz: 'UTC' })   // "Sep 6 at 20:33 UTC"
  * ```
+ *
+ * `time: false` drops the clock and prints the year instead: a published
+ * date is a day, and `00:00` beside it is a time nobody measured.
+ *
+ * ```ts
+ * fmtAbsolute('2026-09-01', { time: false })           // "Sep 1, 2026"
+ * ```
  */
-export function fmtAbsolute(date: Date | string | number | null | undefined, o: { locale?: Locale; tz?: string; seconds?: boolean; year?: boolean } = {}): string {
+export function fmtAbsolute(date: Date | string | number | null | undefined, o: { locale?: Locale; tz?: string; seconds?: boolean; year?: boolean; time?: boolean } = {}): string {
   if (date === null || date === undefined || date === '') return EMPTY
   const d = DATE(date)
   if (Number.isNaN(d.getTime())) return typeof date === 'string' ? date : EMPTY
+  if (o.time === false) {
+    return new Intl.DateTimeFormat(o.locale ?? 'en', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      ...(o.tz ? { timeZone: o.tz } : null),
+    }).format(d)
+  }
   return new Intl.DateTimeFormat(o.locale ?? 'en', {
     month: 'short',
     day: 'numeric',

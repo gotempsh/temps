@@ -2,6 +2,32 @@
 
 ## 0.1.2
 
+- `.op-prose` is the whole look of a body of long-form prose, not just "the
+  sans face": measure (`--op-measure`, ~68ch, capped inside the frame and
+  never by narrowing it), headings on the type ladder (h2 carries a rule, h5/h6
+  are just bold), `.op-lede`, ink links with an underline offset and never
+  blue, square ink bullets and tabular ordinals, GFM task lists, a blockquote
+  as an ink rule on the left (not italic, not grey), `hr`, inline `code` at
+  0.875em on `--muted`, `pre` as a square inset pane at mono 12px scrolling
+  sideways, tables in the ledger idiom (`op-label` header, 1px rules, numbers
+  right through `data-align="end"` or `.num`), framed square figures with
+  `fig. N · …` captions from a CSS counter, `kbd`, `details/summary`,
+  footnotes, and `mark` as an ink underline rather than a yellow wash. Putting
+  the class on a single element still means only "this wraps": every rule is a
+  descendant rule. `.op-raw` is the escape hatch for a live component dropped
+  into a document. New token: `--op-measure`.
+- `Article`, the fourth page template: a page that is read top to bottom.
+  Title, lede, byline (mark · name · absolute date · reading time), a right
+  rail built from the body's own rendered h2/h3 (sticky, current section in
+  ink, every entry a real link), the body in `.op-prose`, and a "back to all
+  posts" footer. `CodeBlock` is a fence with a language/filename label row and
+  a `CopyAction`. `ImageFigure` is a framed, captioned picture that takes
+  `src` and `dark` and swaps them with the theme, and always renders both an
+  alt and a caption.
+- `fmtAbsolute` takes `time: false`, which drops the clock and prints the year
+  (`Sep 1, 2026`). A published date is a day, and `00:00` beside it is a time
+  nobody measured.
+
 - `SessionTimeline` axis draws ticks instead of glyphs (page view a full rule,
   other events short, errors red), on a track inset from the frame so `0s` is
   inside it; the range scrubber spans exactly the track so the thumb sits

@@ -20,6 +20,7 @@ import {
 // barrel carries it — nothing else about the block changes.
 import { Inspector, type InspectorAnchor } from '../../../web/packages/op/src/inspector'
 import { CopyAction } from '../../../web/packages/op/src/copy'
+import { Article, CodeBlock, ImageFigure } from '@/components/op'
 import { BRANCHES } from './ConsoleV1'
 // The five blocks files are the live half of docs/{forms,notifications,content,
 // data-viz,motion,icons}.md. The guide mounts the same components section by
@@ -136,6 +137,8 @@ const TOC = [
   ['content-error', 'Error messages'],
   ['content-time', 'Time and the id beside it'],
   ['content-fmt', 'fmt · the formatters'],
+  ['prose', '.op-prose · a body of prose'],
+  ['article', 'Article · CodeBlock · ImageFigure'],
   ['tokens-table', 'Tokens · tokens.json'],
   ['motion-tiers', 'Motion utilities'],
   ['icons-vocabulary', 'Icons · the vocabulary'],
@@ -147,7 +150,8 @@ function Block({ id, title, rule, api, children }: { id: string; title: string; 
       <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
         <div className="min-w-0">
           <h2 className="op-h2">{title}</h2>
-          <div className="op-prose mt-2 space-y-2 text-sm text-muted-foreground">{rule}</div>
+          {/* The prose face, but not a prose body: `.op-raw` keeps the long-form rules off a doc block. */}
+          <div className="op-prose op-raw mt-2 space-y-2 text-sm text-muted-foreground">{rule}</div>
           <pre tabIndex={0} className="op-inset mt-4 overflow-auto border p-3 font-mono text-[11px] leading-5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">{api}</pre>
         </div>
         <div className="min-w-0 space-y-4">{children}</div>
@@ -769,6 +773,101 @@ served from /api/projects/{id}/icon · fetched after a deploy · monogram until 
           <DataVizBlocks2 />
           <GenUiBlocks />
           <ContentBlocks />
+
+          <Block id="prose" title=".op-prose" api={`<div className="op-prose">{markdown}</div>
+
+.op-lede           the lead paragraph
+data-align="end"   a numeric column, mono + tabular
+.op-raw            a live block: not prose, keeps its own type
+--op-measure       the reading measure (68ch)`}
+            rule={<>
+              <p>The whole look of a body of long-form prose, as one class. A post, a docs page and a changelog entry get it by wrapping the body; <b>Article</b> applies it for you. There is one copy of these rules, so the guide, the docs site and the blog cannot drift apart one renderer at a time.</p>
+              <p>Every rule is a <i>descendant</i> rule, so putting the class on a single paragraph still means only &ldquo;this wraps, so it is the sans face&rdquo;. The measure is capped inside the frame; figures, tables and code panes are allowed past it.</p>
+              <Rule state="ok">Headings on the type ladder, ink links with an underline, square bullets, ledger tables, framed figures with counted captions.</Rule>
+              <Rule state="error">A coloured heading, a blue link, a yellow <code>mark</code>, a rounded or shadowed image, a table that is not a ledger.</Rule>
+            </>}>
+            <Demo label="a body of prose">
+              <div className="op-prose">
+                <h2>What the proxy already knows</h2>
+                <p className="op-lede">Assistants read the site more often than people do, and the proxy already sees every one of those requests.</p>
+                <p>
+                  Every request is written to <code>proxy_logs</code> with the host, the path, the status and the user agent. Nothing extra has to be
+                  installed — which matters, because a crawler does not execute the analytics snippet. Press <kbd>/</kbd> to reach the query bar, and
+                  the token you type is <mark>the whole filter</mark>.
+                </p>
+                <h3>The fields worth keeping</h3>
+                <ul>
+                  <li>Agent — the crawler&rsquo;s own name, verbatim.
+                    <ul><li>Never re-cased: <code>GPTBot</code> is what it calls itself.</li></ul>
+                  </li>
+                  <li>Path, status, bytes out.</li>
+                </ul>
+                <ol>
+                  <li>Filter the log by user agent.</li>
+                  <li>Group by agent over thirty days.</li>
+                </ol>
+                <table>
+                  <thead><tr><th scope="col">agent</th><th scope="col" data-align="end">requests</th><th scope="col" data-align="end">bytes out</th></tr></thead>
+                  <tbody>
+                    <tr><td>GPTBot</td><td data-align="end">184,220</td><td data-align="end">3.1 GB</td></tr>
+                    <tr><td>ClaudeBot</td><td data-align="end">61,905</td><td data-align="end">1.1 GB</td></tr>
+                  </tbody>
+                </table>
+                <blockquote><p>The crawler is not the audience. The person reading the answer that quotes you is.</p></blockquote>
+                <pre><code>{'bunx @temps-sdk/cli logs query --group-by ua --format table'}</code></pre>
+                <details><summary>Why the analytics page was flat</summary><p>A crawler does not run the snippet, so nothing about it reaches analytics.</p></details>
+                <hr />
+                <p>Everything else turned out to be detail we looked at once and never again.</p>
+              </div>
+            </Demo>
+          </Block>
+
+          <Block id="article" title="Article · CodeBlock · ImageFigure" api={`<Article title lede author={{ name, mark }} date readingMinutes
+         toc backHref backLabel aside footer>{body}</Article>
+
+<CodeBlock code lang filename? copy />
+<ImageFigure src dark? alt caption width height />`}
+            rule={<>
+              <p><b>Article</b> is the fourth page template: a page that is read top to bottom rather than operated. Title on the display ladder, lede, byline (mark · name · absolute date · reading time), the body in <code>.op-prose</code>, and a right rail built from the body&rsquo;s <i>rendered</i> h2/h3 — sticky, current section in ink, every entry a real link. Under two headings the rail does not draw.</p>
+              <p><b>CodeBlock</b> says the language and the filename and copies on itself; code in a document exists to be run. <b>ImageFigure</b> frames a picture at 1px, numbers its caption, and swaps <code>src</code> for <code>dark</code> with the theme.</p>
+              <Rule state="ok">The worked example is <Link to="/v1-article" className="underline underline-offset-4">/v1-article</Link>; the rules are <Link to="/guide#content-pages" className="underline underline-offset-4">/guide#content-pages</Link>.</Rule>
+              <Rule state="error">A hero illustration, a browser-chrome mockup, a screenshot on one ground only, a code block a reader has to retype.</Rule>
+            </>}>
+            <Demo label="Article · the shape">
+              <div className="border">
+                <Article
+                  title="Track AI crawler traffic at the proxy"
+                  lede="Assistants read the site far more often than people do."
+                  author={{ name: 'maya', mark: <ProjectMark name="maya" size={16} /> }}
+                  date="2026-09-01"
+                  readingMinutes={6}
+                  backHref="/v1-landing"
+                  className="py-6"
+                >
+                  <h2>What the proxy already knows</h2>
+                  <p>Every request is written with the host, the path, the status and the user agent.</p>
+                  <h2>What the numbers said</h2>
+                  <p>Four paths accounted for more than half of everything read.</p>
+                </Article>
+              </div>
+            </Demo>
+            <Demo label="CodeBlock · a fence that says what it is">
+              <CodeBlock lang="bash" filename="deploy.sh" code={'bunx @temps-sdk/cli deploy --project acme-storefront --env production'} />
+            </Demo>
+            <Demo label="ImageFigure · framed, captioned, both grounds">
+              <div className="op-prose">
+                <ImageFigure
+                  src="/figures/logs-light.png"
+                  dark="/figures/logs-dark.png"
+                  alt="The Temps logs screen: a volume chart above a list of request lines, with facets down the right."
+                  caption="the logs screen · one figure, both grounds"
+                  width={1440}
+                  height={900}
+                />
+              </div>
+            </Demo>
+          </Block>
+
           <TokenBlocks />
     </DocPage>
   )

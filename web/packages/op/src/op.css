@@ -404,6 +404,11 @@
   --op-inset-foreground: oklch(0.13 0 0);
   --op-rule-soft: color-mix(in oklch, var(--foreground) 16%, transparent);
   --op-raise-shadow: 3px 3px 0 0 var(--foreground);
+  /* The reading measure. One line of long-form prose is capped here, inside
+     whatever frame it sits in — the frame keeps the page's edge (brand §6).
+     ~68 characters is the line a reader's eye returns from without losing
+     the next one. Figures, tables and code panes are allowed past it. */
+  --op-measure: 68ch;
   --radius: 0.25rem;
   --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
@@ -799,3 +804,261 @@
 .operator.ink ::-webkit-scrollbar-thumb:hover, html:has(.operator.ink)::-webkit-scrollbar-thumb:hover { background-color: color-mix(in oklch, var(--foreground) 55%, transparent); }
 .operator.ink ::-webkit-scrollbar-corner { background: transparent; }
 /* Sideways strips (.op-scroll-x) already hide their bar above: the clipped edge is the affordance. */
+
+
+/* ── Long-form prose (.op-prose) ───────────────────────────────────────
+   A page that is read top to bottom — a blog post, a docs page, a
+   changelog entry — is not a console screen, but it is the same system.
+   `.op-prose` is the whole look of one, so a markdown or MDX body gets it
+   from one class and there is exactly one copy of these rules.
+
+   `.op-prose` on a single element still means only "this wraps, so it is
+   the sans face" (the rule above). Everything below styles what is
+   *inside* a prose body, so putting the class on one paragraph changes
+   nothing about that paragraph.
+
+   The rules of the system hold: paper and ink, 1px borders, no card, no
+   drop shadow, no rounded image, no coloured heading, colour only where
+   it is a state. The measure is capped inside the frame (`--op-measure`),
+   never by narrowing the frame; a figure, a table and a code pane are
+   allowed past it because they are pictures, not lines to read.
+
+   `.op-raw` is the one escape hatch: a live block dropped into a document
+   (a chart, a ledger, a whole demo) is a component, not prose, and it keeps
+   its own type. It also marks a container that wants the prose *face* — a
+   note, a rule beside a demo — without being a body of prose. Every rule
+   below is guarded against it, so the escape is one class on the wrapper
+   and never a fight with specificity.
+   See design-system/docs/content-pages.md.
+   ──────────────────────────────────────────────────────────────────── */
+.operator.ink .op-prose { counter-reset: op-figure; }
+
+/* Paragraphs and the lead paragraph. */
+.operator.ink .op-prose p:not(:where(.op-raw *)) {
+  max-width: var(--op-measure);
+  margin-top: 1rem;
+  font-size: 0.9375rem;
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+.operator.ink .op-prose > :first-child:not(:where(.op-raw *)) { margin-top: 0; }
+/* Two prose bodies in a row are one document rendered in two pieces (the
+   guide slices its sources at heading boundaries), so the join needs the
+   air the first child gave up. */
+.operator.ink .op-prose + .op-prose { margin-top: 2rem; }
+/* The lead paragraph. A tier, not a prose-only rule: an Article's header
+   uses it above the body, a prose body uses it as its first paragraph. */
+.operator.ink .op-lede {
+  max-width: var(--op-measure);
+  margin-top: 0.75rem;
+  font-size: 1.0625rem;
+  line-height: 1.55;
+  color: var(--muted-foreground);
+  text-wrap: pretty;
+}
+.operator.ink .op-lede strong { color: var(--foreground); font-weight: 500; }
+
+/* Headings, on the type ladder. h2 carries a rule so a long page has
+   visible joints; h3 is smaller and takes space only; h5/h6 are bold. */
+.operator.ink .op-prose h1:not(:where(.op-raw *)) { font-weight: 700; letter-spacing: -0.03em; line-height: 1.15; font-size: 1.75rem; margin-top: 2.5rem; max-width: var(--op-measure); text-wrap: balance; }
+.operator.ink .op-prose h2:not(:where(.op-raw *)) {
+  font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; font-size: 1.375rem;
+  margin-top: 2.5rem; border-top: 1px solid var(--border); padding-top: 1.25rem;
+  max-width: var(--op-measure); text-wrap: balance;
+}
+.operator.ink .op-prose h3:not(:where(.op-raw *)) { font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; font-size: 1.0625rem; margin-top: 1.75rem; max-width: var(--op-measure); }
+.operator.ink .op-prose h4:not(:where(.op-raw *)) { font-weight: 600; line-height: 1.4; font-size: 0.9375rem; margin-top: 1.5rem; max-width: var(--op-measure); }
+.operator.ink .op-prose h5:not(:where(.op-raw *)),
+.operator.ink .op-prose h6:not(:where(.op-raw *)) { font-weight: 600; font-size: 0.9375rem; margin-top: 1.25rem; max-width: var(--op-measure); }
+.operator.ink .op-prose h1 + *:not(:where(.op-raw *)),
+.operator.ink .op-prose h2 + *:not(:where(.op-raw *)),
+.operator.ink .op-prose h3 + *:not(:where(.op-raw *)),
+.operator.ink .op-prose h4 + *:not(:where(.op-raw *)),
+.operator.ink .op-prose h5 + *:not(:where(.op-raw *)),
+.operator.ink .op-prose h6 + *:not(:where(.op-raw *)) { margin-top: 0.5rem; }
+
+/* Links: ink with an underline, offset so descenders survive. Never blue —
+   the one blue in the system is the focus ring. */
+.operator.ink .op-prose a:not(:where(.op-raw *)) {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+  text-decoration-color: color-mix(in oklch, var(--foreground) 45%, transparent);
+}
+.operator.ink .op-prose a:hover:not(:where(.op-raw *)) { text-decoration-color: var(--foreground); }
+.operator.ink .op-prose strong:not(:where(.op-raw *)) { font-weight: 600; color: var(--foreground); }
+.operator.ink .op-prose em:not(:where(.op-raw *)) { font-style: italic; }
+/* A highlight is an ink underline, not a yellow wash: the page has no
+   second hue, and a wash behind text is a background nobody chose. */
+.operator.ink .op-prose mark:not(:where(.op-raw *)) {
+  background: transparent;
+  color: var(--foreground);
+  box-shadow: inset 0 -0.35em 0 0 color-mix(in oklch, var(--foreground) 14%, transparent);
+}
+
+/* Lists. Square ink bullets, tabular ordinals, nesting that stays legible. */
+.operator.ink .op-prose ul:not(:where(.op-raw *)),
+.operator.ink .op-prose ol:not(:where(.op-raw *)) {
+  max-width: var(--op-measure);
+  margin-top: 1rem;
+  padding-inline-start: 1.5rem;
+  font-size: 0.9375rem;
+  line-height: 1.7;
+}
+.operator.ink .op-prose ul:not(:where(.op-raw *)) { list-style: square; }
+.operator.ink .op-prose ol:not(:where(.op-raw *)) { list-style: decimal; }
+.operator.ink .op-prose li:not(:where(.op-raw *)) { margin-top: 0.375rem; }
+.operator.ink .op-prose li::marker:not(:where(.op-raw *)) { color: var(--muted-foreground); }
+.operator.ink .op-prose ol > li::marker:not(:where(.op-raw *)) { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 0.875em; }
+.operator.ink .op-prose li > ul:not(:where(.op-raw *)),
+.operator.ink .op-prose li > ol:not(:where(.op-raw *)) { margin-top: 0.375rem; }
+.operator.ink .op-prose li > p:not(:where(.op-raw *)) { margin-top: 0; max-width: none; }
+.operator.ink .op-prose li > p + p:not(:where(.op-raw *)) { margin-top: 0.5rem; }
+/* GFM task lists: the checkbox is the marker, so the marker goes. */
+.operator.ink .op-prose li:has(> input[type='checkbox']):not(:where(.op-raw *)) { list-style: none; margin-inline-start: -1.25rem; }
+.operator.ink .op-prose li > input[type='checkbox']:not(:where(.op-raw *)) {
+  appearance: none;
+  width: 0.8125rem; height: 0.8125rem;
+  margin-inline-end: 0.5rem;
+  border: 1px solid var(--border);
+  vertical-align: -0.1em;
+}
+.operator.ink .op-prose li > input[type='checkbox']:checked:not(:where(.op-raw *)) {
+  background: var(--foreground);
+  box-shadow: inset 0 0 0 2px var(--background);
+}
+
+/* A quote is an ink rule on the left. Not italic, not grey: it is somebody
+   else's sentence, not a weaker one. */
+.operator.ink .op-prose blockquote:not(:where(.op-raw *)) {
+  max-width: var(--op-measure);
+  margin-top: 1.25rem;
+  border-inline-start: 2px solid var(--border);
+  padding-inline-start: 1rem;
+  font-style: normal;
+  color: var(--foreground);
+}
+.operator.ink .op-prose blockquote p:not(:where(.op-raw *)) { margin-top: 0; }
+.operator.ink .op-prose blockquote p + p:not(:where(.op-raw *)) { margin-top: 0.75rem; }
+.operator.ink .op-prose blockquote cite:not(:where(.op-raw *)) { display: block; margin-top: 0.5rem; font-style: normal; font-size: 0.8125rem; color: var(--muted-foreground); }
+
+/* A break between two parts of one page is a rule, full width. */
+.operator.ink .op-prose hr:not(:where(.op-raw *)) { margin-block: 2.5rem; border: 0; border-top: 1px solid var(--border); }
+
+/* Code. Inline is mono at 0.875em on the muted tone; a block is an inset
+   pane, the same convention the console's log and code panes use. */
+.operator.ink .op-prose :not(pre) > code:not(:where(.op-raw *)) {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--muted);
+  padding: 0.1em 0.3em;
+  border-radius: 0;
+  overflow-wrap: anywhere;
+}
+.operator.ink .op-prose pre:not(:where(.op-raw *)) {
+  margin-top: 1rem;
+  background: var(--op-inset);
+  color: var(--op-inset-foreground);
+  border: 1px solid var(--border);
+  border-radius: 0;
+  padding: 0.75rem;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.operator.ink .op-prose pre > code:not(:where(.op-raw *)) { background: none; padding: 0; font-size: inherit; }
+.operator.ink .op-prose pre:focus-visible:not(:where(.op-raw *)) { outline: 2px solid var(--ring); outline-offset: -2px; }
+
+/* Tables are ledgers: an op-label header row, 1px rules, tabular numerals,
+   and numbers to the right — mark the column with `data-align="end"` on the
+   cell, or `.num`, and the value lands under its header. */
+.operator.ink .op-prose table:not(:where(.op-raw *)) {
+  margin-top: 1.25rem;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--border);
+  font-size: 0.8125rem;
+  text-align: start;
+}
+.operator.ink .op-prose thead th:not(:where(.op-raw *)) {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 0.6875rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  border-bottom: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  vertical-align: bottom;
+}
+.operator.ink .op-prose tbody td:not(:where(.op-raw *)),
+.operator.ink .op-prose tbody th:not(:where(.op-raw *)) { padding: 0.5rem 0.75rem; vertical-align: top; }
+.operator.ink .op-prose tbody tr + tr > *:not(:where(.op-raw *)) { border-top: 1px solid var(--op-rule-soft); }
+.operator.ink .op-prose th[data-align='end']:not(:where(.op-raw *)),
+.operator.ink .op-prose td[data-align='end']:not(:where(.op-raw *)),
+.operator.ink .op-prose th.num:not(:where(.op-raw *)),
+.operator.ink .op-prose td.num:not(:where(.op-raw *)) {
+  text-align: end;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.operator.ink .op-prose thead th[data-align='end']:not(:where(.op-raw *)),
+.operator.ink .op-prose thead th.num:not(:where(.op-raw *)) { font-family: var(--font-sans); }
+
+/* Pictures. One 1px ink frame, no rounding, no shadow; the caption is a
+   mono line under it, numbered by a counter so the prose can say "fig. 3". */
+.operator.ink .op-prose figure:not(:where(.op-raw *)) { margin-top: 1.5rem; counter-increment: op-figure; }
+.operator.ink .op-prose img:not(:where(.op-raw *)) {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  box-shadow: none;
+}
+/* A screenshot is taken on one ground and is unreadable on the other, so a
+   figure ships the pair and the skin picks. `ImageFigure` marks them. */
+.operator.ink .op-prose img[data-theme='dark']:not(:where(.op-raw *)) { display: none; }.dark .operator.ink .op-prose img[data-theme='dark'] { display: block; }.dark .operator.ink .op-prose img[data-theme='light'] { display: none; }
+.operator.ink .op-prose figcaption:not(:where(.op-raw *)) {
+  margin-top: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted-foreground);
+}
+.operator.ink .op-prose figcaption::before:not(:where(.op-raw *)) { content: 'fig. ' counter(op-figure) ' · '; }
+
+/* A key, the same badge `Kbd` renders. */
+.operator.ink .op-prose kbd:not(:where(.op-raw *)) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1rem;
+  height: 1rem;
+  padding: 0 0.25rem;
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  vertical-align: 0.05em;
+}
+
+/* An aside the reader can open. Closed by default, and it says so. */
+.operator.ink .op-prose details:not(:where(.op-raw *)) { margin-top: 1rem; max-width: var(--op-measure); border: 1px solid var(--border); padding: 0.625rem 0.75rem; }
+.operator.ink .op-prose details > summary:not(:where(.op-raw *)) { cursor: pointer; font-weight: 500; font-size: 0.875rem; list-style: none; }
+.operator.ink .op-prose details > summary::-webkit-details-marker:not(:where(.op-raw *)) { display: none; }
+.operator.ink .op-prose details > summary::before:not(:where(.op-raw *)) { content: '▸ '; color: var(--muted-foreground); }
+.operator.ink .op-prose details[open] > summary::before:not(:where(.op-raw *)) { content: '▾ '; }
+.operator.ink .op-prose details > summary:focus-visible:not(:where(.op-raw *)) { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+/* Footnotes: a rule, a label, then the notes at the small size. The back
+   link is part of the note, so the reader can get back to the sentence. */
+.operator.ink .op-prose .footnotes:not(:where(.op-raw *)) { margin-top: 2.5rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+.operator.ink .op-prose .footnotes h2:not(:where(.op-raw *)) { border-top: 0; padding-top: 0; margin-top: 0; font-size: 0.6875rem; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted-foreground); }
+.operator.ink .op-prose .footnotes ol:not(:where(.op-raw *)) { font-size: 0.8125rem; line-height: 1.6; }
+.operator.ink .op-prose .footnotes p:not(:where(.op-raw *)) { font-size: 0.8125rem; line-height: 1.6; }
+.operator.ink .op-prose sup a:not(:where(.op-raw *)),
+.operator.ink .op-prose .footnotes a:not(:where(.op-raw *)) { text-decoration-color: color-mix(in oklch, var(--foreground) 45%, transparent); }

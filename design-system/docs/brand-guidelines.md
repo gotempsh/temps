@@ -442,6 +442,20 @@ the same way every time.
   its own, every block it renders carries the call that produced it, and every
   write is a proposal a human confirms. `docs/generative-ui.md`.
 
+- **A page that is read.** A post, a docs page, a changelog entry and a
+  compare page are not console screens, but they are the same system: paper
+  and ink, 1px borders, no card, no second hue, no hero illustration and no
+  stock photograph. The whole look of a body of prose is one class
+  (`.op-prose`), the measure is capped inside the frame at about 68
+  characters and never by narrowing the frame, headings sit on the same type
+  ladder as everywhere else, a link is ink with an underline and never blue,
+  and a table is a ledger. Every picture is framed at 1px, captioned by
+  number and shipped on both grounds, because a screenshot taken on paper is
+  unreadable on night; every code block is copyable, because code in a
+  document exists to be run. The reader is the same person — they arrived
+  from a search box instead of an alert, and they still get told the truth
+  in the fewest words that carry it. `docs/content-pages.md`.
+
 - **The address is the page.** Everything the reader can see is in the URL: the
   path names the record, the query names the view of it — tab, filter, sort,
   page, range, the row open beside the list. Reload it and the same screen comes

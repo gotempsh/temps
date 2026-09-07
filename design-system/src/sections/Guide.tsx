@@ -27,6 +27,7 @@ import { GenUiBlocks, GENUI_TOC } from './blocks/GenUiBlocks'
 import { NotificationBlocks } from './blocks/NotificationBlocks'
 import { IconsBlock, MotionBlock, TokensBlock } from './blocks/TokenBlocks'
 import { UrlStateDemo } from './blocks/UrlStateBlocks'
+import { SamplePost } from './ArticleV1'
 
 import brandMd from '../../docs/brand-guidelines.md?raw'
 import handoffMd from '../../docs/design-system-handoff.md?raw'
@@ -41,6 +42,7 @@ import generativeUiMd from '../../docs/generative-ui.md?raw'
 import motionMd from '../../docs/motion.md?raw'
 import iconsMd from '../../docs/icons.md?raw'
 import requirementsMd from '../../docs/requirements.md?raw'
+import contentPagesMd from '../../docs/content-pages.md?raw'
 
 /* ────────────────────────────────────────────────────────────────────────
    /guide — the consolidated design-system guide. One page that reads the
@@ -80,8 +82,8 @@ const HANDOFF_RUN = slice(handoffMd, '## 0. How to run and look', '## 1. What th
 const HANDOFF_WHAT = slice(handoffMd, '## 1. What this is', '## 4. Tokens')
 const HANDOFF_TOKENS = slice(handoffMd, '## 4. Tokens', '## 5. Status vocabulary')
 const HANDOFF_STATUS = slice(handoffMd, '## 5. Status vocabulary', '## 6. Components')
-const HANDOFF_COMPONENTS = slice(handoffMd, '## 6. Components', '## 7. The three page templates')
-const HANDOFF_TEMPLATES = slice(handoffMd, '## 7. The three page templates', '## 7b. Redesigned surfaces')
+const HANDOFF_COMPONENTS = slice(handoffMd, '## 6. Components', '## 7. The page templates')
+const HANDOFF_TEMPLATES = slice(handoffMd, '## 7. The page templates', '## 7b. Redesigned surfaces')
 const HANDOFF_SURFACES = slice(handoffMd, '## 7b. Redesigned surfaces', '## 7c. Responsive rules')
 const HANDOFF_KEYBOARD = slice(handoffMd, '## 9. Keyboard', '## 10. Plans as design input')
 const HANDOFF_OPEN = slice(handoffMd, '## 15. Open items', '## 16. How to hand back')
@@ -117,6 +119,7 @@ const RULES_BODY = withoutTitle(rulesMd)
  */
 const DOC_REQUIREMENTS = withoutTitle(requirementsMd)
 const DOC_CONTENT = withoutTitle(contentMd)
+const DOC_CONTENT_PAGES = withoutTitle(contentPagesMd)
 const DOC_LOCALE = withoutTitle(localisationMd)
 const DOC_FORMS = withoutTitle(formsMd)
 const DOC_NOTIFICATIONS = withoutTitle(notificationsMd)
@@ -593,7 +596,7 @@ const LIVE: Record<string, ReactNode> = {
   'tokens--4-tokens': <LiveTokens />,
   'status--5-status-vocabulary': <LiveStatus />,
   'components--6-components': <LiveComponentIndex />,
-  'templates--7-the-three-page-templates': <LiveTemplates />,
+  'templates--7-the-page-templates': <LiveTemplates />,
   'keyboard--9-keyboard': <LiveKeys />,
 }
 
@@ -677,7 +680,9 @@ function DocHeading({ prefix, depth, text, children }: { prefix: string; depth: 
         </a>
       </Tag>
       {prefix === 'surfaces' ? <SurfaceLinks slugId={slug(text)} /> : null}
-      {LIVE[id] ?? null}
+      {/* A live block is a component, not prose: `.op-raw` keeps the prose
+          rules off it wherever a heading is rendered inside `.op-prose`. */}
+      {LIVE[id] ? <div className="op-raw">{LIVE[id]}</div> : null}
     </>
   )
 }
@@ -699,68 +704,57 @@ function mdComponents(prefix: string): Components {
     h4: heading(4),
     h5: heading(5),
     h6: heading(6),
-    p: ({ children }) => <p className="op-prose mt-3 max-w-[72ch] text-sm break-words">{children}</p>,
-    ul: ({ children }) => (
-      <ul className="mt-3 max-w-[72ch] list-disc space-y-1.5 pl-5 text-sm marker:text-muted-foreground">{children}</ul>
-    ),
-    ol: ({ children }) => (
-      <ol className="mt-3 max-w-[72ch] list-decimal space-y-1.5 pl-5 text-sm marker:text-muted-foreground">{children}</ol>
-    ),
-    li: ({ children }) => <li className="op-prose break-words [&>p]:mt-0 [&>p]:max-w-none">{children}</li>,
-    strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-    em: ({ children }) => <em className="italic">{children}</em>,
-    hr: () => <hr className="mt-8 border-t" />,
-    blockquote: ({ children }) => (
-      <blockquote className="mt-4 max-w-[72ch] border-l-2 pl-3 text-sm [&>p]:mt-0 [&>p+p]:mt-2">{children}</blockquote>
-    ),
-    code: ({ children }) => <code className="font-mono text-[0.875em]">{children}</code>,
+    // Everything a class can do is `.op-prose`, on the wrapper below. What is
+    // left here is what a class cannot: the scroller a wide table or a long
+    // fence needs (and the tab stop that comes with it), and the routing a
+    // link needs. Paragraphs, lists, quotes, rules, code, tables and cells
+    // carry no classes at all, so there is exactly one copy of the rules and
+    // the guide reads with the same face as an article.
     pre: ({ children }) => (
-      <pre
-        tabIndex={0}
-        data-allow-overflow
-        className="op-inset mt-4 overflow-auto border p-3 font-mono text-[11px] leading-5 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
-      >
-        {children}
-      </pre>
+      <pre tabIndex={0} data-allow-overflow>{children}</pre>
     ),
     table: ({ children }) => (
       <div data-allow-overflow className="mt-4 overflow-x-auto" tabIndex={0}>
-        <table className="w-full min-w-[34rem] border-separate border-spacing-0 border text-left text-xs">
-          {children}
-        </table>
+        <table className="min-w-[34rem]">{children}</table>
       </div>
     ),
-    thead: ({ children }) => <thead>{children}</thead>,
-    tbody: ({ children }) => <tbody className="op-rows">{children}</tbody>,
-    th: ({ children }) => <th scope="col" className="op-label border-b px-3 py-2 align-bottom">{children}</th>,
-    td: ({ children }) => <td className="px-3 py-2 align-top break-words">{children}</td>,
+    th: ({ children, style }) => <th scope="col" data-align={style?.textAlign === 'right' ? 'end' : undefined}>{children}</th>,
+    td: ({ children, style }) => <td data-align={style?.textAlign === 'right' ? 'end' : undefined}>{children}</td>,
     a: ({ href, children }) => {
       const h = href ?? ''
-      if (h.startsWith('#')) return <a href={h} className="op-status">{children}</a>
-      if (/^https?:/.test(h)) return <a href={h} target="_blank" rel="noreferrer" className="op-status">{children}</a>
+      if (h.startsWith('#')) return <a href={h}>{children}</a>
+      if (/^https?:/.test(h)) return <a href={h} target="_blank" rel="noreferrer">{children}</a>
       const doc = Object.keys(DOC_ANCHORS).find((d) => h.startsWith(d))
       if (doc !== undefined) {
         const to = DOC_ANCHORS[doc]
         return to ? (
-          <a href={to} className="op-status">{children}</a>
+          <a href={to}>{children}</a>
         ) : (
           <span className="font-mono text-[0.875em] text-muted-foreground" title={`${doc} is not part of the guide`}>
             {children}
           </span>
         )
       }
-      if (h.startsWith('/')) return <Link to={h} className="op-status">{children}</Link>
+      if (h.startsWith('/')) return <Link to={h}>{children}</Link>
       return <span className="font-mono text-[0.875em]">{children}</span>
     },
   }
 }
 
+/**
+ * One rendered document. The wrapper carries `.op-prose`, which is the whole
+ * look of a body of prose — the same class an MDX docs page and the Article
+ * template use, so the guide, the docs site and the blog cannot drift apart
+ * one renderer at a time.
+ */
 function Md({ prefix, children }: { prefix: string; children: string }) {
   const components = useMemo(() => mdComponents(prefix), [prefix])
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
-      {children}
-    </ReactMarkdown>
+    <div className="op-prose">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+        {children}
+      </ReactMarkdown>
+    </div>
   )
 }
 
@@ -1372,6 +1366,75 @@ function ScreenFrame({ view, dark, label, href }: { view: string; dark?: boolean
         <Link to={to} className="op-status ml-auto font-mono text-[11px]">{to}</Link>
       </figcaption>
     </figure>
+  )
+}
+
+/**
+ * The article, live at 900×1400 and scaled into a box — the same trick
+ * `ScreenFrame` plays with a console screen, and for the same reason: a
+ * screenshot of a design system goes stale the first time a token moves.
+ * Inert and covered by one link, so the frame is a single tab stop that
+ * opens the page full size.
+ */
+const POST_W = 900
+const POST_H = 1400
+
+function ArticleFrame({ dark }: { dark?: boolean }) {
+  const box = useRef<HTMLDivElement>(null)
+  const [scale, setScale] = useState(0.42)
+  useEffect(() => {
+    const el = box.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setScale(el.clientWidth / POST_W))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  return (
+    <figure className="min-w-0">
+      <div ref={box} className="relative w-full overflow-hidden border bg-background" style={{ height: Math.round(POST_H * scale) }}>
+        <div
+          aria-hidden
+          className={cn('pointer-events-none absolute left-0 top-0 origin-top-left select-none', dark && 'dark')}
+          style={{ width: POST_W, height: POST_H, transform: `scale(${scale})` }}
+        >
+          <div className="operator ink v1 bg-background text-foreground">
+            <SamplePost backHref="/v1-landing" />
+          </div>
+        </div>
+        <Link to="/v1-article" className="absolute inset-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring">
+          <span className="sr-only">Open the article example full size</span>
+        </Link>
+      </div>
+      <figcaption className="mt-2 flex items-baseline gap-2 text-xs">
+        <span className="op-label">{dark ? 'dark' : 'light'}</span>
+        <Link to="/v1-article" className="op-status ml-auto font-mono text-[11px]">/v1-article</Link>
+      </figcaption>
+    </figure>
+  )
+}
+
+/**
+ * The content-pages rules on the left, the page they describe on the right.
+ * The rules are about a shape, and the shape is two screens away otherwise.
+ */
+function ContentPagesSection() {
+  return (
+    <div className="grid items-start gap-x-8 gap-y-6 xl:grid-cols-[2fr_3fr]">
+      <div className="min-w-0">
+        <Md prefix="content-pages">{DOC_CONTENT_PAGES}</Md>
+      </div>
+      <div className="min-w-0 xl:sticky xl:top-6">
+        <p className="op-label mb-3 text-muted-foreground">live · the Article template carrying a real post</p>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <ArticleFrame />
+          <ArticleFrame dark />
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          One post, both grounds. The screenshot inside it is a pair too — a figure that ships
+          one is a figure that is broken in half its states.
+        </p>
+      </div>
+    </div>
   )
 }
 
@@ -2104,6 +2167,13 @@ const SECTIONS: readonly Section[] = [
         <LiveBlocks><ContentBlocks /></LiveBlocks>
       </>
     ),
+  },
+  {
+    id: 'content-pages',
+    label: 'Content pages',
+    source: 'content-pages.md · the Article template, live, carrying design-system/content/sample-post.md',
+    md: [DOC_CONTENT_PAGES],
+    body: <ContentPagesSection />,
   },
   {
     id: 'dataviz',

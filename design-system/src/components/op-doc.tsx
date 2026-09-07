@@ -81,7 +81,8 @@ export function Block({ id, title, rule, api, children }: { id: string; title: s
       <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
         <div className="min-w-0">
           <h2 className="op-h2">{title}</h2>
-          <div className="op-prose mt-2 space-y-2 text-sm text-muted-foreground">{rule}</div>
+          {/* The prose face, but not a prose body: `.op-raw` keeps the long-form rules off a doc block. */}
+          <div className="op-prose op-raw mt-2 space-y-2 text-sm text-muted-foreground">{rule}</div>
           {/* Focusable: a scrollable region a keyboard cannot reach is a serious
               axe violation, and these panes scroll at narrow widths. */}
           {api && (

@@ -37,6 +37,7 @@ const REFERENCE: readonly RefEntry[] = [
   { to: '/kitchen-sink', label: 'Kitchen sink' },
   { to: '/v1', label: 'Operator console v1' },
   { to: '/v1-landing', label: 'Landing v1' },
+  { to: '/v1-article', label: 'Article (a page that is read)' },
   { to: '/status-page', label: 'Status page' },
   { to: '/agent', label: 'Agent conversation' },
 ]
@@ -45,7 +46,7 @@ const REFERENCE: readonly RefEntry[] = [
  * Routes where the page, not the shell, owns `/` (and every other key): they
  * render a whole console or landing page, and its keyboard model is the point.
  */
-const PAGE_OWNS_SLASH = new Set(['/v1', '/v1-landing', '/status-page', '/agent', '/kitchen-sink'])
+const PAGE_OWNS_SLASH = new Set(['/v1', '/v1-landing', '/v1-article', '/status-page', '/agent', '/kitchen-sink'])
 
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme()

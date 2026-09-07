@@ -33,7 +33,16 @@ import { cn } from '@/lib/utils'
    and the Dashboard tab embeds the real v1 console shell.
    ──────────────────────────────────────────────────────────────────────── */
 
-const NAV = ['Docs', 'Blog', 'Roadmap', 'Pricing', 'Managed', 'Enterprise', 'Security', 'Contact']
+/**
+ * The nav, as label + destination. `Blog` is a real route in the sandbox: the
+ * worked long-form example lives at `/v1-article`, so the Article template is
+ * reachable from the place a reader would look for it rather than only from
+ * the guide. Everything else is a mockup link.
+ */
+const NAV: readonly { label: string; to?: string }[] = [
+  { label: 'Docs' }, { label: 'Blog', to: '/v1-article' }, { label: 'Roadmap' }, { label: 'Pricing' },
+  { label: 'Managed' }, { label: 'Enterprise' }, { label: 'Security' }, { label: 'Contact' },
+]
 
 // Hero strip: the real marks of what gets replaced, same as the live hero.
 const TOOLS = [
@@ -240,12 +249,57 @@ function Screen({ tab, view, setView }: { tab: Tour; view: string; setView: (v: 
   }
 }
 
+/**
+ * The landing's header, on its own so more than one page can wear it.
+ *
+ * A blog post is the same site as the landing: the reader arrived from it and
+ * has to be able to get back. A second, slightly different header on the
+ * article route would be the same site drawn twice, which is how a header
+ * starts to drift. So `/article` mounts this one.
+ */
+export function LandingHeader() {
+  const [menu, setMenu] = useState(false)
+  const health = statusSummary('temps')
+  return (
+    <header className="sticky top-0 z-30 grid grid-cols-[auto_1fr_auto] border-b bg-background">
+      <a href="#" className="flex h-12 items-center gap-2 border-r px-4"><LogoMark size={20} /><span className="text-sm font-semibold">Temps</span></a>
+      <nav className="hidden items-stretch lg:flex">
+        {NAV.map((n, i) => {
+          const cls = cn('flex items-center px-4 text-sm hover:bg-foreground hover:text-background', i > 0 && 'border-l')
+          const inner = <>{n.label}{n.label === 'Managed' && <span className="ml-2 border px-1.5 text-[10px] uppercase tracking-[0.1em]">beta</span>}</>
+          return n.to
+            ? <Link key={n.label} to={n.to} className={cls}>{inner}</Link>
+            : <a key={n.label} href="#" className={cls}>{inner}</a>
+        })}
+      </nav>
+      <div className="flex items-stretch">
+        {/* The status verdict, as the status page computes it: glyph + word, and the
+            link is the whole control. It opens the page alone, no sandbox chrome. */}
+        <Link to="/status?project=temps" title="Temps Cloud status" aria-label={`Temps Cloud status: ${health.word}`}
+          className="flex items-center border-l px-4 text-sm hover:bg-foreground hover:text-background">
+          <Status state={health.state} label={health.word} className="hidden font-mono text-xs sm:inline-flex" />
+          <Status state={health.state} label={health.state === 'ok' ? 'operational' : health.word} className="font-mono text-xs sm:hidden" />
+        </Link>
+        {/* The star count is decoration; below sm the status verdict takes its room. */}
+        <a href="#" className="hidden items-center gap-2 border-l px-4 text-sm hover:bg-foreground hover:text-background sm:flex"><Star className="h-4 w-4" /> <span className="font-mono text-xs">712</span></a>
+        <a href="#" className="bg-foreground text-background flex items-center px-4 text-sm">Download</a>
+        <button type="button" aria-label={menu ? 'Close menu' : 'Menu'} aria-expanded={menu} onClick={() => setMenu((m) => !m)} className="flex items-center border-l px-3 lg:hidden">{menu ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}</button>
+      </div>
+      {menu && (
+        <nav className="col-span-3 grid border-t lg:hidden">
+          {NAV.map((n) => n.to
+            ? <Link key={n.label} to={n.to} onClick={() => setMenu(false)} className="flex h-11 items-center border-b px-4 text-sm last:border-b-0">{n.label}</Link>
+            : <a key={n.label} href="#" onClick={() => setMenu(false)} className="flex h-11 items-center border-b px-4 text-sm last:border-b-0">{n.label}</a>)}
+        </nav>
+      )}
+    </header>
+  )
+}
+
 // ── Page ────────────────────────────────────────────────────────────────
 
 
 export function InkLandingV1Page({ full = false }: { /** Render without the sandbox layout: the landing as it would ship. Route `/landing`. */ full?: boolean }) {
-  const [menu, setMenu] = useState(false)
-  const health = statusSummary('temps')
   const [tab, setTab] = useState<Tour>('Dashboard')
   const [view, setView] = useState('projects')
   const [team, setTeam] = useState<string | null>(null)
@@ -258,34 +312,7 @@ export function InkLandingV1Page({ full = false }: { /** Render without the sand
       {/* Sandbox control, not part of the landing: toggles the chrome-free route. */}
       <Link to={full ? '/v1-landing' : '/landing'} aria-label={full ? 'Exit full screen' : 'Full screen'} title={full ? 'back to the sandbox page' : 'the landing alone, no sandbox chrome'} className="fixed bottom-4 right-4 z-40 inline-flex h-8 w-8 items-center justify-center border bg-background text-foreground shadow-sm hover:bg-muted [&_svg]:h-3.5 [&_svg]:w-3.5">{full ? <Minimize2 /> : <Maximize2 />}</Link>
       {/* Nav */}
-      <header className="sticky top-0 z-30 grid grid-cols-[auto_1fr_auto] border-b bg-background">
-        <a href="#" className="flex h-12 items-center gap-2 border-r px-4"><LogoMark size={20} /><span className="text-sm font-semibold">Temps</span></a>
-        <nav className="hidden items-stretch lg:flex">
-          {NAV.map((n, i) => (
-            <a key={n} href="#" className={cn('flex items-center px-4 text-sm hover:bg-foreground hover:text-background', i > 0 && 'border-l')}>
-              {n}{n === 'Managed' && <span className="ml-2 border px-1.5 text-[10px] uppercase tracking-[0.1em]">beta</span>}
-            </a>
-          ))}
-        </nav>
-        <div className="flex items-stretch">
-          {/* The status verdict, as the status page computes it: glyph + word, and the
-              link is the whole control. It opens the page alone, no sandbox chrome. */}
-          <Link to="/status?project=temps" title="Temps Cloud status" aria-label={`Temps Cloud status: ${health.word}`}
-            className="flex items-center border-l px-4 text-sm hover:bg-foreground hover:text-background">
-            <Status state={health.state} label={health.word} className="hidden font-mono text-xs sm:inline-flex" />
-            <Status state={health.state} label={health.state === 'ok' ? 'operational' : health.word} className="font-mono text-xs sm:hidden" />
-          </Link>
-          {/* The star count is decoration; below sm the status verdict takes its room. */}
-          <a href="#" className="hidden items-center gap-2 border-l px-4 text-sm hover:bg-foreground hover:text-background sm:flex"><Star className="h-4 w-4" /> <span className="font-mono text-xs">712</span></a>
-          <a href="#" className="bg-foreground text-background flex items-center px-4 text-sm">Download</a>
-          <button type="button" aria-label={menu ? 'Close menu' : 'Menu'} aria-expanded={menu} onClick={() => setMenu((m) => !m)} className="flex items-center border-l px-3 lg:hidden">{menu ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}</button>
-        </div>
-        {menu && (
-          <nav className="col-span-3 grid border-t lg:hidden">
-            {NAV.map((n) => <a key={n} href="#" onClick={() => setMenu(false)} className="flex h-11 items-center border-b px-4 text-sm last:border-b-0">{n}</a>)}
-          </nav>
-        )}
-      </header>
+      <LandingHeader />
 
       {/* Hero */}
       <section className="px-4 pb-10 pt-14 sm:px-8 lg:pt-20">

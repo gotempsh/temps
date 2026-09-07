@@ -110,6 +110,11 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - A free-text "please provide …" where typed options or a `Field` belong.
 - A `StreamBlock` that is a different shape or height from the block that lands.
 - An external link from a tool that was not a web search.
+- A hero illustration, stock photography, or a browser-chrome mockup around a screenshot.
+- A rounded or shadowed image. A screenshot with no frame, no caption or no alt.
+- A screenshot shipped on one ground only, when the product has two.
+- A picture carrying a fact the prose does not say.
+- A code block a reader has to retype, and a prose measure that is not capped inside its frame.
 
 ## Type
 
@@ -319,6 +324,18 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Separate facts with a spaced middle dot (`·`). No trailing period on a label, cell, button or tab. No exclamation marks. `…` only for truncation.
 - Format numbers, percentages, bytes, durations, counts and times through `fmt.ts`. Nothing is `–`; zero is `0`.
 - Give every relative time a `title` with the absolute stamp, and an id beside it.
+
+## Content pages
+
+- Dress every body of long-form prose with `.op-prose` — a post, a docs page, a changelog entry. One class, one copy of the rules.
+- Use `Article` for a page that is read top to bottom; `Detail` is for a record the reader came to act on.
+- Cap the measure inside the frame (`--op-measure`, ~68ch). Figures, tables and code panes are allowed past it.
+- Give an `Article` a table of contents as soon as it has two `h2`s, built from the rendered headings, and every entry a real link.
+- Frame every screenshot at 1px, caption it (`fig. 3 · …`), and ship it as a light/dark pair through `ImageFigure`.
+- Write the alt as what the picture shows and the caption as what to notice. Both, always.
+- Make every code block copyable: `CodeBlock` says the language, the filename and copies on itself.
+- Write a table as a ledger: `op-label` header, 1px rules, numbers right through `data-align="end"`.
+- Wrap a live block dropped into prose in `.op-raw`. It is a component, not prose.
 
 ## Locale
 

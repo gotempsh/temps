@@ -143,6 +143,10 @@ export const STANDALONE_ROUTES: ReadonlyArray<{ path: string; label: string }> =
   { path: '/console', label: '/console' },
   { path: '/landing', label: '/landing' },
   { path: '/op-components', label: '/op-components' },
+  // The fourth template, both ways it is mounted: chrome-free as it would
+  // ship, and inside the sandbox where the guide links to it.
+  { path: '/article', label: '/article' },
+  { path: '/v1-article', label: '/v1-article' },
 ]
 
 /** Report a moderate a11y violation as an annotation instead of a failure. */
