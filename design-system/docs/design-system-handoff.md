@@ -1480,6 +1480,18 @@ word -- then the text) newest first with open ones on top, then subscribe (email
 glyph vocabulary as the console, state tones only, no console chrome,
 "powered by temps" in the footer. It is per project: `?project=<slug>`.
 
+The landing header carries Temps Cloud's own verdict at its right end, as
+a link to `/status?project=temps` (the page alone, no sandbox chrome):
+`Status` glyph + word, `● all systems operational`, `× API down` or
+`◐ 2 components degraded`, computed by the same `statusSummary(project)`
+the page uses, so the indicator and the page cannot disagree. The
+storefront page keeps the incident scenario; the platform's page is quiet,
+because a marketing page pointing at a live outage is a different design
+problem. The whole cell is the link; below `sm` the word shortens to
+`operational` and the star count, which is decoration, gives it the room. It is the one place on the landing a state tone
+appears above the fold, which is what makes it readable as a verdict and
+not decoration.
+
 ### Proxy (`/v1?p=proxy`)
 
 `src/sections/ConsoleV1Proxy.tsx`. The live page is four metric cards and

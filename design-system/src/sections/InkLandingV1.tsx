@@ -22,6 +22,8 @@ import { ConsoleV1 } from '@/sections/ConsoleV1'
 import { PlatformLogo } from '@/components/platform-logos'
 import { SystemMapSection } from '@/components/system-map-section'
 import { PAGE_BLEED } from '@/components/shell-context'
+import { Status } from '@/components/op'
+import { statusSummary } from '@/sections/StatusPage'
 import { cn } from '@/lib/utils'
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -243,6 +245,7 @@ function Screen({ tab, view, setView }: { tab: Tour; view: string; setView: (v: 
 
 export function InkLandingV1Page({ full = false }: { /** Render without the sandbox layout: the landing as it would ship. Route `/landing`. */ full?: boolean }) {
   const [menu, setMenu] = useState(false)
+  const health = statusSummary('temps')
   const [tab, setTab] = useState<Tour>('Dashboard')
   const [view, setView] = useState('projects')
   const [team, setTeam] = useState<string | null>(null)
@@ -265,7 +268,15 @@ export function InkLandingV1Page({ full = false }: { /** Render without the sand
           ))}
         </nav>
         <div className="flex items-stretch">
-          <a href="#" className="flex items-center gap-2 border-l px-4 text-sm hover:bg-foreground hover:text-background"><Star className="h-4 w-4" /> <span className="font-mono text-xs">712</span></a>
+          {/* The status verdict, as the status page computes it: glyph + word, and the
+              link is the whole control. It opens the page alone, no sandbox chrome. */}
+          <Link to="/status?project=temps" title="Temps Cloud status" aria-label={`Temps Cloud status: ${health.word}`}
+            className="flex items-center border-l px-4 text-sm hover:bg-foreground hover:text-background">
+            <Status state={health.state} label={health.word} className="hidden font-mono text-xs sm:inline-flex" />
+            <Status state={health.state} label={health.state === 'ok' ? 'operational' : health.word} className="font-mono text-xs sm:hidden" />
+          </Link>
+          {/* The star count is decoration; below sm the status verdict takes its room. */}
+          <a href="#" className="hidden items-center gap-2 border-l px-4 text-sm hover:bg-foreground hover:text-background sm:flex"><Star className="h-4 w-4" /> <span className="font-mono text-xs">712</span></a>
           <a href="#" className="bg-foreground text-background flex items-center px-4 text-sm">Download</a>
           <button type="button" aria-label={menu ? 'Close menu' : 'Menu'} aria-expanded={menu} onClick={() => setMenu((m) => !m)} className="flex items-center border-l px-3 lg:hidden">{menu ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}</button>
         </div>

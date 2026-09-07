@@ -54,29 +54,72 @@ const INCIDENTS: Incident[] = [
     { t: '14:15', state: 'identified', text: 'The webhook worker stopped after a certificate expired. Deliveries are queued, not dropped.' },
   ] },
 ]
+/**
+ * One status page per project. The storefront is the incident scenario the
+ * page is designed around; Temps Cloud is the platform's own page, which the
+ * landing header links to, quiet on purpose: a marketing page pointing at a
+ * live outage would be a different design problem.
+ */
+type Fixture = { title: string; components: Component[]; incidents: Incident[] }
+const TEMPS_COMPONENTS: Component[] = [
+  { name: 'Console', group: 'Platform', state: 'ok', uptime90: 100, buckets: days(3) },
+  { name: 'API', group: 'Platform', state: 'ok', uptime90: 99.99, buckets: days(5, [], [61]) },
+  { name: 'Edge proxy', group: 'Platform', state: 'ok', uptime90: 100, buckets: days(7) },
+  { name: 'Builds', group: 'Platform', state: 'ok', uptime90: 99.98, buckets: days(2, [23]) },
+  { name: 'Managed databases', group: 'Services', state: 'ok', uptime90: 100, buckets: days(9) },
+  { name: 'Email delivery', group: 'Services', state: 'ok', uptime90: 100, buckets: days(4) },
+]
+const TEMPS_INCIDENTS: Incident[] = [
+  { id: 'inc_12', title: 'Builds queued longer than usual', state: 'error', affects: ['Builds'], started: 'Jul 2, 09:40 UTC', updates: [
+    { t: '10:25', state: 'resolved', text: 'The queue is drained. Build capacity has been doubled in the region.' },
+    { t: '09:48', state: 'identified', text: 'A burst of builds filled the queue in one region. Deploys are delayed, not failing.' },
+  ] },
+]
+const FIXTURES: Record<string, Fixture> = {
+  'acme-storefront': { title: 'Acme', components: COMPONENTS, incidents: INCIDENTS },
+  temps: { title: 'Temps Cloud', components: TEMPS_COMPONENTS, incidents: TEMPS_INCIDENTS },
+}
+export function fixtureFor(project: string): Fixture { return FIXTURES[project] ?? FIXTURES['acme-storefront'] }
+
 const WORD: Record<State, string> = { ok: 'operational', warn: 'degraded', error: 'outage', idle: 'maintenance', sampled: 'unknown', running: 'in progress' }
 const UPDATE_STATE: Record<Update['state'], State> = { investigating: 'error', identified: 'warn', monitoring: 'warn', resolved: 'ok' }
+
+/**
+ * The one-line answer the status page gives, for anything that links to it
+ * (the landing header). Computed from the same components the page draws, so
+ * the indicator and the page can never disagree.
+ */
+export function statusSummary(project = 'acme-storefront'): { state: State; word: string } {
+  const { components } = fixtureFor(project)
+  const state: State = components.some((c) => c.state === 'error') ? 'error' : components.some((c) => c.state === 'warn') ? 'warn' : 'ok'
+  const affected = components.filter((c) => c.state !== 'ok')
+  const word = state === 'ok' ? 'all systems operational'
+    : affected.length === 1 ? `${affected[0].name} ${state === 'error' ? 'down' : 'degraded'}`
+    : `${affected.length} components ${state === 'error' ? 'down' : 'degraded'}`
+  return { state, word }
+}
 
 export function StatusPage({ full = false }: { full?: boolean }) {
   const [params] = useSearchParams()
   const project = params.get('project') ?? 'acme-storefront'
+  const { components, incidents, title } = fixtureFor(project)
   const [email, setEmail] = useState('')
   const [subscribed, setSubscribed] = useState(false)
-  const worst: State = COMPONENTS.some((c) => c.state === 'error') ? 'error' : COMPONENTS.some((c) => c.state === 'warn') ? 'warn' : 'ok'
-  const affected = COMPONENTS.filter((c) => c.state !== 'ok')
-  const active = INCIDENTS.filter((i) => i.updates[0].state !== 'resolved')
-  const past = INCIDENTS.filter((i) => i.updates[0].state === 'resolved')
-  const groups = useMemo(() => [...new Set(COMPONENTS.map((c) => c.group))], [])
+  const worst: State = components.some((c) => c.state === 'error') ? 'error' : components.some((c) => c.state === 'warn') ? 'warn' : 'ok'
+  const affected = components.filter((c) => c.state !== 'ok')
+  const active = incidents.filter((i) => i.updates[0].state !== 'resolved')
+  const past = incidents.filter((i) => i.updates[0].state === 'resolved')
+  const groups = useMemo(() => [...new Set(components.map((c) => c.group))], [])
   // The legend is built from the states actually on the page (component states and the
   // 90-day strip), never from the full vocabulary.
-  const legend = useMemo(() => (['ok', 'warn', 'error', 'idle', 'sampled'] as State[]).filter((st) => COMPONENTS.some((c) => c.state === st || c.buckets.some((b) => b.state === st))), [])
+  const legend = useMemo(() => (['ok', 'warn', 'error', 'idle', 'sampled'] as State[]).filter((st) => components.some((c) => c.state === st || c.buckets.some((b) => b.state === st))), [])
   const verdict = worst === 'ok' ? 'All systems operational.' : worst === 'warn' ? `${affected.map((c) => c.name).join(' and ')} ${affected.length > 1 ? 'are' : 'is'} degraded.` : `${affected.filter((c) => c.state === 'error').map((c) => c.name).join(' and ')} ${affected.filter((c) => c.state === 'error').length > 1 ? 'are' : 'is'} down${affected.some((c) => c.state === 'warn') ? `; ${affected.filter((c) => c.state === 'warn').map((c) => c.name).join(', ')} degraded` : ''}.`
   return (
     <div className={full ? 'operator ink v1 min-h-screen' : `operator ink v1 min-h-[calc(100vh-3rem)] ${PAGE_BLEED}`}>
       <Link to={full ? '/status-page' : '/status'} aria-label={full ? 'Exit full screen' : 'Full screen'} className="fixed bottom-4 right-4 z-40 inline-flex h-8 w-8 items-center justify-center border bg-background text-foreground hover:bg-muted [&_svg]:h-3.5 [&_svg]:w-3.5">{full ? <Minimize2 /> : <Maximize2 />}</Link>
       <header className="border-b px-4 sm:px-8">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-4 py-4">
-          <span className="flex items-center gap-2 text-sm font-semibold"><ProjectMark name={project} icon={PROJECT_ICONS[project]} size={24} />{project.replace('acme-storefront', 'Acme')} status</span>
+          <span className="flex items-center gap-2 text-sm font-semibold"><ProjectMark name={project} icon={PROJECT_ICONS[project]} size={24} />{title} status</span>
           <nav className="flex items-center gap-4 text-xs text-muted-foreground"><a href="#incidents" className="hover:text-foreground">incidents</a><a href="#subscribe" className="hover:text-foreground">subscribe</a><a href="https://acme.sh" className="hover:text-foreground">acme.sh</a></nav>
         </div>
       </header>
@@ -91,7 +134,7 @@ export function StatusPage({ full = false }: { full?: boolean }) {
           <section key={g} className="mt-8">
             <h2 className="flex items-baseline gap-2 text-sm font-semibold leading-6"><span>{g}</span><span className="font-mono text-[11px] text-muted-foreground">90 days · one segment per day</span></h2>
             <ol className="mt-3 divide-y divide-[var(--op-rule-soft)] border bg-background">
-              {COMPONENTS.filter((c) => c.group === g).map((c) => (
+              {components.filter((c) => c.group === g).map((c) => (
                 <li key={c.name} className="px-4 py-3">
                   <div className="flex items-baseline justify-between gap-3 text-sm">
                     <span className="flex items-baseline gap-2"><span aria-hidden className={GLYPH_CLASS[c.state]}>{GLYPH[c.state]}</span><span className="font-medium">{c.name}</span><span className={`text-xs ${c.state === 'ok' ? 'text-muted-foreground' : GLYPH_CLASS[c.state]}`}>{WORD[c.state]}</span></span>
