@@ -46,7 +46,7 @@ interface FirstProjectOnboardingProps {
 // (see GitImportClone), so this is a true one-click deploy: pick the template,
 // Temps provisions the attached Postgres service, and the app deploys with
 // analytics, error tracking, and tracing already wired. The slug must match the
-// template registered in `temps-core/templates.yaml`.
+// template registered in `temps-core/templates/starters/`.
 const DEMO_TEMPLATE_SLUG = 'observability-starter'
 const DEMO_TEMPLATE_HREF = `/projects/new?source=templates&template=${DEMO_TEMPLATE_SLUG}`
 

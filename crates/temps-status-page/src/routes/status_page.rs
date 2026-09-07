@@ -1147,6 +1147,12 @@ fn map_error(error: StatusPageError) -> Problem {
                 .detail("Database error while processing status page request")
                 .build()
         }
+        StatusPageError::HttpClientBuild { source } => {
+            tracing::error!(error = %source, "status monitor HTTP client initialization failed");
+            internal_server_error()
+                .detail("Status monitoring is temporarily unavailable")
+                .build()
+        }
         StatusPageError::Internal(msg) => {
             tracing::error!("Internal error: {}", msg);
             internal_server_error().detail(&msg).build()

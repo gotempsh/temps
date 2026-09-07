@@ -712,6 +712,7 @@ impl CloudService {
                     credentials,
                     existing_count == 0,
                     true,
+                    None,
                 )
                 .await?;
                 Ok(UpsertOutcome::SameBucket)
@@ -1256,6 +1257,7 @@ mod tests {
     fn managed_row(id: i32, bucket_name: &str) -> temps_entities::s3_sources::Model {
         temps_entities::s3_sources::Model {
             id,
+            backing_service_id: None,
             name: MANAGED_BACKUP_SOURCE_NAME.to_string(),
             bucket_name: bucket_name.to_string(),
             bucket_path: "tenant".to_string(),

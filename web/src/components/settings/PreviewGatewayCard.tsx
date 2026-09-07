@@ -2,14 +2,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  getPreviewGatewayLogs,
+  getPreviewGatewaySettings,
+  getPreviewGatewayStatus,
+  patchPreviewGatewaySettings,
+  restartPreviewGateway,
+  upgradePreviewGateway,
+  type GatewayStatus,
+  type PreviewGatewaySettingsResponse,
+} from '@/api/client'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
+import {
   Card,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -23,83 +33,145 @@ import {
   RefreshCw,
   RotateCw,
   Save,
+  X,
   XCircle,
 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
-interface GatewayStatus {
-  present: boolean
-  running: boolean
-  image: string | null
-  image_digest: string | null
-  container_name: string
-  network: string | null
-  host_port: number | null
-  started_at: string | null
-  restart_count: number | null
-  expected_image: string
-  drift: boolean
-  auto_upgrade: boolean
-}
+import {
+  gatewayErrorAfterSuccessfulAction,
+  previewGatewayErrorMessage,
+  type GatewayAction,
+  type GatewayActionError,
+} from './preview-gateway-errors'
 
-interface GatewaySettings {
-  image: string
-  host_port: number
-  auto_upgrade: boolean
-  default_image: string
-  default_host_port: number
+export function PreviewGatewayErrorAlert({
+  error,
+  onDismiss,
+}: {
+  error: GatewayActionError
+  onDismiss: () => void
+}) {
+  return (
+    <Alert variant="destructive" aria-live="assertive">
+      <AlertTriangle className="h-4 w-4" />
+      <AlertTitle>{error.title}</AlertTitle>
+      <AlertDescription className="pr-8">{error.message}</AlertDescription>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="absolute right-2 top-2 h-8 w-8"
+        aria-label="Dismiss gateway error"
+        onClick={onDismiss}
+      >
+        <X className="h-4 w-4" />
+      </Button>
+    </Alert>
+  )
 }
 
 export function PreviewGatewayCard() {
   const [status, setStatus] = useState<GatewayStatus | null>(null)
-  const [settings, setSettings] = useState<GatewaySettings | null>(null)
+  const [settings, setSettings] =
+    useState<PreviewGatewaySettingsResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [imageInput, setImageInput] = useState('')
+  const [hostPortInput, setHostPortInput] = useState('')
   const [autoUpgrade, setAutoUpgrade] = useState(true)
   const [isDirty, setIsDirty] = useState(false)
   const [busy, setBusy] = useState<null | 'restart' | 'upgrade' | 'save'>(null)
   const [logs, setLogs] = useState<string[] | null>(null)
   const [logsLoading, setLogsLoading] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [actionError, setActionError] = useState<GatewayActionError | null>(
+    null
+  )
 
   const refresh = useCallback(async () => {
     try {
-      const [statusRes, settingsRes] = await Promise.all([
-        fetch('/api/preview-gateway/status'),
-        fetch('/api/preview-gateway/settings'),
+      const [statusResult, settingsResult] = await Promise.all([
+        getPreviewGatewayStatus(),
+        getPreviewGatewaySettings(),
       ])
-      if (statusRes.ok) setStatus(await statusRes.json())
-      if (settingsRes.ok) {
-        const s = (await settingsRes.json()) as GatewaySettings
+      if (statusResult.data) setStatus(statusResult.data)
+      if (settingsResult.data) {
+        const s = settingsResult.data
         setSettings(s)
         setImageInput(s.image)
+        setHostPortInput(String(s.host_port))
         setAutoUpgrade(s.auto_upgrade)
         setIsDirty(false)
       }
-    } catch {
-      // Endpoint may not exist on older versions
+
+      const error = statusResult.error ?? settingsResult.error
+      if (error !== undefined) {
+        setActionError({
+          action: 'refresh',
+          title: 'Failed to refresh preview gateway',
+          message: previewGatewayErrorMessage(
+            error,
+            'Gateway status or settings could not be loaded.',
+            settingsResult.data?.host_port ?? statusResult.data?.host_port
+          ),
+        })
+      } else {
+        setActionError((current) =>
+          gatewayErrorAfterSuccessfulAction(current, 'refresh')
+        )
+      }
+    } catch (error) {
+      setActionError({
+        action: 'refresh',
+        title: 'Failed to refresh preview gateway',
+        message: previewGatewayErrorMessage(
+          error,
+          'Gateway status or settings could not be loaded.'
+        ),
+      })
     } finally {
       setLoading(false)
     }
   }, [])
 
   useEffect(() => {
+    // The initial request synchronizes this card with the external gateway
+    // service; state updates happen only after the awaited HTTP responses.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refresh()
   }, [refresh])
+
+  const reportActionError = (
+    action: GatewayAction,
+    title: string,
+    fallback: string,
+    error: unknown
+  ) => {
+    const message = previewGatewayErrorMessage(
+      error,
+      fallback,
+      settings?.host_port ?? status?.host_port
+    )
+    setActionError({ action, title, message })
+    toast.error(title, { description: message })
+  }
 
   const handleRestart = async () => {
     setBusy('restart')
     try {
-      const res = await fetch('/api/preview-gateway/restart', { method: 'POST' })
-      if (res.ok) {
-        toast.success('Preview gateway restarted')
-        await refresh()
-      } else {
-        toast.error('Failed to restart gateway')
-      }
-    } catch {
-      toast.error('Failed to restart gateway')
+      await restartPreviewGateway({ throwOnError: true })
+      setActionError((current) =>
+        gatewayErrorAfterSuccessfulAction(current, 'restart')
+      )
+      toast.success('Preview gateway restarted')
+      await refresh()
+    } catch (error) {
+      reportActionError(
+        'restart',
+        'Failed to restart preview gateway',
+        'The preview gateway could not be restarted.',
+        error
+      )
     } finally {
       setBusy(null)
     }
@@ -108,43 +180,62 @@ export function PreviewGatewayCard() {
   const handleUpgrade = async () => {
     setBusy('upgrade')
     try {
-      const res = await fetch('/api/preview-gateway/upgrade', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: imageInput.trim() }),
+      await upgradePreviewGateway({
+        body: { image: imageInput.trim() },
+        throwOnError: true,
       })
-      if (res.ok) {
-        toast.success('Preview gateway upgraded')
-        await refresh()
-      } else {
-        toast.error('Failed to upgrade gateway')
-      }
-    } catch {
-      toast.error('Failed to upgrade gateway')
+      setActionError((current) =>
+        gatewayErrorAfterSuccessfulAction(current, 'upgrade')
+      )
+      toast.success('Preview gateway upgraded')
+      await refresh()
+    } catch (error) {
+      reportActionError(
+        'upgrade',
+        'Failed to upgrade preview gateway',
+        'The preview gateway image could not be applied.',
+        error
+      )
     } finally {
       setBusy(null)
     }
   }
 
   const handleSaveSettings = async () => {
+    const hostPort = Number(hostPortInput)
+    if (!Number.isInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+      const message = 'Host port must be a whole number between 1 and 65535.'
+      setActionError({
+        action: 'save',
+        title: 'Invalid preview gateway settings',
+        message,
+      })
+      toast.error('Invalid preview gateway settings', { description: message })
+      return
+    }
+
     setBusy('save')
     try {
-      const res = await fetch('/api/preview-gateway/settings', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      await patchPreviewGatewaySettings({
+        body: {
           image: imageInput.trim() || undefined,
+          host_port: hostPort,
           auto_upgrade: autoUpgrade,
-        }),
+        },
+        throwOnError: true,
       })
-      if (res.ok) {
-        toast.success('Settings saved')
-        await refresh()
-      } else {
-        toast.error('Failed to save settings')
-      }
-    } catch {
-      toast.error('Failed to save settings')
+      setActionError((current) =>
+        gatewayErrorAfterSuccessfulAction(current, 'save')
+      )
+      toast.success('Settings saved')
+      await refresh()
+    } catch (error) {
+      reportActionError(
+        'save',
+        'Failed to save gateway settings',
+        'The preview gateway settings could not be saved.',
+        error
+      )
     } finally {
       setBusy(null)
     }
@@ -160,15 +251,21 @@ export function PreviewGatewayCard() {
   const handleFetchLogs = async () => {
     setLogsLoading(true)
     try {
-      const res = await fetch('/api/preview-gateway/logs?tail=200')
-      if (res.ok) {
-        const data = (await res.json()) as { lines: string[] }
-        setLogs(data.lines)
-      } else {
-        toast.error('Failed to fetch logs')
-      }
-    } catch {
-      toast.error('Failed to fetch logs')
+      const { data } = await getPreviewGatewayLogs({
+        query: { tail: 200 },
+        throwOnError: true,
+      })
+      setLogs(data.lines)
+      setActionError((current) =>
+        gatewayErrorAfterSuccessfulAction(current, 'logs')
+      )
+    } catch (error) {
+      reportActionError(
+        'logs',
+        'Failed to fetch gateway logs',
+        'Gateway logs could not be loaded.',
+        error
+      )
     } finally {
       setLogsLoading(false)
     }
@@ -201,11 +298,23 @@ export function PreviewGatewayCard() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
+        {actionError && (
+          <PreviewGatewayErrorAlert
+            error={actionError}
+            onDismiss={() => setActionError(null)}
+          />
+        )}
+
         {/* Status */}
         <div className="rounded-lg border p-4 space-y-3">
           <div className="flex items-center justify-between">
             <h4 className="text-sm font-medium">Status</h4>
-            <Button variant="ghost" size="sm" onClick={refresh}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={refresh}
+              aria-label="Refresh preview gateway status"
+            >
               <RefreshCw className="h-3.5 w-3.5" />
             </Button>
           </div>
@@ -274,6 +383,31 @@ export function PreviewGatewayCard() {
               Could not fetch gateway status.
             </p>
           )}
+        </div>
+
+        {/* Host port */}
+        <div className="space-y-2">
+          <Label htmlFor="gateway-host-port">Gateway host port</Label>
+          <Input
+            id="gateway-host-port"
+            type="number"
+            min={1}
+            max={65535}
+            value={hostPortInput}
+            onChange={(event) => {
+              setHostPortInput(event.target.value)
+              setIsDirty(true)
+            }}
+            className="max-w-40 font-mono text-sm"
+            aria-describedby="gateway-host-port-description"
+          />
+          <p
+            id="gateway-host-port-description"
+            className="text-sm text-muted-foreground"
+          >
+            Bound only on 127.0.0.1. If another process uses this port, choose a
+            free port, save settings, then restart the gateway.
+          </p>
         </div>
 
         {/* Image */}

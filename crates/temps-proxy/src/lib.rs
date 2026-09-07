@@ -13,6 +13,7 @@
 
 pub mod ai_agent_detector;
 pub mod branded_404;
+pub mod bunny_ips;
 pub mod cloudflare_ips;
 pub mod config;
 mod connection_limiter;

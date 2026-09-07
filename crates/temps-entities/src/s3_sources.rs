@@ -65,6 +65,10 @@ pub struct Model {
     pub lifecycle_reconcile_generation: i32,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    /// Managed external service that supplies this destination, when any.
+    /// Backup schedules must never target this service because doing so would
+    /// recursively write a backup into itself.
+    pub backing_service_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -73,6 +77,12 @@ pub enum Relation {
     BackupSchedules,
     #[sea_orm(has_many = "super::backups::Entity")]
     Backups,
+    #[sea_orm(
+        belongs_to = "super::external_services::Entity",
+        from = "Column::BackingServiceId",
+        to = "super::external_services::Column::Id"
+    )]
+    BackingService,
 }
 
 impl Related<super::backup_schedules::Entity> for Entity {
@@ -84,6 +94,12 @@ impl Related<super::backup_schedules::Entity> for Entity {
 impl Related<super::backups::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Backups.def()
+    }
+}
+
+impl Related<super::external_services::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::BackingService.def()
     }
 }
 
@@ -275,6 +291,7 @@ pub async fn insert_encrypted<C: ConnectionTrait>(
     credentials: S3SourceCredentials,
     is_default: bool,
     managed_by_cloud: bool,
+    backing_service_id: Option<i32>,
 ) -> Result<Model, S3SourceCredentialError> {
     let columns = encrypt_credentials(encryption, &credentials)?;
     let now = chrono::Utc::now();
@@ -294,6 +311,7 @@ pub async fn insert_encrypted<C: ConnectionTrait>(
         managed_by_cloud: Set(managed_by_cloud),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        backing_service_id: Set(backing_service_id),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -388,6 +406,7 @@ mod tests {
             lifecycle_reconcile_generation: 0,
             created_at: now,
             updated_at: now,
+            backing_service_id: None,
         }
     }
 

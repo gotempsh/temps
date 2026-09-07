@@ -609,6 +609,7 @@ mod tests {
             max_runtime_secs: None,
             target_all_services: true,
             include_control_plane: true,
+            generated_kind: None,
         }
     }
 
@@ -894,6 +895,7 @@ mod tests {
                 lifecycle_reconcile_generation: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
+                backing_service_id: Set(None),
             }
         };
 
@@ -933,6 +935,7 @@ mod tests {
                 max_runtime_secs: Set(None),
                 target_all_services: Set(false),
                 include_control_plane: Set(true),
+                generated_kind: Set(None),
             }
         };
 
@@ -1000,6 +1003,7 @@ mod tests {
 
         let source = temps_entities::s3_sources::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
+            backing_service_id: Set(None),
             name: Set("disabled-with-pending-retry".to_string()),
             bucket_name: Set("disabled-with-pending-retry-bucket".to_string()),
             bucket_path: Set("/".to_string()),
@@ -1023,6 +1027,7 @@ mod tests {
 
         temps_entities::backup_schedules::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
+            generated_kind: Set(None),
             name: Set("disabled-sched".to_string()),
             backup_type: Set("full".to_string()),
             retention_period: Set(7),
@@ -1101,6 +1106,7 @@ mod tests {
 
         let source = temps_entities::s3_sources::ActiveModel {
             id: sea_orm::ActiveValue::NotSet,
+            backing_service_id: Set(None),
             name: Set("overlapping-reconciles".to_string()),
             bucket_name: Set("overlapping-reconciles-bucket".to_string()),
             bucket_path: Set("/".to_string()),

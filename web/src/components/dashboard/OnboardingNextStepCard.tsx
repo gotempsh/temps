@@ -90,14 +90,14 @@ export function OnboardingNextStepCard() {
           </div>
         </div>
 
-        <div className="flex w-full shrink-0 items-center justify-end gap-2 pl-12 sm:w-auto sm:pl-0">
-          <Button asChild size="sm">
+        <div className="flex w-full shrink-0 flex-col items-stretch gap-2 sm:w-auto sm:flex-row sm:items-center sm:justify-end">
+          <Button asChild size="sm" className="w-full sm:w-auto">
             <Link to={selectedStep.href}>
-              {selectedStep.cta}
+              <span className="truncate">{selectedStep.cta}</span>
               <ArrowRight className="size-3.5" />
             </Link>
           </Button>
-          <div className="flex w-[7.5rem] shrink-0 items-center justify-end gap-2">
+          <div className="flex w-[7.5rem] shrink-0 self-end items-center justify-end gap-2">
             <Button
               variant="ghost"
               size="icon"

@@ -17,8 +17,6 @@
  */
 
 import {
-  attachScheduleServicesMutation,
-  detachScheduleServiceMutation,
   getBackupScheduleOptions,
   getS3SourceOptions,
   listScheduleServicesOptions,
@@ -142,55 +140,10 @@ export function EditBackupSchedule() {
 
   usePageTitle(schedule ? `Edit — ${schedule.name}` : 'Edit Schedule')
 
-  const attachMutation = useMutation({
-    ...attachScheduleServicesMutation(),
-    meta: { errorTitle: 'Failed to attach services' },
-  })
-  const detachMutation = useMutation({
-    ...detachScheduleServiceMutation(),
-    meta: { errorTitle: 'Failed to detach service' },
-  })
-
   const mutation = useMutation({
     ...updateBackupScheduleMutation(),
     meta: { errorTitle: 'Failed to update schedule' },
-    onSuccess: async () => {
-      // If we're in 'specific' mode, diff the current vs. desired
-      // membership and apply attach/detach calls. The backend already
-      // cleared the join table when the user flipped to 'all' mode, so
-      // there's nothing to do for that branch.
-      if (backupMode === 'specific' && attachedServices) {
-        const current = new Set(attachedServices.map((s) => s.id))
-        const desired = new Set(selectedServiceIds)
-        const toAttach = [...desired].filter((id) => !current.has(id))
-        const toDetach = [...current].filter((id) => !desired.has(id))
-
-        try {
-          if (toAttach.length > 0) {
-            await attachMutation.mutateAsync({
-              path: { id: scheduleIdNum! },
-              body: { service_ids: toAttach },
-            })
-          }
-          for (const sid of toDetach) {
-            await detachMutation.mutateAsync({
-              path: { id: scheduleIdNum!, service_id: sid },
-            })
-          }
-        } catch {
-          toast.warning(
-            'Schedule saved, but updating backup targets failed. You can retry from the schedule detail page.',
-          )
-          void queryClient.invalidateQueries({
-            queryKey: listScheduleServicesQueryKey({
-              path: { id: scheduleIdNum! },
-            }),
-          })
-          navigate(`/backups/s3-sources/${id}`)
-          return
-        }
-      }
-
+    onSuccess: () => {
       toast.success('Backup schedule updated')
       void queryClient.invalidateQueries({
         queryKey: ['list-backup-schedules'],
@@ -275,23 +228,24 @@ export function EditBackupSchedule() {
       body.include_control_plane = includeControlPlane
     }
 
+    if (backupMode === 'specific') {
+      const currentIds = new Set(
+        (attachedServices ?? []).map((service) => service.id),
+      )
+      const selectionChanged =
+        currentIds.size !== selectedServiceIds.length ||
+        selectedServiceIds.some((serviceId) => !currentIds.has(serviceId))
+      if (selectionChanged || schedule.target_all_services) {
+        body.service_ids = selectedServiceIds
+      }
+    }
+
     if (backupMode === 'specific' && selectedServiceIds.length === 0) {
       toast.error(
         'Select at least one database, or switch back to "All databases."',
       )
       return
     }
-    if (
-      backupMode === 'specific' &&
-      selectedServiceIds.length === 0 &&
-      !includeControlPlane
-    ) {
-      toast.error(
-        'This schedule would have nothing to back up. Enable the control plane or pick at least one database.',
-      )
-      return
-    }
-
     mutation.mutate({ path: { id: scheduleIdNum! }, body })
   }
 
@@ -414,7 +368,8 @@ export function EditBackupSchedule() {
                       className="mt-1"
                     />
                     <p className="text-xs text-muted-foreground mt-1">
-                      Format: second minute hour day month weekday
+                      Format: second minute hour day month weekday. Use names
+                      such as SUN for weekdays.
                     </p>
                   </div>
                 )}
@@ -469,11 +424,7 @@ export function EditBackupSchedule() {
                     <ScheduleServicesSelector
                       value={selectedServiceIds}
                       onChange={setSelectedServiceIds}
-                      disabled={
-                        mutation.isPending ||
-                        attachMutation.isPending ||
-                        detachMutation.isPending
-                      }
+                      disabled={mutation.isPending || !seededServices}
                     />
                   </div>
                 )}
@@ -496,11 +447,7 @@ export function EditBackupSchedule() {
                     id="edit-include-control-plane"
                     checked={includeControlPlane}
                     onCheckedChange={setIncludeControlPlane}
-                    disabled={
-                      mutation.isPending ||
-                      attachMutation.isPending ||
-                      detachMutation.isPending
-                    }
+                    disabled={mutation.isPending}
                   />
                 </div>
               </div>
@@ -560,7 +507,12 @@ export function EditBackupSchedule() {
           </Button>
           <Button
             onClick={handleSubmit}
-            disabled={mutation.isPending || isLoadingSchedule || !seeded}
+            disabled={
+              mutation.isPending ||
+              isLoadingSchedule ||
+              !seeded ||
+              !seededServices
+            }
           >
             {mutation.isPending ? 'Saving…' : 'Save changes'}
           </Button>

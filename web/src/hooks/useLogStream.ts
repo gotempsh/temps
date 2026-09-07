@@ -46,7 +46,7 @@ export function buildLogStreamUrl(
 export interface UseLogStreamReturn {
   logs: LiveLogLine[]
   filteredLogs: LiveLogLine[]
-  connectionStatus: 'connecting' | 'connected' | 'error'
+  connectionStatus: 'connecting' | 'connected' | 'complete' | 'error'
   errorMessage: string
   searchTerm: string
   selectedLevels: LiveLogLevel[]
@@ -124,7 +124,7 @@ export function useLogStream({
 }: UseLogStreamOptions): UseLogStreamReturn {
   const [logs, setLogs] = useState<LiveLogLine[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
-    'connecting' | 'connected' | 'error'
+    'connecting' | 'connected' | 'complete' | 'error'
   >('connecting')
   const [errorMessage, setErrorMessage] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
@@ -259,8 +259,14 @@ export function useLogStream({
         onError?.(msg)
       }
 
-      ws.onclose = () => {
-        setConnectionStatus('error')
+      ws.onclose = (event) => {
+        setConnectionStatus(event.code === 1000 ? 'complete' : 'error')
+        if (event.code !== 1000) {
+          const msg =
+            event.reason || `Log stream closed unexpectedly (${event.code})`
+          setErrorMessage(msg)
+          onError?.(msg)
+        }
         isConnectingRef.current = false
       }
 

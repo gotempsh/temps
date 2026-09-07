@@ -860,12 +860,12 @@ export function ManualProjectConfigurator({
                         </FormControl>
                         <div className="space-y-1">
                           <FormLabel className="text-sm">
-                            Encrypt as secret
+                            Treat as secret
                           </FormLabel>
                           <p className="text-xs text-muted-foreground">
-                            Secret values are write-only after creation. Use
-                            this for passwords, tokens, and private connection
-                            strings.
+                            All values are encrypted at rest. Enable this for
+                            stricter masking, permission checks, and audited
+                            reveals.
                           </p>
                         </div>
                       </FormItem>
@@ -1014,6 +1014,9 @@ export function ManualProjectConfigurator({
           }
         }}
         serviceType={selectedServiceType || 'postgres'}
+        successMessage={(service) =>
+          `Database "${service.name}" created successfully!`
+        }
         onSuccess={(service: ExternalServiceInfo) => {
           setIsCreateServiceDialogOpen(false)
           setNewlyCreatedServices((previousServices) =>
@@ -1029,7 +1032,6 @@ export function ManualProjectConfigurator({
             Array.from(new Set([...currentServices, service.id]))
           )
           void refetchServices()
-          toast.success(`Database "${service.name}" created successfully!`)
         }}
       />
     </div>

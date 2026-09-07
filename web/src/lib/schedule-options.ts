@@ -27,7 +27,9 @@ export const scheduleOptions: ScheduleOption[] = [
   },
   {
     label: 'Weekly',
-    value: '0 0 0 * * 0',
+    // Named weekdays avoid the incompatible numeric conventions used by
+    // common Unix cron (0 = Sunday) and the Rust cron parser (1 = Sunday).
+    value: '0 0 0 * * SUN',
     description: 'Runs every Sunday at midnight',
   },
   {

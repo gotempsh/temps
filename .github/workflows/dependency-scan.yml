@@ -153,6 +153,16 @@ jobs:
       #   date) that the requirement is unchanged -- upgrading aws-sdk-s3
       #   does not pull the fixed lru 0.18.2.
       # Remove an entry once its upstream is fixed/replaced.
+      # Install a checksum-verified release binary before audit-check runs.
+      # audit-check otherwise compiles cargo-audit from a newly-resolved
+      # dependency graph, which can fail independently of this repository's
+      # Cargo.lock (for example, when an upstream build-only crate is broken).
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
       - name: Run cargo-audit
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:

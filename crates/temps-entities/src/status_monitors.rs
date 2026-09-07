@@ -19,6 +19,7 @@ pub struct Model {
     pub check_path: Option<String>,
     pub check_interval_seconds: i32,
     pub is_active: bool,
+    pub is_managed: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

@@ -233,6 +233,36 @@ impl AuditOperation for EmailDomainVerifiedAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct EmailDomainImportedAudit {
+    pub context: AuditContext,
+    pub domain_id: i32,
+    pub domain: String,
+    pub provider_id: i32,
+}
+
+impl AuditOperation for EmailDomainImportedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_DOMAIN_IMPORTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EmailDomainDeletedAudit {
     pub context: AuditContext,
     pub domain_id: i32,

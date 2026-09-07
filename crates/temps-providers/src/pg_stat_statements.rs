@@ -207,6 +207,109 @@ pub struct SlowQueryRow {
     pub cache_hit_ratio: Option<f64>,
 }
 
+const REDACTED_SQL_STATEMENT: &str = "[REDACTED: secret-bearing SQL statement]";
+
+/// Remove values that must never leave the server through query-observability
+/// APIs. PostgreSQL normally normalizes DML literals to `$N`, but utility
+/// statements such as `CREATE ROLE ... PASSWORD '...'` may retain their
+/// original text in `pg_stat_statements`.
+///
+/// Query-observability is not a SQL execution path and therefore must not try
+/// to be a second, incomplete PostgreSQL parser. Statements containing
+/// literals or comments are suppressed completely: those are precisely the
+/// constructs in which retained utility-query credentials can hide, and a
+/// context-blind literal scanner can be confused by comments, quoted
+/// identifiers, or PostgreSQL string-mode rules. Normalized DML remains useful
+/// because `pg_stat_statements` represents its values as `$N` placeholders.
+fn redact_sql_for_observability(query: &str) -> String {
+    if contains_sql_literal_or_comment(query) || contains_secret_bearing_sql(query) {
+        return REDACTED_SQL_STATEMENT.to_string();
+    }
+    query.to_string()
+}
+
+fn contains_sql_literal_or_comment(query: &str) -> bool {
+    query.contains('\'')
+        || query.contains("--")
+        || query.contains("/*")
+        || query
+            .match_indices('$')
+            .any(|(index, _)| dollar_quote_delimiter_end(query, index).is_some())
+}
+
+fn dollar_quote_delimiter_end(query: &str, start: usize) -> Option<usize> {
+    let remainder = query.get(start + 1..)?;
+    let tag_end = remainder.find('$')?;
+    let tag = &remainder[..tag_end];
+    if tag.is_empty() {
+        return Some(start + 2);
+    }
+
+    let mut characters = tag.chars();
+    let first = characters.next()?;
+    if !(first == '_' || first.is_alphabetic() || !first.is_ascii()) {
+        return None;
+    }
+    if !characters
+        .all(|character| character == '_' || character.is_alphanumeric() || !character.is_ascii())
+    {
+        return None;
+    }
+
+    Some(start + 1 + tag_end + 1)
+}
+
+fn contains_secret_bearing_sql(query: &str) -> bool {
+    let lowercase = query.to_ascii_lowercase();
+    if lowercase.contains("://") {
+        return true;
+    }
+
+    let words = lowercase
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+
+    if words.iter().any(|word| {
+        *word == "set"
+            || *word == "set_config"
+            || is_sensitive_sql_word(word)
+            || word.split('_').any(is_sensitive_sql_word)
+    }) {
+        return true;
+    }
+
+    words
+        .windows(2)
+        .any(|pair| matches!(pair[0], "api" | "access" | "private" | "signing") && pair[1] == "key")
+}
+
+fn is_sensitive_sql_word(word: &str) -> bool {
+    let exact_or_suffix = matches!(
+        word,
+        "password"
+            | "passwd"
+            | "secret"
+            | "token"
+            | "apikey"
+            | "api_key"
+            | "access_key"
+            | "private_key"
+            | "authorization"
+            | "credential"
+            | "credentials"
+            | "bearer"
+    ) || word.ends_with("_api_key")
+        || word.ends_with("_access_key")
+        || word.ends_with("_access_key_id")
+        || word.ends_with("_private_key");
+    let components = word.split('_').collect::<Vec<_>>();
+    exact_or_suffix
+        || components
+            .windows(2)
+            .any(|pair| matches!(pair[0], "api" | "access" | "private") && pair[1] == "key")
+}
+
 /// Column a slow-queries listing may be sorted by.
 ///
 /// Deliberately a closed enum rather than a raw column-name string: the SQL
@@ -789,7 +892,7 @@ impl PgStatStatementsService {
                     })?;
 
             result.push(SlowQueryRow {
-                query,
+                query: redact_sql_for_observability(&query),
                 database,
                 calls,
                 total_exec_time_ms: total_exec_time,
@@ -844,6 +947,106 @@ mod tests {
             Value::Int(Some(argument_count)),
         );
         row
+    }
+
+    #[test]
+    fn query_observability_redacts_postgres_literal_forms() {
+        let cases = [
+            "SELECT 'TEST_ONLY_SENTINEL_STANDARD'",
+            "SELECT E'TEST_ONLY_SENTINEL_E\\'SCAPED'",
+            "SELECT U&'TEST_ONLY_SENTINEL_UNICODE'",
+            "SELECT 'TEST_ONLY_SENTINEL_''DOUBLED'",
+            "SELECT $$TEST_ONLY_SENTINEL_DOLLAR$$",
+            "SELECT $safe_tag$TEST_ONLY_SENTINEL_TAGGED$safe_tag$",
+            "SELECT $tëst$TEST_ONLY_SENTINEL_UNICODE_TAG$tëst$",
+            "SELECT $TEST_ONLY_SENTINEL_TAG$payload$TEST_ONLY_SENTINEL_TAG$",
+            "SELECT 'TEST_ONLY_SENTINEL_UNTERMINATED",
+            "SELECT 'TEST_ONLY_SENTINEL_MULTIBYTE_áéí'",
+        ];
+
+        for query in cases {
+            let redacted = redact_sql_for_observability(query);
+            assert!(
+                !redacted.contains("TEST_ONLY_SENTINEL"),
+                "literal leaked from query: {query}"
+            );
+            assert_eq!(redacted, REDACTED_SQL_STATEMENT);
+        }
+    }
+
+    #[test]
+    fn query_observability_suppresses_secret_bearing_statements() {
+        let cases = [
+            "CrEaTe RoLe sample LOGIN PASSWORD 'TEST_ONLY_SENTINEL_ROLE'",
+            "ALTER USER sample ENCRYPTED PASSWORD E'TEST_ONLY_SENTINEL_ALTER' VALID UNTIL 'infinity'",
+            "ALTER SYSTEM SET app.api_token = 'TEST_ONLY_SENTINEL_SYSTEM'",
+            "SELECT set_config('client_secret', 'TEST_ONLY_SENTINEL_CONFIG', false)",
+            "SELECT dblink_connect('postgresql://sample:TEST_ONLY_SENTINEL_URI@db.invalid/app')",
+            "SET authorization = TEST_ONLY_SENTINEL_UNQUOTED",
+            "SET app.db_password = TEST_ONLY_SENTINEL_CUSTOM_GUC",
+            "ALTER ROLE sample SET app.refresh_token = TEST_ONLY_SENTINEL_ROLE_GUC",
+            "SET app.api_key = TEST_ONLY_SENTINEL_API_KEY",
+            "ALTER SYSTEM SET app.access_key = TEST_ONLY_SENTINEL_ACCESS_KEY",
+            "SET aws.aws_access_key_id = TEST_ONLY_SENTINEL_AWS_KEY",
+            "SET app.access_key_id = TEST_ONLY_SENTINEL_ACCESS_KEY_ID",
+            "ALTER SYSTEM SET app.api_key_value = TEST_ONLY_SENTINEL_API_KEY_VALUE",
+            "ALTER ROLE sample SET tls.private_key = TEST_ONLY_SENTINEL_PRIVATE_KEY",
+            "SELECT 1 /* Authorization: Bearer TEST_ONLY_SENTINEL_BEARER */",
+            "SELECT 1 /* Authorization: Bearer\tTEST_ONLY_SENTINEL_TAB */",
+            "SELECT 1 /* Authorization: Bearer\nTEST_ONLY_SENTINEL_NEWLINE */",
+            "SELECT 1 /* X-Api-Key: TEST_ONLY_SENTINEL_HEADER */",
+            "SELECT 1 /* nats://u:TEST_ONLY_SENTINEL_NATS@host */",
+            "ALTER SYSTEM SET app.signing_key = TEST_ONLY_SENTINEL_SIGNING_KEY",
+            "COMMENT ON TABLE decoy$x$ IS $x$TEST_ONLY_SENTINEL_IDENTIFIER$x$",
+            "COMMENT ON TABLE sample IS /* ' */ 'TEST_ONLY_SENTINEL_COMMENT'",
+            "SET search_path = '\\', 'TEST_ONLY_SENTINEL_STANDARD_MODE'",
+            "SELECT 1; CREATE ROLE sample PASSWORD $pw$TEST_ONLY_SENTINEL_MULTI$pw$",
+        ];
+
+        for query in cases {
+            assert_eq!(
+                redact_sql_for_observability(query),
+                REDACTED_SQL_STATEMENT,
+                "secret-bearing query was not suppressed: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_observability_preserves_structure_and_placeholders() {
+        let query = "SELECT \"token\", value FROM measurements WHERE id = $1 AND label = 'public'";
+        let redacted = redact_sql_for_observability(query);
+
+        // A quoted identifier named token is still conservatively treated as
+        // secret-bearing. The important invariant is that no value crosses
+        // the API boundary when the statement is ambiguous.
+        assert_eq!(redacted, REDACTED_SQL_STATEMENT);
+
+        let ordinary = redact_sql_for_observability(
+            "SELECT \"display_name\" FROM measurements WHERE id = $1 AND sample_id = $2",
+        );
+        assert!(ordinary.contains("\"display_name\""));
+        assert!(ordinary.contains("$1"));
+        assert!(ordinary.contains("$2"));
+    }
+
+    #[test]
+    fn serialized_slow_query_row_never_contains_literal_sentinel() {
+        let row = SlowQueryRow {
+            query: redact_sql_for_observability(
+                "SELECT * FROM audit WHERE note = 'TEST_ONLY_SENTINEL_SERIALIZED'",
+            ),
+            database: "sample".to_string(),
+            calls: 1,
+            total_exec_time_ms: 1.0,
+            mean_exec_time_ms: 1.0,
+            rows: 1,
+            cache_hit_ratio: Some(1.0),
+        };
+
+        let serialized = serde_json::to_string(&row).expect("test DTO must serialize");
+        assert!(!serialized.contains("TEST_ONLY_SENTINEL"));
+        assert!(serialized.contains(REDACTED_SQL_STATEMENT));
     }
 
     #[test]
@@ -948,9 +1151,8 @@ mod tests {
         assert!(!rows.is_empty(), "statistics page should contain rows");
         assert!(rows.iter().all(|row| row.calls > 0));
         assert!(
-            rows.iter()
-                .any(|row| row.query.contains("temps_pgstat_reset_probe")),
-            "statistics page should decode the tagged sample query"
+            rows.iter().any(|row| row.query == REDACTED_SQL_STATEMENT),
+            "statistics page should decode and suppress the tagged sample query"
         );
 
         PgStatStatementsService::reset_on_client(&client, 42)

@@ -4172,12 +4172,15 @@ mod tests {
             allow_alternate_sources: None,
             ai_write_actions_enabled: false,
             error_source_context_enabled: true,
+            vulnerability_scanning_enabled: false,
             error_source_root: None,
             enable_preview_environments: true,
             preview_envs_on_demand: false,
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
             cross_project_trace_sharing: true,
         }
     }

@@ -84,6 +84,7 @@ import {
   SERVICE_ALERT_COMPARATOR_OPTIONS,
   type ServiceAlertComparator,
 } from '@/lib/service-alert-comparator'
+import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -1460,6 +1461,11 @@ export function ServiceMonitoring() {
     refetchInterval,
   })
   const lastReceivedAt = statusData?.last_received_at ?? null
+  const freshnessSummary = telemetryFreshnessSummary(
+    engine,
+    latestMetrics?.map((metric) => metric.name) ?? [],
+    lastReceivedAt ? formatRelativeTime(lastReceivedAt) : null
+  )
 
   const handleRefresh = () => {
     refetch()
@@ -1505,10 +1511,9 @@ export function ServiceMonitoring() {
               </h1>
               <p className="text-sm text-muted-foreground mt-0.5">
                 Real-time metrics and performance monitoring
-                {lastReceivedAt && (
+                {freshnessSummary && (
                   <span>
-                    {' '}
-                    · last received {formatRelativeTime(lastReceivedAt)}
+                    {' '}· {freshnessSummary}
                   </span>
                 )}
               </p>

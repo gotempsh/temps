@@ -3433,6 +3433,7 @@ mod tests {
             lifecycle_reconcile_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            backing_service_id: None,
         };
 
         let backup_s3_source_plaintext = temps_entities::s3_sources::Model {

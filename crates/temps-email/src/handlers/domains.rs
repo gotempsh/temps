@@ -22,17 +22,17 @@ use temps_dns::providers::{DnsProvider, DnsRecordContent, DnsRecordRequest};
 use tracing::{error, info, warn};
 
 use super::audit::{
-    EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainProjectAuthorizedAudit,
-    EmailDomainProjectChangeRequestedAudit, EmailDomainProjectRevokedAudit,
-    EmailDomainVerifiedAudit,
+    EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainImportedAudit,
+    EmailDomainProjectAuthorizedAudit, EmailDomainProjectChangeRequestedAudit,
+    EmailDomainProjectRevokedAudit, EmailDomainVerifiedAudit,
 };
 use super::types::{
     AppState, AuthorizedEmailDomainProjectResponse, CreateEmailDomainRequest, DnsRecordResponse,
-    DnsRecordSetupResult, EmailDomainResponse, EmailDomainWithDnsResponse, ListDomainsQuery,
-    SetupDnsRequest, SetupDnsResponse,
+    DnsRecordSetupResult, EmailDomainResponse, EmailDomainWithDnsResponse,
+    ImportEmailDomainRequest, ListDomainsQuery, SetupDnsRequest, SetupDnsResponse,
 };
 use crate::errors::EmailError;
-use crate::services::CreateDomainRequest;
+use crate::services::{CreateDomainRequest, ImportDomainRequest};
 
 /// Map every EmailError variant to its correct HTTP status + real error message.
 ///
@@ -54,6 +54,10 @@ impl From<EmailError> for Problem {
                 .with_title("Domain Not Verified")
                 .with_detail(error.to_string()),
 
+            EmailError::DomainAlreadyExists { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Domain Already Exists")
+                .with_detail(error.to_string()),
+
             EmailError::DomainNotAuthorized { .. } => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Sender Domain Not Authorized")
                 .with_detail(error.to_string()),
@@ -65,6 +69,33 @@ impl From<EmailError> for Problem {
             EmailError::Validation(_) | EmailError::InvalidProviderType(_) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Validation Error")
+                    .with_detail(error.to_string())
+            }
+
+            // The provider's API definitively rejected the credentials supplied
+            // by the operator — this is a client input problem, not an internal
+            // error. 422 Unprocessable Entity is the appropriate status: the
+            // request was well-formed but the server cannot process it because
+            // the credentials were checked and found invalid.
+            EmailError::InvalidCredentials { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Invalid Provider Credentials")
+                    .with_detail(error.to_string())
+            }
+
+            // A network-level failure reaching the provider — the credentials
+            // may well be correct. 502 Bad Gateway signals "upstream problem"
+            // and distinguishes this from an InvalidCredentials rejection.
+            EmailError::ProviderUnreachable { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
+                .with_title("Provider Unreachable")
+                .with_detail(error.to_string()),
+
+            // The domain's Temps-side record is already gone by the time this
+            // is returned — 502 signals "the request mostly succeeded, but an
+            // upstream cleanup step failed" rather than "nothing happened".
+            EmailError::ProviderCleanupFailed { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Provider Cleanup Failed")
                     .with_detail(error.to_string())
             }
 
@@ -96,6 +127,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/email-domains",
             post(create_email_domain).get(list_email_domains),
         )
+        // Static segments must come before the `{id}` wildcard so that Axum
+        // matches "/email-domains/import" and "/email-domains/by-domain/…"
+        // before falling through to the ID-based routes.
+        .route("/email-domains/import", post(import_email_domain))
         .route("/email-domains/by-domain/{domain}", get(get_domain_by_name))
         .route(
             "/email-domains/{id}",
@@ -377,6 +412,94 @@ fn request_is_same_origin(metadata: &RequestMetadata) -> bool {
                     .strip_prefix(expected_origin)
                     .is_some_and(|suffix| suffix.starts_with('/'))
         })
+}
+
+/// Import an already-provisioned email domain from the provider
+///
+/// Use this endpoint when the domain identity was created directly in the email
+/// provider's console or API. Temps will fetch its current verification state
+/// rather than registering a new identity, preventing duplicate or conflicting
+/// provider-side entries.
+#[utoipa::path(
+    tag = "Email Domains",
+    post,
+    path = "/email-domains/import",
+    request_body = ImportEmailDomainRequest,
+    responses(
+        (status = 201, description = "Domain imported successfully", body = EmailDomainWithDnsResponse),
+        (status = 400, description = "Invalid request or provider lookup failed"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found"),
+        (status = 409, description = "Domain already registered for this provider"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn import_email_domain(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Json(request): Json<ImportEmailDomainRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsCreate);
+
+    let import_request = ImportDomainRequest {
+        provider_id: request.provider_id,
+        domain: request.domain.clone(),
+        provider_identity_id: request.provider_identity_id,
+    };
+
+    let result = state
+        .domain_service
+        .import(import_request)
+        .await
+        .map_err(|e| {
+            error!("Failed to import email domain: {}", e);
+            Problem::from(e)
+        })?;
+
+    // Audit log
+    let audit = EmailDomainImportedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        domain_id: result.domain.id,
+        domain: result.domain.domain.clone(),
+        provider_id: result.domain.provider_id,
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for domain import: {}", e);
+    }
+
+    let response = EmailDomainWithDnsResponse {
+        domain: EmailDomainResponse {
+            id: result.domain.id,
+            provider_id: result.domain.provider_id,
+            domain: result.domain.domain,
+            status: result.domain.status,
+            last_verified_at: result.domain.last_verified_at.map(|dt| dt.to_rfc3339()),
+            verification_error: result.domain.verification_error,
+            created_at: result.domain.created_at.to_rfc3339(),
+            updated_at: result.domain.updated_at.to_rfc3339(),
+        },
+        dns_records: result
+            .dns_records
+            .into_iter()
+            .map(|r| DnsRecordResponse {
+                record_type: r.record_type,
+                name: r.name,
+                value: r.value,
+                priority: r.priority,
+                status: r.status.into(),
+            })
+            .collect(),
+    };
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 /// Create a new email domain
@@ -791,14 +914,11 @@ pub async fn delete_email_domain(
         not_found().detail("Domain not found").build()
     })?;
 
-    state.domain_service.delete(id).await.map_err(|e| {
-        error!("Failed to delete email domain: {}", e);
-        internal_server_error()
-            .detail("Failed to delete domain")
-            .build()
-    })?;
+    let delete_result = state.domain_service.delete(id).await;
 
-    // Create audit log
+    // The domain's Temps-side row is gone in both the success case and the
+    // ProviderCleanupFailed case (see DomainService::delete) -- audit the
+    // deletion either way, before propagating a cleanup failure below.
     let audit = EmailDomainDeletedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -812,6 +932,8 @@ pub async fn delete_email_domain(
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
+
+    delete_result?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1159,5 +1281,37 @@ mod tests {
         let denied = require_global_sender_domain_authority(&auth_with_role(Role::User))
             .expect_err("project membership must not confer authority over a global domain");
         assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    // ========== Tests for From<EmailError> for Problem HTTP status codes ==========
+    //
+    // These tests cover the two new error variants added for credential
+    // verification. They call `Into::<Problem>::into(err)` which exercises the
+    // exhaustive `From<EmailError> for Problem` impl defined in this module.
+
+    #[test]
+    fn invalid_credentials_maps_to_422_unprocessable_entity() {
+        use crate::errors::EmailError;
+        use temps_core::problemdetails::Problem;
+
+        let err = EmailError::InvalidCredentials {
+            provider_type: "scaleway".to_string(),
+            reason: "the API key was rejected (HTTP 401)".to_string(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn provider_unreachable_maps_to_502_bad_gateway() {
+        use crate::errors::EmailError;
+        use temps_core::problemdetails::Problem;
+
+        let err = EmailError::ProviderUnreachable {
+            provider_type: "ses".to_string(),
+            reason: "could not connect to AWS SES".to_string(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
     }
 }

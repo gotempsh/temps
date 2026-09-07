@@ -49,4 +49,30 @@ describe('ProjectCard deployment state', () => {
     expect(unavailable).toContain('Unavailable')
     expect(unavailable).not.toContain('Last attempt')
   })
+
+  test('shows persisted service-template identity and logo', () => {
+    const serviceProject = {
+      ...project,
+      project_type: 'service',
+      template_slug: 'keycloak',
+      service_template_version: '1.0.0',
+      service_template_image_url: '/templates/keycloak.svg',
+    } as ProjectResponse
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProjectCard
+          project={serviceProject}
+          layout="compact"
+          latestDeploymentMedia={{
+            latest_attempt_status: 'deployed',
+            url: 'https://keycloak.example.test',
+          }}
+        />
+      </MemoryRouter>
+    )
+
+    expect(markup).toContain('Service template')
+    expect(markup).toContain('Service template keycloak 1.0.0')
+    expect(markup).toContain('src="/templates/keycloak.svg"')
+  })
 })

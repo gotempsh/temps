@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { getServiceOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getServiceOptions,
+  listServiceProjectsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -22,23 +25,19 @@ import {
   type LogSearchLine,
   useLogHistoryInfinite,
 } from '@/hooks/useLogHistory'
+import { serviceLogAvailability } from '@/lib/service-log-availability'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Database,
+  Link2,
   Loader2,
   RefreshCw,
   ScrollText,
   Server,
 } from 'lucide-react'
 import type { DateRange } from 'react-day-picker'
-import {
-  useCallback,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
@@ -108,10 +107,26 @@ export function ServiceLogs() {
     enabled: !Number.isNaN(serviceId),
   })
 
+  const {
+    data: linkedProjects,
+    isLoading: linkedProjectsLoading,
+    isError: linkedProjectsFailed,
+  } = useQuery({
+    ...listServiceProjectsOptions({ path: { id: serviceId } }),
+    enabled: !Number.isNaN(serviceId),
+  })
+
+  const logAvailability = serviceLogAvailability({
+    linksLoading: linkedProjectsLoading,
+    linksFailed: linkedProjectsFailed,
+    linkedProjectCount: linkedProjects?.length,
+  })
+
   const [text, setText] = useState('')
   const [activeLevels, setActiveLevels] = useState<LogLevel[]>([])
   // Bumped by Refresh to collapse back to a single newest page and re-tail.
   const [refreshKey, setRefreshKey] = useState(0)
+  const [rangeAnchor, setRangeAnchor] = useState(Date.now)
 
   // ── Date/time range filter ───────────────────────────────────────────
   const [preset, setPreset] = useState<TimePreset>('24h')
@@ -126,7 +141,7 @@ export function ServiceLogs() {
     if (preset !== 'custom') {
       const ms = PRESET_MS[preset]
       return {
-        startTime: new Date(Date.now() - ms).toISOString(),
+        startTime: new Date(rangeAnchor - ms).toISOString(),
         endTime: undefined,
       }
     }
@@ -134,13 +149,14 @@ export function ServiceLogs() {
       startTime: customRange?.from?.toISOString(),
       endTime: customRange?.to?.toISOString(),
     }
-  }, [preset, customRange])
+  }, [preset, customRange, rangeAnchor])
 
   // When switching away from custom, reset the custom range so the DateRangePicker
   // comes up clean if the user switches back.
   function handlePresetChange(next: TimePreset) {
     if (next !== 'custom') setCustomRange(undefined)
     setPreset(next)
+    setRangeAnchor(Date.now())
     // A time-range change should re-tail to the newest lines.
     setRefreshKey((k) => k + 1)
   }
@@ -168,7 +184,9 @@ export function ServiceLogs() {
       pageSize: PAGE_SIZE,
       refreshKey,
     },
-    !Number.isNaN(serviceId) && startTime !== undefined
+    !Number.isNaN(serviceId) &&
+      startTime !== undefined &&
+      logAvailability === 'available'
   )
 
   // Pages come newest-first (page 0 = newest). Reverse so the oldest loaded
@@ -338,7 +356,10 @@ export function ServiceLogs() {
               variant="outline"
               size="sm"
               className="gap-2"
-              onClick={() => setRefreshKey((k) => k + 1)}
+              onClick={() => {
+                setRangeAnchor(Date.now())
+                setRefreshKey((k) => k + 1)
+              }}
               disabled={refreshing}
             >
               <RefreshCw
@@ -411,7 +432,30 @@ export function ServiceLogs() {
 
         {/* Log panel — bounded height + its own scrollbar. Tails to the newest
             line on load; scrolling to the top lazily pages in older lines. */}
-        {preset === 'custom' && !customRange?.from ? (
+        {logAvailability === 'needs-project' ? (
+          <div className="rounded-md border border-dashed p-8 text-center">
+            <Link2 className="mx-auto h-6 w-6 text-muted-foreground" />
+            <p className="mt-3 text-sm font-medium">
+              Link this service to a project to view logs
+            </p>
+            <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
+              Service logs inherit project access controls. Link at least one
+              project before searching or retaining this service&apos;s logs.
+            </p>
+            <Button asChild variant="outline" size="sm" className="mt-4">
+              <Link to={`/storage/${id}`} state={{ openLinkedProjects: true }}>
+                <Link2 className="mr-2 h-4 w-4" />
+                Link a project
+              </Link>
+            </Button>
+          </div>
+        ) : logAvailability === 'checking' ? (
+          <div className="space-y-2">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <Skeleton key={i} className="h-5 w-full" />
+            ))}
+          </div>
+        ) : preset === 'custom' && !customRange?.from ? (
           <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
             Select a start date above to load logs for a custom time range.
           </div>

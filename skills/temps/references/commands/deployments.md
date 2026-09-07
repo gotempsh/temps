@@ -18,6 +18,7 @@ Manage deployments
 - `resume` - Resume a paused deployment
 - `teardown` - Teardown a deployment and remove all resources
 - `logs` - Show deployment build logs
+- `container-logs` - Show live container logs, including retained failed deployments
 - `failure-report` - Preview or send a redacted deploy-failure trace
 
 ### `deployments list` (alias: `ls`)
@@ -119,6 +120,22 @@ Show deployment build logs
 | `-f, --follow` | Follow log output | - | No |
 | `-n, --lines <number>` | Number of lines to show | `100` | No |
 | `-d, --deployment <id>` | Specific deployment ID | - | No |
+
+### `deployments container-logs`
+
+Show live container logs, including retained failed deployments
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Environment | `production` | No |
+| `-d, --deployment <id>` | Deployment ID | - | Yes |
+| `-c, --container <id>` | Container ID or name (partial match supported) | - | No |
+| `-n, --tail <lines>` | Number of lines to tail | `1000` | No |
+| `-t, --timestamps` | Show timestamps | - | No |
+| `-f, --follow` | Follow log output | - | No |
 
 ### `deployments failure-report`
 

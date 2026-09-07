@@ -63,6 +63,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { CopyButton } from '@/components/ui/copy-button'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { Input } from '@/components/ui/input'
@@ -92,6 +93,7 @@ import {
   ArrowLeft,
   ArrowUpCircle,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -99,8 +101,8 @@ import {
   Eye,
   EyeOff,
   HardDrive,
+  Link2,
   Loader2,
-  MoreVertical,
   Pencil,
   Plus,
   Radio,
@@ -305,6 +307,15 @@ export function ServiceDetail() {
     Math.ceil((serviceBackupsData?.total ?? 0) / BACKUPS_PAGE_SIZE)
   )
 
+  useEffect(() => {
+    if (backupsPage > backupsTotalPages) {
+      // The server total can shrink after a backup is removed while this page
+      // is open; synchronize the requested page back into the valid range.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setBackupsPage(backupsTotalPages)
+    }
+  }, [backupsPage, backupsTotalPages])
+
   const paginatedBackups = serviceBackups
 
   const backupsPageWindow = useMemo(() => {
@@ -319,7 +330,14 @@ export function ServiceDetail() {
     return Array.from({ length: windowSize }, (_, idx) => start + idx)
   }, [backupsPage, backupsTotalPages])
 
-  const [isLinkPopoverOpen, setIsLinkPopoverOpen] = useState(false)
+  const [isLinkPopoverOpen, setIsLinkPopoverOpen] = useState(
+    () =>
+      (
+        location.state as {
+          openLinkedProjects?: boolean
+        } | null
+      )?.openLinkedProjects === true
+  )
 
   const linkService = useMutation({
     ...linkServiceToProjectMutation(),
@@ -353,10 +371,10 @@ export function ServiceDetail() {
   // Notify when cluster creation completes or fails
   useEffect(() => {
     const currentStatus = service?.service?.status
-    const previousStatus = prevStatusRef.current
-    if (previousStatus === 'creating' && currentStatus === 'running') {
+    const prevStatus = prevStatusRef.current
+    if (prevStatus === 'creating' && currentStatus === 'running') {
       toast.success('Cluster created successfully')
-    } else if (previousStatus === 'creating' && currentStatus === 'failed') {
+    } else if (prevStatus === 'creating' && currentStatus === 'failed') {
       toast.error('Cluster creation failed')
     }
     prevStatusRef.current = currentStatus
@@ -656,19 +674,16 @@ export function ServiceDetail() {
               onOpenChange={setIsLinkPopoverOpen}
             >
               <PopoverTrigger asChild>
-                <Button variant="outline" size="sm" className="gap-2">
-                  <Plus className="h-4 w-4" />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="min-h-12 gap-2 sm:min-h-8"
+                >
+                  <Link2 className="h-4 w-4" />
                   {linkedProjectsLoading ? (
                     <Loader2 className="h-3 w-3 animate-spin" />
                   ) : (
-                    <>
-                      <span className="hidden sm:inline">
-                        {linkedProjectsResponse?.length || 0} linked
-                      </span>
-                      <span className="sm:hidden">
-                        {linkedProjectsResponse?.length || 0}
-                      </span>
-                    </>
+                    <span>{linkedProjectsResponse?.length || 0} linked</span>
                   )}
                 </Button>
               </PopoverTrigger>
@@ -745,61 +760,92 @@ export function ServiceDetail() {
               </PopoverContent>
             </Popover>
 
-            {service.service.status === 'running' && (
-              <Link to={`/storage/${id}/monitoring`}>
-                <Button variant="outline" size="sm" className="gap-2">
-                  <Activity className="h-4 w-4" />
-                  <span className="hidden sm:inline">Monitoring</span>
-                </Button>
-              </Link>
-            )}
-            <Link to={`/storage/${id}/browse`}>
-              <Button variant="outline" size="sm" className="gap-2">
-                <Database className="h-4 w-4" />
-                <span className="hidden sm:inline">Browse Data</span>
-              </Button>
-            </Link>
-            <Link to={`/storage/${id}/logs`}>
-              <Button variant="outline" size="sm" className="gap-2">
-                <ScrollText className="h-4 w-4" />
-                <span className="hidden sm:inline">Logs</span>
-              </Button>
-            </Link>
-            {service.service.service_type === 'postgres' && (
-              <Link to={`/storage/${id}/query-performance`}>
-                <Button variant="outline" size="sm" className="gap-2">
-                  <BarChart2 className="h-4 w-4" />
-                  <span className="hidden sm:inline">Query Performance</span>
-                </Button>
-              </Link>
-            )}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" className="h-8 w-8">
-                  <MoreVertical className="h-4 w-4" />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="min-h-12 gap-2 sm:min-h-8"
+                >
+                  <Eye className="h-4 w-4" />
+                  Explore
+                  <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-48">
+                {service.service.status === 'running' && (
+                  <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                    <Link to={`/storage/${id}/monitoring`}>
+                      <Activity className="mr-2 h-4 w-4" />
+                      Monitoring
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                  <Link to={`/storage/${id}/browse`}>
+                    <Database className="mr-2 h-4 w-4" />
+                    Browse data
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                  <Link to={`/storage/${id}/logs`}>
+                    <ScrollText className="mr-2 h-4 w-4" />
+                    Logs
+                  </Link>
+                </DropdownMenuItem>
+                {service.service.service_type === 'postgres' && (
+                  <DropdownMenuItem asChild className="min-h-12 sm:min-h-8">
+                    <Link to={`/storage/${id}/query-performance`}>
+                      <BarChart2 className="mr-2 h-4 w-4" />
+                      Query performance
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="min-h-12 gap-2 sm:min-h-8"
+                >
+                  Actions
+                  <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => setIsBackupDialogOpen(true)}>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
+                  onClick={() => setIsBackupDialogOpen(true)}
+                >
                   <HardDrive className="h-4 w-4 mr-2" />
                   Backup
                 </DropdownMenuItem>
                 <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
                   onClick={() => navigate(`/storage/${parseInt(id!)}/restore`)}
                 >
                   <RotateCcw className="h-4 w-4 mr-2" />
                   Restore…
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setIsEditDialogOpen(true)}>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
+                  onClick={() => setIsEditDialogOpen(true)}
+                >
                   <Pencil className="h-4 w-4 mr-2" />
                   Edit
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setIsUpgradeDialogOpen(true)}>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
+                  onClick={() => setIsUpgradeDialogOpen(true)}
+                >
                   <ArrowUpCircle className="h-4 w-4 mr-2" />
                   Upgrade
                 </DropdownMenuItem>
                 {service.service.service_type === 'postgres' ? (
                   <DropdownMenuItem
+                    className="min-h-12 sm:min-h-8"
                     onClick={() => setIsMajorUpgradeDialogOpen(true)}
                   >
                     <ArrowUpCircle className="h-4 w-4 mr-2" />
@@ -814,11 +860,11 @@ export function ServiceDetail() {
                     startService.isPending ||
                     stopService.isPending
                   }
-                  className={
-                    service.service.status === 'running'
-                      ? 'text-destructive focus:text-destructive'
-                      : ''
-                  }
+                  className={cn(
+                    'min-h-12 sm:min-h-8',
+                    service.service.status === 'running' &&
+                      'text-destructive focus:text-destructive'
+                  )}
                 >
                   {startService.isPending || stopService.isPending ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
@@ -836,7 +882,7 @@ export function ServiceDetail() {
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => setIsDeleteDialogOpen(true)}
-                  className="text-destructive focus:text-destructive"
+                  className="min-h-12 text-destructive focus:text-destructive sm:min-h-8"
                 >
                   <Trash2 className="h-4 w-4 mr-2" />
                   Delete
@@ -1775,11 +1821,7 @@ export function ServiceDetail() {
           </DialogHeader>
           <div className="space-y-2">
             <Label htmlFor="confirm-delete-service-name">
-              Type{' '}
-              <span className="font-mono font-semibold text-foreground">
-                {service.service.name}
-              </span>{' '}
-              to confirm
+              Type <ConfirmNameBadge value={service.service.name} /> to confirm
             </Label>
             <Input
               id="confirm-delete-service-name"

@@ -339,6 +339,7 @@ mod tests {
                     host_port,
                     container_port: host_port,
                     protocol: Protocol::Tcp,
+                    host_ip: None,
                 })
                 .collect(),
             environment_vars: HashMap::new(),

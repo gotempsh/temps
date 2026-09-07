@@ -15,6 +15,7 @@ View runtime container logs (use -f to follow in real-time)
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name | `production` | No |
 | `-c, --container <id>` | Container ID (partial match supported) | - | No |
+| `-d, --deployment <id>` | Deployment ID, including failed retained containers | - | No |
 | `-n, --tail <lines>` | Number of lines to tail | `1000` | No |
 | `-t, --timestamps` | Show timestamps | - | No |
 | `-f, --follow` | Follow log output (stream in real-time) | - | No |

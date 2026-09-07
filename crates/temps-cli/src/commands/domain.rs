@@ -9,9 +9,10 @@
 
 use anyhow::Context;
 use chrono::Utc;
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use colored::Colorize;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ use temps_core::EncryptionService;
 use temps_database::establish_connection;
 use temps_entities::domains;
 use x509_parser::prelude::*;
+
+use super::api_url::management_api_url;
 
 /// Domain and certificate management commands
 #[derive(Args)]
@@ -136,10 +139,20 @@ pub struct CertStatusCommand {
 
 /// Show details for a specific domain
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("domain_identifier")
+        .required(true)
+        .multiple(false)
+        .args(["id", "domain"])
+))]
 pub struct ShowDomainCommand {
-    /// Domain ID
+    /// Domain ID (use either --id or --domain)
     #[arg(long)]
-    pub id: i32,
+    pub id: Option<i32>,
+
+    /// Domain hostname (e.g. example.com)
+    #[arg(long, short = 'd')]
+    pub domain: Option<String>,
 
     /// Temps API URL
     #[arg(long, env = "TEMPS_API_URL")]
@@ -511,7 +524,7 @@ impl DomainCommand {
 // ========================================
 
 fn api_url(base: &str, path: &str) -> String {
-    format!("{}{}", base.trim_end_matches('/'), path)
+    management_api_url(base, path)
 }
 
 // ========================================
@@ -522,6 +535,69 @@ async fn handle_api_error(response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     anyhow::anyhow!("API request failed (HTTP {}): {}", status, body)
+}
+
+/// Decode a successful API response without hiding the endpoint and response
+/// metadata that operators need when the server returns an unexpected body.
+/// The body itself is deliberately omitted because domain responses can carry
+/// certificate material and live DNS challenge values.
+async fn parse_api_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    method: &str,
+    url: &str,
+) -> anyhow::Result<T> {
+    let diagnostic_url = diagnostic_api_url(url);
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("missing content-type")
+        .to_string();
+    let body = response.bytes().await.map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to read {} {} response (HTTP {}, content-type {}): {}",
+            method,
+            diagnostic_url,
+            status,
+            content_type,
+            error
+        )
+    })?;
+
+    serde_json::from_slice(&body).map_err(|error| {
+        let hint = if content_type.contains("text/html") {
+            " The server returned HTML instead of JSON; verify that --api-url points to the Temps instance (the CLI adds /api automatically)."
+        } else {
+            ""
+        };
+        anyhow::anyhow!(
+            "Failed to decode {} {} response (HTTP {}, content-type {}): {}.{}",
+            method,
+            diagnostic_url,
+            status,
+            content_type,
+            error,
+            hint
+        )
+    })
+}
+
+/// Preserve the endpoint information needed to diagnose routing problems
+/// without echoing URL userinfo, query credentials, or fragments into logs.
+fn diagnostic_api_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "<invalid API URL>".to_string();
+    };
+    if parsed.set_username("").is_err() {
+        return "<redacted API URL>".to_string();
+    }
+    if parsed.set_password(None).is_err() {
+        return "<redacted API URL>".to_string();
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
 }
 
 // ========================================
@@ -612,10 +688,7 @@ async fn execute_add(cmd: AddDomainCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let domain_resp: DomainResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let domain_resp: DomainResponse = parse_api_response(response, "POST", &url).await?;
 
     println!(
         "  {} Domain created (ID: {})",
@@ -844,10 +917,7 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let list_resp: ListDomainsResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let list_resp: ListDomainsResponse = parse_api_response(response, "GET", &url).await?;
 
     // Filter to on-demand-state hostnames when --on-demand is set.
     let domains: Vec<&DomainResponse> = if cmd.on_demand {
@@ -982,7 +1052,12 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
 
 async fn execute_show(cmd: ShowDomainCommand) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
-    let url = api_url(&cmd.api_url, &format!("/domains/{}", cmd.id));
+    let path = match (cmd.id, cmd.domain.as_deref()) {
+        (Some(id), None) => format!("/domains/{id}"),
+        (None, Some(domain)) => format!("/domains/by-host/{}", urlencoding::encode(domain)),
+        _ => anyhow::bail!("Specify exactly one of --id or --domain"),
+    };
+    let url = api_url(&cmd.api_url, &path);
 
     let response = client
         .get(&url)
@@ -995,10 +1070,7 @@ async fn execute_show(cmd: ShowDomainCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let domain_resp: DomainResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let domain_resp: DomainResponse = parse_api_response(response, "GET", &url).await?;
 
     if cmd.json {
         println!(
@@ -1131,10 +1203,7 @@ async fn execute_provision(cmd: ProvisionDomainCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let provision_resp: ProvisionApiResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let provision_resp: ProvisionApiResponse = parse_api_response(response, "POST", &url).await?;
 
     match provision_resp {
         ProvisionApiResponse::Complete(domain) => {
@@ -1199,10 +1268,7 @@ async fn execute_cert_status(cmd: CertStatusCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let status_resp: CertStatusResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let status_resp: CertStatusResponse = parse_api_response(response, "GET", &url).await?;
 
     if cmd.json {
         println!(
@@ -1375,10 +1441,8 @@ async fn execute_order_create(cmd: OrderCreateCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let challenge_resp: DomainChallengeResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let challenge_resp: DomainChallengeResponse =
+        parse_api_response(response, "POST", &url).await?;
 
     println!(
         "  {} ACME order created for {}",
@@ -1441,10 +1505,7 @@ async fn execute_order_show(cmd: OrderShowCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let order_resp: AcmeOrderResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let order_resp: AcmeOrderResponse = parse_api_response(response, "GET", &url).await?;
 
     if cmd.json {
         println!(
@@ -1599,10 +1660,7 @@ async fn execute_order_cancel(cmd: OrderCancelCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let domain_resp: DomainResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let domain_resp: DomainResponse = parse_api_response(response, "DELETE", &url).await?;
 
     println!(
         "  {} Order cancelled for domain '{}'",
@@ -1648,10 +1706,7 @@ async fn execute_order_finalize(cmd: OrderFinalizeCommand) -> anyhow::Result<()>
         return Err(handle_api_error(response).await);
     }
 
-    let domain_resp: DomainResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let domain_resp: DomainResponse = parse_api_response(response, "POST", &url).await?;
 
     match domain_resp.status.as_str() {
         "active" => {
@@ -1701,10 +1756,7 @@ async fn execute_order_list(cmd: OrderListCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let list_resp: ListOrdersResponse = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+    let list_resp: ListOrdersResponse = parse_api_response(response, "GET", &url).await?;
 
     if cmd.json {
         println!(
@@ -2087,6 +2139,68 @@ fn validate_private_key(key_pem: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        http::{header, HeaderMap, StatusCode},
+        response::{Html, IntoResponse},
+        routing::get,
+        Json, Router,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn show_accepts_exactly_one_domain_identifier() {
+        let common = ["--api-url", "http://127.0.0.1", "--api-token", "test-token"];
+
+        let mut by_domain = vec!["temps", "domain", "show", "--domain", "example.com"];
+        by_domain.extend(common);
+        assert!(crate::Cli::try_parse_from(by_domain).is_ok());
+
+        let mut by_id = vec!["temps", "domain", "show", "--id", "7"];
+        by_id.extend(common);
+        assert!(crate::Cli::try_parse_from(by_id).is_ok());
+
+        let mut missing = vec!["temps", "domain", "show"];
+        missing.extend(common);
+        let missing_error = match crate::Cli::try_parse_from(missing) {
+            Ok(_) => panic!("show without an identifier must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            missing_error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let mut conflicting = vec![
+            "temps",
+            "domain",
+            "show",
+            "--id",
+            "7",
+            "--domain",
+            "example.com",
+        ];
+        conflicting.extend(common);
+        let conflict_error = match crate::Cli::try_parse_from(conflicting) {
+            Ok(_) => panic!("show with both identifiers must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            conflict_error.kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn diagnostic_urls_redact_credentials_and_query_values() {
+        let diagnostic = diagnostic_api_url(
+            "https://operator:super-secret@example.com/api/domains?token=query-secret#fragment",
+        );
+
+        assert_eq!(diagnostic, "https://example.com/api/domains");
+        assert!(!diagnostic.contains("operator"));
+        assert!(!diagnostic.contains("super-secret"));
+        assert!(!diagnostic.contains("query-secret"));
+    }
 
     #[test]
     fn test_validate_private_key_rsa() {
@@ -2175,11 +2289,11 @@ MIIBkTCB+wIJAKHBfpeg...
     fn test_api_url() {
         assert_eq!(
             api_url("http://localhost:3000", "/domains"),
-            "http://localhost:3000/domains"
+            "http://localhost:3000/api/domains"
         );
         assert_eq!(
-            api_url("http://localhost:3000/", "/domains"),
-            "http://localhost:3000/domains"
+            api_url("http://localhost:3000/api/", "/domains"),
+            "http://localhost:3000/api/domains"
         );
     }
 
@@ -2290,5 +2404,140 @@ MIIBkTCB+wIJAKHBfpeg...
         }"#;
         let parsed: DomainResponse = serde_json::from_str(json).unwrap();
         assert!(parsed.on_demand_backoff_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_list_uses_api_prefix_and_decodes_millis_and_pem() {
+        async fn domains(headers: HeaderMap) -> impl IntoResponse {
+            if headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                != Some("Bearer test-token")
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+
+            Json(serde_json::json!({
+                "domains": [{
+                    "id": 7,
+                    "domain": "example.com",
+                    "status": "active",
+                    "expiration_time": 1796278035000_i64,
+                    "last_renewed": 1788505547092_i64,
+                    "created_at": 1788505084030_i64,
+                    "updated_at": 1788505547092_i64,
+                    "certificate": "-----BEGIN CERTIFICATE-----\nMIIB-test-chain\n-----END CERTIFICATE-----\n",
+                    "is_wildcard": false,
+                    "verification_method": "dns-01"
+                }],
+                "total": 1,
+                "page": 1,
+                "page_size": 20
+            }))
+            .into_response()
+        }
+
+        let app = Router::new()
+            .route("/api/domains", get(domains))
+            // Mirrors the console SPA fallback that previously returned HTTP
+            // 200 HTML for the CLI's incorrect `/domains` request.
+            .fallback(|| async { Html("<html>Temps console</html>") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let result = execute_list_api(ListDomainsApiCommand {
+            api_url: format!("http://{address}"),
+            api_token: "test-token".to_string(),
+            on_demand: false,
+            json: true,
+        })
+        .await;
+
+        server.abort();
+        assert!(result.is_ok(), "domain list failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn domain_show_by_hostname_uses_encoded_api_route_and_decodes_response() {
+        async fn domain_by_host(
+            axum::extract::Path(hostname): axum::extract::Path<String>,
+        ) -> impl IntoResponse {
+            if hostname != "*.example.com" {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Json(serde_json::json!({
+                "id": 7,
+                "domain": hostname,
+                "status": "active",
+                "expiration_time": 1796278035000_i64,
+                "created_at": 1788505084030_i64,
+                "updated_at": 1788505547092_i64,
+                "certificate": "-----BEGIN CERTIFICATE-----\nMIIB-test-chain\n-----END CERTIFICATE-----\n",
+                "is_wildcard": true,
+                "verification_method": "dns-01"
+            }))
+            .into_response()
+        }
+
+        let app = Router::new().route("/api/domains/by-host/{hostname}", get(domain_by_host));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let result = execute_show(ShowDomainCommand {
+            id: None,
+            domain: Some("*.example.com".to_string()),
+            api_url: format!("http://{address}"),
+            api_token: "test-token".to_string(),
+            json: true,
+        })
+        .await;
+
+        server.abort();
+        assert!(result.is_ok(), "domain show failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn html_decode_error_identifies_endpoint_and_configuration_hint() {
+        let app = Router::new().route(
+            "/api/domains",
+            get(|| async { Html("<html>not JSON</html>") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let error = execute_list_api(ListDomainsApiCommand {
+            api_url: format!("http://{address}"),
+            api_token: "test-token".to_string(),
+            on_demand: false,
+            json: true,
+        })
+        .await
+        .expect_err("HTML response must not decode as a domain list");
+
+        server.abort();
+        let message = error.to_string();
+        assert!(message.contains("GET http://"));
+        assert!(message.contains("/api/domains"));
+        assert!(message.contains("text/html"));
+        assert!(message.contains("CLI adds /api automatically"));
+        assert!(
+            !message.contains("not JSON"),
+            "response body leaked: {message}"
+        );
     }
 }

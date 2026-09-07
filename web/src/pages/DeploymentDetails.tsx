@@ -18,6 +18,7 @@ import {
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
+import { RetainedFailedContainers } from '@/components/deployments/RetainedFailedContainers'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -46,6 +47,8 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
+import { historicalImageRuntime } from '@/lib/template-runtime-defaults'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
@@ -425,8 +428,10 @@ function SecondaryActions({
 // Top-level failure/cancellation banner shown directly under the header for
 // deployments that didn't succeed.
 function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
+  const [isExpanded, setIsExpanded] = useState(false)
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
+  const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
   return (
     <div className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
@@ -434,9 +439,21 @@ function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
         <p className="text-sm font-medium text-destructive">
           {isCancelled ? 'Deployment cancelled' : 'Deployment failed'}
         </p>
-        <p className="mt-0.5 break-words text-sm text-destructive/80">
-          {deployment.cancelled_reason}
+        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm text-destructive/80">
+          {isExpanded ? failureReason.fullReason : failureReason.summary}
         </p>
+        {failureReason.hasMore && (
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
+            aria-expanded={isExpanded}
+            onClick={() => setIsExpanded((expanded) => !expanded)}
+          >
+            {isExpanded ? 'Collapse error' : 'Show full error'}
+          </Button>
+        )}
       </div>
     </div>
   )
@@ -996,6 +1013,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     imageRef?: string
   }) => {
     if (project.source_type === 'docker_image') {
+      const deploymentRuntime = historicalImageRuntime(deployment?.metadata)
       const ref =
         editedImageRef?.trim() || deployment?.metadata?.externalImageRef
       if (!ref) {
@@ -1004,7 +1022,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       }
       await redeployImage.mutateAsync({
         path: { project_id: project.id, environment_id: environmentId },
-        body: { image_ref: ref },
+        body: {
+          ...deploymentRuntime,
+          image_ref: ref,
+        },
       })
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
       return
@@ -1275,6 +1296,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}
         <CancelledReason deployment={deployment} />
+
+        {/* Failed Compose candidates are the primary debugging surface, so
+            keep their live logs beside the concise failure summary instead
+            of below the complete deployment pipeline. */}
+        <RetainedFailedContainers
+          projectId={deployment.project_id}
+          projectSlug={project.slug}
+          environmentId={deployment.environment_id}
+          deploymentId={deployment.id}
+          deploymentStatus={deployment.status}
+        />
+
         <DeployFailureReport project={project} deployment={deployment} />
 
         {resourceBadges.length > 0 && (

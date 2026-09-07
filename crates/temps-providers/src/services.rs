@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use temps_entities::{
-    external_service_backups, external_service_health_checks, external_services, nodes,
-    postgres_major_upgrades, project_services, projects, service_members, settings,
+    backup_schedule_services, backup_schedules, external_service_backups,
+    external_service_health_checks, external_services, nodes, postgres_major_upgrades,
+    project_services, projects, service_members, settings,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -56,6 +57,13 @@ fn live_state_is_writable_primary(state: Option<&str>) -> bool {
     state
         .and_then(|state| state.parse::<PgAutoFailoverState>().ok())
         .is_some_and(PgAutoFailoverState::is_primary)
+}
+
+fn generated_schedule_loses_last_target(
+    generated_kind: Option<&str>,
+    remaining_targets: u64,
+) -> bool {
+    generated_kind.is_some() && remaining_targets == 0
 }
 
 /// Return the monitor identity of the sole healthy, recently reporting writer.
@@ -2093,7 +2101,6 @@ impl ExternalServiceManager {
         })?;
 
         let parameters = self.get_service_parameters(service_id).await?;
-
         let config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -2635,17 +2642,58 @@ impl ExternalServiceManager {
         // get_service_parameters looks the service up by ID, which would fail
         // once the row is gone.
         let parameters = self.get_service_parameters(service_id).await?;
+        let service_name_snapshot = service.name.clone();
+        let service_type_snapshot = service.service_type.clone();
 
         // Delete from database first
         self.db
             .transaction::<_, (), ExternalServiceError>(|txn| {
                 Box::pin(async move {
+                    // Auto-generated per-service schedules are lifecycle-owned
+                    // by Temps. Disable one in the same transaction when its
+                    // final target is removed; user-created schedules are left
+                    // untouched for the operator to repair deliberately.
+                    let generated_schedules = backup_schedules::Entity::find()
+                        .inner_join(backup_schedule_services::Entity)
+                        .filter(backup_schedule_services::Column::ServiceId.eq(service_id))
+                        .filter(backup_schedules::Column::GeneratedKind.is_not_null())
+                        .all(txn)
+                        .await?;
+                    for schedule in generated_schedules {
+                        let remaining_targets = backup_schedule_services::Entity::find()
+                            .filter(backup_schedule_services::Column::ScheduleId.eq(schedule.id))
+                            .filter(backup_schedule_services::Column::ServiceId.ne(service_id))
+                            .count(txn)
+                            .await?;
+                        if generated_schedule_loses_last_target(
+                            schedule.generated_kind.as_deref(),
+                            remaining_targets,
+                        ) {
+                            let mut update: backup_schedules::ActiveModel = schedule.into();
+                            update.enabled = Set(false);
+                            update.updated_at = Set(Utc::now());
+                            update.update(txn).await?;
+                        }
+                    }
+
                     project_services::Entity::delete_many()
                         .filter(project_services::Column::ServiceId.eq(service_id))
                         .exec(txn)
                         .await?;
 
-                    external_service_backups::Entity::delete_many()
+                    // Backup audit rows intentionally outlive their source
+                    // service. Capture immutable provenance before deleting
+                    // the mutable service record; the migration removes the
+                    // former ON DELETE CASCADE foreign key.
+                    external_service_backups::Entity::update_many()
+                        .col_expr(
+                            external_service_backups::Column::ServiceNameSnapshot,
+                            Expr::value(service_name_snapshot.clone()),
+                        )
+                        .col_expr(
+                            external_service_backups::Column::ServiceTypeSnapshot,
+                            Expr::value(service_type_snapshot.clone()),
+                        )
                         .filter(external_service_backups::Column::ServiceId.eq(service_id))
                         .exec(txn)
                         .await?;
@@ -9837,10 +9885,13 @@ echo "[restore] Pre-seed complete"
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
         let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id_val))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!("Environment {} not found", environment_id),
+            .ok_or(ExternalServiceError::EnvironmentNotFound {
+                environment_id,
+                project_id: project_id_val,
             })?;
 
         let linked_services = project_services::Entity::find()
@@ -11614,6 +11665,19 @@ mod tests {
             validate_creator_claim(7, Some(99), false, 42),
             Err(ExternalServiceError::ServiceClaimDenied { service_id: 7 })
         ));
+    }
+
+    #[test]
+    fn generated_schedule_is_disabled_only_after_its_last_target_is_deleted() {
+        assert!(generated_schedule_loses_last_target(
+            Some("mariadb_base_backup"),
+            0
+        ));
+        assert!(!generated_schedule_loses_last_target(
+            Some("mariadb_base_backup"),
+            1
+        ));
+        assert!(!generated_schedule_loses_last_target(None, 0));
     }
 
     // ── Cluster write availability ──────────────────────────────────────
@@ -13988,6 +14052,93 @@ mod tests {
         }
     }
 
+    fn environment_preview_project(id: i32) -> projects::Model {
+        let now = Utc::now();
+        projects::Model {
+            id,
+            name: "preview-project".to_string(),
+            repo_name: "preview-project".to_string(),
+            repo_owner: "test".to_string(),
+            directory: String::new(),
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::NextJs,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: "preview-project".to_string(),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: Default::default(),
+            project_type: temps_entities::types::ProjectType::Server,
+            allow_alternate_sources: None,
+            template_slug: None,
+            service_template: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            cross_project_trace_sharing: false,
+            ai_api_traffic_summary_enabled: None,
+            image_retention_hours: None,
+            cloud_telemetry_fidelity: Default::default(),
+            cloud_telemetry_attribute_allowlist: Vec::new(),
+            cloud_telemetry_write_mode: Default::default(),
+            cloud_analytics_write_mode: Default::default(),
+        }
+    }
+
+    async fn assert_preview_rejects_unavailable_environment(environment_id: i32) {
+        let project_id = 10;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![environment_preview_project(project_id)]])
+            // The scoped `id + project_id + deleted_at IS NULL` query returns
+            // no row for both foreign-project and soft-deleted environments.
+            .append_query_results([Vec::<temps_entities::environments::Model>::new()])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let error = manager
+            .preview_project_service_environment_variables(project_id, environment_id)
+            .await
+            .expect_err("unavailable environment must not be used for a service preview");
+
+        assert!(matches!(
+            error,
+            ExternalServiceError::EnvironmentNotFound {
+                environment_id: actual_environment_id,
+                project_id: 10,
+            } if actual_environment_id == environment_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn service_preview_rejects_cross_project_environment() {
+        assert_preview_rejects_unavailable_environment(20).await;
+    }
+
+    #[tokio::test]
+    async fn service_preview_rejects_soft_deleted_environment() {
+        assert_preview_rejects_unavailable_environment(21).await;
+    }
+
     #[tokio::test]
     async fn runtime_credentials_reject_cross_project_environment_before_provisioning() {
         let service = encrypted_service_model(
@@ -16158,6 +16309,7 @@ mod tests {
         let now = Utc::now();
         temps_entities::s3_sources::Model {
             id,
+            backing_service_id: None,
             name: format!("test-source-{id}"),
             bucket_name: "test-bucket".to_string(),
             region: "us-east-1".to_string(),

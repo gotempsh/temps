@@ -802,8 +802,8 @@ mod tests {
         let app = configure_routes().with_state(ctx.app_state);
         let server = TestServer::new(app);
 
-        // Create a valid Sentry SDK error envelope
-        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"sent_at\":\"2023-06-28T14:30:00.000Z\"}\n{\"type\":\"event\"}\n{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"timestamp\":1687962600.0,\"platform\":\"javascript\",\"level\":\"error\",\"exception\":{\"values\":[{\"type\":\"Error\",\"value\":\"Test error message\",\"stacktrace\":{\"frames\":[{\"filename\":\"app.js\",\"function\":\"onClick\",\"lineno\":42,\"colno\":15}]}}]},\"environment\":\"production\",\"release\":\"1.0.0\"}\n";
+        // The official PHP SDK places event_id only in the envelope header.
+        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"sent_at\":\"2023-06-28T14:30:00.000Z\"}\n{\"type\":\"event\",\"content_type\":\"application/json\"}\n{\"timestamp\":1687962600.0,\"platform\":\"php\",\"level\":\"error\",\"exception\":{\"values\":[{\"type\":\"Error\",\"value\":\"Test error message\",\"stacktrace\":{\"frames\":[{\"filename\":\"app.php\",\"function\":\"handleRequest\",\"lineno\":42}]}}]},\"environment\":\"production\",\"release\":\"1.0.0\"}\n";
 
         let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
 
@@ -818,12 +818,7 @@ mod tests {
             .await;
 
         // Should successfully ingest the event
-        assert!(
-            response.status_code() == StatusCode::OK
-                || response.status_code() == StatusCode::BAD_REQUEST,
-            "Expected 200 or 400, got {}",
-            response.status_code()
-        );
+        assert_eq!(response.status_code(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -154,6 +154,7 @@ mod tests {
         let now = chrono::Utc::now();
         s3_sources::Model {
             id,
+            backing_service_id: None,
             name: format!("source-{id}"),
             bucket_name: "backups".to_string(),
             region: "us-east-1".to_string(),

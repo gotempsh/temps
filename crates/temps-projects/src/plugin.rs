@@ -82,6 +82,13 @@ impl TempsPlugin for ProjectsPlugin {
         let custom_domain_service = context.require_service::<CustomDomainService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let template_service = context.require_service::<TemplateService>();
+        let config_service = context.require_service::<temps_config::ConfigService>();
+        let public_hostname_resolver = context
+            .get_service::<dyn temps_core::PublicHostnameResolver>()
+            .unwrap_or_else(|| {
+                Arc::new(temps_core::StandardHostnameResolver)
+                    as Arc<dyn temps_core::PublicHostnameResolver>
+            });
         let project_archive_cleaner =
             context.require_service::<dyn temps_core::ProjectArchiveCleaner>();
         let telemetry = context
@@ -101,6 +108,8 @@ impl TempsPlugin for ProjectsPlugin {
             custom_domain_service,
             audit_service,
             template_service,
+            config_service,
+            public_hostname_resolver,
             project_archive_cleaner,
             telemetry,
             project_access_checker,

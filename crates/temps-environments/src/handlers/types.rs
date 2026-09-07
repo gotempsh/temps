@@ -73,10 +73,10 @@ pub struct CreateEnvironmentVariableRequest {
     #[serde(default = "default_include_in_preview")]
     #[schema(default = false)]
     pub include_in_preview: bool,
-    /// When true the variable is treated as write-only: never returned in
-    /// plaintext from the API, masked in the UI, and updates that omit the
-    /// value preserve the existing ciphertext. The flag is one-way — secret
-    /// vars cannot be demoted back to regular vars.
+    /// When true the variable is masked in list responses and can only be
+    /// viewed through the permission-checked, audited per-variable reveal
+    /// endpoint. Updates that omit the value preserve the existing ciphertext.
+    /// The flag is one-way — secret vars cannot be demoted to regular vars.
     #[serde(default)]
     pub is_secret: bool,
 }
@@ -109,15 +109,15 @@ pub struct EnvironmentVariableResponse {
     pub id: i32,
     pub key: String,
     /// Plaintext value for non-secret vars (or `"***"` mask for list responses).
-    /// `None` for secret vars — secrets are write-only.
+    /// `None` for secret vars; use the audited per-variable reveal endpoint.
     pub value: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<EnvironmentInfo>,
     /// Include this environment variable in preview environments
     pub include_in_preview: bool,
-    /// Whether the variable is a write-only secret. Secrets always have
-    /// `value: None` in responses.
+    /// Whether the variable is a secret. Secrets always have `value: None` in
+    /// list responses.
     pub is_secret: bool,
 }
 

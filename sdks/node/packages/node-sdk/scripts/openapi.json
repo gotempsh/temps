@@ -5812,7 +5812,7 @@
                     "Events"
                 ],
                 "summary": "Get dashboard analytics for multiple projects in a single batch request",
-                "description": "Returns unique visitor counts and hourly sparkline data for all requested projects\nusing only 2 SQL queries instead of 2\u00d7N per-project queries.",
+                "description": "Returns unique visitor counts and hourly sparkline data for all requested projects\nusing only 2 SQL queries instead of 2×N per-project queries.",
                 "operationId": "get_dashboard_projects_analytics",
                 "parameters": [
                     {
@@ -11960,7 +11960,7 @@
                 "tags": [
                     "Nodes"
                 ],
-                "summary": "List all registered nodes (admin \u2014 session auth via RequireAuth)",
+                "summary": "List all registered nodes (admin — session auth via RequireAuth)",
                 "operationId": "admin_list_nodes",
                 "responses": {
                     "200": {
@@ -12039,7 +12039,7 @@
                 "tags": [
                     "Nodes"
                 ],
-                "summary": "Get a specific node by ID (admin \u2014 session auth via RequireAuth)",
+                "summary": "Get a specific node by ID (admin — session auth via RequireAuth)",
                 "operationId": "admin_get_node",
                 "parameters": [
                     {
@@ -14894,7 +14894,7 @@
                 "tags": [
                     "GenAI"
                 ],
-                "summary": "Query GenAI trace summaries \u2014 traces containing spans with `gen_ai.*` attributes.",
+                "summary": "Query GenAI trace summaries — traces containing spans with `gen_ai.*` attributes.",
                 "operationId": "query_genai_traces",
                 "parameters": [
                     {
@@ -15742,7 +15742,7 @@
                 "tags": [
                     "OTel"
                 ],
-                "summary": "Query trace summaries \u2014 one row per trace with span count, error count,\nroot span info, and proper trace-level pagination.",
+                "summary": "Query trace summaries — one row per trace with span count, error count,\nroot span info, and proper trace-level pagination.",
                 "operationId": "query_trace_summaries",
                 "parameters": [
                     {
@@ -17262,7 +17262,7 @@
                     {
                         "name": "per_page",
                         "in": "query",
-          "description": "Number of items per page (1-100)",
+                        "description": "Number of items per page (1-100)",
                         "required": false,
                         "schema": {
                             "type": "integer",
@@ -17386,10 +17386,6 @@
         },
         "/projects/from-template": {
             "post": {
-                "tags": [
-                    "Projects"
-                ],
-                "summary": "Create a new project from a template",
                 "description": "Creates a new repository from a template and sets up the project with the\nspecified configuration. The template is cloned to a new repository under\nthe authenticated user's account or specified organization.",
                 "operationId": "create_project_from_template",
                 "requestBody": {
@@ -17404,14 +17400,14 @@
                 },
                 "responses": {
                     "201": {
-                        "description": "Project created successfully",
                         "content": {
                             "application/json": {
                                 "schema": {
                                     "$ref": "#/components/schemas/CreateProjectFromTemplateResponse"
                                 }
                             }
-                        }
+                        },
+                        "description": "Project created successfully"
                     },
                     "400": {
                         "description": "Invalid input"
@@ -17433,6 +17429,10 @@
                     {
                         "bearer_auth": []
                     }
+                ],
+                "summary": "Create a new project from a template",
+                "tags": [
+                    "Projects"
                 ]
             }
         },
@@ -22135,7 +22135,7 @@
                     "Events"
                 ],
                 "summary": "Record an analytics event via the console API with explicit project ID.",
-                "description": "The app backend forwards the user's encrypted Temps cookies, so visitor/session\nidentity is resolved automatically by middleware. No geolocation or user-agent\nenrichment is performed \u2014 this is a lightweight server-side ingestion path.",
+                "description": "The app backend forwards the user's encrypted Temps cookies, so visitor/session\nidentity is resolved automatically by middleware. No geolocation or user-agent\nenrichment is performed — this is a lightweight server-side ingestion path.",
                 "operationId": "record_console_event",
                 "parameters": [
                     {
@@ -27685,42 +27685,47 @@
         },
         "/templates": {
             "get": {
-                "tags": [
-                    "Templates"
-                ],
-                "summary": "List all available templates",
                 "description": "Returns a list of all public templates, optionally filtered by tag or featured status.",
-                "operationId": "list_templates",
+                "operationId": "list_project_templates",
                 "parameters": [
                     {
-                        "name": "tag",
-                        "in": "query",
                         "description": "Filter templates by tag",
+                        "in": "query",
+                        "name": "tag",
                         "required": false,
                         "schema": {
                             "type": "string"
                         }
                     },
                     {
-                        "name": "featured",
-                        "in": "query",
                         "description": "Only return featured templates",
+                        "in": "query",
+                        "name": "featured",
                         "required": false,
                         "schema": {
                             "type": "boolean"
+                        }
+                    },
+                    {
+                        "description": "Filter by gallery: starter or service",
+                        "in": "query",
+                        "name": "kind",
+                        "required": false,
+                        "schema": {
+                            "$ref": "#/components/schemas/TemplateKind"
                         }
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "List of templates",
                         "content": {
                             "application/json": {
                                 "schema": {
                                     "$ref": "#/components/schemas/ListTemplatesResponse"
                                 }
                             }
-                        }
+                        },
+                        "description": "List of templates"
                     },
                     "401": {
                         "description": "Unauthorized"
@@ -27733,6 +27738,10 @@
                     {
                         "bearer_auth": []
                     }
+                ],
+                "summary": "List all available templates",
+                "tags": [
+                    "Templates"
                 ]
             }
         },
@@ -27771,17 +27780,13 @@
         },
         "/templates/{slug}": {
             "get": {
-                "tags": [
-                    "Templates"
-                ],
-                "summary": "Get a specific template by slug",
                 "description": "Returns detailed information about a single template.",
-                "operationId": "get_template",
+                "operationId": "get_project_template",
                 "parameters": [
                     {
-                        "name": "slug",
-                        "in": "path",
                         "description": "Template slug",
+                        "in": "path",
+                        "name": "slug",
                         "required": true,
                         "schema": {
                             "type": "string"
@@ -27790,14 +27795,14 @@
                 ],
                 "responses": {
                     "200": {
-                        "description": "Template details",
                         "content": {
                             "application/json": {
                                 "schema": {
                                     "$ref": "#/components/schemas/TemplateResponse"
                                 }
                             }
-                        }
+                        },
+                        "description": "Template details"
                     },
                     "401": {
                         "description": "Unauthorized"
@@ -27813,6 +27818,10 @@
                     {
                         "bearer_auth": []
                     }
+                ],
+                "summary": "Get a specific template by slug",
+                "tags": [
+                    "Templates"
                 ]
             }
         },
@@ -29345,8 +29354,12 @@
                             }
                         }
                     },
-                    "401": { "description": "Unauthorized" },
-                    "403": { "description": "Insufficient permissions" },
+                    "401": {
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "description": "Insufficient permissions"
+                    },
                     "404": {
                         "description": "Domain not found"
                     },
@@ -29393,8 +29406,12 @@
                     "204": {
                         "description": "Project authorized"
                     },
-                    "401": { "description": "Unauthorized" },
-                    "403": { "description": "Only an instance or platform administrator may change global sender-domain grants" },
+                    "401": {
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "description": "Only an instance or platform administrator may change global sender-domain grants"
+                    },
                     "404": {
                         "description": "Domain or project not found"
                     },
@@ -29439,8 +29456,12 @@
                     "204": {
                         "description": "Project authorization revoked"
                     },
-                    "401": { "description": "Unauthorized" },
-                    "403": { "description": "Only an instance or platform administrator may change global sender-domain grants" },
+                    "401": {
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "description": "Only an instance or platform administrator may change global sender-domain grants"
+                    },
                     "404": {
                         "description": "Domain not found"
                     },
@@ -29453,6 +29474,180 @@
                         "bearer_auth": []
                     }
                 ]
+            }
+        },
+        "/projects/{project_id}/service-template": {
+            "get": {
+                "operationId": "get_project_service_template",
+                "parameters": [
+                    {
+                        "description": "Project ID",
+                        "in": "path",
+                        "name": "project_id",
+                        "required": true,
+                        "schema": {
+                            "format": "int32",
+                            "type": "integer"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ServiceTemplateInstanceResponse"
+                                }
+                            }
+                        },
+                        "description": "Applied service release and upgrade preview"
+                    },
+                    "400": {
+                        "description": "Project is not a service"
+                    },
+                    "401": {
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "description": "Forbidden"
+                    },
+                    "404": {
+                        "description": "Project not found"
+                    }
+                },
+                "security": [
+                    {
+                        "bearer_auth": []
+                    }
+                ],
+                "summary": "Atomically replace a service-template project's image runtime and resource\nprofile. This endpoint is deliberately separate from generic project\nsettings because these fields form one deployable configuration.",
+                "tags": [
+                    "Projects"
+                ],
+                "x-maturity": "beta"
+            }
+        },
+        "/projects/{project_id}/service-template/upgrade": {
+            "post": {
+                "operationId": "upgrade_project_service_template",
+                "parameters": [
+                    {
+                        "description": "Project ID",
+                        "in": "path",
+                        "name": "project_id",
+                        "required": true,
+                        "schema": {
+                            "format": "int32",
+                            "type": "integer"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/UpgradeServiceTemplateRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ProjectResponse"
+                                }
+                            }
+                        },
+                        "description": "Service template upgraded"
+                    },
+                    "400": {
+                        "description": "Invalid or stale upgrade"
+                    },
+                    "401": {
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "description": "Forbidden"
+                    },
+                    "404": {
+                        "description": "Project or template not found"
+                    }
+                },
+                "security": [
+                    {
+                        "bearer_auth": []
+                    }
+                ],
+                "tags": [
+                    "Projects"
+                ],
+                "x-maturity": "beta"
+            }
+        },
+        "/projects/{project_id}/service-runtime": {
+            "patch": {
+                "operationId": "update_service_template_runtime",
+                "parameters": [
+                    {
+                        "description": "Project ID",
+                        "in": "path",
+                        "name": "project_id",
+                        "required": true,
+                        "schema": {
+                            "format": "int32",
+                            "type": "integer"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/UpdateServiceTemplateRuntimeRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ProjectResponse"
+                                }
+                            }
+                        },
+                        "description": "Service runtime updated successfully"
+                    },
+                    "400": {
+                        "description": "Invalid service runtime"
+                    },
+                    "401": {
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "description": "Forbidden"
+                    },
+                    "404": {
+                        "description": "Project not found"
+                    },
+                    "500": {
+                        "description": "Internal server error"
+                    }
+                },
+                "security": [
+                    {
+                        "bearer_auth": []
+                    }
+                ],
+                "tags": [
+                    "Projects"
+                ],
+                "x-maturity": "beta"
             }
         }
     },
@@ -33020,67 +33215,175 @@
                 }
             },
             "CreateProjectFromTemplateRequest": {
-                "type": "object",
-                "description": "Request to create a project from a template",
-                "required": [
-                    "template_slug",
-                    "project_name",
-                    "git_provider_connection_id",
-                    "repository_name"
-                ],
+                "description": "Request to create a project from a template\n\nSupports two deploy modes:\n  * **Fork mode** — when `git_provider_connection_id` is set, the template\n    repo is cloned into a new repository under the user's Git account and the\n    project tracks that fork (git-push deploys, automatic deploy on push).\n  * **One-click public-repo mode** — when `git_provider_connection_id` is\n    omitted, the project deploys directly from the template's public source\n    repository (no fork, no Git account required). This is the activation\n    path: a brand-new user with no Git provider connected can still deploy a\n    demo in one click. `repository_name` / `repository_owner` are ignored in\n    this mode, and automatic-deploy-on-push is unavailable (there is no fork\n    to receive webhooks).",
                 "properties": {
                     "automatic_deploy": {
-                        "type": "boolean",
-                        "description": "Enable automatic deployment on push (defaults to true)"
+                        "description": "Enable automatic deployment on push (defaults to true). Only honoured in\nfork mode; public-repo deploys cannot receive push webhooks.",
+                        "type": "boolean"
+                    },
+                    "command": {
+                        "description": "Optional image entrypoint arguments. An empty list explicitly uses the\nimage's own default command instead of the template command.",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": [
+                            "array",
+                            "null"
+                        ]
+                    },
+                    "cpu_limit": {
+                        "description": "CPU limit override in microcores. Zero means uncapped.",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "cpu_request": {
+                        "description": "CPU request override in microcores (1_000_000 = one CPU core).",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
                     },
                     "environment_variables": {
-                        "type": "array",
+                        "description": "Environment variables to set (key-value pairs)",
                         "items": {
                             "$ref": "#/components/schemas/EnvVarInput"
                         },
-                        "description": "Environment variables to set (key-value pairs)"
+                        "type": "array"
+                    },
+                    "exposed_port": {
+                        "description": "Public container port override.",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
                     },
                     "git_provider_connection_id": {
-                        "type": "integer",
+                        "description": "Git provider connection ID. When omitted, the project deploys directly\nfrom the template's public source repository instead of forking it.",
                         "format": "int32",
-                        "description": "Git provider connection ID (required to create the repository)"
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
                     },
-                    "private": {
-                        "type": "boolean",
-                        "description": "Whether to make the repository private (defaults to true)"
-                    },
-                    "project_name": {
-                        "type": "string",
-                        "description": "Name for the new project"
-                    },
-                    "repository_name": {
-                        "type": "string",
-                        "description": "Name for the new repository to create"
-                    },
-                    "repository_owner": {
+                    "health_check_path": {
+                        "description": "Relative HTTP health-check path override.",
                         "type": [
                             "string",
                             "null"
-                        ],
-                        "description": "Owner/organization for the new repository (defaults to authenticated user)"
+                        ]
+                    },
+                    "image": {
+                        "description": "Optional prebuilt-image override. Curated template values remain the\ndefault when this is omitted. Accepted only for image templates.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "memory_limit": {
+                        "description": "Memory limit override in MiB. Zero means uncapped.",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "memory_request": {
+                        "description": "Memory request override in MiB.",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "private": {
+                        "description": "Whether to make the repository private (defaults to true)",
+                        "type": "boolean"
+                    },
+                    "project_name": {
+                        "description": "Name for the new project",
+                        "type": "string"
+                    },
+                    "repository_name": {
+                        "description": "Name for the new repository to create. Required in fork mode; ignored in\none-click public-repo mode.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "repository_owner": {
+                        "description": "Owner/organization for the new repository (defaults to authenticated user)",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
                     },
                     "storage_service_ids": {
-                        "type": "array",
+                        "description": "External storage service IDs to attach to the project",
                         "items": {
-                            "type": "integer",
-                            "format": "int32"
+                            "format": "int32",
+                            "type": "integer"
                         },
-                        "description": "External storage service IDs to attach to the project"
+                        "type": "array"
                     },
                     "template_slug": {
-                        "type": "string",
-                        "description": "Template slug to use as the base"
+                        "description": "Template slug to use as the base",
+                        "type": "string"
                     }
-                }
+                },
+                "required": [
+                    "template_slug",
+                    "project_name"
+                ],
+                "type": "object"
             },
             "CreateProjectFromTemplateResponse": {
-                "type": "object",
                 "description": "Response after creating a project from template",
+                "properties": {
+                    "deployment_error": {
+                        "description": "Actionable retry guidance when project creation succeeded but deployment dispatch did not. Internal queue errors are never exposed.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "deployment_queued": {
+                        "description": "Whether the initial deployment was successfully queued. This is set for native image service templates; Git-backed modes use their pipeline flow.",
+                        "type": [
+                            "boolean",
+                            "null"
+                        ]
+                    },
+                    "message": {
+                        "description": "Message with additional info",
+                        "type": "string"
+                    },
+                    "project_id": {
+                        "description": "ID of the created project",
+                        "format": "int32",
+                        "type": "integer"
+                    },
+                    "project_name": {
+                        "description": "Name of the created project",
+                        "type": "string"
+                    },
+                    "project_slug": {
+                        "description": "Slug of the created project",
+                        "type": "string"
+                    },
+                    "repository_url": {
+                        "description": "URL of the created repository",
+                        "type": "string"
+                    },
+                    "template_slug": {
+                        "description": "Template that was used",
+                        "type": "string"
+                    }
+                },
                 "required": [
                     "project_id",
                     "project_slug",
@@ -33089,33 +33392,7 @@
                     "template_slug",
                     "message"
                 ],
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Message with additional info"
-                    },
-                    "project_id": {
-                        "type": "integer",
-                        "format": "int32",
-                        "description": "ID of the created project"
-                    },
-                    "project_name": {
-                        "type": "string",
-                        "description": "Name of the created project"
-                    },
-                    "project_slug": {
-                        "type": "string",
-                        "description": "Slug of the created project"
-                    },
-                    "repository_url": {
-                        "type": "string",
-                        "description": "URL of the created repository"
-                    },
-                    "template_slug": {
-                        "type": "string",
-                        "description": "Template that was used"
-                    }
-                }
+                "type": "object"
             },
             "CreateProjectRequest": {
                 "type": "object",
@@ -34066,7 +34343,7 @@
                 "properties": {
                     "antiAffinity": {
                         "type": "boolean",
-                        "description": "Anti-affinity: spread replicas across different nodes.\n\nWhen enabled, the scheduler avoids placing two replicas of the same\nenvironment on the same node. If there are fewer eligible nodes than\nreplicas, remaining replicas wrap around (best-effort spreading).\n\nDefaults to `true` \u2014 replicas spread by default."
+                        "description": "Anti-affinity: spread replicas across different nodes.\n\nWhen enabled, the scheduler avoids placing two replicas of the same\nenvironment on the same node. If there are fewer eligible nodes than\nreplicas, remaining replicas wrap around (best-effort spreading).\n\nDefaults to `true` — replicas spread by default."
                     },
                     "automaticDeploy": {
                         "type": "boolean",
@@ -34150,7 +34427,7 @@
                         "description": "Enable session recording for analytics"
                     },
                     "targetLabels": {
-                        "description": "Label selector for node-based scheduling. Replicas are only deployed to\nnodes whose labels match the selector.\n\nMatching rules:\n- **Same key, array value** \u2192 OR: node must match any value\n- **Different keys** \u2192 AND: node must satisfy all keys\n\nExample: `{\"region\": [\"us\", \"asia\"], \"gpu\": \"true\"}`\n\u2192 (region=us OR region=asia) AND gpu=true\n\nApplied after `target_nodes` filtering (they stack)."
+                        "description": "Label selector for node-based scheduling. Replicas are only deployed to\nnodes whose labels match the selector.\n\nMatching rules:\n- **Same key, array value** → OR: node must match any value\n- **Different keys** → AND: node must satisfy all keys\n\nExample: `{\"region\": [\"us\", \"asia\"], \"gpu\": \"true\"}`\n→ (region=us OR region=asia) AND gpu=true\n\nApplied after `target_nodes` filtering (they stack)."
                     },
                     "targetNodes": {
                         "type": [
@@ -37040,43 +37317,55 @@
                 }
             },
             "EnvVarTemplateResponse": {
-                "type": "object",
                 "description": "Environment variable template response",
-                "required": [
-                    "name",
-                    "required"
-                ],
                 "properties": {
                     "default": {
+                        "description": "Default value if not provided by user",
                         "type": [
                             "string",
                             "null"
-                        ],
-                        "description": "Default value if not provided by user"
+                        ]
+                    },
+                    "default_generator": {
+                        "description": "Frontend-side generator hint for the default value\n(e.g. `app_url`, `random_secret`, `random_hex_32`)",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
                     },
                     "description": {
+                        "description": "Description of what this variable is used for",
                         "type": [
                             "string",
                             "null"
-                        ],
-                        "description": "Description of what this variable is used for"
+                        ]
                     },
                     "example": {
+                        "description": "Example value for documentation",
                         "type": [
                             "string",
                             "null"
-                        ],
-                        "description": "Example value for documentation"
+                        ]
                     },
                     "name": {
-                        "type": "string",
-                        "description": "Name of the environment variable"
+                        "description": "Name of the environment variable",
+                        "type": "string"
                     },
                     "required": {
-                        "type": "boolean",
-                        "description": "Whether this variable is required"
+                        "description": "Whether this variable is required",
+                        "type": "boolean"
+                    },
+                    "secret": {
+                        "description": "Whether values must use the protected secret reveal path.",
+                        "type": "boolean"
                     }
-                }
+                },
+                "required": [
+                    "name",
+                    "required",
+                    "secret"
+                ],
+                "type": "object"
             },
             "EnvironmentConfiguration": {
                 "type": "object",
@@ -39440,7 +39729,7 @@
             },
             "GenAiTraceSummary": {
                 "type": "object",
-                "description": "Summary of a GenAI conversation \u2014 aggregated from OTel spans with `gen_ai.*` attributes.",
+                "description": "Summary of a GenAI conversation — aggregated from OTel spans with `gen_ai.*` attributes.",
                 "required": [
                     "trace_id",
                     "root_span_name",
@@ -39721,7 +40010,7 @@
                     },
                     "token": {
                         "type": "string",
-                        "description": "The plaintext join token \u2014 shown only once, save it now"
+                        "description": "The plaintext join token — shown only once, save it now"
                     }
                 }
             },
@@ -43196,7 +43485,7 @@
                         "items": {
                             "$ref": "#/components/schemas/DataImplication"
                         },
-                        "description": "Data implications \u2014 what could go wrong or what the user needs to know"
+                        "description": "Data implications — what could go wrong or what the user needs to know"
                     },
                     "description": {
                         "type": "string",
@@ -45901,7 +46190,7 @@
             },
             "PluginManifest": {
                 "type": "object",
-                "description": "The complete plugin manifest \u2014 the handshake contract.",
+                "description": "The complete plugin manifest — the handshake contract.",
                 "required": [
                     "name",
                     "version"
@@ -46450,28 +46739,51 @@
                 }
             },
             "ProjectResponse": {
-                "type": "object",
-                "required": [
-                    "id",
-                    "slug",
-                    "name",
-                    "directory",
-                    "main_branch",
-                    "created_at",
-                    "updated_at",
-                    "deployment_config",
-                    "attack_mode",
-                    "enable_preview_environments",
-                    "source_type"
-                ],
                 "properties": {
+                    "ai_alert_summaries_enabled": {
+                        "description": "Opt-in to AI summarization of metric alert notifications (NULL/false = off).",
+                        "type": [
+                            "boolean",
+                            "null"
+                        ]
+                    },
+                    "ai_api_traffic_summary_enabled": {
+                        "description": "Opt-in to AI summarization of API traffic analytics (NULL/false = off).",
+                        "type": [
+                            "boolean",
+                            "null"
+                        ]
+                    },
+                    "ai_debug_chat_enabled": {
+                        "description": "Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).",
+                        "type": [
+                            "boolean",
+                            "null"
+                        ]
+                    },
+                    "ai_write_actions_enabled": {
+                        "description": "Opt-in to AI propose-then-confirm write capability (false = off).",
+                        "type": "boolean"
+                    },
+                    "allow_alternate_sources": {
+                        "description": "Whether this project also accepts deployments from a source other than\n`source_type` — chiefly, whether a Git-backed project will take an\nuploaded source archive (`drop`). `null` or `false` means only the\nconfigured `source_type` (plus Docker images and static bundles, which\nevery project accepts) may be deployed.",
+                        "example": false,
+                        "type": [
+                            "boolean",
+                            "null"
+                        ]
+                    },
                     "attack_mode": {
-                        "type": "boolean",
-                        "description": "Attack mode - when enabled, requires CAPTCHA verification for all project environments"
+                        "description": "Attack mode - when enabled, requires CAPTCHA verification for all project environments",
+                        "type": "boolean"
                     },
                     "created_at": {
-                        "type": "integer",
-                        "format": "int64"
+                        "format": "int64",
+                        "type": "integer"
+                    },
+                    "cross_project_trace_sharing": {
+                        "description": "ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed\nfrom cross-project discovery results. Default true (consistent with the\nOSS global-observability model where any OtelRead holder can query any\nproject's telemetry).",
+                        "type": "boolean"
                     },
                     "deployment_config": {
                         "$ref": "#/components/schemas/DeploymentConfig",
@@ -46481,33 +46793,73 @@
                         "type": "string"
                     },
                     "enable_preview_environments": {
-                        "type": "boolean",
-                        "description": "Enable automatic preview environment creation for each branch"
+                        "description": "Enable automatic preview environment creation for each branch",
+                        "type": "boolean"
                     },
-                    "git_provider_connection_id": {
-                        "type": [
-                            "integer",
-                            "null"
-                        ],
-                        "format": "int32"
+                    "error_source_context_enabled": {
+                        "description": "Opt-in to native error-tracking source context (false = off). When on,\nTemps stores uploaded source files and shows source code in stack traces.",
+                        "type": "boolean"
                     },
-                    "git_url": {
+                    "error_source_root": {
+                        "description": "Where auto-capture reads source from (relative to the checkout). Null =\nthe deployment's Docker build context.",
                         "type": [
                             "string",
                             "null"
-                        ],
-                        "description": "Git clone URL for the repository (used for public repos without a provider connection)"
+                        ]
                     },
-                    "id": {
-                        "type": "integer",
-                        "format": "int32"
-                    },
-                    "last_deployment": {
+                    "git_provider_connection_id": {
+                        "format": "int32",
                         "type": [
                             "integer",
                             "null"
-                        ],
-                        "format": "int64"
+                        ]
+                    },
+                    "git_provider_type": {
+                        "description": "Git provider behind `git_provider_connection_id`: `github`,\n`github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when\nthe project has no connection (public repository, Docker image or\nuploaded source).\n\nClients must use this rather than guessing the host from `git_url`: a\nself-hosted GitLab/Gitea/Bitbucket instance can live on any domain, and\na connected project may have no clone URL stored at all.",
+                        "example": "gitlab",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "git_url": {
+                        "description": "Git clone URL for the repository (used for public repos without a provider connection)",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "gitlab_webhook_id": {
+                        "description": "GitLab webhook ID installed on the connected repository.\n`null` when no GitLab webhook is installed (not connected to GitLab,\nor webhook was removed / never created).",
+                        "example": 42,
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "id": {
+                        "format": "int32",
+                        "type": "integer"
+                    },
+                    "image_retention_hours": {
+                        "description": "Hours to retain built Docker images before nightly cleanup. Null = use the\nsystem-wide default from settings.",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "is_public_repo": {
+                        "description": "Authoritative repository visibility. A missing connection alone does\nnot imply that an incompletely configured repository is public.",
+                        "type": "boolean"
+                    },
+                    "last_deployment": {
+                        "format": "int64",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
                     },
                     "main_branch": {
                         "type": "string"
@@ -46522,7 +46874,33 @@
                         ]
                     },
                     "preset_config": {
-                        "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+                        "oneOf": [
+                            {
+                                "type": "null"
+                            },
+                            {
+                                "$ref": "#/components/schemas/PresetConfigSchema",
+                                "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+                            }
+                        ]
+                    },
+                    "preview_envs_idle_timeout_seconds": {
+                        "description": "Idle timeout (seconds) for on-demand preview environments.",
+                        "format": "int32",
+                        "type": "integer"
+                    },
+                    "preview_envs_on_demand": {
+                        "description": "When true, newly-created preview environments default to on-demand mode\n(containers stop after the configured idle timeout to save resources).",
+                        "type": "boolean"
+                    },
+                    "preview_envs_wake_timeout_seconds": {
+                        "description": "Wake timeout (seconds) for on-demand preview environments.",
+                        "format": "int32",
+                        "type": "integer"
+                    },
+                    "project_type": {
+                        "description": "Product lifecycle classification. `service` projects are tied to a\npersisted, versioned template release; this is independent from the\ndeployment transport in `source_type`.",
+                        "type": "string"
                     },
                     "repo_name": {
                         "type": [
@@ -46536,6 +46914,20 @@
                             "null"
                         ]
                     },
+                    "service_template_image_url": {
+                        "description": "Logo from the immutable service-template release applied to this\nproject. Clients should prefer it over a deployed site's favicon.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "service_template_version": {
+                        "description": "Exact service-template version currently applied to the project.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
                     "slug": {
                         "type": "string"
                     },
@@ -46543,11 +46935,45 @@
                         "$ref": "#/components/schemas/SourceType",
                         "description": "Source type for deployments (git, docker_image, or static_files)"
                     },
+                    "template_slug": {
+                        "description": "Bundled template slug that created this project. Clients use this to\npresent template-specific runtime configuration instead of generic\nsource-build controls.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
                     "updated_at": {
-                        "type": "integer",
-                        "format": "int64"
+                        "format": "int64",
+                        "type": "integer"
+                    },
+                    "vulnerability_scanning_enabled": {
+                        "description": "Opt-in Trivy vulnerability scanning of this project's deployed Docker\nimages. Off by default — project owners explicitly enable it.",
+                        "type": "boolean"
                     }
-                }
+                },
+                "required": [
+                    "id",
+                    "slug",
+                    "name",
+                    "directory",
+                    "main_branch",
+                    "project_type",
+                    "created_at",
+                    "updated_at",
+                    "is_public_repo",
+                    "deployment_config",
+                    "attack_mode",
+                    "ai_write_actions_enabled",
+                    "error_source_context_enabled",
+                    "vulnerability_scanning_enabled",
+                    "enable_preview_environments",
+                    "preview_envs_on_demand",
+                    "preview_envs_idle_timeout_seconds",
+                    "preview_envs_wake_timeout_seconds",
+                    "source_type",
+                    "cross_project_trace_sharing"
+                ],
+                "type": "object"
             },
             "ProjectServiceInfo": {
                 "type": "object",
@@ -52328,83 +52754,160 @@
                 }
             },
             "TemplateResponse": {
-                "type": "object",
                 "description": "Response type for a single template",
+                "properties": {
+                    "command": {
+                        "description": "Optional command passed to the image entrypoint.",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": [
+                            "array",
+                            "null"
+                        ]
+                    },
+                    "description": {
+                        "description": "Short description",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "env_vars": {
+                        "description": "Environment variables template",
+                        "items": {
+                            "$ref": "#/components/schemas/EnvVarTemplateResponse"
+                        },
+                        "type": "array"
+                    },
+                    "exposed_port": {
+                        "description": "Container port the prebuilt image listens on (image deploys only).",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "features": {
+                        "description": "Feature highlights",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "git": {
+                        "$ref": "#/components/schemas/GitRefResponse",
+                        "description": "Git repository reference"
+                    },
+                    "health_check_path": {
+                        "description": "HTTP health-check path probed after the container starts (image deploys).",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "image": {
+                        "description": "Prebuilt Docker image reference. When set, the one-click deploy pulls and\nruns this image directly (no build); when absent it builds from `git`.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "image_url": {
+                        "description": "URL to template image/icon",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "is_featured": {
+                        "description": "Whether the template is featured/promoted",
+                        "type": "boolean"
+                    },
+                    "kind": {
+                        "$ref": "#/components/schemas/TemplateKind",
+                        "description": "Gallery this template belongs to."
+                    },
+                    "managed_service_bindings": {
+                        "additionalProperties": {
+                            "additionalProperties": {
+                                "type": "string"
+                            },
+                            "propertyNames": {
+                                "type": "string"
+                            },
+                            "type": "object"
+                        },
+                        "description": "Managed-service environment aliases used at deployment time.",
+                        "propertyNames": {
+                            "type": "string"
+                        },
+                        "type": "object"
+                    },
+                    "name": {
+                        "description": "Display name",
+                        "type": "string"
+                    },
+                    "preset": {
+                        "description": "Framework/preset to use",
+                        "type": "string"
+                    },
+                    "resources": {
+                        "oneOf": [
+                            {
+                                "type": "null"
+                            },
+                            {
+                                "$ref": "#/components/schemas/TemplateResources",
+                                "description": "Curated CPU/memory profile applied when the project is created."
+                            }
+                        ]
+                    },
+                    "screenshot_url": {
+                        "description": "URL to a wide screenshot/banner preview of the deployed template.\nAbsent for templates that don't have one captured yet.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "services": {
+                        "description": "Required external services",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "slug": {
+                        "description": "Unique identifier for the template (used in URLs)",
+                        "type": "string"
+                    },
+                    "tags": {
+                        "description": "Tags/categories for filtering",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "version": {
+                        "description": "Immutable release identifier for service templates.",
+                        "type": "string"
+                    }
+                },
                 "required": [
                     "slug",
                     "name",
+                    "version",
+                    "kind",
                     "git",
                     "preset",
                     "tags",
                     "features",
                     "services",
                     "env_vars",
-                    "is_featured"
+                    "is_featured",
+                    "managed_service_bindings"
                 ],
-                "properties": {
-                    "description": {
-                        "type": [
-                            "string",
-                            "null"
-                        ],
-                        "description": "Short description"
-                    },
-                    "env_vars": {
-                        "type": "array",
-                        "items": {
-                            "$ref": "#/components/schemas/EnvVarTemplateResponse"
-                        },
-                        "description": "Environment variables template"
-                    },
-                    "features": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
-                        "description": "Feature highlights"
-                    },
-                    "git": {
-                        "$ref": "#/components/schemas/GitRefResponse",
-                        "description": "Git repository reference"
-                    },
-                    "image_url": {
-                        "type": [
-                            "string",
-                            "null"
-                        ],
-                        "description": "URL to template image/icon"
-                    },
-                    "is_featured": {
-                        "type": "boolean",
-                        "description": "Whether the template is featured/promoted"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Display name"
-                    },
-                    "preset": {
-                        "type": "string",
-                        "description": "Framework/preset to use"
-                    },
-                    "services": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
-                        "description": "Required external services"
-                    },
-                    "slug": {
-                        "type": "string",
-                        "description": "Unique identifier for the template (used in URLs)"
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
-                        "description": "Tags/categories for filtering"
-                    }
-                }
+                "type": "object"
             },
             "TestEmailRequest": {
                 "type": "object",
@@ -52800,7 +53303,7 @@
             },
             "TraceSummary": {
                 "type": "object",
-                "description": "A trace summary for the list view \u2014 one row per trace, aggregated from spans.",
+                "description": "A trace summary for the list view — one row per trace, aggregated from spans.",
                 "required": [
                     "trace_id",
                     "root_span_name",
@@ -56201,6 +56704,464 @@
                         "type": "string"
                     }
                 }
+            },
+            "TemplateKind": {
+                "description": "Where a template is presented in the project creation flow.",
+                "enum": [
+                    "starter",
+                    "service"
+                ],
+                "type": "string"
+            },
+            "TemplateResources": {
+                "description": "Resource profile required by a curated template. CPU values use the same\nmicrocore unit as project deployment configuration; memory values are MiB.",
+                "properties": {
+                    "cpu_limit": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "cpu_request": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "memory_limit": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "memory_request": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    }
+                },
+                "type": "object"
+            },
+            "ProjectTemplate": {
+                "description": "A curated project template",
+                "properties": {
+                    "command": {
+                        "description": "Optional command passed to the container image. This is needed for\nproduction images whose default command is intentionally a development\nmode (for example Keycloak).",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": [
+                            "array",
+                            "null"
+                        ]
+                    },
+                    "description": {
+                        "description": "Short description",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "env_vars": {
+                        "description": "Environment variables template",
+                        "items": {
+                            "$ref": "#/components/schemas/EnvVarTemplate"
+                        },
+                        "type": "array"
+                    },
+                    "exposed_port": {
+                        "description": "Container port the prebuilt image listens on (used for routing when\ndeploying from `image`). Falls back to the image's EXPOSE / 3000 default.",
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "features": {
+                        "description": "Feature highlights",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "git": {
+                        "$ref": "#/components/schemas/GitRef",
+                        "description": "Git repository reference (supports any git provider). Always present as\nthe source-of-truth / build fallback, even for image-based templates."
+                    },
+                    "health_check_path": {
+                        "description": "HTTP health-check path probed after the container starts (image deploys\ncan't read `.temps.yaml`). Must start with '/'. Defaults to \"/\".",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "image": {
+                        "description": "Prebuilt Docker image reference (e.g. \"ghcr.io/org/app:latest\"). When set,\nthe one-click deploy pulls and runs this image directly (source_type\ndocker_image) instead of building from `git` — instant, no BuildKit. When\nabsent, the template builds from source.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "image_url": {
+                        "description": "URL to template image/icon",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "is_featured": {
+                        "description": "Whether the template is featured/promoted",
+                        "type": "boolean"
+                    },
+                    "is_public": {
+                        "description": "Whether the template is publicly visible",
+                        "type": "boolean"
+                    },
+                    "kind": {
+                        "$ref": "#/components/schemas/TemplateKind",
+                        "description": "Gallery this template belongs to. Older configurations default to a\nsource-code starter, preserving their existing behaviour."
+                    },
+                    "managed_service_bindings": {
+                        "additionalProperties": {
+                            "additionalProperties": {
+                                "type": "string"
+                            },
+                            "propertyNames": {
+                                "type": "string"
+                            },
+                            "type": "object"
+                        },
+                        "description": "Environment aliases populated from a linked managed service. The outer\nkey is the Temps service type and each inner entry maps an application\nvariable to a variable supplied by that service.\n\nExample: `postgres.KC_DB_USERNAME: POSTGRES_USER`.",
+                        "propertyNames": {
+                            "type": "string"
+                        },
+                        "type": "object"
+                    },
+                    "name": {
+                        "description": "Display name",
+                        "type": "string"
+                    },
+                    "preset": {
+                        "description": "Framework/preset to use (e.g., \"nextjs\", \"fastapi\", \"dockerfile\")",
+                        "type": "string"
+                    },
+                    "preset_config": {
+                        "description": "Preset-specific configuration"
+                    },
+                    "resources": {
+                        "oneOf": [
+                            {
+                                "type": "null"
+                            },
+                            {
+                                "$ref": "#/components/schemas/TemplateResources",
+                                "description": "Minimum/safe runtime resources for this application. These values are\nvalidated against operator-configured tenant ceilings before creation."
+                            }
+                        ]
+                    },
+                    "screenshot_url": {
+                        "description": "URL to a full screenshot/banner preview of the deployed template (e.g.\n`/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the\ntemplate card; optional — templates without one show no banner.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "services": {
+                        "description": "Required external services (e.g., [\"postgres\", \"redis\"])",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "slug": {
+                        "description": "Unique identifier for the template (used in URLs)",
+                        "type": "string"
+                    },
+                    "sort_order": {
+                        "description": "Sort order for display (lower = first)",
+                        "format": "int32",
+                        "type": "integer"
+                    },
+                    "tags": {
+                        "description": "Tags/categories for filtering",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "version": {
+                        "description": "Version of this template release. Service projects pin this value and\nthe complete resolved definition so catalog updates are always an\nexplicit, reviewable upgrade rather than a silent runtime mutation.",
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "slug",
+                    "name",
+                    "git",
+                    "preset"
+                ],
+                "type": "object"
+            },
+            "EnvVarTemplate": {
+                "description": "Environment variable template definition",
+                "properties": {
+                    "default": {
+                        "description": "Default value if not provided by user",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "default_generator": {
+                        "description": "Frontend-side generator for the default value. Recognised values:\n`app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),\n`random_hex_32` (32-byte hex). Unknown values are ignored client-side.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "description": {
+                        "description": "Description of what this variable is used for",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "example": {
+                        "description": "Example value for documentation",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "name": {
+                        "description": "Name of the environment variable",
+                        "type": "string"
+                    },
+                    "required": {
+                        "description": "Whether this variable is required",
+                        "type": "boolean"
+                    },
+                    "secret": {
+                        "description": "Explicit sensitivity classification for credentials whose names do not\nmatch the conservative built-in heuristic.",
+                        "type": "boolean"
+                    }
+                },
+                "required": [
+                    "name"
+                ],
+                "type": "object"
+            },
+            "ServiceTemplateInstance": {
+                "description": "Immutable template release attached to a service project.\n\nThe resolved definition is deliberately stored with the project. The live\ncatalog is only needed to discover a newer release; deployments, edits and\nrollbacks continue to work if the catalog later changes or disappears.",
+                "properties": {
+                    "schema_version": {
+                        "description": "Catalog schema used to deserialize `template`.",
+                        "type": "string"
+                    },
+                    "slug": {
+                        "description": "Stable service family identifier.",
+                        "type": "string"
+                    },
+                    "template": {
+                        "$ref": "#/components/schemas/ProjectTemplate",
+                        "description": "Exact resolved release from which this project was created/upgraded."
+                    },
+                    "version": {
+                        "description": "Applied template release.",
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "schema_version",
+                    "slug",
+                    "version",
+                    "template"
+                ],
+                "type": "object"
+            },
+            "ServiceTemplateInstanceResponse": {
+                "properties": {
+                    "applied": {
+                        "$ref": "#/components/schemas/ServiceTemplateInstance"
+                    },
+                    "catalog_drift": {
+                        "description": "The catalog definition changed without a version bump. Applying it is\nintentionally blocked because mutable releases make upgrades and\nrollbacks non-reproducible.",
+                        "type": "boolean"
+                    },
+                    "catalog_error": {
+                        "description": "User-safe explanation when the active catalog could not provide this\nservice family. The applied snapshot remains authoritative and editable.",
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "changes": {
+                        "items": {
+                            "$ref": "#/components/schemas/ServiceTemplateUpgradeChange"
+                        },
+                        "type": "array"
+                    },
+                    "latest": {
+                        "oneOf": [
+                            {
+                                "type": "null"
+                            },
+                            {
+                                "$ref": "#/components/schemas/ServiceTemplateInstance",
+                                "description": "Latest release for the same service family. Absent when the catalog no\nlonger carries the template; the applied snapshot is still usable."
+                            }
+                        ]
+                    },
+                    "missing_services": {
+                        "description": "Managed service families that must be linked before this release can be\napplied. Existing links are never removed automatically.",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "project_id": {
+                        "format": "int32",
+                        "type": "integer"
+                    },
+                    "required_configuration": {
+                        "description": "Required target inputs that are not currently configured and cannot be\nfilled from a template default or generator.",
+                        "items": {
+                            "$ref": "#/components/schemas/EnvVarTemplate"
+                        },
+                        "type": "array"
+                    },
+                    "upgrade_available": {
+                        "type": "boolean"
+                    }
+                },
+                "required": [
+                    "project_id",
+                    "applied",
+                    "upgrade_available",
+                    "catalog_drift",
+                    "changes",
+                    "required_configuration",
+                    "missing_services"
+                ],
+                "type": "object"
+            },
+            "ServiceTemplateChangeKind": {
+                "enum": [
+                    "added",
+                    "removed",
+                    "changed"
+                ],
+                "type": "string"
+            },
+            "ServiceTemplateUpgradeChange": {
+                "description": "One reviewable change between the project's applied service release and\nthe current catalog release. Values contain public template metadata only;\nproject environment values and secrets never enter this response.",
+                "properties": {
+                    "current": {
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    },
+                    "field": {
+                        "type": "string"
+                    },
+                    "kind": {
+                        "$ref": "#/components/schemas/ServiceTemplateChangeKind"
+                    },
+                    "target": {
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    }
+                },
+                "required": [
+                    "field",
+                    "kind"
+                ],
+                "type": "object"
+            },
+            "UpdateServiceTemplateRuntimeRequest": {
+                "description": "Complete replacement for the editable runtime of a single-container\nservice-template project. Runtime and resource fields are written to the\nsame project row in one transaction.",
+                "properties": {
+                    "command": {
+                        "description": "Empty means use the image's own default command.",
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array"
+                    },
+                    "cpuLimit": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "cpuRequest": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "exposedPort": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "healthCheckPath": {
+                        "type": "string"
+                    },
+                    "imageRef": {
+                        "type": "string"
+                    },
+                    "memoryLimit": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    },
+                    "memoryRequest": {
+                        "format": "int32",
+                        "type": [
+                            "integer",
+                            "null"
+                        ]
+                    }
+                },
+                "required": [
+                    "imageRef",
+                    "healthCheckPath"
+                ],
+                "type": "object"
+            },
+            "UpgradeServiceTemplateRequest": {
+                "properties": {
+                    "environment_variables": {
+                        "description": "Values for inputs introduced by the target release. Existing project\nvalues are preserved and cannot be overwritten through this endpoint.",
+                        "items": {
+                            "$ref": "#/components/schemas/EnvVarInput"
+                        },
+                        "type": "array"
+                    },
+                    "target_version": {
+                        "description": "Optimistic target selected from the preview. The server rejects a stale\ntarget if the catalog changes between preview and apply.",
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "target_version"
+                ],
+                "type": "object"
             }
         },
         "securitySchemes": {

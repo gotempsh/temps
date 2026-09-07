@@ -17,6 +17,7 @@ import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Input } from '@/components/ui/input'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import {
   getProjectsOptions,
   listGitProvidersOptions,
@@ -170,7 +171,7 @@ export function Projects() {
     ))
 
   return (
-    <div className="p-4 sm:p-8 space-y-6">
+    <PageContainer innerClassName="space-y-6">
       {/* Header */}
       <ProjectsHeader
         actions={
@@ -242,7 +243,7 @@ export function Projects() {
             onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
           />
         )}
-    </div>
+    </PageContainer>
   )
 }
 
@@ -314,17 +315,11 @@ function ProjectSearch({
  */
 function ProjectsHeader({ actions }: { actions: React.ReactNode }) {
   return (
-    <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
-        <p className="text-sm text-muted-foreground">
-          Manage your projects and their settings
-        </p>
-      </div>
-      <div className="flex flex-1 flex-wrap justify-start gap-2 sm:justify-end">
-        {actions}
-      </div>
-    </div>
+    <PageHeader
+      title="Projects"
+      description="Manage your projects and their settings"
+      actions={actions}
+    />
   )
 }
 

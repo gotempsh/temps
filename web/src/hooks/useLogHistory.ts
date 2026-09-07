@@ -96,7 +96,9 @@ export interface LogSearchParams {
 
 // ── API call ───────────────────────────────────────────────────────────
 
-async function searchLogs(params: LogSearchParams): Promise<SearchLogsResponse> {
+async function searchLogs(
+  params: LogSearchParams
+): Promise<SearchLogsResponse> {
   const body: Record<string, unknown> = {
     project_id: params.projectId,
   }
@@ -128,7 +130,13 @@ async function searchLogs(params: LogSearchParams): Promise<SearchLogsResponse> 
   // React Query sets `error` and the UI shows the failure state instead of
   // crashing in getNextPageParam when it receives an undefined page.
   if (response.data == null) {
-    throw new Error('Log search returned no data — the server may have returned an error')
+    const problem = response.error as
+      { detail?: string; title?: string } | undefined
+    throw new Error(
+      problem?.detail ??
+        problem?.title ??
+        'Log search returned no data — the server may have returned an error'
+    )
   }
 
   return response.data as SearchLogsResponse
@@ -156,7 +164,8 @@ export function useLogHistory(params: LogSearchParams, enabled = true) {
       params.nodeIds,
     ],
     queryFn: () => searchLogs(params),
-    enabled: enabled && (!!params.projectId || params.externalServiceId != null),
+    enabled:
+      enabled && (!!params.projectId || params.externalServiceId != null),
     staleTime: 1000 * 30, // 30 seconds
     placeholderData: keepPreviousData,
   })
@@ -202,7 +211,8 @@ export function useLogHistoryInfinite(
     // lastPage is the most recently fetched (oldest) page; its next_cursor
     // points at the next-older page. Undefined stops the "load older" walk.
     getNextPageParam: (lastPage) => lastPage?.next_cursor ?? undefined,
-    enabled: enabled && (!!params.projectId || params.externalServiceId != null),
+    enabled:
+      enabled && (!!params.projectId || params.externalServiceId != null),
     staleTime: 1000 * 30,
   })
 }

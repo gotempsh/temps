@@ -13,6 +13,7 @@ import { status } from './status.js'
 import { drop } from './drop.js'
 import { cancelDeploymentAction, pauseDeploymentAction, resumeDeploymentAction, teardownDeploymentAction } from './actions.js'
 import { failureReportPreviewAction, failureReportSendAction } from './failure-report.js'
+import { runtimeLogs } from '../runtime-logs.js'
 
 export function registerDeployCommands(program: Command): void {
   program
@@ -182,6 +183,18 @@ export function registerDeployCommands(program: Command): void {
     .option('-n, --lines <number>', 'Number of lines to show', '100')
     .option('-d, --deployment <id>', 'Specific deployment ID')
     .action(logs)
+
+  deployments
+    .command('container-logs')
+    .description('Show live container logs, including retained failed deployments')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-e, --environment <env>', 'Environment', 'production')
+    .requiredOption('-d, --deployment <id>', 'Deployment ID')
+    .option('-c, --container <id>', 'Container ID or name (partial match supported)')
+    .option('-n, --tail <lines>', 'Number of lines to tail', '1000')
+    .option('-t, --timestamps', 'Show timestamps')
+    .option('-f, --follow', 'Follow log output')
+    .action(runtimeLogs)
 
   const failureReport = deployments
     .command('failure-report')

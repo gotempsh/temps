@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
+
+/// Private ACME-order metadata key used to retain DNS cleanup receipts until
+/// provider-side challenge records reach a terminal cleanup outcome.
+pub(crate) const DNS_CLEANUP_PLAN_KEY: &str = "temps_dns_cleanup";
 use temps_core::UtcDateTime;
 
 /// TLS certificate stored in the `domains` table.

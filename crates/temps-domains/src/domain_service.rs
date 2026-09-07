@@ -534,6 +534,7 @@ impl DomainService {
                 format!("No ACME order found for domain: {}. Please create an order first using POST /domains/{}/order",
                     domain_name, domain.id)
             ))?;
+        let retain_order_for_dns_cleanup = has_pending_dns_cleanup(order.authorizations.as_ref());
 
         // Check if order is in a valid state
         if order.status != "pending" && order.status != "ready" {
@@ -636,9 +637,16 @@ impl DomainService {
 
                 let updated_domain = domain_active.update(self.db.as_ref()).await?;
 
-                // Clean up ACME order
-                if let Some(order) = self.repository.find_acme_order_by_domain(domain_id).await? {
-                    self.repository.delete_acme_order(&order.order_url).await?;
+                // Keep orders carrying provider record receipts until the
+                // handler completes (or explicitly skips) external DNS
+                // cleanup. A transient provider failure can then be retried
+                // without reissuing the certificate.
+                if !retain_order_for_dns_cleanup {
+                    if let Some(order) =
+                        self.repository.find_acme_order_by_domain(domain_id).await?
+                    {
+                        self.repository.delete_acme_order(&order.order_url).await?;
+                    }
                 }
 
                 info!(
@@ -1535,6 +1543,14 @@ pub struct OnDemandCertStatus {
 /// `source()` level joined by `: ` — for the `on_demand_cert_attempts.error_chain`
 /// audit column (ADR-018 §5). This is the operator's first-line diagnostic, so it
 /// must preserve every nested cause rather than the top-level message alone.
+fn has_pending_dns_cleanup(authorizations: Option<&serde_json::Value>) -> bool {
+    authorizations.is_some_and(|metadata| {
+        metadata
+            .get(crate::tls::models::DNS_CLEANUP_PLAN_KEY)
+            .is_some()
+    })
+}
+
 fn error_chain_string(err: &dyn std::error::Error) -> String {
     let mut parts = vec![err.to_string()];
     let mut source = err.source();
@@ -1579,6 +1595,22 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use std::sync::Arc;
+
+    #[test]
+    fn acme_orders_with_dns_cleanup_receipts_are_retained_after_issuance() {
+        let with_receipt = serde_json::json!({
+            crate::tls::models::DNS_CLEANUP_PLAN_KEY: {
+                "provider_id": 7,
+                "zone": "example.com",
+                "records": []
+            }
+        });
+        let without_receipt = serde_json::json!({"challenge_type": "dns-01"});
+
+        assert!(has_pending_dns_cleanup(Some(&with_receipt)));
+        assert!(!has_pending_dns_cleanup(Some(&without_receipt)));
+        assert!(!has_pending_dns_cleanup(None));
+    }
 
     struct MockProvider;
 

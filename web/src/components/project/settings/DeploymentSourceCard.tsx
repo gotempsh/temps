@@ -27,11 +27,7 @@ import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 type SourceType =
-  | 'git'
-  | 'docker_image'
-  | 'static_files'
-  | 'uploaded_source'
-  | 'manual'
+  'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual'
 
 /** How each source type reads in the "keeps deploying from X" sentence. */
 const SOURCE_LABELS: Record<SourceType, string> = {
@@ -181,7 +177,9 @@ export function DeploymentSourceCard({
     <Card>
       <CardHeader>
         <CardTitle>Deployment source</CardTitle>
-        <CardDescription>How this project is built and deployed.</CardDescription>
+        <CardDescription>
+          How this project is built and deployed.
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-2">
         {SOURCE_TYPES.map((t) => (

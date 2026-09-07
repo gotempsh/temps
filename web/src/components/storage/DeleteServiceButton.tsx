@@ -14,6 +14,7 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
@@ -98,11 +99,7 @@ export function DeleteServiceButton({
         </AlertDialogHeader>
         <div className="space-y-2">
           <Label htmlFor="confirm-service-name">
-            Type{' '}
-            <span className="font-mono font-semibold text-foreground">
-              {serviceName}
-            </span>{' '}
-            to confirm
+            Type <ConfirmNameBadge value={serviceName} /> to confirm
           </Label>
           <Input
             id="confirm-service-name"

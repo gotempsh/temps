@@ -251,6 +251,9 @@ export function buildPlatformSettingsUpdateBody(
     // this field makes serde restore DockerRegistrySettings::default(), so a
     // successful save immediately clears the registry configuration.
     docker_registry: updated.docker_registry,
+    // Same reasoning: omitting this would silently clear the configured
+    // registry-mirror prefix on every unrelated settings save.
+    registry_mirror_prefix: updated.registry_mirror_prefix,
     disk_space_alert: updated.disk_space_alert,
     // The response replaces encrypted provider credentials with masked status
     // fields. The server restores those omitted secrets from storage on PUT.

@@ -13,6 +13,7 @@ use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use super::deployment_config::DeploymentConfig;
 use super::preset::{Preset, PresetConfig};
 use super::source_type::SourceType;
+use super::types::ProjectType;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "projects")]
@@ -64,6 +65,12 @@ pub struct Model {
     /// application source is always a deliberate choice.
     #[sea_orm(default_value = "false")]
     pub error_source_context_enabled: bool,
+    /// Opt-in Trivy vulnerability scanning of this project's deployed Docker
+    /// images (post-deployment scan + daily rescans). Off by default — scanning
+    /// costs CPU/time per image and requires the `trivy` binary; project owners
+    /// explicitly enable it when they want the coverage.
+    #[sea_orm(default_value = "false")]
+    pub vulnerability_scanning_enabled: bool,
     /// Where the auto-capture job reads source from, relative to the git
     /// checkout. NULL = default to the deployment's Docker build context (the
     /// directory the image was built from) — the correct root for Dockerfile
@@ -89,6 +96,11 @@ pub struct Model {
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]
     pub source_type: SourceType,
+    /// Product-level project classification. Unlike `source_type`, which
+    /// describes how bytes reach the deployer, this distinguishes a regular
+    /// application from a versioned template-backed service.
+    #[sea_orm(default_value = "server")]
+    pub project_type: ProjectType,
     /// Opt-in: accept deployments whose source differs from `source_type`.
     ///
     /// `source_type` stays the project's primary/default source — a Git project
@@ -97,11 +109,16 @@ pub struct Model {
     /// (`drop`), so the same project can be shipped from git, a Docker image, or
     /// a local folder. NULL means off.
     pub allow_alternate_sources: Option<bool>,
-    /// Bounded template provenance: a reviewed bundled slug or `custom`.
-    /// NULL means the project was not created through the template catalog;
-    /// operator-defined slugs are never stored in this field.
+    /// Bounded template provenance: a reviewed bundled slug or the fixed
+    /// `custom` marker. Service projects additionally persist their complete,
+    /// immutable template release in `service_template`.
     #[serde(skip_serializing)]
     pub template_slug: Option<String>,
+    /// Immutable resolved service-template release. Stored as JSONB so an
+    /// existing service remains deployable and editable without consulting the
+    /// mutable catalog. Only `project_type = service` may populate it.
+    #[serde(skip_serializing)]
+    pub service_template: Option<Json>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install
     /// the webhook on repo connect. NULL when not connected to a GitLab repository.
     pub gitlab_webhook_id: Option<i32>,

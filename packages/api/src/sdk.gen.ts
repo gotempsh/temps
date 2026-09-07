@@ -1180,10 +1180,12 @@ import type {
   GetPreferencesErrors,
   GetPreferencesResponses,
   GetPreviewGatewayLogsData,
+  GetPreviewGatewayLogsErrors,
   GetPreviewGatewayLogsResponses,
   GetPreviewGatewaySettingsData,
   GetPreviewGatewaySettingsResponses,
   GetPreviewGatewayStatusData,
+  GetPreviewGatewayStatusErrors,
   GetPreviewGatewayStatusResponses,
   GetPricingData,
   GetPricingErrors,
@@ -1211,6 +1213,9 @@ import type {
   GetProjectServiceEnvironmentVariablesData,
   GetProjectServiceEnvironmentVariablesErrors,
   GetProjectServiceEnvironmentVariablesResponses,
+  GetProjectServiceTemplateData,
+  GetProjectServiceTemplateErrors,
+  GetProjectServiceTemplateResponses,
   GetProjectSessionReplaysData,
   GetProjectSessionReplaysErrors,
   GetProjectSessionReplaysResponses,
@@ -1520,6 +1525,9 @@ import type {
   HasTracesData,
   HasTracesErrors,
   HasTracesResponses,
+  ImportEmailDomainData,
+  ImportEmailDomainErrors,
+  ImportEmailDomainResponses,
   ImportExternalServiceData,
   ImportExternalServiceErrors,
   ImportExternalServiceResponses,
@@ -1994,6 +2002,7 @@ import type {
   PatchAdminGateErrors,
   PatchAdminGateResponses,
   PatchPreviewGatewaySettingsData,
+  PatchPreviewGatewaySettingsErrors,
   PatchPreviewGatewaySettingsResponses,
   PauseDeploymentData,
   PauseDeploymentErrors,
@@ -2154,6 +2163,7 @@ import type {
   RestartContainerErrors,
   RestartContainerResponses,
   RestartPreviewGatewayData,
+  RestartPreviewGatewayErrors,
   RestartPreviewGatewayResponses,
   RestartSandboxData,
   RestartSandboxErrors,
@@ -2614,6 +2624,9 @@ import type {
   UpdateServiceResourcesErrors,
   UpdateServiceResourcesResponses,
   UpdateServiceResponses,
+  UpdateServiceTemplateRuntimeData,
+  UpdateServiceTemplateRuntimeErrors,
+  UpdateServiceTemplateRuntimeResponses,
   UpdateSessionDurationData,
   UpdateSessionDurationErrors,
   UpdateSessionDurationResponses,
@@ -2645,7 +2658,11 @@ import type {
   UpdateWebhookProviderResponses,
   UpdateWebhookResponses,
   UpgradePreviewGatewayData,
+  UpgradePreviewGatewayErrors,
   UpgradePreviewGatewayResponses,
+  UpgradeProjectServiceTemplateData,
+  UpgradeProjectServiceTemplateErrors,
+  UpgradeProjectServiceTemplateResponses,
   UpgradeServiceData,
   UpgradeServiceErrors,
   UpgradeServiceResponses,
@@ -6672,6 +6689,35 @@ export const getDomainByName = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/email-domains/by-domain/{domain}",
     ...options,
+  });
+
+/**
+ * Import an already-provisioned email domain from the provider
+ *
+ * Use this endpoint when the domain identity was created directly in the email
+ * provider's console or API. Temps will fetch its current verification state
+ * rather than registering a new identity, preventing duplicate or conflicting
+ * provider-side entries.
+ */
+export const importEmailDomain = <ThrowOnError extends boolean = false>(
+  options: Options<ImportEmailDomainData, ThrowOnError>,
+): RequestResult<
+  ImportEmailDomainResponses,
+  ImportEmailDomainErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ImportEmailDomainResponses,
+    ImportEmailDomainErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-domains/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -12391,10 +12437,14 @@ export const generatePresetDockerfile = <ThrowOnError extends boolean = false>(
 
 export const getPreviewGatewayLogs = <ThrowOnError extends boolean = false>(
   options?: Options<GetPreviewGatewayLogsData, ThrowOnError>,
-): RequestResult<GetPreviewGatewayLogsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetPreviewGatewayLogsResponses,
+  GetPreviewGatewayLogsErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).get<
     GetPreviewGatewayLogsResponses,
-    unknown,
+    GetPreviewGatewayLogsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12404,10 +12454,14 @@ export const getPreviewGatewayLogs = <ThrowOnError extends boolean = false>(
 
 export const restartPreviewGateway = <ThrowOnError extends boolean = false>(
   options?: Options<RestartPreviewGatewayData, ThrowOnError>,
-): RequestResult<RestartPreviewGatewayResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  RestartPreviewGatewayResponses,
+  RestartPreviewGatewayErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).post<
     RestartPreviewGatewayResponses,
-    unknown,
+    RestartPreviewGatewayErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12432,10 +12486,14 @@ export const patchPreviewGatewaySettings = <
   ThrowOnError extends boolean = false,
 >(
   options: Options<PatchPreviewGatewaySettingsData, ThrowOnError>,
-): RequestResult<PatchPreviewGatewaySettingsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  PatchPreviewGatewaySettingsResponses,
+  PatchPreviewGatewaySettingsErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).patch<
     PatchPreviewGatewaySettingsResponses,
-    unknown,
+    PatchPreviewGatewaySettingsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12449,10 +12507,14 @@ export const patchPreviewGatewaySettings = <
 
 export const getPreviewGatewayStatus = <ThrowOnError extends boolean = false>(
   options?: Options<GetPreviewGatewayStatusData, ThrowOnError>,
-): RequestResult<GetPreviewGatewayStatusResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetPreviewGatewayStatusResponses,
+  GetPreviewGatewayStatusErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).get<
     GetPreviewGatewayStatusResponses,
-    unknown,
+    GetPreviewGatewayStatusErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12462,10 +12524,14 @@ export const getPreviewGatewayStatus = <ThrowOnError extends boolean = false>(
 
 export const upgradePreviewGateway = <ThrowOnError extends boolean = false>(
   options: Options<UpgradePreviewGatewayData, ThrowOnError>,
-): RequestResult<UpgradePreviewGatewayResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  UpgradePreviewGatewayResponses,
+  UpgradePreviewGatewayErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).post<
     UpgradePreviewGatewayResponses,
-    unknown,
+    UpgradePreviewGatewayErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -12558,9 +12624,9 @@ export const getVisibleCustomDomainByHostname = <
 /**
  * Create a new project from a template
  *
- * Creates a new repository from a template and sets up the project with the
- * specified configuration. The template is cloned to a new repository under
- * the authenticated user's account or specified organization.
+ * Image-backed service templates are created directly from their pinned image.
+ * Source-backed starter templates can either use their public repository or
+ * create a repository under the selected Git provider account.
  */
 export const createProjectFromTemplate = <ThrowOnError extends boolean = false>(
   options: Options<CreateProjectFromTemplateData, ThrowOnError>,
@@ -16958,6 +17024,73 @@ export const updateProjectSecret = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/projects/{project_id}/secrets/{secret_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateServiceTemplateRuntime = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateServiceTemplateRuntimeData, ThrowOnError>,
+): RequestResult<
+  UpdateServiceTemplateRuntimeResponses,
+  UpdateServiceTemplateRuntimeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateServiceTemplateRuntimeResponses,
+    UpdateServiceTemplateRuntimeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/service-runtime",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Return the immutable service-template release applied to a project together
+ * with catalog drift, missing requirements, and an available upgrade preview.
+ */
+export const getProjectServiceTemplate = <ThrowOnError extends boolean = false>(
+  options: Options<GetProjectServiceTemplateData, ThrowOnError>,
+): RequestResult<
+  GetProjectServiceTemplateResponses,
+  GetProjectServiceTemplateErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetProjectServiceTemplateResponses,
+    GetProjectServiceTemplateErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/service-template",
+    ...options,
+  });
+
+export const upgradeProjectServiceTemplate = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpgradeProjectServiceTemplateData, ThrowOnError>,
+): RequestResult<
+  UpgradeProjectServiceTemplateResponses,
+  UpgradeProjectServiceTemplateErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UpgradeProjectServiceTemplateResponses,
+    UpgradeProjectServiceTemplateErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/service-template/upgrade",
     ...options,
     headers: {
       "Content-Type": "application/json",

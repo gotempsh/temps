@@ -367,6 +367,35 @@ fn otlp_to_store_point(p: &OtlpMetricPoint, deployment_id: i32) -> Option<StoreM
     })
 }
 
+fn service_otlp_to_store_point(
+    point: &OtlpMetricPoint,
+    service_id: i32,
+) -> Option<StoreMetricPoint> {
+    if point.metric_type == MetricType::Histogram {
+        return None;
+    }
+    if validate_metric_name(&point.metric_name).is_err() {
+        warn!(
+            service_id,
+            metric_name = %point.metric_name,
+            "Dropping service metric: name outside allowlist (possible injection attempt)"
+        );
+        return None;
+    }
+    Some(StoreMetricPoint {
+        time: point.timestamp,
+        source_kind: SourceKind::Database,
+        source_id: service_id,
+        name: point.metric_name.clone(),
+        value: point.value?,
+        kind: MetricKind::Gauge,
+        engine: None,
+        environment: None,
+        node_id: None,
+        labels: HashMap::new(),
+    })
+}
+
 // ── Shared ingest logic ─────────────────────────────────────────────
 
 /// Resolved context for an ingest request: who authenticated and which
@@ -512,37 +541,7 @@ async fn do_ingest_service_metrics(
     let store_points: Vec<StoreMetricPoint> = if state.metrics_write_tx.is_some() {
         points
             .iter()
-            .filter_map(|p| {
-                if p.metric_type == MetricType::Histogram {
-                    return None;
-                }
-                // SECURITY(metrics-security-1): metric names on the `si_` ingest
-                // path are attacker-controllable (sent by the monitored
-                // container over OTLP) and are interpolated into SQL by the
-                // store. Drop names outside the [a-zA-Z0-9_.:-] allowlist here,
-                // at the trust boundary, so they never reach the write path.
-                if validate_metric_name(&p.metric_name).is_err() {
-                    warn!(
-                        service_id = service_auth.service_id,
-                        metric_name = %p.metric_name,
-                        "Dropping service metric: name outside allowlist (possible injection attempt)"
-                    );
-                    return None;
-                }
-                let value = p.value?;
-                Some(StoreMetricPoint {
-                    time: p.timestamp,
-                    source_kind: SourceKind::Database,
-                    source_id: service_auth.service_id,
-                    name: p.metric_name.clone(),
-                    value,
-                    kind: MetricKind::Gauge,
-                    engine: None,
-                    environment: None,
-                    node_id: None,
-                    labels: HashMap::new(),
-                })
-            })
+            .filter_map(|point| service_otlp_to_store_point(point, service_auth.service_id))
             .collect()
     } else {
         Vec::new()
@@ -1626,9 +1625,9 @@ mod tests {
     #[test]
     fn test_otlp_accepts_valid_metric_name() {
         let mut p = make_otlp_point(MetricType::Gauge, 42.0);
-        p.metric_name = "rustfs.storage.used_bytes".to_string();
+        p.metric_name = "rustfs_cluster_capacity_used_bytes".to_string();
         let sp = otlp_to_store_point(&p, 42).expect("valid name should produce a store point");
-        assert_eq!(sp.name, "rustfs.storage.used_bytes");
+        assert_eq!(sp.name, "rustfs_cluster_capacity_used_bytes");
         assert_eq!(sp.value, 42.0);
     }
 
@@ -1723,7 +1722,7 @@ mod tests {
             time: chrono::Utc::now(),
             source_kind: SourceKind::Database,
             source_id: 7,
-            name: "rustfs.storage.used_bytes".to_string(),
+            name: "rustfs_cluster_capacity_used_bytes".to_string(),
             value: 1024.0,
             kind: temps_metrics::MetricKind::Gauge,
             engine: None,
@@ -1733,7 +1732,7 @@ mod tests {
         };
         assert_eq!(point.source_id, 7);
         assert!(matches!(point.source_kind, SourceKind::Database));
-        assert_eq!(point.name, "rustfs.storage.used_bytes");
+        assert_eq!(point.name, "rustfs_cluster_capacity_used_bytes");
     }
 
     #[test]
@@ -1835,7 +1834,7 @@ mod tests {
                     scope: None,
                     #[allow(clippy::needless_update)]
                     metrics: vec![proto::metrics::v1::Metric {
-                        name: "rustfs.storage.used_bytes".to_string(),
+                        name: "rustfs_cluster_capacity_used_bytes".to_string(),
                         description: "Storage used in bytes".to_string(),
                         unit: "By".to_string(),
                         data: Some(proto::metrics::v1::metric::Data::Gauge(
@@ -1871,7 +1870,24 @@ mod tests {
         let rm = &decoded.resource_metrics[0];
         assert_eq!(
             rm.scope_metrics[0].metrics[0].name,
-            "rustfs.storage.used_bytes"
+            "rustfs_cluster_capacity_used_bytes"
         );
+
+        // Exercise the same protobuf decode and service-store conversion used
+        // by authenticated `si_` ingestion. This catches exporter-name drift,
+        // not merely protobuf round-trip behavior.
+        let points = decode::decode_metrics_request(&encoded, 0, None)
+            .expect("realistic RustFS metrics payload must decode");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].metric_name, "rustfs_cluster_capacity_used_bytes");
+        assert_eq!(points[0].value, Some(1073741824.0));
+        assert_eq!(points[0].resource.service_name, "rustfs-main");
+
+        let store_point = service_otlp_to_store_point(&points[0], 42)
+            .expect("RustFS gauge must reach service storage");
+        assert_eq!(store_point.source_kind, SourceKind::Database);
+        assert_eq!(store_point.source_id, 42);
+        assert_eq!(store_point.name, "rustfs_cluster_capacity_used_bytes");
+        assert_eq!(store_point.value, 1073741824.0);
     }
 }

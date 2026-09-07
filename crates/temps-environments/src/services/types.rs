@@ -18,8 +18,8 @@ pub struct EnvVarWithEnvironments {
     pub id: i32,
     pub project_id: i32,
     pub key: String,
-    /// Plaintext value. `None` when `is_secret = true` (write-only). Callers
-    /// that need plaintext for deploy must go through
+    /// Plaintext value. `None` when `is_secret = true` so list responses stay
+    /// masked. Callers that need plaintext for deploy must go through
     /// `EnvVarService::get_for_deploy` which decrypts independently of the
     /// secret flag.
     pub value: Option<String>,

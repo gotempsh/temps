@@ -70,7 +70,7 @@ export function registerProjectsCommands(program: Command): void {
 
   projects
     .command('settings')
-    .description('Update project settings (name, slug, attack mode, preview environments, image retention)')
+    .description('Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--name <name>', 'Project display name (does not change the URL)')
     .option('--slug <slug>', 'Project URL slug')
@@ -78,6 +78,14 @@ export function registerProjectsCommands(program: Command): void {
     .option('--no-attack-mode', 'Disable attack mode')
     .option('--preview-envs', 'Enable preview environments')
     .option('--no-preview-envs', 'Disable preview environments')
+    .option(
+      '--vulnerability-scanning',
+      'Enable Trivy vulnerability scanning of deployed Docker images (post-deploy + daily)'
+    )
+    .option(
+      '--no-vulnerability-scanning',
+      'Disable vulnerability scanning'
+    )
     .option(
       '--image-retention-hours <hours>',
       'Hours to keep built images before nightly cleanup removes them (1-8760). ' +

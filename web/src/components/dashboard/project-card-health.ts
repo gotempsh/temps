@@ -82,10 +82,12 @@ function measuredDetail(
 }
 
 /**
- * A configured production monitor is the direct answer to "is this healthy",
- * so it outranks traffic — including when traffic is silent. `no_monitors`
- * means the project opted out, not that it is unhealthy, so it declines to
- * answer and lets the traffic signal decide.
+ * A configured production monitor is the direct answer to "is this up",
+ * so it outranks traffic — including when traffic is silent. Monitor-derived
+ * labels are explicitly qualified as uptime signals so they cannot be read as
+ * an overall application-health verdict when request traffic is degraded.
+ * `no_monitors` means the project opted out, not that it is unhealthy, so it
+ * declines to answer and lets the traffic signal decide.
  */
 function monitorIndicator(
   monitor: ProjectMonitorHealthInput
@@ -94,21 +96,21 @@ function monitorIndicator(
     case 'operational':
       return {
         tone: 'healthy',
-        label: 'Healthy',
+        label: 'Uptime healthy',
         detail:
           'The production uptime monitor reports every check operational.',
       }
     case 'degraded':
       return {
         tone: 'degraded',
-        label: 'Degraded',
+        label: 'Uptime degraded',
         detail:
           'Some production uptime monitors are failing their checks. Open Monitors to see which.',
       }
     case 'down':
       return {
         tone: 'down',
-        label: 'Down',
+        label: 'Uptime down',
         detail:
           'Every production uptime monitor is failing its checks, or has not reported in over a day.',
       }

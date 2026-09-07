@@ -1,51 +1,58 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { test, expect, describe } from 'bun:test'
-import { filterPresetsByType, formatPresetPort } from './index.js'
-import type { PresetResponse } from '../../api/types.gen.js'
+import { test, expect, describe } from "bun:test";
+import { filterTemplatesByKind, formatTemplatePort } from "./index.js";
+import type { TemplateResponse } from "../../api/types.gen.js";
 
-function preset(overrides: Partial<PresetResponse>): PresetResponse {
+function template(overrides: Partial<TemplateResponse>): TemplateResponse {
   return {
-    slug: 'node',
-    label: 'Node.js',
-    project_type: 'server',
-    default_port: 3000,
-    description: 'A Node.js server',
+    slug: "node",
+    name: "Node.js",
+    kind: "starter",
+    version: "",
+    exposed_port: 3000,
+    description: "A Node.js server",
     ...overrides,
-  } as PresetResponse
+  } as TemplateResponse;
 }
 
-describe('filterPresetsByType', () => {
-  const nodePreset = preset({ slug: 'node', project_type: 'server' })
-  const staticPreset = preset({ slug: 'static-site', project_type: 'static' })
-  const presets = [nodePreset, staticPreset]
+describe("filterTemplatesByKind", () => {
+  const starter = template({ slug: "node", kind: "starter" });
+  const service = template({
+    slug: "keycloak",
+    kind: "service",
+    version: "1.0.0",
+  });
+  const templates = [starter, service];
 
-  test('returns every preset when no type filter is given', () => {
-    expect(filterPresetsByType(presets, undefined)).toEqual(presets)
-  })
+  test("returns every preset when no type filter is given", () => {
+    expect(filterTemplatesByKind(templates, undefined)).toEqual(templates);
+  });
 
-  test('matches case-insensitively so --type Server still finds "server" presets', () => {
-    expect(filterPresetsByType(presets, 'Server')).toEqual([nodePreset])
-    expect(filterPresetsByType(presets, 'STATIC')).toEqual([staticPreset])
-  })
+  test("matches case-insensitively so --kind Service finds service templates", () => {
+    expect(filterTemplatesByKind(templates, "Service")).toEqual([service]);
+    expect(filterTemplatesByKind(templates, "STARTER")).toEqual([starter]);
+  });
 
-  test('returns an empty list rather than throwing for an unknown type', () => {
-    expect(filterPresetsByType(presets, 'nonexistent')).toEqual([])
-  })
-})
+  test("rejects an unknown kind instead of silently returning no templates", () => {
+    expect(() => filterTemplatesByKind(templates, "nonexistent")).toThrow(
+      'Invalid template kind "nonexistent". Expected "starter" or "service".',
+    );
+  });
+});
 
-describe('formatPresetPort', () => {
-  test('renders a real port as a string', () => {
-    expect(formatPresetPort(3000)).toBe('3000')
-  })
+describe("formatTemplatePort", () => {
+  test("renders a real port as a string", () => {
+    expect(formatTemplatePort(3000)).toBe("3000");
+  });
 
   test('renders a missing port as a dash, not "0" or "null"', () => {
-    expect(formatPresetPort(null)).toBe('-')
-    expect(formatPresetPort(undefined)).toBe('-')
-  })
+    expect(formatTemplatePort(null)).toBe("-");
+    expect(formatTemplatePort(undefined)).toBe("-");
+  });
 
-  test('keeps an actual port 0 distinct from missing', () => {
-    expect(formatPresetPort(0)).toBe('0')
-  })
-})
+  test("keeps an actual port 0 distinct from missing", () => {
+    expect(formatTemplatePort(0)).toBe("0");
+  });
+});

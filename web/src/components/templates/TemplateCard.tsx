@@ -82,10 +82,19 @@ export function TemplateCard({
   return (
     <Card
       className={cn(
-        'cursor-pointer overflow-hidden transition-all hover:border-primary/50 hover:shadow-md',
+        onClick &&
+          'cursor-pointer overflow-hidden transition-all hover:border-primary/50 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
         selected && 'border-primary ring-2 ring-primary/20'
       )}
       onClick={() => onClick?.(template)}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      aria-pressed={onClick ? Boolean(selected) : undefined}
+      onKeyDown={(event) => {
+        if (!onClick || (event.key !== 'Enter' && event.key !== ' ')) return
+        event.preventDefault()
+        onClick(template)
+      }}
     >
       {!compact && template.screenshot_url && (
         <TemplateScreenshot src={template.screenshot_url} alt={template.name} />
@@ -107,9 +116,7 @@ export function TemplateCard({
                   <Star className="h-4 w-4 text-yellow-500 fill-yellow-500" />
                 )}
               </CardTitle>
-              <p className="text-xs text-muted-foreground">
-                {template.preset}
-              </p>
+              <p className="text-xs text-muted-foreground">{template.preset}</p>
             </div>
           </div>
         </div>
@@ -141,9 +148,7 @@ export function TemplateCard({
         {template.services.length > 0 && (
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <Database className="h-3 w-3" />
-            <span>
-              {template.services.map(getServiceLabel).join(', ')}
-            </span>
+            <span>{template.services.map(getServiceLabel).join(', ')}</span>
           </div>
         )}
 
@@ -153,7 +158,8 @@ export function TemplateCard({
             <Server className="h-3 w-3" />
             <span className="line-clamp-1">
               {template.features.slice(0, 2).join(' · ')}
-              {template.features.length > 2 && ` +${template.features.length - 2}`}
+              {template.features.length > 2 &&
+                ` +${template.features.length - 2}`}
             </span>
           </div>
         )}

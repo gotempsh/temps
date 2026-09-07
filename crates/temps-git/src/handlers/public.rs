@@ -181,6 +181,8 @@ pub struct PublicComposeServicePreview {
     /// Ports declared by Compose. `target` is the container port Temps can
     /// route to; `published` is only the optional Docker host port.
     pub ports: Vec<ComposePortMapping>,
+    /// HTTP path declared by a loopback Compose healthcheck, if unambiguous.
+    pub health_check_path: Option<String>,
 }
 
 /// Response for compose-file service preview
@@ -915,6 +917,7 @@ pub async fn get_public_compose_services(
             looks_like_database: s.looks_like_database,
             detected_service_type: s.detected_service_type,
             ports: s.ports,
+            health_check_path: s.health_check_path,
         })
         .collect();
 

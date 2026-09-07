@@ -50,7 +50,7 @@ use crate::static_file_serving::{
 use crate::tls_fingerprint;
 use crate::traits::*;
 use async_trait::async_trait;
-use axum::http::header;
+use axum::http::{header, uri::Authority};
 use bytes::Bytes;
 use cookie::Cookie;
 use pingora::http::StatusCode;
@@ -59,7 +59,7 @@ use pingora_core::{
     upstreams::peer::{HttpPeer, Peer},
     Result,
 };
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
@@ -1053,22 +1053,23 @@ impl LoadBalancer {
         }
     }
 
-    fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
-        let host_with_port = if let Some(host) = session.req_header().headers.get("host") {
+    fn request_authority(&self, session: &PingoraSession) -> Result<PublicAuthority> {
+        let raw_authority = if let Some(host) = session.req_header().headers.get("host") {
             host.to_str()
                 .map_err(|_| Error::new_str("Invalid host header encoding"))?
-                .to_string()
-        } else if let Some(host) = session.req_header().uri.host() {
-            // Try to get the :authority pseudo-header first (used in HTTP/2)
-            host.to_string()
+        } else if let Some(authority) = session.req_header().uri.authority() {
+            // HTTP/2 carries the public authority in the request URI.
+            authority.as_str()
         } else {
             return Err(Error::new_str("Missing Host or :authority header"));
         };
 
-        // Remove port from host before returning (e.g., "example.com:3000" -> "example.com")
-        // This ensures we match against domain names in the route table correctly
-        let host = host_with_port.split(':').next().unwrap_or(&host_with_port);
-        Ok(host.to_string())
+        parse_public_authority(raw_authority)
+            .ok_or_else(|| Error::new_str("Invalid Host or :authority header"))
+    }
+
+    fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
+        Ok(self.request_authority(session)?.host)
     }
 
     /// Extract TLS fingerprint with client characteristics
@@ -2698,25 +2699,66 @@ fn response_body_filter_inner(
     Ok(None)
 }
 
-/// Resolve the client IP for a session from the TCP peer, honoring
-/// `CF-Connecting-IP` only when the peer is a verified Cloudflare egress
-/// address (see `cloudflare_ips`). Returns `None` for non-inet peers (unix
-/// sockets) so callers keep their own fallback.
+/// Resolve the client IP for a session from the TCP peer, honoring CDN
+/// client-IP headers only when the peer is a verified edge address.
 ///
-/// Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers intact —
-/// `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled prefix.
+/// Security invariant: the *peer address* (not any header) determines which
+/// CDN, if any, is trusted. Headers are only consulted for verified peers and
+/// must parse as a bare `IpAddr`; anything else falls back to the peer. This
+/// makes header spoofing from untrusted origins impossible.
+///
+/// Chain:
+/// 1. Cloudflare peer → honor `CF-Connecting-IP` (see `cloudflare_ips`).
+/// 2. Bunny CDN peer → honor `X-Real-IP` (see `bunny_ips`).
+/// 3. All other peers → use peer address directly.
+///
+/// Returns `None` for non-inet peers (unix sockets) so callers keep their own
+/// fallback. Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers
+/// intact — `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled
+/// prefix.
+///
+/// Bunny's refresher bootstrap is intentionally triggered here
+/// unconditionally, on every call, regardless of whether this peer matched
+/// Cloudflare, Bunny, or neither — see the long rationale in the
+/// `bunny_ips` module doc comment. In short: Cloudflare's CIDR seed is
+/// complete enough that gating its refresher on a prior `is_cloudflare`
+/// match still self-bootstraps correctly (left unchanged here), but Bunny's
+/// individual-IP seed is deliberately sparse and will almost never match a
+/// real edge on a fresh deployment, so gating its trigger the same way
+/// would deadlock forever. `ensure_refresh_started` is a cheap idempotent
+/// no-op (one atomic load/compare-exchange) after the first successful
+/// call in the process, so calling it unconditionally here is within the
+/// hot-path budget.
 fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
     let peer = session.client_addr()?.as_inet()?.ip();
-    let cf_connecting_ip = session
-        .req_header()
-        .headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok());
-    Some(
-        crate::cloudflare_ips::CLOUDFLARE_TRUST
-            .resolve_client_ip(peer, cf_connecting_ip)
-            .to_string(),
-    )
+    let headers = &session.req_header().headers;
+
+    crate::bunny_ips::BUNNY_TRUST.ensure_refresh_started();
+
+    // --- Cloudflare: check peer first, then header ---
+    if crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(peer) {
+        let cf_connecting_ip = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok());
+        return Some(
+            crate::cloudflare_ips::CLOUDFLARE_TRUST
+                .resolve_client_ip(peer, cf_connecting_ip)
+                .to_string(),
+        );
+    }
+
+    // --- Bunny CDN: check peer first, then header ---
+    if crate::bunny_ips::BUNNY_TRUST.is_bunny(peer) {
+        let x_real_ip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
+        return Some(
+            crate::bunny_ips::BUNNY_TRUST
+                .resolve_client_ip(peer, x_real_ip)
+                .to_string(),
+        );
+    }
+
+    // --- Direct connection: use peer address ---
+    Some(peer.to_string())
 }
 
 /// Selects the upstream read/write/idle timeout for a proxied request.
@@ -2760,6 +2802,94 @@ fn ip_restriction_denies(
         Some(ip) => !gate.is_allowed(project_id, environment_id, ip),
         None => gate.has_active_policy(project_id, environment_id),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicAuthority {
+    host: String,
+    forwarded_host: String,
+    port: Option<u16>,
+}
+
+fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
+    // Userinfo is valid in generic URI authorities but never in an HTTP Host
+    // header. Reject it explicitly rather than forwarding ambiguous input.
+    if raw_authority.is_empty() || raw_authority.contains('@') {
+        return None;
+    }
+
+    let has_explicit_port = if raw_authority.starts_with('[') {
+        let closing_bracket = raw_authority.find(']')?;
+        match &raw_authority[closing_bracket + 1..] {
+            "" => false,
+            suffix if suffix.starts_with(':') && suffix.len() > 1 => true,
+            _ => return None,
+        }
+    } else if let Some((host, port)) = raw_authority.rsplit_once(':') {
+        // HTTP requires IPv6 literals to be bracketed. A single colon is the
+        // port separator and must be followed by a valid numeric port.
+        if host.contains(':') || port.is_empty() {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+
+    let authority = raw_authority.parse::<Authority>().ok()?;
+    let authority_host = authority.host();
+    let host = authority_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(authority_host);
+    if host.is_empty() {
+        return None;
+    }
+
+    let port = match (has_explicit_port, authority.port_u16()) {
+        (false, None) => None,
+        (true, Some(port)) if port > 0 => Some(port),
+        _ => return None,
+    };
+
+    let host = host.to_ascii_lowercase();
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let forwarded_host = match port {
+        Some(port) => format!("{authority_host}:{port}"),
+        None => authority_host,
+    };
+
+    Some(PublicAuthority {
+        host,
+        forwarded_host,
+        port,
+    })
+}
+
+/// Strip every client-controlled IP/forwarding header from the request that
+/// is about to be forwarded upstream to the deployed tenant app.
+///
+/// Callers must invoke this only *after* `resolve_session_client_ip` has
+/// already read whatever CDN header it needed from the original inbound
+/// request — the resolved value is then re-emitted as the sole trusted
+/// `X-Forwarded-For` (see the call site's comment). At this trust boundary
+/// `Forwarded`, `X-Real-IP`, and `CF-Connecting-IP` are all client-supplied:
+/// any direct client (bypassing Bunny/Cloudflare entirely) can set them to
+/// an arbitrary value. If left in place, a tenant app that itself reads one
+/// of these headers (very common, e.g. nginx-era `X-Real-IP` convention)
+/// would see the attacker's forged value verbatim instead of the platform's
+/// resolved IP, letting an external client forge how its own request
+/// appears to the tenant's own IP-based logic (rate limiting, geofencing,
+/// abuse detection). Extend this function, not a second call site, if a
+/// future CDN adds another raw client-IP header to the trust chain.
+fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
+    request.remove_header("forwarded");
+    request.remove_header("x-real-ip");
+    request.remove_header("cf-connecting-ip");
 }
 
 /// Whether a `Content-Type` value's media type — its "essence", the part
@@ -4902,6 +5032,14 @@ impl ProxyHttp for LoadBalancer {
             return Ok(true); // Skip proxying
         }
 
+        // RFC 7239 Forwarded, X-Real-IP, and CF-Connecting-IP are all
+        // client-controlled at this trust boundary (any direct client can
+        // set them, bypassing Bunny/Cloudflare entirely). We emit a
+        // complete trusted X-Forwarded-* set below from the already-
+        // resolved `ctx.ip_address`, so do not let a tenant app read a raw,
+        // possibly-spoofed client-supplied header instead.
+        strip_untrusted_client_ip_headers(session.req_header_mut());
+
         // Capture request headers
         let request_headers: HashMap<String, String> = session
             .req_header()
@@ -4954,15 +5092,30 @@ impl ProxyHttp for LoadBalancer {
                 .insert_header("X-Forwarded-For", ip.as_str())?;
         }
 
-        // Add X-Forwarded-Proto header to indicate the original protocol (HTTP/HTTPS)
-        let proto = if self.is_https_request(session) {
-            "https"
-        } else {
-            "http"
-        };
+        // Overwrite the complete public authority forwarded upstream. Apps
+        // such as Keycloak trust this set when constructing absolute URLs.
+        // Forwarding only the scheme loses non-default ports and produces
+        // redirects to port 80/443 instead of the Temps proxy.
+        let is_https = self.is_https_request(session);
+        let proto = if is_https { "https" } else { "http" };
+        let public_authority = self.request_authority(session)?;
+        let forwarded_port = public_authority
+            .port
+            .unwrap_or(if is_https { 443 } else { 80 });
+        // The same parsed authority controls routing and reaches the upstream.
+        // Never pass the raw client Host after making a routing decision.
+        session
+            .req_header_mut()
+            .insert_header("Host", public_authority.forwarded_host.clone())?;
         session
             .req_header_mut()
             .insert_header("X-Forwarded-Proto", proto)?;
+        session
+            .req_header_mut()
+            .insert_header("X-Forwarded-Host", public_authority.forwarded_host)?;
+        session
+            .req_header_mut()
+            .insert_header("X-Forwarded-Port", forwarded_port.to_string())?;
 
         ctx.referrer = session
             .req_header()
@@ -7487,6 +7640,202 @@ mod traffic_classification_tests {
         assert_eq!(
             LoadBalancer::traffic_classification("/api/health", "Mozilla/5.0"),
             ("proxy", false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwarded_authority_tests {
+    use super::{parse_public_authority, strip_untrusted_client_ip_headers, PublicAuthority};
+    use axum::http::HeaderValue;
+    use pingora_http::RequestHeader;
+
+    #[test]
+    fn preserves_non_default_public_port() {
+        assert_eq!(
+            parse_public_authority("keycloak-production.localho.st:8200"),
+            Some(PublicAuthority {
+                host: "keycloak-production.localho.st".to_string(),
+                forwarded_host: "keycloak-production.localho.st:8200".to_string(),
+                port: Some(8200),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_bracketed_ipv6_authority() {
+        assert_eq!(
+            parse_public_authority("[::1]:8200"),
+            Some(PublicAuthority {
+                host: "::1".to_string(),
+                forwarded_host: "[::1]:8200".to_string(),
+                port: Some(8200),
+            })
+        );
+    }
+
+    #[test]
+    fn leaves_default_port_to_the_request_scheme_and_normalizes_route_host() {
+        assert_eq!(
+            parse_public_authority("KEYCLOAK-production.example.com"),
+            Some(PublicAuthority {
+                host: "keycloak-production.example.com".to_string(),
+                forwarded_host: "keycloak-production.example.com".to_string(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_authorities() {
+        for authority in [
+            "example.com:invalid",
+            "example.com:0",
+            "valid-route.example:80.evil",
+            "user@valid-route.example",
+            "::1:8200",
+            "",
+        ] {
+            assert_eq!(
+                parse_public_authority(authority),
+                None,
+                "authority {authority:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn removes_client_supplied_rfc_7239_forwarded_header() {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        request
+            .insert_header(
+                "forwarded",
+                HeaderValue::from_static("for=192.0.2.1;proto=https;host=evil.example"),
+            )
+            .expect("Forwarded test header must be valid");
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_client_ip_headers(&mut request);
+
+        assert!(!request.headers.contains_key("forwarded"));
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+
+    /// A direct client that bypasses Bunny/Cloudflare entirely can still set
+    /// `X-Real-IP` / `CF-Connecting-IP` itself. Those raw headers must never
+    /// reach the tenant app upstream — only the platform's own resolved
+    /// `X-Forwarded-For` (set separately by the caller) is trustworthy.
+    #[test]
+    fn removes_client_supplied_cdn_ip_headers() {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        request
+            .insert_header("x-real-ip", HeaderValue::from_static("203.0.113.99"))
+            .expect("X-Real-IP test header must be valid");
+        request
+            .insert_header("cf-connecting-ip", HeaderValue::from_static("203.0.113.99"))
+            .expect("CF-Connecting-IP test header must be valid");
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_client_ip_headers(&mut request);
+
+        assert!(!request.headers.contains_key("x-real-ip"));
+        assert!(!request.headers.contains_key("cf-connecting-ip"));
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+}
+
+/// Tests for the CDN client-IP resolution chain in `resolve_session_client_ip`.
+///
+/// `PingoraSession` cannot be constructed in isolation in unit tests (it
+/// requires a live I/O object). We therefore test the resolution logic through
+/// the underlying trust-store methods directly — `BunnyIpTrust::resolve_client_ip`
+/// and `CloudflareIpTrust::resolve_client_ip` — which is where the anti-spoofing
+/// invariant and header parsing actually live. This follows the same pattern as
+/// the unit tests in `cloudflare_ips.rs` and `bunny_ips.rs`.
+#[cfg(test)]
+mod cdn_client_ip_tests {
+    use crate::bunny_ips::BunnyIpTrust;
+    use std::collections::HashSet;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn bunny_trust_with(ips: &[&str]) -> BunnyIpTrust {
+        let set: HashSet<IpAddr> = ips.iter().map(|s| ip(s)).collect();
+        BunnyIpTrust::with_ips(set)
+    }
+
+    /// Simulates a request arriving from a Bunny edge IP with a valid
+    /// `X-Real-IP` header. The resolved client IP must be the header value.
+    #[test]
+    fn bunny_edge_peer_with_valid_x_real_ip_uses_header() {
+        let bunny_edge = "185.152.66.10";
+        let real_client = "203.0.113.42";
+        let t = bunny_trust_with(&[bunny_edge]);
+        assert_eq!(
+            t.resolve_client_ip(ip(bunny_edge), Some(real_client)),
+            ip(real_client),
+            "verified Bunny peer must use the X-Real-IP header value"
+        );
+    }
+
+    /// Simulates a direct connection (no CDN): an arbitrary peer with a
+    /// spoofed `X-Real-IP` must NOT be trusted — the peer address is returned.
+    #[test]
+    fn non_bunny_peer_with_spoofed_x_real_ip_uses_peer() {
+        let attacker = "203.0.113.99";
+        let spoofed_client = "10.0.0.1";
+        // Trust set does NOT include the attacker's IP.
+        let t = bunny_trust_with(&["185.152.66.10"]);
+        assert_eq!(
+            t.resolve_client_ip(ip(attacker), Some(spoofed_client)),
+            ip(attacker),
+            "untrusted peer must ignore X-Real-IP even when the header value is valid"
+        );
+    }
+
+    /// A Bunny edge peer with a malformed or missing header falls back to peer.
+    #[test]
+    fn bunny_edge_peer_with_bad_header_falls_back_to_peer() {
+        let bunny_edge = "185.152.66.10";
+        let t = bunny_trust_with(&[bunny_edge]);
+        let peer = ip(bunny_edge);
+        for bad in ["not-an-ip", "1.2.3.4, 5.6.7.8", "1.2.3.4:8080", ""] {
+            assert_eq!(
+                t.resolve_client_ip(peer, Some(bad)),
+                peer,
+                "malformed X-Real-IP {bad:?} must fall back to peer"
+            );
+        }
+        assert_eq!(t.resolve_client_ip(peer, None), peer);
+    }
+
+    /// Verify the Cloudflare trust chain still works correctly alongside Bunny
+    /// (regression guard: adding Bunny must not break the existing CF path).
+    #[test]
+    fn cloudflare_peer_still_uses_cf_connecting_ip() {
+        use crate::cloudflare_ips::CloudflareIpTrust;
+        let t = CloudflareIpTrust::new();
+        // 104.16.1.1 is inside the builtin Cloudflare ranges.
+        let cf_edge = ip("104.16.1.1");
+        let real_client = ip("198.51.100.7");
+        assert_eq!(
+            t.resolve_client_ip(cf_edge, Some("198.51.100.7")),
+            real_client
         );
     }
 }

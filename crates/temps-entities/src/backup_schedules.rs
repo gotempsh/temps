@@ -40,6 +40,9 @@ pub struct Model {
     /// single DB and doesn't want the control plane lumped in.
     #[sea_orm(default_value = true)]
     pub include_control_plane: bool,
+    /// Stable machine-readable marker for schedules created by Temps.
+    /// User-created schedules remain `None` and are never lifecycle-managed.
+    pub generated_kind: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

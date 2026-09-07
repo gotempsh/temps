@@ -233,6 +233,11 @@ const AddEmailProvider = lazy(() =>
     default: m.AddEmailProvider,
   }))
 )
+const EmailDomainNew = lazy(() =>
+  import('./pages/EmailDomainNew').then((m) => ({
+    default: m.EmailDomainNew,
+  }))
+)
 const AuditLogs = lazy(() =>
   import('./pages/AuditLogs').then((m) => ({ default: m.AuditLogs }))
 )
@@ -753,6 +758,10 @@ const FullAppRoutes = () => {
                       element={<AddClusterMember />}
                     />
                     <Route path="/email" element={<Email />} />
+                    <Route
+                      path="/email/domains/new"
+                      element={<EmailDomainNew />}
+                    />
                     <Route
                       path="/email/domains/:id"
                       element={<EmailDomainDetail />}

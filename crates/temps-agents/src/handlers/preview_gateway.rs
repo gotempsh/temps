@@ -21,14 +21,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
-use temps_core::{problemdetails::Problem, PreviewGatewaySettings};
+use temps_core::{
+    problemdetails::{Problem, ProblemDetails},
+    PreviewGatewaySettings,
+};
 use tracing::{error, info};
 use utoipa::ToSchema;
 
 use crate::handlers::AppState;
 use crate::preview_gateway::{
-    self, GatewayStatus, PreviewGatewaySpec, DEFAULT_PREVIEW_GATEWAY_HOST_PORT,
-    PREVIEW_GATEWAY_IMAGE,
+    self, sanitize_gateway_diagnostic, GatewayStatus, PreviewGatewaySpec,
+    DEFAULT_PREVIEW_GATEWAY_HOST_PORT, PREVIEW_GATEWAY_IMAGE,
 };
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -53,7 +56,7 @@ pub struct LogsQuery {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct LogsResponse {
+pub struct PreviewGatewayLogsResponse {
     pub lines: Vec<String>,
 }
 
@@ -102,7 +105,10 @@ pub struct PatchSettingsRequest {
     tag = "Preview Gateway",
     get,
     path = "/preview-gateway/status",
-    responses((status = 200, body = GatewayStatus)),
+    responses(
+        (status = 200, body = GatewayStatus),
+        (status = 500, description = "Docker status request failed", body = ProblemDetails)
+    ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_preview_gateway_status(
@@ -114,8 +120,13 @@ pub async fn get_preview_gateway_status(
     let status = preview_gateway::inspect_status(&state.docker, &settings)
         .await
         .map_err(|e| {
-            error!("preview gateway status failed: {}", e);
-            internal(format!("failed to inspect preview gateway: {}", e))
+            let detail = anyhow_detail(
+                "failed to inspect preview gateway",
+                &e,
+                &[&settings.shared_secret],
+            );
+            error!(error = %detail, "preview gateway status failed");
+            internal(detail)
         })?;
     Ok(Json(status))
 }
@@ -125,7 +136,10 @@ pub async fn get_preview_gateway_status(
     get,
     path = "/preview-gateway/logs",
     params(("tail" = Option<usize>, Query, description = "Lines to tail (default 200, max 2000)")),
-    responses((status = 200, body = LogsResponse)),
+    responses(
+        (status = 200, body = PreviewGatewayLogsResponse),
+        (status = 500, description = "Docker log request failed", body = ProblemDetails)
+    ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_preview_gateway_logs(
@@ -145,15 +159,24 @@ pub async fn get_preview_gateway_logs(
         tail,
     )
     .await
-    .map_err(|e| internal(format!("failed to tail logs: {}", e)))?;
-    Ok(Json(LogsResponse { lines }))
+    .map_err(|e| {
+        internal(anyhow_detail(
+            "failed to tail logs",
+            &e,
+            &[&settings.shared_secret],
+        ))
+    })?;
+    Ok(Json(PreviewGatewayLogsResponse { lines }))
 }
 
 #[utoipa::path(
     tag = "Preview Gateway",
     post,
     path = "/preview-gateway/restart",
-    responses((status = 204, description = "Gateway restarted")),
+    responses(
+        (status = 204, description = "Gateway restarted"),
+        (status = 500, description = "Gateway restart failed", body = ProblemDetails)
+    ),
     security(("bearer_auth" = []))
 )]
 pub async fn restart_preview_gateway(
@@ -170,7 +193,13 @@ pub async fn restart_preview_gateway(
     );
     preview_gateway::force_restart(state.docker.clone(), spec)
         .await
-        .map_err(|e| internal(format!("restart failed: {}", e)))?;
+        .map_err(|e| {
+            internal(anyhow_detail(
+                "restart failed",
+                &e,
+                &[&settings.shared_secret],
+            ))
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -179,7 +208,10 @@ pub async fn restart_preview_gateway(
     post,
     path = "/preview-gateway/upgrade",
     request_body = UpgradeRequest,
-    responses((status = 204, description = "Gateway upgraded")),
+    responses(
+        (status = 204, description = "Gateway upgraded"),
+        (status = 500, description = "Gateway upgrade failed", body = ProblemDetails)
+    ),
     security(("bearer_auth" = []))
 )]
 pub async fn upgrade_preview_gateway(
@@ -194,9 +226,10 @@ pub async fn upgrade_preview_gateway(
     } else {
         body.image.trim().to_string()
     };
+    let safe_image = sanitize_gateway_diagnostic(&new_image, &[]);
     info!(
         user_id = auth.user_id(),
-        image = %new_image,
+        image = %safe_image,
         "preview gateway upgrade requested"
     );
 
@@ -204,13 +237,24 @@ pub async fn upgrade_preview_gateway(
         .platform_config_service
         .update_setting_field(|s| s.preview_gateway.image = new_image.clone())
         .await
-        .map_err(|e| internal(format!("failed to persist new image: {}", e)))?;
+        .map_err(|e| {
+            internal(sanitize_gateway_diagnostic(
+                &format!("failed to persist new image: {e}"),
+                &[],
+            ))
+        })?;
 
     let settings = preview_gateway::load_settings(&state.db).await;
     let spec = PreviewGatewaySpec::from_settings(&settings);
     preview_gateway::reconcile(state.docker.clone(), spec)
         .await
-        .map_err(|e| internal(format!("reconcile failed: {}", e)))?;
+        .map_err(|e| {
+            internal(anyhow_detail(
+                "reconcile failed",
+                &e,
+                &[&settings.shared_secret],
+            ))
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -236,7 +280,10 @@ pub async fn get_preview_gateway_settings(
     patch,
     path = "/preview-gateway/settings",
     request_body = PatchSettingsRequest,
-    responses((status = 200, body = PreviewGatewaySettingsResponse)),
+    responses(
+        (status = 200, body = PreviewGatewaySettingsResponse),
+        (status = 500, description = "Settings update failed", body = ProblemDetails)
+    ),
     security(("bearer_auth" = []))
 )]
 pub async fn patch_preview_gateway_settings(
@@ -260,7 +307,12 @@ pub async fn patch_preview_gateway_settings(
             }
         })
         .await
-        .map_err(|e| internal(format!("failed to persist settings: {}", e)))?;
+        .map_err(|e| {
+            internal(sanitize_gateway_diagnostic(
+                &format!("failed to persist settings: {e}"),
+                &[],
+            ))
+        })?;
 
     let settings = preview_gateway::load_settings(&state.db).await;
     Ok(Json(PreviewGatewaySettingsResponse::from(settings)))
@@ -272,4 +324,72 @@ fn internal(detail: String) -> Problem {
         .title("Preview gateway error")
         .detail(detail)
         .build()
+}
+
+/// Render every `anyhow` context and source at the HTTP boundary. `Display`
+/// (`{}`) only includes the outermost context, which hides Docker daemon
+/// diagnostics such as a failed host-port bind added below
+/// `create_and_start`'s operation context.
+fn anyhow_detail(operation: &str, error: &anyhow::Error, sensitive_values: &[&str]) -> String {
+    sanitize_gateway_diagnostic(&format!("{operation}: {error:#}"), sensitive_values)
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+    use axum::{body::to_bytes, http::header::CONTENT_TYPE, response::IntoResponse};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn internal_anyhow_problem_preserves_complete_error_chain() {
+        let error = anyhow!(
+            "Docker daemon rejected the port mapping: address already in use; registry https://user:password@example.test/image?token=query-value; Authorization=header-value; shared fixture-secret"
+        )
+            .context("failed to start container preview-gateway");
+
+        let response =
+            internal(anyhow_detail("restart failed", &error, &["fixture-secret"])).into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("problem response body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("problem response should be JSON");
+
+        assert_eq!(json["title"], "Preview gateway error");
+        let detail = json["detail"]
+            .as_str()
+            .expect("problem detail should be a string");
+        assert!(detail.starts_with(
+            "restart failed: failed to start container preview-gateway: Docker daemon rejected the port mapping: address already in use"
+        ));
+        assert!(
+            detail.contains("https://[redacted]@example.test/image?[redacted]"),
+            "unexpected sanitized detail: {detail}"
+        );
+        assert!(detail.contains("Authorization=[redacted]"));
+        assert!(!detail.contains("password"));
+        assert!(!detail.contains("query-value"));
+        assert!(!detail.contains("header-value"));
+        assert!(!detail.contains("fixture-secret"));
+    }
+
+    #[test]
+    fn gateway_diagnostics_are_bounded_before_the_http_boundary() {
+        let error = anyhow!("{}", "x".repeat(8_000)).context("docker request failed");
+        let detail = anyhow_detail("restart failed", &error, &[]);
+
+        assert!(detail.chars().count() < 4_100);
+        assert!(detail.contains("diagnostic truncated"));
+    }
 }

@@ -26,6 +26,8 @@ use colored::Colorize;
 use sea_orm::EntityTrait;
 use serde::Deserialize;
 
+use super::api_url::management_api_url;
+
 /// Inspect the multi-host overlay on this node and across the cluster.
 #[derive(Args)]
 pub struct NetworkCommand {
@@ -681,10 +683,9 @@ fn ping(host: &str, count: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 async fn fetch_peers(auth: &ResolvedAuth) -> anyhow::Result<WirePeerListResponse> {
-    let url = format!(
-        "{}/api/internal/nodes/{}/network/peers",
-        auth.control_plane_url.trim_end_matches('/'),
-        auth.node_id
+    let url = management_api_url(
+        &auth.control_plane_url,
+        &format!("/internal/nodes/{}/network/peers", auth.node_id),
     );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))

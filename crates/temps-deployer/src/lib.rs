@@ -246,6 +246,12 @@ pub struct PortMapping {
     pub host_port: u16,
     pub container_port: u16,
     pub protocol: Protocol,
+    /// Optional host interface for this published port. When omitted, the
+    /// runtime's configured bind address is used. Remote app deployments set
+    /// this to the node's private address so candidate ports never bind the
+    /// public interface directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -972,6 +978,7 @@ mod tests {
             host_port: 8080,
             container_port: 3000,
             protocol: Protocol::Tcp,
+            host_ip: None,
         }];
 
         let request = DeployRequest {
@@ -1042,11 +1049,21 @@ mod tests {
             host_port: 8080,
             container_port: 80,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
 
         assert_eq!(mapping.host_port, 8080);
         assert_eq!(mapping.container_port, 80);
         assert!(matches!(mapping.protocol, Protocol::Tcp));
+
+        let private_mapping = PortMapping {
+            host_ip: Some("10.20.0.8".to_string()),
+            ..mapping
+        };
+        let encoded = serde_json::to_string(&private_mapping).expect("serialize port mapping");
+        let decoded: PortMapping =
+            serde_json::from_str(&encoded).expect("deserialize port mapping");
+        assert_eq!(decoded.host_ip.as_deref(), Some("10.20.0.8"));
     }
 
     #[test]
@@ -1065,6 +1082,7 @@ mod tests {
                 host_port: 8080,
                 container_port: 3000,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             }],
             environment_vars: env_vars,
             restart_count: Some(0),
@@ -1253,16 +1271,19 @@ CMD ["echo", "Hello from container"]
                 host_port: 8080,
                 container_port: 80,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             },
             PortMapping {
                 host_port: 8443,
                 container_port: 443,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             },
             PortMapping {
                 host_port: 9090,
                 container_port: 9090,
                 protocol: Protocol::Udp,
+                host_ip: None,
             },
         ];
 
@@ -1337,6 +1358,7 @@ CMD ["echo", "Hello from container"]
             host_port: 8080,
             container_port: 3000,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
         assert_eq!(port_mapping.host_port, 8080);
 

@@ -27,7 +27,10 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
+use temps_auth::{
+    permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+    RequireAuth,
+};
 use temps_core::external_plugin::VerifiedPluginApiCaller;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDateTime};
@@ -188,6 +191,7 @@ pub async fn deploy_from_uploaded_source(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
     let upload_permit = ArchiveUploadPermit::acquire()?;
 
     let project = projects::Entity::find_by_id(project_id)
@@ -508,6 +512,10 @@ pub struct DeployFromImageRequest {
     #[serde(default)]
     #[schema(example = "/api/healthz")]
     pub health_check_path: Option<String>,
+    /// Optional container command override. Each entry is passed directly as
+    /// one argv element; no shell parsing or interpolation is performed.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 const RESERVED_LOCAL_IMAGE_PREFIX: &str = "temps.internal/";
@@ -813,6 +821,39 @@ fn validate_health_check_path(path: &str) -> Result<(), Problem> {
     Ok(())
 }
 
+fn validate_container_command(command: &[String]) -> Result<(), Problem> {
+    let invalid = |detail: &str| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Container Command")
+            .with_detail(detail.to_string())
+    };
+
+    if command.len() > 64 {
+        return Err(invalid("command supports at most 64 arguments"));
+    }
+    if command
+        .iter()
+        .any(|part| part.is_empty() || part.len() > 1024 || part.chars().any(char::is_control))
+    {
+        return Err(invalid(
+            "command arguments must be non-empty, at most 1024 bytes, and contain no control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn persisted_project_image_runtime(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+) -> Option<temps_entities::preset::ImageRuntimeConfig> {
+    if let Some(temps_entities::preset::PresetConfig::Dockerfile(config)) = preset_config {
+        if let Some(runtime) = config.image_runtime.as_ref() {
+            return Some(runtime.clone());
+        }
+    }
+
+    None
+}
+
 // Response Types
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -944,14 +985,70 @@ pub async fn deploy_from_image(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
     authorize_local_image_claim(
         req.claim_local,
         plugin_caller.as_ref().map(|Extension(caller)| caller),
     )?;
 
-    // Validate optional deploy-time health-check path override up front
-    if let Some(ref path) = req.health_check_path {
+    // Load the project before resolving the request so saved template runtime
+    // settings are authoritative for every API/CLI caller, not only the web UI.
+    let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
+        .one(state.db.as_ref())
+        .await
+        .map_err(|error| {
+            error!(%error, project_id, "Could not load project for image deployment");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(format!("Project {} not found", project_id))
+        })?;
+
+    // Reject cross-project or deleted environments before creating the
+    // deployment. Runtime defaults come only from the project's persisted
+    // configuration; catalog state and deployment history are never inferred.
+    let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::ProjectId.eq(project_id))
+        .filter(environments::Column::DeletedAt.is_null())
+        .one(state.db.as_ref())
+        .await
+        .map_err(|error| {
+            error!(%error, project_id, environment_id, "Could not load deployment environment");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found")
+                .with_detail(format!("Environment {} not found", environment_id))
+        })?;
+
+    let saved_runtime = persisted_project_image_runtime(project.preset_config.as_ref());
+
+    let effective_command = match req.command.as_ref() {
+        Some(command) if command.is_empty() => None,
+        Some(command) => Some(command.clone()),
+        None => saved_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.command.clone()),
+    };
+    let effective_health_check_path = req.health_check_path.clone().or_else(|| {
+        saved_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.health_check_path.clone())
+    });
+
+    if let Some(ref path) = effective_health_check_path {
         validate_health_check_path(path)?;
+    }
+    if let Some(ref command) = effective_command {
+        validate_container_command(command)?;
     }
 
     // Resolve image_ref: either use provided value or fetch from external_image_id
@@ -994,35 +1091,43 @@ pub async fn deploy_from_image(
 
             (external_image.image_ref, Some(ext_id))
         }
-        // Neither provided: error
+        // Neither provided: use the durable service-template image when this
+        // is an ordinary registry deployment. A local-image claim must always
+        // identify the image it is claiming explicitly.
         (None, None) => {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Missing Image Reference")
-                .with_detail("Either image_ref or external_image_id must be provided"));
+            if req.claim_local {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Missing Image Reference")
+                    .with_detail("A local image claim requires image_ref"));
+            }
+            let image_ref = saved_runtime
+                .as_ref()
+                .map(|runtime| runtime.image_ref.clone())
+                .filter(|image| !image.is_empty())
+                .ok_or_else(|| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Missing Image Reference")
+                        .with_detail("Either image_ref, external_image_id, or a saved service runtime is required")
+                })?;
+            (image_ref, None)
         }
     };
+
+    temps_presets::validate_image_runtime_config(&temps_entities::preset::ImageRuntimeConfig {
+        image_ref: image_ref.clone(),
+        command: effective_command.clone(),
+        health_check_path: effective_health_check_path.clone(),
+    })
+    .map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Image Runtime")
+            .with_detail(error.to_string())
+    })?;
 
     info!(
         "Deploying external image {} to project {} environment {}",
         image_ref, project_id, environment_id
     );
-
-    // 1. Verify project exists and has DockerImage source type
-    let project = projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(format!("Project {} not found", project_id))
-        })?;
 
     // Verify project source type allows Docker image deployments
     if !project
@@ -1036,24 +1141,6 @@ pub async fn deploy_from_image(
                 project.source_type
             )));
     }
-
-    // 2. Verify environment exists, belongs to project, and is not deleted
-    let environment = environments::Entity::find_by_id(environment_id)
-        .filter(environments::Column::ProjectId.eq(project_id))
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Environment Not Found")
-                .with_detail(format!("Environment {} not found", environment_id))
-        })?;
 
     let (image_ref, uploaded_image_id) = if req.claim_local {
         if external_image_id.is_some() {
@@ -1085,7 +1172,8 @@ pub async fn deploy_from_image(
         deployment_source_type: Some(SourceType::DockerImage),
         image_uploaded_locally: uploaded_image_id.is_some(),
         uploaded_image_id,
-        health_check_path: req.health_check_path.clone(),
+        health_check_path: effective_health_check_path,
+        command: effective_command,
         ..Default::default()
     };
 
@@ -1250,6 +1338,7 @@ pub async fn deploy_from_static(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -1521,6 +1610,7 @@ pub async fn deploy_from_image_upload(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = query.health_check_path {
@@ -1929,6 +2019,7 @@ pub async fn upload_static_bundle(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
     let _static_upload_permit = ArchiveUploadPermit::acquire()?;
 
     debug!("Uploading static bundle for project {}", project_id);
@@ -2263,6 +2354,7 @@ pub async fn register_external_image(
     Json(req): Json<RegisterImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
@@ -2344,6 +2436,7 @@ pub async fn list_remote_external_images(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (images, total) = state
@@ -2391,6 +2484,7 @@ pub async fn get_remote_external_image(
     Path((project_id, image_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let image = state
@@ -2435,6 +2529,7 @@ pub async fn delete_external_image(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
@@ -2496,6 +2591,7 @@ pub async fn list_static_bundles(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (bundles, total) = state
@@ -2543,6 +2639,7 @@ pub async fn get_static_bundle(
     Path((project_id, bundle_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let bundle = state
@@ -2587,6 +2684,7 @@ pub async fn delete_static_bundle(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
@@ -2772,6 +2870,26 @@ mod tests {
     }
 
     #[test]
+    fn saved_image_runtime_wins_over_catalog_and_preserves_default_command_choice() {
+        let stored = temps_entities::preset::PresetConfig::Dockerfile(
+            temps_entities::preset::DockerfileConfig {
+                image_runtime: Some(temps_entities::preset::ImageRuntimeConfig {
+                    image_ref: "quay.io/keycloak/keycloak:27.0.0".to_string(),
+                    command: None,
+                    health_check_path: Some("/ready".to_string()),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let runtime =
+            persisted_project_image_runtime(Some(&stored)).expect("saved runtime should resolve");
+        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:27.0.0");
+        assert_eq!(runtime.command, None);
+        assert_eq!(runtime.health_check_path.as_deref(), Some("/ready"));
+    }
+
+    #[test]
     fn health_check_path_accepts_valid_paths() {
         assert!(validate_health_check_path("/").is_ok());
         assert!(validate_health_check_path("/api/healthz").is_ok());
@@ -2802,8 +2920,48 @@ mod tests {
     }
 
     #[test]
+    fn container_command_accepts_argv_and_rejects_unsafe_parts() {
+        assert!(
+            validate_container_command(&["start".to_string(), "--optimized".to_string()]).is_ok()
+        );
+        assert!(validate_container_command(&[String::new()]).is_err());
+        assert!(validate_container_command(&["bad\nargument".to_string()]).is_err());
+        assert!(validate_container_command(&vec!["part".to_string(); 65]).is_err());
+    }
+
+    #[test]
     fn health_check_path_rejects_overlong_path() {
         let long = format!("/{}", "a".repeat(2048));
         assert!(validate_health_check_path(&long).is_err());
+    }
+
+    #[test]
+    fn every_project_scoped_remote_handler_enforces_deployment_token_scope() {
+        let source = include_str!("remote_deployments.rs");
+        for handler_name in [
+            "deploy_from_uploaded_source",
+            "deploy_from_image",
+            "deploy_from_static",
+            "deploy_from_image_upload",
+            "upload_static_bundle",
+            "register_external_image",
+            "list_remote_external_images",
+            "get_remote_external_image",
+            "delete_external_image",
+            "list_static_bundles",
+            "get_static_bundle",
+            "delete_static_bundle",
+        ] {
+            let start = source
+                .find(&format!("pub async fn {handler_name}"))
+                .unwrap_or_else(|| panic!("handler {handler_name} should exist"));
+            let tail = &source[start + 1..];
+            let end = tail.find("pub async fn").unwrap_or(tail.len());
+            let body = &source[start..start + 1 + end];
+            assert!(
+                body.contains("project_scope_guard!(auth, project_id)"),
+                "handler {handler_name} must restrict deployment tokens to their project"
+            );
+        }
     }
 }

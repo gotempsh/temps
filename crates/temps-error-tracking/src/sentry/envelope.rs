@@ -280,13 +280,17 @@ impl Envelope {
                     let val: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse event: {}", e))
                     })?;
-                    Some(EnvelopeItem::Event(Event::from_value(val.into())))
+                    let mut event = Event::from_value(val.into());
+                    apply_envelope_event_id(&mut event, header.event_id);
+                    Some(EnvelopeItem::Event(event))
                 }
                 ItemType::Transaction => {
                     let val: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse transaction: {}", e))
                     })?;
-                    Some(EnvelopeItem::Transaction(Event::from_value(val.into())))
+                    let mut transaction = Event::from_value(val.into());
+                    apply_envelope_event_id(&mut transaction, header.event_id);
+                    Some(EnvelopeItem::Transaction(transaction))
                 }
                 ItemType::Session => {
                     let session = SessionUpdate::parse(payload.as_bytes()).map_err(|e| {
@@ -363,6 +367,16 @@ impl Envelope {
     }
 }
 
+/// Apply the canonical envelope event ID to an event or transaction payload.
+///
+/// Sentry requires the ID in the envelope header and permits payloads to omit
+/// it. When both locations contain an ID, the envelope header takes precedence.
+fn apply_envelope_event_id(event: &mut Annotated<Event>, event_id: Option<EventId>) {
+    if let (Some(event), Some(event_id)) = (event.value_mut(), event_id) {
+        event.id.set_value(Some(event_id));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +392,75 @@ mod tests {
 
         let envelope = envelope.unwrap();
         assert_eq!(envelope.items().count(), 1);
+    }
+
+    #[test]
+    fn event_uses_event_id_from_envelope_header() {
+        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n\
+            {\"type\":\"event\",\"content_type\":\"application/json\"}\n\
+            {\"level\":\"error\",\"platform\":\"php\",\"message\":\"Synthetic test\"}\n";
+
+        let envelope = Envelope::from_slice(envelope_data.as_bytes())
+            .unwrap_or_else(|error| panic!("PHP SDK envelope should parse: {error}"));
+        let event = match envelope.items().next() {
+            Some(EnvelopeItem::Event(event)) => event,
+            _ => panic!("expected one event item"),
+        };
+
+        assert_eq!(
+            event
+                .value()
+                .and_then(|event| event.id.value())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("9ec79c33ec9942ab8353589fcb2e04dc")
+        );
+    }
+
+    #[test]
+    fn envelope_header_event_id_takes_precedence_over_event_payload() {
+        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n\
+            {\"type\":\"event\"}\n\
+            {\"event_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"level\":\"error\",\"platform\":\"other\"}\n";
+
+        let envelope = Envelope::from_slice(envelope_data.as_bytes())
+            .unwrap_or_else(|error| panic!("event envelope should parse: {error}"));
+        let event = match envelope.items().next() {
+            Some(EnvelopeItem::Event(event)) => event,
+            _ => panic!("expected one event item"),
+        };
+
+        assert_eq!(
+            event
+                .value()
+                .and_then(|event| event.id.value())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("9ec79c33ec9942ab8353589fcb2e04dc")
+        );
+    }
+
+    #[test]
+    fn transaction_uses_event_id_from_envelope_header() {
+        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n\
+            {\"type\":\"transaction\"}\n\
+            {\"type\":\"transaction\",\"transaction\":\"GET /example\",\"platform\":\"php\"}\n";
+
+        let envelope = Envelope::from_slice(envelope_data.as_bytes())
+            .unwrap_or_else(|error| panic!("transaction envelope should parse: {error}"));
+        let transaction = match envelope.items().next() {
+            Some(EnvelopeItem::Transaction(transaction)) => transaction,
+            _ => panic!("expected one transaction item"),
+        };
+
+        assert_eq!(
+            transaction
+                .value()
+                .and_then(|event| event.id.value())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("9ec79c33ec9942ab8353589fcb2e04dc")
+        );
     }
 
     #[test]

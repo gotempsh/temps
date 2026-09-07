@@ -104,6 +104,7 @@ export async function updateSettingsAction(
     slug?: string
     attackMode?: boolean
     previewEnvs?: boolean
+    vulnerabilityScanning?: boolean
     imageRetentionHours?: string
     resetImageRetention?: boolean
     json?: boolean
@@ -176,6 +177,7 @@ export async function updateSettingsAction(
   let slug = options.slug
   let attackMode = options.attackMode
   let previewEnvs = options.previewEnvs
+  let vulnerabilityScanning = options.vulnerabilityScanning
 
   // Only prompt if no flags provided AND not in automation mode
   if (
@@ -183,6 +185,7 @@ export async function updateSettingsAction(
     slug === undefined &&
     attackMode === undefined &&
     previewEnvs === undefined &&
+    vulnerabilityScanning === undefined &&
     imageRetentionHours === undefined &&
     !options.yes
   ) {
@@ -210,6 +213,12 @@ export async function updateSettingsAction(
       message: 'Enable preview environments for branches?',
       default: project.enable_preview_environments ?? false,
     })
+
+    vulnerabilityScanning = await promptConfirm({
+      message:
+        'Enable vulnerability scanning (Trivy scans of deployed Docker images, post-deploy + daily)?',
+      default: project.vulnerability_scanning_enabled ?? false,
+    })
   }
 
   const updated = await withSpinner('Updating project settings...', async () => {
@@ -221,6 +230,7 @@ export async function updateSettingsAction(
         slug: slug ?? undefined,
         attack_mode: attackMode ?? undefined,
         enable_preview_environments: previewEnvs ?? undefined,
+        vulnerability_scanning_enabled: vulnerabilityScanning ?? undefined,
         // Only include the key when the user actually asked to change it —
         // sending `null` unconditionally would silently reset every project
         // to the system default.
@@ -248,6 +258,14 @@ export async function updateSettingsAction(
   keyValue('Slug', updated?.slug ?? slug ?? project.slug)
   keyValue('Attack Mode', attackMode ? colors.success('Enabled') : colors.muted('Disabled'))
   keyValue('Preview Environments', previewEnvs ? colors.success('Enabled') : colors.muted('Disabled'))
+  keyValue(
+    'Vulnerability Scanning',
+    (updated?.vulnerability_scanning_enabled ??
+      vulnerabilityScanning ??
+      project.vulnerability_scanning_enabled)
+      ? colors.success('Enabled')
+      : colors.muted('Disabled')
+  )
 
   const effectiveRetention =
     imageRetentionHours !== undefined

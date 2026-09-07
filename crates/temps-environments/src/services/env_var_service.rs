@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -19,6 +19,12 @@ pub enum EnvVarError {
 
     #[error("Environment variable not found")]
     NotFound(String),
+
+    #[error("Environment {environment_id} was not found in project {project_id}")]
+    EnvironmentNotFound {
+        environment_id: i32,
+        project_id: i32,
+    },
 
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
@@ -54,9 +60,6 @@ pub enum EnvVarError {
         "Secret env var '{key}' requires a non-empty value. Omit the value entirely to keep the one already stored."
     )]
     SecretValueRequired { key: String },
-
-    #[error("Secret env var '{key}' (id={var_id}) is write-only and cannot be revealed")]
-    SecretValueCannotBeRevealed { var_id: i32, key: String },
 
     #[error(
         "Environment variable '{key}' is ambiguous in project {project_id}; specify an environment"
@@ -140,6 +143,54 @@ impl EnvVarService {
             })
     }
 
+    /// Resolve every requested environment inside the authorized project.
+    ///
+    /// Environment IDs are globally allocated, so accepting an ID without the
+    /// project and soft-delete filters would allow one project to create links
+    /// to another project's environment and expose its metadata.
+    async fn environments_in_project(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        environment_ids: &[i32],
+    ) -> Result<Vec<environments::Model>, EnvVarError> {
+        if environment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let unique_ids = environment_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_ids.len() != environment_ids.len() {
+            return Err(EnvVarError::InvalidInput(
+                "Environment IDs must not contain duplicates".to_string(),
+            ));
+        }
+
+        let models = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(unique_ids.iter().copied()))
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .all(txn)
+            .await?;
+        let mut by_id = models
+            .into_iter()
+            .map(|environment| (environment.id, environment))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        environment_ids
+            .iter()
+            .map(|environment_id| {
+                by_id
+                    .remove(environment_id)
+                    .ok_or(EnvVarError::EnvironmentNotFound {
+                        environment_id: *environment_id,
+                        project_id,
+                    })
+            })
+            .collect()
+    }
+
     pub async fn get_environment_variables(
         &self,
         project_id: i32,
@@ -192,9 +243,8 @@ impl EnvVarService {
                 continue;
             }
 
-            // Secret values are write-only — never returned in plaintext from
-            // the API surface. The deployer path goes through
-            // `get_for_deploy` instead.
+            // Secret values are never returned in plaintext from this bulk
+            // API surface. Deployment and explicit reveal use scoped methods.
             let value = if var.is_secret {
                 None
             } else {
@@ -262,6 +312,9 @@ impl EnvVarService {
                 let environment_ids = environment_ids.clone();
 
                 Box::pin(async move {
+                    let scoped_environments =
+                        Self::environments_in_project(txn, project_id, &environment_ids).await?;
+
                     let new_var = env_vars::ActiveModel {
                         project_id: Set(project_id),
                         key: Set(key.clone()),
@@ -278,7 +331,7 @@ impl EnvVarService {
                     let var = new_var.insert(txn).await?;
 
                     let mut environments = Vec::new();
-                    for env_id in &environment_ids {
+                    for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
                         let new_env_rel = env_var_environments::ActiveModel {
                             env_var_id: Set(var.id),
                             environment_id: Set(*env_id),
@@ -287,11 +340,6 @@ impl EnvVarService {
                         };
 
                         new_env_rel.insert(txn).await?;
-
-                        let env = environments::Entity::find_by_id(*env_id)
-                            .one(txn)
-                            .await?
-                            .ok_or(EnvVarError::Other("Environment not found".to_string()))?;
 
                         environments.push(EnvVarEnvironment {
                             id: env.id,
@@ -369,149 +417,146 @@ impl EnvVarService {
         let value_is_explicitly_empty = value.as_ref().is_some_and(|v| v.is_empty());
         let encryption_service = self.encryption_service.clone();
 
-        let result =
-            self.db
-                .transaction::<_, UpdateEnvVarOutcome, EnvVarError>(|txn| {
-                    let encrypted_value_opt = encrypted_value_opt.clone();
-                    let key = key.clone();
-                    let environment_ids = environment_ids.clone();
-                    let encryption_service = encryption_service.clone();
+        let result = self
+            .db
+            .transaction::<_, UpdateEnvVarOutcome, EnvVarError>(|txn| {
+                let encrypted_value_opt = encrypted_value_opt.clone();
+                let key = key.clone();
+                let environment_ids = environment_ids.clone();
+                let encryption_service = encryption_service.clone();
 
-                    Box::pin(async move {
-                        // SELECT ... FOR UPDATE. Every decision below is derived
-                        // from this row — whether the flag may change, and
-                        // whether an empty value is about to be sealed — so the
-                        // read has to be serialized with concurrent updates.
-                        // Without the lock, a promotion committing between this
-                        // read and our own write lets a deliberate blank land on
-                        // a row that has since become secret, which is the
-                        // unrecoverable state both guards exist to prevent.
-                        let env_var = env_vars::Entity::find_by_id(var_id)
-                            .filter(env_vars::Column::ProjectId.eq(project_id))
-                            .lock_exclusive()
-                            .one(txn)
-                            .await?
-                            .ok_or(EnvVarError::Other(
-                                "Environment variable not found".to_string(),
-                            ))?;
+                Box::pin(async move {
+                    // SELECT ... FOR UPDATE. Every decision below is derived
+                    // from this row — whether the flag may change, and
+                    // whether an empty value is about to be sealed — so the
+                    // read has to be serialized with concurrent updates.
+                    // Without the lock, a promotion committing between this
+                    // read and our own write lets a deliberate blank land on
+                    // a row that has since become secret, which is the
+                    // unrecoverable state both guards exist to prevent.
+                    let env_var = env_vars::Entity::find_by_id(var_id)
+                        .filter(env_vars::Column::ProjectId.eq(project_id))
+                        .lock_exclusive()
+                        .one(txn)
+                        .await?
+                        .ok_or(EnvVarError::Other(
+                            "Environment variable not found".to_string(),
+                        ))?;
+                    let scoped_environments =
+                        Self::environments_in_project(txn, project_id, &environment_ids).await?;
 
-                        // One-way secret flag: reject demotion.
-                        let final_is_secret = match (env_var.is_secret, is_secret) {
-                            (true, Some(false)) => {
-                                return Err(EnvVarError::CannotDemoteSecret {
-                                    var_id: env_var.id,
-                                    key: env_var.key.clone(),
-                                });
-                            }
-                            (current, Some(new)) => current || new,
-                            (current, None) => current,
-                        };
-
-                        // Refuse to seal an empty value over a real one. Without
-                        // this a client that failed to load the current value
-                        // (a denied or transient reveal) silently overwrites the
-                        // credential with "" and marks it write-only, which is
-                        // unrecoverable: it cannot be read back to notice the
-                        // loss, and cannot be demoted to inspect it. Mirrors the
-                        // create-time `SecretValueRequired` guard.
-                        if final_is_secret && value_is_explicitly_empty {
-                            return Err(EnvVarError::SecretValueRequired { key: key.clone() });
+                    // One-way secret flag: reject demotion.
+                    let final_is_secret = match (env_var.is_secret, is_secret) {
+                        (true, Some(false)) => {
+                            return Err(EnvVarError::CannotDemoteSecret {
+                                var_id: env_var.id,
+                                key: env_var.key.clone(),
+                            });
                         }
+                        (current, Some(new)) => current || new,
+                        (current, None) => current,
+                    };
 
-                        // A promotion is the transition non-secret -> secret. It is
-                        // reported back to the handler so the write can be audited
-                        // as the one-way, security-relevant change that it is.
-                        let was_secret = env_var.is_secret;
-                        let promoted_to_secret = !was_secret && final_is_secret;
-                        let was_encrypted = env_var.is_encrypted;
-                        let stored_value = env_var.value.clone();
+                    // Refuse to seal an empty value over a real one. Without
+                    // this a client that failed to load the current value
+                    // (a denied or transient reveal) silently overwrites the
+                    // credential with "" and marks it secret. The empty
+                    // credential is unusable and the classification cannot
+                    // be demoted. Mirrors the create-time guard.
+                    if final_is_secret && value_is_explicitly_empty {
+                        return Err(EnvVarError::SecretValueRequired { key: key.clone() });
+                    }
 
-                        let mut active_var: env_vars::ActiveModel = env_var.into();
-                        active_var.key = Set(key.clone());
-                        if let Some(encrypted_value) = encrypted_value_opt {
-                            active_var.value = Set(encrypted_value);
-                            active_var.is_encrypted = Set(true);
-                        } else if promoted_to_secret && !was_encrypted {
-                            // Legacy plaintext row being promoted without a new
-                            // value: encrypt what is already there so the secret is
-                            // unreadable at rest, not merely hidden from the API.
-                            let ciphertext = encryption_service
+                    // A promotion is the transition non-secret -> secret. It is
+                    // reported back to the handler so the write can be audited
+                    // as the one-way, security-relevant change that it is.
+                    let was_secret = env_var.is_secret;
+                    let promoted_to_secret = !was_secret && final_is_secret;
+                    let was_encrypted = env_var.is_encrypted;
+                    let stored_value = env_var.value.clone();
+
+                    let mut active_var: env_vars::ActiveModel = env_var.into();
+                    active_var.key = Set(key.clone());
+                    if let Some(encrypted_value) = encrypted_value_opt {
+                        active_var.value = Set(encrypted_value);
+                        active_var.is_encrypted = Set(true);
+                    } else if promoted_to_secret && !was_encrypted {
+                        // Legacy plaintext row being promoted without a new
+                        // value: encrypt what is already there so the secret is
+                        // unreadable at rest, not merely hidden from the API.
+                        let ciphertext =
+                            encryption_service
                                 .encrypt_string(&stored_value)
                                 .map_err(|e| EnvVarError::EncryptionFailed {
                                     key: key.clone(),
                                     reason: e.to_string(),
                                 })?;
-                            active_var.value = Set(ciphertext);
-                            active_var.is_encrypted = Set(true);
-                        }
-                        // Only touch the column on an actual promotion. Writing
-                        // it unconditionally re-asserts a value derived from an
-                        // unlocked read, so two concurrent updates that both saw
-                        // `is_secret = false` would let the second (an ordinary
-                        // edit that never asked to change the flag) clear the
-                        // promotion the first one just committed — silently
-                        // unmasking the secret, since the ciphertext survives.
-                        // Leaving the column out of the UPDATE makes an
-                        // unrequested demote impossible regardless of ordering.
-                        if promoted_to_secret {
-                            active_var.is_secret = Set(true);
-                        }
-                        active_var.include_in_preview = Set(include_in_preview);
-                        active_var.updated_at = Set(chrono::Utc::now());
-                        let var = active_var.update(txn).await?;
+                        active_var.value = Set(ciphertext);
+                        active_var.is_encrypted = Set(true);
+                    }
+                    // Only touch the column on an actual promotion. Writing
+                    // it unconditionally re-asserts a value derived from an
+                    // unlocked read, so two concurrent updates that both saw
+                    // `is_secret = false` would let the second (an ordinary
+                    // edit that never asked to change the flag) clear the
+                    // promotion the first one just committed — silently
+                    // unmasking the secret, since the ciphertext survives.
+                    // Leaving the column out of the UPDATE makes an
+                    // unrequested demote impossible regardless of ordering.
+                    if promoted_to_secret {
+                        active_var.is_secret = Set(true);
+                    }
+                    active_var.include_in_preview = Set(include_in_preview);
+                    active_var.updated_at = Set(chrono::Utc::now());
+                    let var = active_var.update(txn).await?;
 
-                        env_var_environments::Entity::delete_many()
-                            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
-                            .exec(txn)
-                            .await?;
+                    env_var_environments::Entity::delete_many()
+                        .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+                        .exec(txn)
+                        .await?;
 
-                        let mut environments = Vec::new();
-                        for env_id in &environment_ids {
-                            let new_env_rel = env_var_environments::ActiveModel {
-                                env_var_id: Set(var.id),
-                                environment_id: Set(*env_id),
-                                created_at: Set(chrono::Utc::now()),
-                                ..Default::default()
-                            };
+                    let mut environments = Vec::new();
+                    for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
+                        let new_env_rel = env_var_environments::ActiveModel {
+                            env_var_id: Set(var.id),
+                            environment_id: Set(*env_id),
+                            created_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        };
 
-                            new_env_rel.insert(txn).await?;
+                        new_env_rel.insert(txn).await?;
 
-                            let env = environments::Entity::find_by_id(*env_id)
-                                .one(txn)
-                                .await?
-                                .ok_or(EnvVarError::Other("Environment not found".to_string()))?;
+                        environments.push(EnvVarEnvironment {
+                            id: env.id,
+                            name: env.name,
+                            main_url: env.subdomain,
+                            current_deployment_id: env.current_deployment_id,
+                        });
+                    }
 
-                            environments.push(EnvVarEnvironment {
-                                id: env.id,
-                                name: env.name,
-                                main_url: env.subdomain,
-                                current_deployment_id: env.current_deployment_id,
-                            });
-                        }
+                    // Secret rows never return plaintext, even from update.
+                    // Non-secret rows return the supplied plaintext or
+                    // None when value wasn't changed (caller already has
+                    // the current value via list).
+                    let value = if var.is_secret { None } else { value };
 
-                        // Secret rows never return plaintext, even from update.
-                        // Non-secret rows return the supplied plaintext or
-                        // None when value wasn't changed (caller already has
-                        // the current value via list).
-                        let value = if var.is_secret { None } else { value };
-
-                        Ok(UpdateEnvVarOutcome {
-                            var: EnvVarWithEnvironments {
-                                id: var.id,
-                                project_id: var.project_id,
-                                key: var.key,
-                                value,
-                                created_at: var.created_at,
-                                updated_at: var.updated_at,
-                                environments,
-                                include_in_preview: var.include_in_preview,
-                                is_secret: var.is_secret,
-                            },
-                            promoted_to_secret,
-                        })
+                    Ok(UpdateEnvVarOutcome {
+                        var: EnvVarWithEnvironments {
+                            id: var.id,
+                            project_id: var.project_id,
+                            key: var.key,
+                            value,
+                            created_at: var.created_at,
+                            updated_at: var.updated_at,
+                            environments,
+                            include_in_preview: var.include_in_preview,
+                            is_secret: var.is_secret,
+                        },
+                        promoted_to_secret,
                     })
                 })
-                .await?;
+            })
+            .await?;
 
         Ok(result)
     }
@@ -524,16 +569,25 @@ impl EnvVarService {
         self.db
             .transaction::<_, (), EnvVarError>(|txn| {
                 Box::pin(async move {
+                    let env_var = env_vars::Entity::find_by_id(var_id)
+                        .filter(env_vars::Column::ProjectId.eq(project_id))
+                        .lock_exclusive()
+                        .one(txn)
+                        .await?
+                        .ok_or_else(|| {
+                            EnvVarError::NotFound(format!(
+                                "Environment variable {} not found in project {}",
+                                var_id, project_id
+                            ))
+                        })?;
+
                     env_var_environments::Entity::delete_many()
                         .filter(env_var_environments::Column::EnvVarId.eq(var_id))
                         .exec(txn)
                         .await?;
 
-                    env_vars::Entity::delete_many()
-                        .filter(env_vars::Column::Id.eq(var_id))
-                        .filter(env_vars::Column::ProjectId.eq(project_id))
-                        .exec(txn)
-                        .await?;
+                    let active_var: env_vars::ActiveModel = env_var.into();
+                    active_var.delete(txn).await?;
 
                     Ok(())
                 })
@@ -543,7 +597,12 @@ impl EnvVarService {
         Ok(())
     }
 
-    pub async fn get_environment_variable_value(
+    /// Decrypt one value for an HTTP reveal flow.
+    ///
+    /// This stays crate-private and is deliberately named after its security
+    /// invariant: callers must authorize and durably audit the reveal before
+    /// returning the plaintext outside the process.
+    pub(crate) async fn get_environment_variable_value_for_audited_reveal(
         &self,
         project_id: i32,
         key: &str,
@@ -585,13 +644,6 @@ impl EnvVarService {
                 key, project_id
             ))
         })?;
-
-        if var.is_secret {
-            return Err(EnvVarError::SecretValueCannotBeRevealed {
-                var_id: var.id,
-                key: var.key,
-            });
-        }
 
         self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)
     }
@@ -768,6 +820,47 @@ mod tests {
         }
     }
 
+    async fn assert_create_rejects_unavailable_environment(environment_id: i32) {
+        let svc = make_encryption_service();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<env_vars::Model>::new()])
+                .append_query_results([Vec::<environments::Model>::new()])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, svc);
+
+        let error = service
+            .create_environment_variable(
+                10,
+                vec![environment_id],
+                "SCOPED_KEY".to_string(),
+                "value".to_string(),
+                false,
+                false,
+            )
+            .await
+            .expect_err("foreign or deleted environment must be rejected before insert");
+
+        assert!(matches!(
+            error,
+            EnvVarError::EnvironmentNotFound {
+                environment_id: actual_environment_id,
+                project_id: 10,
+            } if actual_environment_id == environment_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_cross_project_environment() {
+        assert_create_rejects_unavailable_environment(20).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_soft_deleted_environment() {
+        assert_create_rejects_unavailable_environment(21).await;
+    }
+
     #[tokio::test]
     async fn test_get_environment_variables_decrypts_values() {
         let svc = make_encryption_service();
@@ -875,7 +968,7 @@ mod tests {
 
         let service = EnvVarService::new(db, svc);
         let value = service
-            .get_environment_variable_value(10, "API_KEY", None, None)
+            .get_environment_variable_value_for_audited_reveal(10, "API_KEY", None, None)
             .await
             .unwrap();
 
@@ -904,7 +997,7 @@ mod tests {
         let service = EnvVarService::new(db, encryption_service);
 
         let value = service
-            .get_environment_variable_value(10, "SHARED_KEY", Some(22), None)
+            .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", Some(22), None)
             .await
             .expect("environment-scoped reveal should select the linked row");
 
@@ -927,7 +1020,7 @@ mod tests {
         let service = EnvVarService::new(db, encryption_service);
 
         let error = service
-            .get_environment_variable_value(10, "SHARED_KEY", None, None)
+            .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", None, None)
             .await
             .expect_err("unscoped duplicate-key reveal must fail closed");
 
@@ -960,7 +1053,7 @@ mod tests {
         let service = EnvVarService::new(db, encryption_service);
 
         let value = service
-            .get_environment_variable_value(10, "SHARED_KEY", None, Some(4))
+            .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", None, Some(4))
             .await
             .expect("row-scoped reveal should return the requested env-var row");
 
@@ -968,9 +1061,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_environment_variable_value_rejects_write_only_secret() {
+    async fn test_get_environment_variable_value_reveals_secret_through_scoped_endpoint() {
         let encryption_service = make_encryption_service();
-        let encrypted = encryption_service.encrypt_string("never-reveal").unwrap();
+        let encrypted = encryption_service
+            .encrypt_string("reveal-on-demand")
+            .unwrap();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![make_env_var_model_full(
@@ -985,18 +1080,12 @@ mod tests {
         );
         let service = EnvVarService::new(db, encryption_service);
 
-        let error = service
-            .get_environment_variable_value(10, "WRITE_ONLY_TOKEN", None, None)
+        let value = service
+            .get_environment_variable_value_for_audited_reveal(10, "WRITE_ONLY_TOKEN", None, None)
             .await
-            .expect_err("write-only secret must not be revealable");
+            .expect("an authorized audited endpoint must be able to reveal a secret");
 
-        assert!(matches!(
-            error,
-            EnvVarError::SecretValueCannotBeRevealed {
-                var_id: 4,
-                ref key,
-            } if key == "WRITE_ONLY_TOKEN"
-        ));
+        assert_eq!(value, "reveal-on-demand");
     }
 
     /// Building a mock that walks the update transaction: SELECT the row,
@@ -1016,6 +1105,74 @@ mod tests {
                 }])
                 .into_connection(),
         )
+    }
+
+    async fn assert_update_rejects_unavailable_environment(environment_id: i32) {
+        let encryption_service = make_encryption_service();
+        let before = make_env_var_model(3, 10, "SCOPED_KEY", "encrypted", true);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![before]])
+                .append_query_results([Vec::<environments::Model>::new()])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .update_environment_variable(
+                10,
+                3,
+                "SCOPED_KEY".to_string(),
+                None,
+                vec![environment_id],
+                false,
+                None,
+            )
+            .await
+            .expect_err("foreign or deleted environment must be rejected before update");
+
+        assert!(matches!(
+            error,
+            EnvVarError::EnvironmentNotFound {
+                environment_id: actual_environment_id,
+                project_id: 10,
+            } if actual_environment_id == environment_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_cross_project_environment() {
+        assert_update_rejects_unavailable_environment(20).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_soft_deleted_environment() {
+        assert_update_rejects_unavailable_environment(21).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_rejects_cross_project_variable_before_deleting_links() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<env_vars::Model>::new()])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db.clone(), make_encryption_service());
+
+        let error = service
+            .delete_environment_variable(10, 404)
+            .await
+            .expect_err("foreign variable must be rejected");
+        assert!(matches!(error, EnvVarError::NotFound(_)));
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+        let statements = format!("{:?}", db.into_transaction_log()).to_uppercase();
+        assert!(statements.contains("SELECT"));
+        assert!(
+            !statements.contains("DELETE"),
+            "foreign variable links must remain untouched: {statements}"
+        );
     }
 
     #[tokio::test]
@@ -1144,8 +1301,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_rejects_empty_value_for_an_existing_secret() {
-        // Same hazard without a promotion: blanking a secret that is already
-        // write-only is equally unrecoverable.
+        // Same hazard without a promotion: blanking an existing secret leaves
+        // an unusable credential.
         let encryption_service = make_encryption_service();
         let encrypted = encryption_service.encrypt_string("still_needed").unwrap();
         let before = make_env_var_model_full(7, 10, "TOKEN", &encrypted, true, true);

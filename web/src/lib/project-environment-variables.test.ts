@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   isLikelySecretProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
+  templateEnvironmentVariableDefaultsToSecret,
 } from './project-environment-variables'
 
 describe('projectEnvironmentVariablesSchema', () => {
@@ -52,7 +53,7 @@ describe('projectEnvironmentVariablesSchema', () => {
     )
   })
 
-  test('rejects an empty write-only secret', () => {
+  test('rejects an empty secret', () => {
     const result = projectEnvironmentVariablesSchema.safeParse([
       { key: 'API_TOKEN', value: '', isSecret: true },
     ])
@@ -61,7 +62,7 @@ describe('projectEnvironmentVariablesSchema', () => {
     if (result.success) return
     expect(result.error.issues).toContainEqual(
       expect.objectContaining({
-        message: 'A secret needs a value — it cannot be filled in later',
+        message: 'A secret needs a value',
         path: [0, 'value'],
       })
     )
@@ -100,4 +101,44 @@ describe('isLikelySecretProjectEnvironmentVariable', () => {
       expect(isLikelySecretProjectEnvironmentVariable(key)).toBe(false)
     }
   )
+})
+
+describe('templateEnvironmentVariableDefaultsToSecret', () => {
+  test.each([
+    ['KC_BOOTSTRAP_ADMIN_PASSWORD', 'random_secret'],
+    ['DATABASE_URL', undefined],
+    ['API_TOKEN', undefined],
+  ])(
+    'protects native service credential %s by default',
+    (key, defaultGenerator) => {
+      expect(
+        templateEnvironmentVariableDefaultsToSecret({
+          templateKind: 'service',
+          key,
+          defaultGenerator,
+        })
+      ).toBe(true)
+    }
+  )
+
+  test('preserves likely-secret defaults for starter templates', () => {
+    expect(
+      templateEnvironmentVariableDefaultsToSecret({
+        templateKind: 'starter',
+        key: 'NEXTAUTH_SECRET',
+        defaultGenerator: 'random_secret',
+      })
+    ).toBe(true)
+  })
+
+  test('protects an explicitly classified secret with a non-heuristic name', () => {
+    expect(
+      templateEnvironmentVariableDefaultsToSecret({
+        templateKind: 'service',
+        key: 'ADMIN_CREDENTIAL',
+        defaultGenerator: undefined,
+        explicitSecret: true,
+      })
+    ).toBe(true)
+  })
 })

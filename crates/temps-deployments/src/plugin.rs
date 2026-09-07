@@ -534,7 +534,6 @@ impl TempsPlugin for DeploymentsPlugin {
 
         // Get data directory for local file storage
         let data_dir = config_service.data_dir();
-
         // Create NodeService for admin node routes (list/get with session auth)
         let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
 

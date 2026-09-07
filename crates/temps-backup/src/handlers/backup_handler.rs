@@ -258,6 +258,9 @@ pub struct CreateS3SourceRequest {
     /// The very first S3 source is always created as default regardless of this flag.
     #[schema(example = false)]
     pub is_default: Option<bool>,
+    /// Managed RustFS/S3 service that supplies this destination. When set,
+    /// schedules using this source can never target that service itself.
+    pub backing_service_id: Option<i32>,
 }
 
 #[derive(Deserialize, ToSchema, Clone)]
@@ -301,8 +304,9 @@ pub struct CreateBackupScheduleRequest {
     pub max_runtime_secs: Option<i64>,
     /// When `true` (default), the schedule backs up every external service
     /// on the host — including databases created in the future. When
-    /// `false`, the schedule backs up only the services explicitly attached
-    /// via `POST /backups/schedules/{id}/services`. Omit to use the default.
+    /// `false`, the schedule backs up only the services supplied in
+    /// `service_ids` (or later attached through the schedule-services API).
+    /// Omit to use the default.
     #[serde(default)]
     pub target_all_services: Option<bool>,
     /// When `true` (default), every run also produces a `control_plane`
@@ -311,6 +315,11 @@ pub struct CreateBackupScheduleRequest {
     /// keep the run history focused on those services.
     #[serde(default)]
     pub include_control_plane: Option<bool>,
+    /// External services to target when `target_all_services` is `false`.
+    /// The schedule and these memberships are created atomically, so an
+    /// enabled schedule can never be observed without its requested targets.
+    #[serde(default)]
+    pub service_ids: Vec<i32>,
 }
 
 /// Deserializer for `Option<Option<i64>>` that maps:
@@ -369,6 +378,10 @@ pub struct UpdateBackupScheduleRequest {
     pub target_all_services: Option<bool>,
     /// Toggle whether the control-plane backup is produced on every run.
     pub include_control_plane: Option<bool>,
+    /// Replace the explicit external-service selection atomically with the
+    /// schedule update. Only meaningful when `target_all_services` resolves
+    /// to `false`; an empty list explicitly clears the selection.
+    pub service_ids: Option<Vec<i32>>,
 }
 
 /// Returns the names of fields that are present (i.e., `Some`) in the patch
@@ -401,6 +414,9 @@ fn changed_fields_for_audit(request: &UpdateBackupScheduleRequest) -> Vec<String
     }
     if request.include_control_plane.is_some() {
         fields.push("include_control_plane".to_string());
+    }
+    if request.service_ids.is_some() {
+        fields.push("service_ids".to_string());
     }
     fields
 }
@@ -443,6 +459,9 @@ pub struct ExternalServiceBackupResponse {
     pub created_by: i32,
     #[schema(example = "2025-02-15T14:30:00.123Z")]
     pub expires_at: Option<String>,
+    /// Immutable provenance retained when the source service is deleted.
+    pub service_name_snapshot: Option<String>,
+    pub service_type_snapshot: Option<String>,
 }
 
 impl From<temps_entities::external_service_backups::Model> for ExternalServiceBackupResponse {
@@ -463,6 +482,8 @@ impl From<temps_entities::external_service_backups::Model> for ExternalServiceBa
             compression_type: backup.compression_type,
             created_by: backup.created_by,
             expires_at: backup.expires_at.map(|dt| dt.to_rfc3339()),
+            service_name_snapshot: backup.service_name_snapshot,
+            service_type_snapshot: backup.service_type_snapshot,
         }
     }
 }
@@ -3004,7 +3025,18 @@ async fn update_backup_schedule(
     Json(request): Json<UpdateBackupScheduleRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
-    require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "update").await?;
+    if let Some(service_ids) = request.service_ids.as_deref() {
+        require_schedule_attach_access(
+            &app_state,
+            &auth,
+            id,
+            service_ids,
+            Permission::BackupsWrite,
+        )
+        .await?;
+    } else {
+        require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "update").await?;
+    }
     if matches!(request.target_all_services, Some(true))
         || matches!(request.include_control_plane, Some(true))
     {

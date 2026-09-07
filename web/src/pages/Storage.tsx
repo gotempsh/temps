@@ -39,13 +39,15 @@ import { cn } from '@/lib/utils'
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 
 export function Storage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
-  const [selectedService, setSelectedService] = useState<ExternalServiceInfo | null>(null)
+  const [selectedService, setSelectedService] =
+    useState<ExternalServiceInfo | null>(null)
   const [isCreateDropdownOpen, setIsCreateDropdownOpen] = useState(false)
 
   // Get active tab from URL or default to 'external'
@@ -121,11 +123,7 @@ export function Storage() {
           <p className="text-sm text-muted-foreground mb-4">
             Failed to load services
           </p>
-          <Button
-            variant="outline"
-            onClick={() => refetch()}
-            className="gap-2"
-          >
+          <Button variant="outline" onClick={() => refetch()} className="gap-2">
             <RefreshCcw className="h-4 w-4" />
             Try again
           </Button>
@@ -166,12 +164,17 @@ export function Storage() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="sm:p-4 space-y-6 md:p-6">
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-semibold sm:text-2xl">Databases</h1>
-        </div>
+      <PageContainer innerClassName="space-y-6">
+        <PageHeader
+          title="Databases"
+          description="Manage platform and external data services"
+        />
 
-        <Tabs value={activeTab} onValueChange={handleTabChange} className="space-y-6">
+        <Tabs
+          value={activeTab}
+          onValueChange={handleTabChange}
+          className="space-y-6"
+        >
           <TabsList>
             <TabsTrigger value="platform" className="gap-2">
               <Database className="h-4 w-4" />
@@ -209,7 +212,7 @@ export function Storage() {
             }}
           />
         )}
-      </div>
+      </PageContainer>
     </div>
   )
 }
@@ -328,7 +331,7 @@ function ServicesCardGrid({
         // probing (status === 'running'). Others haven't been checked.
         const health =
           service.status === 'running'
-            ? healthMap?.get(service.id)?.status ?? null
+            ? (healthMap?.get(service.id)?.status ?? null)
             : null
         return (
           <ServiceCard
@@ -455,11 +458,7 @@ function ServiceMetricsCell({ serviceId }: { serviceId: number }) {
     staleTime: 50_000,
   })
 
-  if (
-    stats.isPending ||
-    stats.isError ||
-    !stats.data?.members?.length
-  ) {
+  if (stats.isPending || stats.isError || !stats.data?.members?.length) {
     return null
   }
 
@@ -469,12 +468,12 @@ function ServiceMetricsCell({ serviceId }: { serviceId: number }) {
   // "% of cap" numbers.
   const cpuPercentTotal = stats.data.members.reduce(
     (sum, m) => sum + (m.cpu_percent ?? 0),
-    0,
+    0
   )
 
   const memBytes = stats.data.members.reduce(
     (sum, m) => sum + (m.memory_usage_bytes ?? 0),
-    0,
+    0
   )
   const hasCpu = stats.data.members.some((m) => m.cpu_percent != null)
   const hasMem = stats.data.members.some((m) => m.memory_usage_bytes != null)
@@ -483,12 +482,10 @@ function ServiceMetricsCell({ serviceId }: { serviceId: number }) {
   // so it composes with formatBytes. CPU cap in cores (sum across members).
   const memLimitMib = runtime.data?.members.reduce(
     (sum, r) => sum + (r.resource_limits?.memory_mb ?? 0),
-    0,
+    0
   )
   const memLimitBytes =
-    memLimitMib != null && memLimitMib > 0
-      ? memLimitMib * 1024 * 1024
-      : null
+    memLimitMib != null && memLimitMib > 0 ? memLimitMib * 1024 * 1024 : null
   const cpuLimitCores = runtime.data?.members.reduce((sum, r) => {
     const nano = r.resource_limits?.nano_cpus ?? 0
     return sum + (nano > 0 ? nano / 1_000_000_000 : 0)

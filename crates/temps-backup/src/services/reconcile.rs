@@ -155,6 +155,8 @@ mod tests {
             compression_type: "lz4".into(),
             created_by: 1,
             expires_at: None,
+            service_name_snapshot: Some("redis-test".to_string()),
+            service_type_snapshot: Some("redis".to_string()),
         }
     }
 

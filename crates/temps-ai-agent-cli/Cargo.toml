@@ -23,6 +23,8 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+subtle = "2.6"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tower = { workspace = true }

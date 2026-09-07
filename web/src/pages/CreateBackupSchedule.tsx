@@ -14,7 +14,6 @@
  */
 
 import {
-  attachScheduleServicesMutation,
   createBackupScheduleMutation,
   getS3SourceOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -85,11 +84,6 @@ export function CreateBackupSchedule() {
   // who only use Temps to orchestrate external DB backups can flip it off.
   const [includeControlPlane, setIncludeControlPlane] = useState(true)
 
-  const attachMutation = useMutation({
-    ...attachScheduleServicesMutation(),
-    meta: { errorTitle: 'Failed to attach services to schedule' },
-  })
-
   // The mutation's generated error type is `ProblemDetails`. Adding an
   // explicit `onError: (err: unknown) => ...` widens that and breaks the
   // typed-options spread above. We rely on the app-wide error toast
@@ -98,26 +92,7 @@ export function CreateBackupSchedule() {
   const createMutation = useMutation({
     ...createBackupScheduleMutation(),
     meta: { errorTitle: 'Failed to create backup schedule' },
-    onSuccess: async (created) => {
-      // In 'specific' mode, attach the picked services. In 'all' mode there
-      // is nothing to attach — the schedule's `target_all_services` flag is
-      // already set on the backend and the fan-out picks every DB at run
-      // time.
-      if (backupMode === 'specific' && selectedServiceIds.length > 0) {
-        try {
-          await attachMutation.mutateAsync({
-            path: { id: created.id },
-            body: { service_ids: selectedServiceIds },
-          })
-        } catch {
-          // Toast already raised by mutation meta; surface partial success.
-          toast.warning(
-            'Schedule created, but attaching services failed. You can retry from the schedule detail page.',
-          )
-          navigate(`/backups/s3-sources/${id}`)
-          return
-        }
-      }
+    onSuccess: () => {
       toast.success('Backup schedule created successfully')
       navigate(`/backups/s3-sources/${id}`)
     },
@@ -173,20 +148,6 @@ export function CreateBackupSchedule() {
       )
       return
     }
-    if (
-      backupMode === 'specific' &&
-      selectedServiceIds.length === 0 &&
-      !includeControlPlane
-    ) {
-      toast.error(
-        'This schedule would have nothing to back up. Enable the control plane or pick at least one database.',
-      )
-      return
-    }
-    if (backupMode === 'all' && !includeControlPlane) {
-      // Allowed (all DBs covered), nothing to block here.
-    }
-
     createMutation.mutate({
       body: {
         name: form.name,
@@ -200,6 +161,8 @@ export function CreateBackupSchedule() {
         max_runtime_secs,
         target_all_services: backupMode === 'all',
         include_control_plane: includeControlPlane,
+        service_ids:
+          backupMode === 'specific' ? selectedServiceIds : [],
       },
     })
   }
@@ -302,7 +265,8 @@ export function CreateBackupSchedule() {
                     className="mt-1"
                   />
                   <p className="text-xs text-muted-foreground mt-1">
-                    Format: second minute hour day month weekday
+                    Format: second minute hour day month weekday. Use names
+                    such as SUN for weekdays.
                   </p>
                 </div>
               )}
@@ -368,9 +332,7 @@ export function CreateBackupSchedule() {
                 <ScheduleServicesSelector
                   value={selectedServiceIds}
                   onChange={setSelectedServiceIds}
-                  disabled={
-                    createMutation.isPending || attachMutation.isPending
-                  }
+                  disabled={createMutation.isPending}
                 />
               </div>
             )}
@@ -393,9 +355,7 @@ export function CreateBackupSchedule() {
                 id="include-control-plane"
                 checked={includeControlPlane}
                 onCheckedChange={setIncludeControlPlane}
-                disabled={
-                  createMutation.isPending || attachMutation.isPending
-                }
+                disabled={createMutation.isPending}
               />
             </div>
           </div>
@@ -431,11 +391,9 @@ export function CreateBackupSchedule() {
         </Button>
         <Button
           onClick={handleSubmit}
-          disabled={createMutation.isPending || attachMutation.isPending}
+          disabled={createMutation.isPending}
         >
-          {createMutation.isPending || attachMutation.isPending
-            ? 'Creating…'
-            : 'Create schedule'}
+          {createMutation.isPending ? 'Creating…' : 'Create schedule'}
         </Button>
       </div>
     </div>

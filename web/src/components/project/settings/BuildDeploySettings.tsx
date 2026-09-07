@@ -10,6 +10,7 @@ import { DeploymentSourceCard } from './DeploymentSourceCard'
 import { EnvironmentPortOverrideCard } from './EnvironmentPortOverrideCard'
 import { ImageRetentionCard } from './ImageRetentionCard'
 import { PreviewEnvironmentsCard } from './PreviewEnvironmentsCard'
+import { ServiceTemplateRuntimeCard } from './ServiceTemplateRuntimeCard'
 
 const TABS = ['source', 'build', 'deploy', 'previews'] as const
 type TabValue = (typeof TABS)[number]
@@ -72,7 +73,11 @@ export function BuildDeploySettings({
         </TabsContent>
 
         <TabsContent value="build" className="space-y-6">
-          <BuildSettings project={project} refetch={refetch} embedded />
+          {project.project_type === 'service' ? (
+            <ServiceTemplateRuntimeCard project={project} refetch={refetch} />
+          ) : (
+            <BuildSettings project={project} refetch={refetch} embedded />
+          )}
         </TabsContent>
 
         <TabsContent value="deploy" className="space-y-6">

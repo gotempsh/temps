@@ -34,6 +34,25 @@ struct McpBridgeState {
 const MCP_EVENT_CAPACITY: usize = 32;
 const MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MCP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Constant-time equality for the bridge's bearer token check.
+///
+/// Same primitive `temps-routes` uses for its route-sync token check
+/// (`subtle::ConstantTimeEq`), applied here as defense-in-depth: the bridge
+/// already binds to loopback on an ephemeral port behind a random per-instance
+/// path and token, but a length-preserving `==` still leaks a timing signal.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
+
+fn build_bridge_router(path: &str, state: McpBridgeState) -> axum::Router {
+    axum::Router::new()
+        .route(path, axum::routing::post(mcp_bridge_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MCP_BODY_LIMIT_BYTES))
+        .with_state(state)
+}
 
 async fn mcp_bridge_handler(
     axum::extract::State(state): axum::extract::State<McpBridgeState>,
@@ -43,7 +62,12 @@ async fn mcp_bridge_handler(
     let authorized = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == format!("Bearer {}", state.token));
+        .is_some_and(|value| {
+            constant_time_eq(
+                value.as_bytes(),
+                format!("Bearer {}", state.token).as_bytes(),
+            )
+        });
     if !authorized {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
@@ -195,9 +219,7 @@ impl ScopedMcpBridge {
             tool_slot: Arc::new(Semaphore::new(1)),
             tool_timeout: MCP_TOOL_TIMEOUT,
         };
-        let router = axum::Router::new()
-            .route(&path, axum::routing::post(mcp_bridge_handler))
-            .with_state(state);
+        let router = build_bridge_router(&path, state);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, router)
@@ -1647,6 +1669,61 @@ mod tests {
             events.recv().await,
             Some(Ok(ChatStreamDelta::ToolResult { result, .. })) if result.contains("timed out")
         ));
+    }
+
+    // These two tests exercise the built router (rather than calling
+    // `mcp_bridge_handler` directly, as the tests above do) because
+    // `DefaultBodyLimit` is enforced by the extractor via a `tower::Layer`,
+    // which only runs when a request actually passes through the router.
+    #[tokio::test]
+    async fn mcp_bridge_router_rejects_request_over_body_limit() {
+        use tower::ServiceExt;
+        let (state, _events) = test_mcp_state();
+        let router = build_bridge_router("/mcp/test", state);
+        let oversized_body = vec![b'a'; MCP_BODY_LIMIT_BYTES + 1];
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp/test")
+            .header(axum::http::header::AUTHORIZATION, "Bearer one-turn-token")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(oversized_body))
+            .expect("valid request");
+
+        let response = router.oneshot(request).await.expect("router responds");
+
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_router_accepts_realistic_sized_tool_call() {
+        use tower::ServiceExt;
+        let (state, _events) = test_mcp_state();
+        let router = build_bridge_router("/mcp/test", state);
+        // Real MCP tool-call payloads (JSON-RPC envelope plus tool name and
+        // arguments) run from a few hundred bytes to a handful of KB --
+        // nowhere near MCP_BODY_LIMIT_BYTES. A large arguments blob (e.g. a
+        // pasted file) can reach the low hundreds of KB, still well under
+        // the 1 MiB limit; this asserts the limit doesn't clip that range.
+        let body = serde_json::json!({
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "temps",
+                "arguments": {"command": "projects list", "padding": "x".repeat(200 * 1024)}
+            }
+        })
+        .to_string();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp/test")
+            .header(axum::http::header::AUTHORIZATION, "Bearer one-turn-token")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("valid request");
+
+        let response = router.oneshot(request).await.expect("router responds");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]

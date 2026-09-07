@@ -1159,19 +1159,22 @@ fn mongodb_default_seeds() -> Vec<RuleSeed> {
 }
 
 fn rustfs_default_seeds() -> Vec<RuleSeed> {
-    // Metric names mirror what the S3/Prometheus collector maps from RustFS /
-    // MinIO (see `RUSTFS_METRICS` in `temps_metrics::collector::prometheus`).
+    // The pinned RustFS image exports these exact names through OTLP. Do not use the
+    // legacy `s3.*` Prometheus aliases here: RustFS has no functional MinIO
+    // `/minio/v2/metrics/cluster` scrape path, so those rules never receive
+    // samples for a managed RustFS service.
     //
     // Two raw thresholds we can trust:
-    //   - `s3.nodes_offline` > 0 — any offline node degrades availability
-    //   - `s3.capacity_usable_free_bytes` — absolute byte thresholds are the
+    //   - `rustfs_cluster_health_drives_offline_count` > 0 — any offline
+    //     drive degrades availability
+    //   - `rustfs_cluster_capacity_free_bytes` — absolute byte thresholds are the
     //     only safe option; the collector does not emit a free/used ratio.
     //     The thresholds below assume a small-to-medium deployment. Users on
     //     larger clusters should tune these per-rule via the UI.
     vec![
         RuleSeed {
             name: "Storage nodes offline",
-            metric_name: "s3.nodes_offline",
+            metric_name: "rustfs_cluster_health_drives_offline_count",
             threshold: 0.0,
             comparator: ">",
             severity: "critical",
@@ -1180,7 +1183,7 @@ fn rustfs_default_seeds() -> Vec<RuleSeed> {
         RuleSeed {
             name: "Low free capacity (warning)",
             // 10 GiB free
-            metric_name: "s3.capacity_usable_free_bytes",
+            metric_name: "rustfs_cluster_capacity_free_bytes",
             threshold: 10.0 * 1024.0 * 1024.0 * 1024.0,
             comparator: "<",
             severity: "warning",
@@ -1189,7 +1192,7 @@ fn rustfs_default_seeds() -> Vec<RuleSeed> {
         RuleSeed {
             name: "Low free capacity (critical)",
             // 2 GiB free
-            metric_name: "s3.capacity_usable_free_bytes",
+            metric_name: "rustfs_cluster_capacity_free_bytes",
             threshold: 2.0 * 1024.0 * 1024.0 * 1024.0,
             comparator: "<",
             severity: "critical",
@@ -1541,6 +1544,18 @@ mod tests {
                 s.metric_name
             );
         }
+    }
+
+    #[test]
+    fn rustfs_default_seeds_use_beta6_otlp_metric_names() {
+        let names: Vec<&str> = rustfs_default_seeds()
+            .iter()
+            .map(|seed| seed.metric_name)
+            .collect();
+
+        assert!(names.contains(&"rustfs_cluster_health_drives_offline_count"));
+        assert!(names.contains(&"rustfs_cluster_capacity_free_bytes"));
+        assert!(names.iter().all(|name| !name.starts_with("s3.")));
     }
 
     // ── default rule builders ──────────────────────────────────────────────────

@@ -913,6 +913,7 @@ mod tests {
         let now = chrono::Utc::now();
         temps_entities::s3_sources::Model {
             id: 1,
+            backing_service_id: None,
             name: "operator-source".to_string(),
             bucket_name: "backups".to_string(),
             region: "us-east-1".to_string(),

@@ -2209,6 +2209,7 @@ mod tests {
             lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
+            backing_service_id: Set(None),
         }
         .insert(&db)
         .await
@@ -2360,6 +2361,7 @@ mod tests {
                 lifecycle_reconcile_generation: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
+                backing_service_id: Set(None),
             };
         // Source 1: the operator's own bucket, their own credentials -- never
         // a mirror candidate. Source 2: provisioned by the Cloud link.
@@ -2727,6 +2729,8 @@ mod tests {
                 compression_type: "none".to_owned(),
                 created_by: 1,
                 expires_at: None,
+                service_name_snapshot: None,
+                service_type_snapshot: None,
             })
             .collect::<Vec<_>>();
         let service = temps_entities::external_services::Model {
@@ -2757,6 +2761,7 @@ mod tests {
         };
         let source = temps_entities::s3_sources::Model {
             id: 7,
+            backing_service_id: None,
             name: "mirror".to_owned(),
             bucket_name: "mirror".to_owned(),
             region: "test-1".to_owned(),
@@ -2948,6 +2953,7 @@ mod tests {
             lifecycle_reconcile_generation: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
+            backing_service_id: Set(None),
         }
         .insert(&db)
         .await
@@ -3155,6 +3161,7 @@ mod tests {
             name: Set("Temps Cloud managed backups".to_owned()),
             bucket_name: Set("managed-bucket".to_owned()),
             region: Set("test-1".to_owned()),
+            backing_service_id: Set(None),
             // A closed loopback port: any S3 call this test reaches fails
             // fast with connection-refused instead of hanging or reaching
             // real AWS, per the convention documented on `linked_link_fixture`.
@@ -3229,6 +3236,8 @@ mod tests {
             compression_type: "gzip".to_owned(),
             created_by: 1,
             expires_at: None,
+            service_name_snapshot: None,
+            service_type_snapshot: None,
         }
         .into_active_model()
         .insert(&db)
@@ -4112,6 +4121,7 @@ mod tests {
         temps_entities::s3_sources::ActiveModel {
             id: Set(1),
             name: Set("Temps Cloud managed backups".to_owned()),
+            backing_service_id: Set(None),
             bucket_name: Set("source-bucket".to_owned()),
             region: Set("test-1".to_owned()),
             endpoint: Set(Some(format!("http://{address}"))),
@@ -4196,6 +4206,8 @@ mod tests {
             id: 1,
             service_id: 1,
             backup_id: 1,
+            service_name_snapshot: None,
+            service_type_snapshot: None,
             backup_type: "scheduled".to_owned(),
             state: "completed".to_owned(),
             started_at: now,

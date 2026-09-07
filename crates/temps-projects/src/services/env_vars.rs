@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use super::types::{EnvVarEnvironment, EnvVarWithEnvironments};
 
-/// Placeholder returned in place of a write-only secret's plaintext.
+/// Placeholder returned in place of a secret's plaintext in list responses.
 const SECRET_VALUE_MASK: &str = "***";
 
 #[derive(Error, Debug)]
@@ -38,10 +38,12 @@ pub enum EnvVarError {
         reason: String,
     },
 
-    #[error("Secret env var '{key}' (id={var_id}) is write-only and cannot be revealed")]
-    SecretValueCannotBeRevealed { var_id: i32, key: String },
+    #[error(
+        "Secret env var '{key}' (id={var_id}) must be read through the audited reveal endpoint"
+    )]
+    SecretValueRequiresAuditedReveal { var_id: i32, key: String },
 
-    #[error("Secret env var '{key}' requires a non-empty value: secrets are write-only and an empty one can never be read back or corrected")]
+    #[error("Secret env var '{key}' requires a non-empty value")]
     SecretValueRequired { key: String },
 
     #[error("Other error: {0}")]
@@ -149,22 +151,59 @@ impl EnvVarService {
             }
         }
 
+        // Older rows can still carry their scope in env_vars.environment_id
+        // instead of the junction table. Surface that scope to callers so
+        // upgrade previews use the same precedence as deployment resolution.
+        let direct_environment_ids = vars
+            .iter()
+            .filter_map(|variable| variable.environment_id)
+            .collect::<Vec<_>>();
+        let direct_environments = if direct_environment_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            environments::Entity::find()
+                .filter(environments::Column::Id.is_in(direct_environment_ids))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|environment| (environment.id, environment))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        for variable in &vars {
+            let Some(environment_id) = variable.environment_id else {
+                continue;
+            };
+            let Some(environment) = direct_environments.get(&environment_id) else {
+                continue;
+            };
+            let scopes = env_map.entry(variable.id).or_default();
+            if !scopes.iter().any(|scope| scope.id == environment.id) {
+                scopes.push(EnvVarEnvironment {
+                    id: environment.id,
+                    name: environment.name.clone(),
+                });
+            }
+        }
+
         let mut result = Vec::new();
         for var in vars {
             let environments = env_map.get(&var.id).cloned().unwrap_or_default();
-            // Write-only secrets never yield plaintext through a listing path.
+            // Secrets never yield plaintext through a listing path.
             // Masking (rather than skipping the row) keeps the variable visible
             // so callers can still see that the key exists.
+            let cleartext = self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
+            let has_value = !cleartext.is_empty();
             let decrypted_value = if var.is_secret {
                 SECRET_VALUE_MASK.to_string()
             } else {
-                self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?
+                cleartext
             };
             result.push(EnvVarWithEnvironments {
                 id: var.id,
                 project_id: var.project_id,
                 key: var.key,
                 value: decrypted_value,
+                has_value,
                 created_at: var.created_at,
                 updated_at: var.updated_at,
                 environments,
@@ -182,9 +221,8 @@ impl EnvVarService {
         value: String,
         is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
-        // A secret is write-only, so an empty one can never be filled in later
-        // through the UI — reject it at creation instead of storing a variable
-        // nobody can repair without deleting it.
+        // Empty secrets are almost always accidental and cannot authenticate
+        // anything, so reject them at creation.
         if is_secret && value.is_empty() {
             return Err(EnvVarError::SecretValueRequired { key });
         }
@@ -261,16 +299,18 @@ impl EnvVarService {
                         });
                     }
 
+                    let cleartext = encryption_service.decrypt_string(&var.value).map_err(|e| {
+                        EnvVarError::DecryptionFailed {
+                            var_id: var.id,
+                            key: var.key.clone(),
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let has_value = !cleartext.is_empty();
                     let decrypted_value = if var.is_secret {
                         SECRET_VALUE_MASK.to_string()
                     } else {
-                        encryption_service.decrypt_string(&var.value).map_err(|e| {
-                            EnvVarError::DecryptionFailed {
-                                var_id: var.id,
-                                key: var.key.clone(),
-                                reason: e.to_string(),
-                            }
-                        })?
+                        cleartext
                     };
 
                     Ok(EnvVarWithEnvironments {
@@ -278,6 +318,7 @@ impl EnvVarService {
                         project_id: var.project_id,
                         key: var.key,
                         value: decrypted_value,
+                        has_value,
                         created_at: var.created_at,
                         updated_at: var.updated_at,
                         environments,
@@ -297,6 +338,7 @@ impl EnvVarService {
         value: String,
         environment_ids: Vec<i32>,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
+        let has_value = !value.is_empty();
         let encrypted_value = self.encrypt_value(&key, &value)?;
         let encryption_service = self.encryption_service.clone();
 
@@ -315,6 +357,9 @@ impl EnvVarService {
                         .ok_or(EnvVarError::Other(
                             "Environment variable not found".to_string(),
                         ))?;
+                    if env_var.is_secret && !has_value {
+                        return Err(EnvVarError::SecretValueRequired { key: key.clone() });
+                    }
 
                     let mut active_var: env_vars::ActiveModel = env_var.into();
                     active_var.key = Set(key.clone());
@@ -350,16 +395,18 @@ impl EnvVarService {
                         });
                     }
 
+                    let cleartext = encryption_service.decrypt_string(&var.value).map_err(|e| {
+                        EnvVarError::DecryptionFailed {
+                            var_id: var.id,
+                            key: var.key.clone(),
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let has_value = !cleartext.is_empty();
                     let decrypted_value = if var.is_secret {
                         SECRET_VALUE_MASK.to_string()
                     } else {
-                        encryption_service.decrypt_string(&var.value).map_err(|e| {
-                            EnvVarError::DecryptionFailed {
-                                var_id: var.id,
-                                key: var.key.clone(),
-                                reason: e.to_string(),
-                            }
-                        })?
+                        cleartext
                     };
 
                     Ok(EnvVarWithEnvironments {
@@ -367,6 +414,7 @@ impl EnvVarService {
                         project_id: var.project_id,
                         key: var.key,
                         value: decrypted_value,
+                        has_value,
                         created_at: var.created_at,
                         updated_at: var.updated_at,
                         environments,
@@ -418,11 +466,11 @@ impl EnvVarService {
             .await?
             .ok_or_else(|| EnvVarError::Other("Environment variable not found".to_string()))?;
 
-        // Mirrors the guard in temps-environments' EnvVarService: a variable
-        // converted to a secret is write-only on every read path, so no caller
-        // can walk around the restriction by reaching this service instead.
+        // This legacy service has no authorization or audit context. Secret
+        // plaintext is available only through temps-environments' dedicated
+        // permission-checked, fail-closed audited reveal flow.
         if var.is_secret {
-            return Err(EnvVarError::SecretValueCannotBeRevealed {
+            return Err(EnvVarError::SecretValueRequiresAuditedReveal {
                 var_id: var.id,
                 key: var.key,
             });
@@ -451,8 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_a_secret_with_an_empty_value() {
-        // A secret is write-only, so an empty one can never be inspected or
-        // corrected afterwards — it has to be refused up front.
+        // Empty secrets are unusable credentials and should be refused up front.
         let service = make_service(MockDatabase::new(DatabaseBackend::Postgres));
 
         let error = service
@@ -486,5 +533,80 @@ mod tests {
             !matches!(error, EnvVarError::SecretValueRequired { .. }),
             "a non-secret empty value must not trip the secret guard, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn update_rejects_an_empty_value_for_an_existing_secret() {
+        let now = chrono::Utc::now();
+        let service = make_service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![
+                env_vars::Model {
+                    id: 9,
+                    project_id: 3,
+                    environment_id: None,
+                    key: "API_KEY".to_string(),
+                    value: "encrypted".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    include_in_preview: false,
+                    is_encrypted: true,
+                    is_secret: true,
+                },
+            ]]),
+        );
+
+        let error = service
+            .update_environment_variable(3, 9, "API_KEY".to_string(), String::new(), vec![])
+            .await
+            .expect_err("an existing secret cannot be cleared to an empty value");
+
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueRequired { ref key } if key == "API_KEY"
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_read_rejects_secret_without_an_audit_context() {
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test key is valid"),
+        );
+        let encrypted = encryption_service
+            .encrypt_string("generated-admin-password")
+            .expect("test value encrypts");
+        let now = chrono::Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![env_vars::Model {
+                    id: 9,
+                    project_id: 3,
+                    environment_id: None,
+                    key: "KC_BOOTSTRAP_ADMIN_PASSWORD".to_string(),
+                    value: encrypted,
+                    created_at: now,
+                    updated_at: now,
+                    include_in_preview: false,
+                    is_encrypted: true,
+                    is_secret: true,
+                }]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .get_environment_variable_value(3, "KC_BOOTSTRAP_ADMIN_PASSWORD", None)
+            .await
+            .expect_err("legacy reads must not bypass the audited reveal endpoint");
+
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueRequiresAuditedReveal {
+                var_id: 9,
+                ref key,
+            } if key == "KC_BOOTSTRAP_ADMIN_PASSWORD"
+        ));
     }
 }

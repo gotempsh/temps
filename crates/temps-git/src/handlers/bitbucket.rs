@@ -428,6 +428,7 @@ mod tests {
             ai_write_actions_enabled: false,
             cross_project_trace_sharing: true,
             error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
             error_source_root: None,
             image_retention_hours: None,
             cloud_telemetry_fidelity:
@@ -442,6 +443,8 @@ mod tests {
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,

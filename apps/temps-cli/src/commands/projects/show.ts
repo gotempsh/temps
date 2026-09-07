@@ -87,6 +87,7 @@ export async function show(options: ShowOptions): Promise<void> {
     'Git Provider': gitProviderLabel(project.git_provider_type),
     'Attack Mode': project.attack_mode ? 'Enabled' : 'Disabled',
     'Preview Envs': project.enable_preview_environments ? 'Enabled' : 'Disabled',
+    'Vulnerability Scanning': project.vulnerability_scanning_enabled ? 'Enabled' : 'Disabled',
     Created: formatDate(new Date(project.created_at * 1000).toISOString()),
     Updated: formatDate(new Date(project.updated_at * 1000).toISOString()),
   })

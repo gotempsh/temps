@@ -5,6 +5,23 @@ import { describe, expect, test } from 'bun:test'
 import { projectCardMediaSources } from './project-card-media'
 
 describe('project card media fallbacks', () => {
+  test('prefers the persisted service-template logo over deployment media', () => {
+    expect(
+      projectCardMediaSources(
+        'https://example.temps.sh/dashboard',
+        'screenshots/project.webp',
+        '/templates/keycloak.svg'
+      )
+    ).toEqual([
+      { kind: 'template', src: '/templates/keycloak.svg' },
+      { kind: 'favicon', src: 'https://example.temps.sh/favicon.ico' },
+      {
+        kind: 'screenshot',
+        src: '/api/files/screenshots/project.webp',
+      },
+    ])
+  })
+
   test('tries the deployed page favicon before its screenshot', () => {
     expect(
       projectCardMediaSources(
