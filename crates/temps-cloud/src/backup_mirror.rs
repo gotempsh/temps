@@ -1840,10 +1840,19 @@ fn s3_client(
     let secret_key = encryption
         .decrypt_string(&source.secret_key)
         .map_err(|error| StageError::Retry(format!("could not decrypt S3 secret key: {error}")))?;
+    // `None` for every operator-configured long-lived credential, which
+    // leaves the values below byte-for-byte what they were. A Cloud-vended
+    // STS credential (`managed_by_cloud = true`) carries a session token
+    // here; dropping it silently turns every request into an unauthenticated
+    // one against that provider, which fails auth on every retry forever.
+    let session_token = temps_entities::s3_sources::decrypt_session_token(encryption, source)
+        .map_err(|error| {
+            StageError::Retry(format!("could not decrypt S3 session token: {error}"))
+        })?;
     let credentials = aws_sdk_s3::config::Credentials::new(
         access_key,
         secret_key,
-        None,
+        session_token,
         None,
         "cloud-backup-mirror",
     );
