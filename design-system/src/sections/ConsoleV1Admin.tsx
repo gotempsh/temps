@@ -10,6 +10,7 @@ import {
   Callout, Columns, Detail, DurationField, EchoDialog, Field, GitProviderLogo, KeyValue, Ledger, Lede, Metric, MetricGrid, Num, PageState, Phrase, Picker, ScheduleField, Section, Segmented, Settings, Status, StatusLine,
   type LedgerRow, type State, type StatusItem, type Weekday } from '@/components/op'
 import { cn } from '@/lib/utils'
+import { useUrlPatch, useUrlState, useUrlText } from './console-url'
 
 /* ────────────────────────────────────────────────────────────────────────
    Backups · Git providers · Security on v1, from the real console's shapes:
@@ -86,8 +87,9 @@ function sizeNum(v: string) { const m = v.match(/([\d.]+)\s*(GB|TB|MB)/i); if (!
 const NEXT_RUN_ORDER: Record<string, number> = { 'in 12m': 1, 'in 41m': 2, 'in 2h': 3, 'in 3h': 4, 'in 6h': 5, 'tonight 02:00': 6, 'tomorrow 02:00': 7, 'Sunday 03:00': 8 }
 
 export function BackupsScreen({ dense, plan, notify, go }: { dense: boolean; plan: Plan; notify: Notify; go: (v: string) => void }) {
-  const [tab, setTab] = useState<(typeof BK_TABS)[number]>('schedules')
-  const [q, setQ] = useState('')
+  const patch = useUrlPatch()
+  const [tab, setTab] = useUrlState<(typeof BK_TABS)[number]>('tab', 'schedules', { values: BK_TABS })
+  const [q, setQ] = useUrlText()
   const [backups, setBackups] = useState(BACKUPS)
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState<{ name: string; time: string; days: Weekday[]; cron: string; keep: number }>({ name: '', time: '02:00', days: [], cron: '0 2 * * *', keep: 30 * DAY })
@@ -150,7 +152,7 @@ export function BackupsScreen({ dense, plan, notify, go }: { dense: boolean; pla
   }))
 
   return (
-    <Detail title="Backups" meta={`${SCHEDULES.filter((s) => s.enabled).length} schedules · ${sources.length} sources · point-in-time recovery ${plan.pitr}`} status={status} tabs={BK_TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
+    <Detail title="Backups" meta={`${SCHEDULES.filter((s) => s.enabled).length} schedules · ${sources.length} sources · point-in-time recovery ${plan.pitr}`} status={status} tabs={BK_TABS} tab={tab} onTab={(t) => patch({ tab: t === 'schedules' ? null : t, f: null })}
       actions={<>
         {tab === 'schedules' && <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => notify('ok', 'nightly-all started', 'events-ch first, then the rest')}><Play /> run nightly-all now</Button>}
         {tab === 'schedules' && <Button size="sm" className="op-primary h-8 text-xs" onClick={() => setAdding((a) => !a)}><Plus /> new schedule</Button>}
@@ -232,7 +234,7 @@ const CONNECTIONS = [
 const CONN_STATE: Record<string, State> = { healthy: 'ok', degraded: 'warn', expired: 'error', unknown: 'idle' }
 
 export function GitProvidersScreen({ dense, go }: { dense: boolean; go: (v: string) => void }) {
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const bad = PROVIDERS.find((p) => p.state === 'error')
   const rows: LedgerRow[] = PROVIDERS.filter((p) => matches(q, p.name, p.kind, p.base_url, p.auth_method)).map((p) => ({
     id: p.name, state: p.state, onOpen: () => go(`git:${p.id}`),
@@ -261,7 +263,7 @@ const GP_TABS = ['overview', 'connections', 'settings'] as const
 
 export function GitProviderScreen({ id, dense, notify, go }: { id: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const p0 = PROVIDERS.find((p) => String(p.id) === id)
-  const [tab, setTab] = useState<(typeof GP_TABS)[number]>('overview')
+  const [tab, setTab] = useUrlState<(typeof GP_TABS)[number]>('tab', 'overview', { values: GP_TABS })
   const [conns, setConns] = useState(CONNECTIONS)
   const [cq, setCq] = useState('')
   const [form, setForm] = useState({ default: p0?.is_default ?? false, autoDeploy: true })
@@ -387,8 +389,8 @@ const scanState = (s: (typeof SCANS)[number]): State => (s.status === 'failed' ?
 const SEC_TABS = ['scans', 'headers', 'access'] as const
 
 export function SecurityScreen({ dense, notify, go }: { dense: boolean; notify: Notify; go: (v: string) => void }) {
-  const [tab, setTab] = useState<(typeof SEC_TABS)[number]>('scans')
-  const [q, setQ] = useState('')
+  const [tab, setTab] = useUrlState<(typeof SEC_TABS)[number]>('tab', 'scans', { values: SEC_TABS })
+  const [q, setQ] = useUrlText()
   const worst = SCANS.find((s) => s.critical_count > 0)
   const failedScan = SCANS.find((s) => s.status === 'failed')
   const items: StatusItem[] = []
@@ -472,8 +474,8 @@ export function SecurityScreen({ dense, notify, go }: { dense: boolean; notify: 
 
 export function ScanScreen({ id, dense, notify }: { id: string; dense: boolean; /** The trail back to the scans list lives in the shell header, not on the page. */ go?: (v: string) => void; notify: Notify }) {
   const s = SCANS.find((x) => String(x.id) === id) ?? SCANS[0]
-  const [q, setQ] = useState('')
-  const [only, setOnly] = useState<'all' | 'fixable'>('all')
+  const [q, setQ] = useUrlText()
+  const [only, setOnly] = useUrlState<'all' | 'fixable'>('seg', 'all', { values: ['all', 'fixable'] })
   const list = VULNS.filter((v) => matches(q, v.package_name, v.vulnerability_id, v.title, v.target) && (only === 'all' || v.fixed_version))
   const rows: LedgerRow[] = list.map((v) => ({
     id: v.vulnerability_id, state: SEV_STATE[v.severity], onOpen: () => notify('ok', `open ${v.vulnerability_id}`),

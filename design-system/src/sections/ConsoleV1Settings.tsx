@@ -12,6 +12,7 @@ import {
 import { Toggle } from './ConsoleV1Admin'
 import type { Notify } from './ConsoleV1Observe'
 import { NodesLedger, ClusterPage } from './ConsoleV1Nodes'
+import { useUrlText } from './console-url'
 
 /**
  * Settings, organised by what the operator is doing rather than by which
@@ -154,7 +155,7 @@ function PluginReload({ notify }: { notify: Notify }) {
 export function SettingsPage({ slug, dense, notify, go }: { slug: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const page = ALL.find((p) => p.slug === slug) ?? ALL[0]
   const [dirty, setDirty] = useState(false)
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const [newKey, setNewKey] = useState(false)
   const [keyName, setKeyName] = useState('')
   const [keyExpiry, setKeyExpiry] = useState('2026-12-06')

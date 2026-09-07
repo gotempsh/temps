@@ -7,11 +7,12 @@ import { Activity, Bot, Compass, ExternalLink, Globe, Link, Mail, Megaphone, Mon
 import { Button } from '@/components/ui/button'
 import {
   ChartFooter, Detail, Ledger, Lede, Live, Metric, MetricGrid, Num, Phrase, RangePicker, PageState, Section, Segmented, Columns, Status, StatusLine, GeoMap, EchoDialog, KeyValue, StateTimeline, StatusStrip, TimeChart, Timeline, UsageBar,
-  Breakdown, Sparkline, Funnel, Flow, type BreakdownRow, type KV, type LedgerRow, type State, type StateSegment, type StatusBucket, type TimeRange,
+  Breakdown, Sparkline, Funnel, Flow, type BreakdownRow, type KV, type LedgerRow, type State, type StateSegment, type StatusBucket,
 } from '@/components/op'
 import { fmtNum, fmtPct } from '@/components/op'
 import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
+import { useUrlNumber, useUrlPatch, useUrlState, useUrlText, useUrlWindow } from './console-url'
 
 /* ────────────────────────────────────────────────────────────────────────
    Analytics and Uptime on v1, built on the observe primitives (viz.tsx).
@@ -237,18 +238,21 @@ const TABS = ['overview', 'audience', 'campaigns', 'pages', 'events', 'funnels',
 type Tab = (typeof TABS)[number]
 
 export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; plan: Plan; notify: Notify; go: (v: string) => void }) {
-  const [tab, setTab] = useState<Tab>('overview')
-  const [range, setRange] = useState('24h')
+  const patch = useUrlPatch()
+  const [tab, setTab] = useUrlState<Tab>('tab', 'overview', { values: TABS })
+  const [range, setRange] = useUrlState('range', '24h')
   const [compare, setCompare] = useState(false)
-  const [sel, setSel] = useState<TimeRange | null>(null)
-  const [q, setQ] = useState('')
+  const [sel, setSel] = useUrlWindow()
+  const [q, setQ] = useUrlText()
   const fresh = useFresh()
-  const [pagesView, setPagesView] = useState<'list' | 'flow'>('list')
-  const [device, setDevice] = useState<'desktop' | 'mobile'>('desktop')
-  const [vital, setVital] = useState<VitalKey>('LCP')
-  const [geoView, setGeoView] = useState<'list' | 'map'>('list')
-  const [perfDim, setPerfDim] = useState<PerfDim>('pages')
-  const [funnel, setFunnel] = useState(0)
+  /* `seg` is free per tab: pages and audience are never on screen together, so
+     both renderings can answer to the same key without meaning two things. */
+  const [pagesView, setPagesView] = useUrlState<'list' | 'flow'>('seg', 'list', { values: ['list', 'flow'] })
+  const [device, setDevice] = useUrlState<'desktop' | 'mobile'>('device', 'desktop', { values: ['desktop', 'mobile'] })
+  const [vital, setVital] = useUrlState<VitalKey>('metric', 'LCP', { values: VITALS.map((v) => v.k) })
+  const [geoView, setGeoView] = useUrlState<'list' | 'map'>('seg', 'list', { values: ['list', 'map'] })
+  const [perfDim, setPerfDim] = useUrlState<PerfDim>('dim', 'pages', { values: PERF_DIMS.map(([v]) => v) })
+  const [funnel, setFunnel] = useUrlNumber('step', 0)
   const perfRows: LedgerRow[] = [...PERF[perfDim]].filter((r) => matchesQ(q, r.label)).sort((a, b) => b.v[vital] - a.v[vital]).map((r) => ({
     id: r.label, state: worst(r.v), onOpen: () => notify('ok', `filter speed by ${r.label}`, `${r.samples} samples`),
     sort: { label: r.label, samples: r.samples, ...r.v },
@@ -312,7 +316,7 @@ export function AnalyticsScreen({ dense, plan, notify, go }: { dense: boolean; p
   }))
   const tagged = CAMPAIGNS.reduce((a, c) => a + c.visitors, 0)
   return (
-    <Detail title="Analytics" meta={fresh ? 'acme-storefront · production · no data yet' : `acme-storefront · production · ${fmtNum(TOTAL)} visitors · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
+    <Detail title="Analytics" meta={fresh ? 'acme-storefront · production · no data yet' : `acme-storefront · production · ${fmtNum(TOTAL)} visitors · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(t) => patch({ tab: t === 'overview' ? null : t, f: null })}
       actions={<>
         <label className="inline-flex h-7 items-center gap-1.5 text-xs"><input type="checkbox" checked={compare} onChange={(e) => setCompare(e.target.checked)} className="accent-foreground" /> compare with previous {range}</label>
         <RangePicker ranges={RANGES} value={range} onChange={setRange} retentionDays={plan.retentionDays} retentionLabel={plan.retention} onGated={(r) => notify('warn', `${r.label} is beyond this plan's retention`, `currently ${plan.retention}`)} />
@@ -562,7 +566,7 @@ const MONITORS: Monitor[] = [
 ]
 
 export function UptimeScreen({ dense, notify, go }: { dense: boolean; notify: Notify; go: (v: string) => void }) {
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const [paused, setPaused] = useState(false)
   const list = useMemo(() => MONITORS.filter((m) => matchesQ(q, m.name, m.url)), [q])
   const down = MONITORS.filter((m) => m.state === 'error')
@@ -619,7 +623,7 @@ const SEGMENTS = (m: Monitor): StateSegment[] => {
 }
 export function MonitorScreen({ id, notify, go }: { id: string; notify: Notify; go: (v: string) => void }) {
   const m = MONITORS.find((x) => x.id === id) ?? MONITORS[0]
-  const [range, setRange] = useState<'24h' | '7d' | '30d' | '90d'>('24h')
+  const [range, setRange] = useUrlState<'24h' | '7d' | '30d' | '90d'>('range', '24h', { values: ['24h', '7d', '30d', '90d'] })
   const [paused, setPaused] = useState(false)
   const up = { '24h': m.uptime, '7d': Math.min(100, m.uptime + 0.4), '30d': Math.min(100, m.uptime + 0.9), '90d': Math.min(100, m.uptime + 1.2) }
   const word = paused ? 'paused' : m.state === 'error' ? 'down' : m.state === 'warn' ? 'slow' : 'up'

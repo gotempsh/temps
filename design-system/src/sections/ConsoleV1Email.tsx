@@ -14,6 +14,7 @@ import {
 import { fmtCount, fmtNum, fmtPct } from '@/components/op'
 import { Toggle } from './ConsoleV1Admin'
 import { useFresh } from './console-fresh'
+import { useUrlNumber, useUrlPatch, useUrlState, useUrlText, useUrlWindow } from './console-url'
 
 /* ────────────────────────────────────────────────────────────────────────
    Email on v1, from the real console's shapes: EmailProviderResponse
@@ -144,12 +145,13 @@ const TABS = ['mail', 'domains', 'providers', 'settings'] as const
 type Tab = (typeof TABS)[number]
 
 export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense: boolean; notify: Notify; go: (v: string) => void; initialTab?: Tab }) {
-  const [tab, setTab] = useState<Tab>(initialTab)
-  const [q, setQ] = useState('')
-  const [statusFilter, setStatusFilter] = useState<string>('all')
-  const [range, setRange] = useState<TimeRange | null>(null)
-  const [pageNo, setPageNo] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
+  const patch = useUrlPatch()
+  const [tab, setTab] = useUrlState<Tab>('tab', initialTab, { values: TABS })
+  const [q, setQ] = useUrlText('f', { page: null })
+  const [statusFilter] = useUrlState('seg', 'all')
+  const [range] = useUrlWindow()
+  const [pageNo, setPageNo] = useUrlNumber('page', 1)
+  const [pageSize] = useUrlNumber('size', 20)
   // Fresh install (shell toggle, `?fresh=1`): no provider, no domain, nothing sent. Every tab must onboard rather than go blank.
   const fresh = useFresh()
   const mails: Mail[] = fresh ? [] : MAILS
@@ -177,7 +179,7 @@ export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense:
   const filtered = mails.filter((m) => inRange(m, range) && (statusFilter === 'all' || (statusFilter === 'problems' ? m.status === 'bounced' || m.status === 'failed' : m.status === statusFilter)) && (!q || `${m.to} ${m.subject} ${m.from} ${m.project}`.toLowerCase().includes(q.toLowerCase())))
   // Server-side in the real console (page, page_size on ListEmailsQuery); here the filtered set is sliced the same way.
   const pageOf = <T,>(xs: T[]) => xs.slice((pageNo - 1) * pageSize, pageNo * pageSize)
-  const mailPage: Page = { page: pageNo, pageSize, total: filtered.length, onPage: setPageNo, onPageSize: (n) => { setPageSize(n); setPageNo(1) } }
+  const mailPage: Page = { page: pageNo, pageSize, total: filtered.length, onPage: setPageNo, onPageSize: (n) => patch({ size: n === 20 ? null : String(n), page: null }) }
   const mailRows: LedgerRow[] = pageOf(filtered).map((m) => ({
     id: m.id,
     state: MAIL_STATE[m.status],
@@ -242,7 +244,7 @@ export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense:
   const trackingDirty = JSON.stringify(tracking) !== JSON.stringify(savedTracking)
 
   return (
-    <Detail title="Email" meta={`${fmtCount(providers.filter((p) => p.is_active).length, 'active provider')} · ${fmtCount(domains.length, 'domain')} · ${fmtNum(fresh ? 0 : STATS.total)} sent · 30d`} status={status} tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
+    <Detail title="Email" meta={`${fmtCount(providers.filter((p) => p.is_active).length, 'active provider')} · ${fmtCount(domains.length, 'domain')} · ${fmtNum(fresh ? 0 : STATS.total)} sent · 30d`} status={status} tabs={TABS} tab={tab} onTab={(t) => patch({ tab: t === initialTab ? null : t, f: null })}
       actions={<a href="https://temps.sh/docs/email" target="_blank" rel="noreferrer" className="inline-flex h-7 items-center gap-1 text-xs text-muted-foreground hover:text-foreground">SDK docs <ExternalLink className="h-3 w-3" /></a>}>
       {tab === 'mail' && mails.length === 0 && !q && statusFilter === 'all' && !range && (
         <PageState state="unconfigured" title="Nothing has been sent yet"
@@ -260,18 +262,18 @@ export function EmailScreen({ dense, notify, go, initialTab = 'mail' }: { dense:
             <Metric label="opened" value={openPct} unit="%" baseline={`${STATS.clicked} clicked · tracking on`} />
           </MetricGrid>
           <div className="border p-3">
-            <TimeChart data={SERIES} series={MAIL_SERIES} markers={[{ id: 'dep_90e', x: HOURS[2] }, { id: 'dep_91a', x: HOURS[7], note: 'billing-worker · invoice template' }]} unit="/h" height={160} onOpen={(id) => go(`deploy:${id}`)} selection={range} onSelect={(r) => { setRange(r); setPageNo(1) }}
+            <TimeChart data={SERIES} series={MAIL_SERIES} markers={[{ id: 'dep_90e', x: HOURS[2] }, { id: 'dep_91a', x: HOURS[7], note: 'billing-worker · invoice template' }]} unit="/h" height={160} onOpen={(id) => go(`deploy:${id}`)} selection={range} onSelect={(r) => patch({ sel: r ? `${r.from}~${r.to}` : null, page: null })}
               title="mail sent and bounced" range="last 10h" verdict={`${STATS.bounced} bounces on ${fmtNum(STATS.total)} sent, ${bounceRate > 1 ? 'above' : 'under'} the 1% threshold since dep_91a.`} />
             <ChartFooter><span>last 10h · hourly</span><span>┆ deploy</span><span className="ml-auto">drag to narrow the list below</span></ChartFooter>
           </div>
         <Ledger status={null} dense={dense}
           columns={[{ label: 'to', key: 'to' }, { label: 'subject', key: 'subject' }, { label: 'status', key: 'status' }, { label: 'from', key: 'from' }, 'project', { label: 'when', key: 'at', numeric: true }]}
           grid="minmax(8rem,1.2fr) minmax(10rem,2fr) minmax(9rem,1.6fr) minmax(8rem,1.2fr) minmax(90px,max-content) minmax(60px,max-content)"
-          rows={mailRows} total={mails.length} filter={q} onFilter={(v) => { setQ(v); setPageNo(1) }} page={mailPage} placeholder="filter by recipient, subject, sender or project" hint={range ? `${filtered.length} in ${range.from} → ${range.to} · clear the selection on the chart to see all` : `${STATS.queued} queued · ${STATS.captured} captured from previews`}
+          rows={mailRows} total={mails.length} filter={q} onFilter={setQ} page={mailPage} placeholder="filter by recipient, subject, sender or project" hint={range ? `${filtered.length} in ${range.from} → ${range.to} · clear the selection on the chart to see all` : `${STATS.queued} queued · ${STATS.captured} captured from previews`}
           action={
-            <Picker skin="operator ink v1" value={statusFilter} onChange={(v) => { setStatusFilter(v); setPageNo(1) }} placeholder="status" options={[{ value: 'all', meta: `${mails.length}` }, { value: 'problems', meta: `${mails.filter((m) => m.status === 'bounced' || m.status === 'failed').length}`, state: 'error' }, { value: 'delivered' }, { value: 'opened' }, { value: 'bounced', state: 'error' }, { value: 'failed', state: 'error' }, { value: 'queued', state: 'idle' }, { value: 'captured', state: 'sampled' }]} />
+            <Picker skin="operator ink v1" value={statusFilter} onChange={(v) => patch({ seg: v === 'all' ? null : v, page: null })} placeholder="status" options={[{ value: 'all', meta: `${mails.length}` }, { value: 'problems', meta: `${mails.filter((m) => m.status === 'bounced' || m.status === 'failed').length}`, state: 'error' }, { value: 'delivered' }, { value: 'opened' }, { value: 'bounced', state: 'error' }, { value: 'failed', state: 'error' }, { value: 'queued', state: 'idle' }, { value: 'captured', state: 'sampled' }]} />
           }
-          state={filtered.length === 0 ? <PageState state="empty" title="No emails match" reason={`Nothing ${statusFilter === 'all' ? '' : statusFilter + ' '}matches “${q}”.`} next={<button type="button" className="underline underline-offset-4" onClick={() => { setQ(''); setStatusFilter('all') }}>clear filters</button>} /> : undefined} />
+          state={filtered.length === 0 ? <PageState state="empty" title="No emails match" reason={`Nothing ${statusFilter === 'all' ? '' : statusFilter + ' '}matches “${q}”.`} next={<button type="button" className="underline underline-offset-4" onClick={() => patch({ f: null, seg: null })}>clear filters</button>} /> : undefined} />
         </div>
       )}
 

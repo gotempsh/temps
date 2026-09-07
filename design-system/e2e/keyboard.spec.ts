@@ -171,9 +171,12 @@ test.describe('ledger keyboard', () => {
     await expect(tabByLabel(page, 'events')).toHaveAttribute('aria-selected', 'true')
 
     // Enter in the filter does not open the cursor row either: the window
-    // handler only opens on ⏎ when nothing is focused (§9).
-    const url = page.url()
+    // handler only opens on ⏎ when nothing is focused (§9). The filter is in
+    // the address now (docs/requirements.md), so let the clear land before
+    // signing the URL — otherwise the comparison races the write, not ⏎.
     await filter.fill('')
+    await expect.poll(() => new URL(page.url()).searchParams.get('f')).toBeNull()
+    const url = page.url()
     await page.keyboard.press('Enter')
     expect((await focused(page)).tag).toBe('INPUT')
     expect(page.url()).toBe(url)

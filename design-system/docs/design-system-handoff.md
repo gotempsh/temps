@@ -1022,6 +1022,16 @@ whose options carry the variable count and state per environment and a
 seventh value break the layout? Environments, services, branches and projects
 all grow; facets do not.
 
+**The templates own the URL.** A template's own controls are view state, so
+they are read from and written to the query, never held in a component: the
+`Ledger`'s sort, page and filter (`?sort=` `?page=` `?f=`) and the `Detail`'s
+facet (`?tab=`), with the range (`?range=`) and the row open in an `Inspector`
+(`?row=`) beside them. Defaults are omitted, a view change replaces and a
+navigation pushes, and a screen writes several keys in one patch rather than
+calling `setParams` twice from the same snapshot. The shared hook is
+`design-system/src/sections/console-url.ts`; the rule and its test are
+`docs/requirements.md`.
+
 **Detail**: title, status line, tabs with number keys, actions on the right, body.
 Body convention: one TimeChart, one MetricGrid, one `.op-raise` (the incident
 or activity thread), deploy rows linked to the markers. `Segmented` for compare
@@ -2293,7 +2303,13 @@ design-system/
      ("in api-gateway, billing-worker · from the facets").
    Minor, with it: `Drop` anchors right by default, so a suggestion panel
    needs a `start-0 end-auto` override.
-10. Nine gaps the Resources screens (§7b) hit and worked around locally,
+10. Requirements (`docs/requirements.md`) are enforced by `e2e/state.spec.ts`
+    (reload signatures) and nothing else. The lint has no rule for "a `useState`
+    that decides what is on screen", and three axes are still local by choice
+    and want a second look: the agent conversation, the Logs live tail, and the
+    `Settings` form drafts, which are the one case where the address cannot
+    carry the state and the page has to say so instead.
+11. Nine gaps the Resources screens (§7b) hit and worked around locally,
     with none of the package touched. The first two are the expensive ones:
     - **`TimeChart` has no `cursor` / `onCursor` pair.** It owns its hover
       state, so a group of charts cannot be made to read the same bucket.
@@ -2333,7 +2349,7 @@ design-system/
     - **Threshold labels overprint** each other and the deploy-cluster label
       at the right edge when two lines are close (`busy 80%` under
       `saturated 95%`).
-11. The `op.css` blanket transition rule carries `!important`, so every class
+12. The `op.css` blanket transition rule carries `!important`, so every class
     that must actually animate has to be lifted out of it with a `:not(…)`
     arm — now `.animate-spin`, `.animate-pulse` and `.op-pulse`. That is
     fragile (opting one class in means editing a selector three hundred lines

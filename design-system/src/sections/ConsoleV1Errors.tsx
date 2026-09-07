@@ -12,6 +12,7 @@ import { fmtNum } from '@/components/op'
 import type { Notify, Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
 import { PROJECT_ICONS } from './console-projects'
+import { useUrlNumber, useUrlPatch, useUrlState, useUrlText } from './console-url'
 
 /**
  * Errors, the Sentry shape with the noise removed. An issue is one row: the
@@ -62,9 +63,9 @@ const inFilter = (i: Issue, f: Filter) => f === 'all' ? true : f === 'review' ? 
 const RANGES: readonly Range[] = [{ label: '1h', days: 0.05 }, { label: '24h', days: 1 }, { label: '7d', days: 7 }, { label: '30d', days: 30 }, { label: '90d', days: 90 }]
 export function ErrorsScreen({ dense, plan, notify, go }: { dense: boolean; plan: Plan; notify: Notify; go: (v: string) => void }) {
   const fresh = useFresh()
-  const [q, setQ] = useState('')
-  const [filter, setFilter] = useState<Filter>('review')
-  const [range, setRange] = useState('24h')
+  const [q, setQ] = useUrlText()
+  const [filter, setFilter] = useUrlState<Filter>('seg', 'review', { values: FILTERS.map(([v]) => v) })
+  const [range, setRange] = useUrlState('range', '24h')
   const [win, setWin] = useState({ from: '', to: '' })
   const rangeLabel = range === 'custom' ? `${win.from.replace('T', ' ')} → ${win.to.replace('T', ' ')}` : range
   // `?fail=1` keeps the outage demo: the error store itself is down, the page says which one and offers retry.
@@ -131,9 +132,11 @@ const TABS = ['overview', 'events', 'tags'] as const
 type Tab = (typeof TABS)[number]
 export function IssueScreen({ id, dense, notify, go }: { id: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const i = ISSUES.find((x) => x.id === id) ?? ISSUES[0]
-  const [tab, setTab] = useState<Tab>('overview')
-  const [q, setQ] = useState('')
-  const [page, setPage] = useState(1)
+  const patch = useUrlPatch()
+  const [tab, setTab] = useUrlState<Tab>('tab', 'overview', { values: TABS })
+  // Narrowing a paged list puts the reader back on page 1: one patch, one entry.
+  const [q, setQ] = useUrlText('f', { page: null })
+  const [page, setPage] = useUrlNumber('page', 1)
   const [state, setState] = useState<IssueState>(i.state)
   const word = state === 'regressed' ? 'regressed' : state === 'new' ? 'new' : state === 'resolved' ? 'resolved' : state === 'ignored' ? 'ignored' : 'unresolved'
   const status = state === 'regressed'
@@ -164,7 +167,7 @@ export function IssueScreen({ id, dense, notify, go }: { id: string; dense: bool
   }))
   return (
     <Detail title={<span className="min-w-0"><span className="font-semibold">{i.type}</span> <span className="font-normal text-muted-foreground">{i.message}</span></span>} mark={<ProjectMark name={i.project} icon={PROJECT_ICONS[i.project]} size={24} />} meta={`${i.id} · ${i.project} · ${i.env}`} status={status} lede={tab === 'overview' ? lede : undefined}
-      tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ(''); setPage(1) }}
+      tabs={TABS} tab={tab} onTab={(t) => patch({ tab: t === 'overview' ? null : t, f: null, page: null })}
       actions={<>
         {state !== 'resolved' && <Button size="sm" className="op-primary h-7 text-xs" onClick={() => { setState('resolved'); notify('ok', `${i.id} resolved`, 'reopens if it comes back in a later release') }}><Check /> resolve</Button>}
         {state === 'resolved' && <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setState('unresolved')}>reopen</Button>}
@@ -213,7 +216,7 @@ export function IssueScreen({ id, dense, notify, go }: { id: string; dense: bool
         <Ledger status={null} dense={dense}
           columns={['event', 'when', 'user', 'browser', 'url', 'release']}
           grid="minmax(6rem,1fr) minmax(64px,max-content) minmax(6rem,1fr) minmax(10rem,1.4fr) minmax(6rem,1fr) minmax(64px,max-content)"
-          rows={eventRows} total={matched.length} filter={q} onFilter={(v) => { setQ(v); setPage(1) }} placeholder="filter by event id" page={{ page, pageSize: EVENT_PAGE, total: matched.length, onPage: setPage }}
+          rows={eventRows} total={matched.length} filter={q} onFilter={setQ} placeholder="filter by event id" page={{ page, pageSize: EVENT_PAGE, total: matched.length, onPage: setPage }}
           hint={q ? `${fmtNum(matched.length)} of ${fmtNum(i.events24h)} events match · newest first` : `${fmtNum(i.events24h)} events in 24h · newest first`}
           footer={<span>each event is one occurrence with its own stack, breadcrumbs and tags · ⏎ opens it</span>} />
       )}

@@ -2,7 +2,7 @@
 
 Machine-readable digest of `brand-guidelines.md`, `design-system-handoff.md`,
 `content.md`, `localisation.md`, `forms.md`, `notifications.md`, `data-viz.md`,
-`generative-ui.md`, `motion.md` and `icons.md`.
+`generative-ui.md`, `motion.md`, `icons.md` and `requirements.md`.
 Imperative only. When this file and those documents disagree, they win — fix this file.
 Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
@@ -26,6 +26,18 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Use Geist and Geist Mono. No other faces.
 - Set numbers in mono, tabular, unit after the value in muted.
 
+## Requirements
+
+- Put every piece of view state in the URL: tab or facet, filter, sort, page, range, inspected row, columns. The path names the record, the query names the view of it.
+- Rebuild the page from its address alone. A reload, a pasted link and a second tab produce the same layout and the same data.
+- Prove it with a reload signature: title + heading + active facet + first three row ids + range label, before and after a reload. Identical, or it is a bug.
+- Derive every fetch from the path and the params. The same URL fetches the same thing; nothing is fetched from component-local state.
+- Omit defaults. Writing the fallback deletes the key, so the common address carries no query at all.
+- Replace on a view change, push on a navigation. Typing a filter must not fill the history one keystroke at a time.
+- Write several keys in one patch. Two `setParams` calls in one handler compute from the same snapshot, so the second drops the first.
+- Emit complete links: every row, every "open in …", and `copy link` carries the view the reader is on, not the bare record.
+- Keep only the moment local: a hover, an open menu, a two-second `copied`, an unsubmitted draft — and say so before a reload would lose the draft.
+
 ## Tokens
 
 - A hover or a selection lifts the whole row: muted text, state glyphs and icons step up with the fill, never dimmer under the reader. One variable (`--muted-foreground`) does it, so nothing is left behind.
@@ -37,6 +49,8 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Banned
 
+- View state that only lives in React state: a tab, a filter, a sort, a page or a range you cannot link to.
+- A link that drops the view: a row or a `copy link` that opens the record without the facet, filter and range the reader was on.
 - Tailwind palette literals (`text-red-500`), a hex or an `oklch()` in tsx.
 - A literal duration in a tsx file. `duration-150`, `transition-all`.
 - A second hue. `data-accent` is landing-only, one filled element per viewport.

@@ -13,6 +13,7 @@ import { NodeLede, NodeResources, containersOf, nodeVerdict, pressureRank, readi
 import { Toggle } from './ConsoleV1Admin'
 import { EffectLegend, eff } from './ConsoleV1Settings'
 import type { Notify } from './ConsoleV1Observe'
+import { useUrlSort, useUrlState, useUrlText } from './console-url'
 
 /**
  * A node is a machine the fleet runs on. The question the list answers is
@@ -100,7 +101,8 @@ function Sparks({ node, off }: { node: string; off: boolean }) {
 }
 
 export function NodesLedger({ dense, go, meta }: { dense: boolean; go: (v: string) => void; meta: React.ReactNode }) {
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
+  const [sort, setSort] = useUrlSort()
   const offline = NODES.filter((n) => n.status === 'offline')
   const hot = NODES.filter((n) => n.status === 'online' && pressureState(n) === 'warn')
   // Pressure first: an unreachable machine, then the one closest to a threshold.
@@ -145,7 +147,7 @@ export function NodesLedger({ dense, go, meta }: { dense: boolean; go: (v: strin
     <Ledger title="Nodes" meta={meta} dense={dense} status={status}
       columns={[{ label: 'node', key: 'name' }, { label: 'status', key: 'status' }, 'role', 'address', 'size', { label: 'pressure', key: 'mem' }, 'cpu · mem · disk · net · 24h', { label: 'running', key: 'running', numeric: true }]}
       grid="minmax(7rem,max-content) minmax(9rem,max-content) minmax(8rem,max-content) minmax(6rem,max-content) minmax(9rem,max-content) minmax(12rem,max-content) minmax(8rem,1fr) minmax(7rem,max-content)"
-      rows={rows} total={NODES.length} filter={q} onFilter={setQ} placeholder="filter nodes"
+      rows={rows} total={NODES.length} sort={sort} onSort={setSort} filter={q} onFilter={setQ} placeholder="filter nodes"
       hint={<>pressure first: unreachable, then closest to a threshold · <Phrase onClick={() => go('settings:cluster')}>cluster: dns on · join token valid 23h</Phrase></>}
       action={<Button size="sm" className="op-primary h-7 text-xs" onClick={() => go('settings:cluster')}>join a node</Button>}
       footer={<span>× offline: no heartbeat for 45s · ◐ draining or above a threshold · sparklines are the same 24h the record plots · colour on the one number that is not fine</span>} />
@@ -161,7 +163,7 @@ const TABS = ['resources', 'agent log'] as const
 
 export function NodeScreen({ name, dense, notify, go }: { name: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const n = NODES.find((x) => x.name === name) ?? NODES[0]
-  const [tab, setTab] = useState<Tab>('resources')
+  const [tab, setTab] = useUrlState<Tab>('tab', 'resources', { values: TABS })
   const off = n.status === 'offline'
   const facts: NodeFacts = { name: n.name, role: n.role, reach: n.reach, arch: n.arch, offline: off, draining: n.status === 'draining', heartbeat: n.heartbeat, agent: n.agent }
   const running = containersOf(n.name).length

@@ -15,6 +15,7 @@ import { EMPTY, fmtNum, fmtPct, fmtStamp } from '@/components/op'
 import type { Notify } from './ConsoleV1Observe'
 import { PROJECT_ICONS } from './console-projects'
 import { agoNum, sizeNum } from './ConsoleV1'
+import { useUrlPatch, useUrlState, useUrlText } from './console-url'
 
 /**
  * A managed database is one record with a lot attached to it. The rule is
@@ -93,11 +94,12 @@ type Tab = (typeof TABS)[number]
 export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const db = DBS.find((d) => d.id === id) ?? DBS[0]
   const metrics = METRICS[db.engine]
-  const [tab, setTab] = useState<Tab>('overview')
+  const patch = useUrlPatch()
+  const [tab, setTab] = useUrlState<Tab>('tab', 'overview', { values: TABS })
   const [metric, setMetric] = useState(metrics[0].key)
-  const [range, setRange] = useState<'1h' | '6h' | '24h' | '7d'>('1h')
+  const [range, setRange] = useUrlState<'1h' | '6h' | '24h' | '7d'>('range', '1h', { values: ['1h', '6h', '24h', '7d'] })
   const [reveal, setReveal] = useState(false)
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const [pct, setPct] = useState<Pct>('p95')
   const [live, setLive] = useState(true)
   const [dataView, setDataView] = useState<'tree' | 'sql'>('tree')
@@ -170,7 +172,7 @@ export function DatabaseScreen({ id, dense, notify, go }: { id: string; dense: b
   return (
     <Detail title={db.name} mark={<span className="inline-flex h-6 w-6 items-center justify-center border text-muted-foreground [&_svg]:h-3.5 [&_svg]:w-3.5"><Database /></span>}
       meta={`${db.engine} ${db.version} · ${db.env} · created ${db.created}`} status={status} lede={tab === 'overview' ? lede : undefined}
-      tabs={TABS} tab={tab} onTab={(t) => { setTab(t); setQ('') }}
+      tabs={TABS} tab={tab} onTab={(t) => patch({ tab: t === 'overview' ? null : t, f: null })}
       actions={<>
         <CopyButton value={url.replace('••••••••', db.password)} label="copy URL" variant="outline" className="h-7 text-xs">copy URL</CopyButton>
         <Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'backup started', `${db.name} → r2-backups`)}><HardDrive /> back up now</Button>

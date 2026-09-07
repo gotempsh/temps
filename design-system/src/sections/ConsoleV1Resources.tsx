@@ -11,6 +11,7 @@ import {
   type InkLayer, type KV, type LedgerRow, type Marker, type Series, type State, type TimePoint,
 } from '@/components/op'
 import type { Notify } from './ConsoleV1Observe'
+import { useUrlState, useUrlText } from './console-url'
 
 /**
  * Resources: what a machine and a service are actually using, and what to do
@@ -330,6 +331,7 @@ const dateIn = (days: number) => {
 const RETENTION = { days: 7, label: '7d' }
 const RANGES = [['1h', '1h'], ['24h', '24h'], ['7d', '7d'], ['30d', '30d']] as const
 type RangeKey = (typeof RANGES)[number][0]
+const RANGE_KEYS = RANGES.map(([k]) => k)
 
 /**
  * The range strip: 1h · 24h · 7d · 30d, with everything past the sample
@@ -528,7 +530,7 @@ const rankOf = (s: State) => RANK[s] ?? 5
  * act on.
  */
 function ContainerLedger({ rows: cs, dense, go, meta, showNode }: { rows: ContainerRes[]; dense: boolean; go: (v: string) => void; meta: ReactNode; showNode?: boolean }) {
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const shown = useMemo(
     () => cs.filter((c) => c.name.toLowerCase().includes(q.trim().toLowerCase()) || c.project.toLowerCase().includes(q.trim().toLowerCase()))
       .sort((a, b) => rankOf(a.state) - rankOf(b.state) || pressureOf(b) - pressureOf(a)),
@@ -595,7 +597,7 @@ export function NodeResources({ node, go, notify, dense }: { node: NodeFacts; go
   const rd = readingsOf(node.name)
   const cs = containersOf(node.name)
   const off = node.offline
-  const [range, setRange] = useState<RangeKey>('24h')
+  const [range, setRange] = useUrlState<RangeKey>('range', '24h', { values: RANGE_KEYS })
   const [memBy, setMemBy] = useState<'total' | 'container'>('total')
   const [alerting, setAlerting] = useState(false)
   const { paused, toggle } = useLive()
@@ -804,7 +806,9 @@ const netSparkOf = (c: ContainerRes) =>
  */
 export function ServiceResources({ project, go, dense }: { project: string; go: (v: string) => void; dense: boolean }) {
   const reps = replicasOf(project)
-  const [range, setRange] = useState<RangeKey>('24h')
+  /* The project record already spends `range` on its requests chart, so the
+     resources section takes its own key rather than moving both at once. */
+  const [range, setRange] = useUrlState<RangeKey>('resrange', '24h', { values: RANGE_KEYS })
   const { paused, toggle } = useLive()
   if (!reps.length) {
     return (

@@ -442,6 +442,18 @@ the same way every time.
   its own, every block it renders carries the call that produced it, and every
   write is a proposal a human confirms. `docs/generative-ui.md`.
 
+- **The address is the page.** Everything the reader can see is in the URL: the
+  path names the record, the query names the view of it — tab, filter, sort,
+  page, range, the row open beside the list. Reload it and the same screen comes
+  back; paste it to somebody and they open what you were looking at, not a fresh
+  dashboard. An operator works in tabs, sends links to whoever can fix the thing,
+  and reloads when the network hiccups; view state kept only in memory is state
+  they lose exactly when something has already gone wrong. Defaults stay out of
+  the query so the ordinary address is short, a view change replaces and a
+  navigation pushes, and every link the console emits — a row, an "open in Logs",
+  `copy link` — carries the whole view rather than the bare record.
+  `docs/requirements.md`.
+
 ## 7. Do and don't
 
 Do

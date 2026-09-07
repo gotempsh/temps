@@ -10,6 +10,7 @@ import {
 } from '@/components/op'
 import type { Notify } from './ConsoleV1Observe'
 import { DEPS, ENVS } from './ConsoleV1Env'
+import { useUrlState, useUrlText } from './console-url'
 
 /**
  * A deployment is the record people open most, and usually because something
@@ -120,8 +121,8 @@ const TABS = ['overview', 'build log', 'runtime log', 'checks'] as const
 
 export function DeploymentScreen({ tag, dense, notify, go }: { tag: string; dense: boolean; notify: Notify; go: (v: string) => void }) {
   const d = DEPLOYMENTS.find((x) => x.tag === tag) ?? fromList(tag)
-  const [tab, setTab] = useState<Tab>('overview')
-  const [q, setQ] = useState('')
+  const [tab, setTab] = useUrlState<Tab>('tab', 'overview', { values: TABS })
+  const [q, setQ] = useUrlText()
   const [live, setLive] = useState(d.status === 'building' || d.status === 'live')
   const [elapsed, setElapsed] = useState(51)
   useEffect(() => { if (d.status !== 'building') return; const id = window.setInterval(() => setElapsed((e) => e + 1), 1000); return () => window.clearInterval(id) }, [d.status])

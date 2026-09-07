@@ -11,6 +11,7 @@ import { useFresh } from './console-fresh'
 import { PROJECT_ICONS } from './console-projects'
 import { ProjectMark } from '@/components/op'
 import { fmtNum, fmtPct } from '@/components/op'
+import { useUrlPatch, useUrlState, useUrlText } from './console-url'
 
 /**
  * The proxy is the hot path: every request to every project passes through
@@ -61,11 +62,12 @@ const TABS = ['overview', 'routes', 'log'] as const
 type Tab = (typeof TABS)[number]
 export function ProxyScreen({ dense, plan, notify, go }: { dense: boolean; plan: Plan; notify: Notify; go: (v: string) => void }) {
   const fresh = useFresh()
-  const [tab, setTab] = useState<Tab>('overview')
+  const patch = useUrlPatch()
+  const [tab, setTab] = useUrlState<Tab>('tab', 'overview', { values: TABS })
   const [tile, setTile] = useState<TileKey>('requests')
-  const [range, setRange] = useState('1h')
+  const [range, setRange] = useUrlState('range', '1h')
   const [project, setProject] = useState('all')
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const [live, setLive] = useState(true)
   const t = TILES.find((x) => x.key === tile) ?? TILES[0]
   const status = fresh
@@ -93,7 +95,7 @@ export function ProxyScreen({ dense, plan, notify, go }: { dense: boolean; plan:
     ],
   }))
   return (
-    <Detail title="Proxy" meta={fresh ? 'control plane · hetzner-1 · no traffic yet' : `control plane · hetzner-1 · ${fmtNum(SUM)} requests · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(tb) => { setTab(tb); setQ('') }}
+    <Detail title="Proxy" meta={fresh ? 'control plane · hetzner-1 · no traffic yet' : `control plane · hetzner-1 · ${fmtNum(SUM)} requests · ${range}`} status={status} tabs={TABS} tab={tab} onTab={(tb) => patch({ tab: tb === 'overview' ? null : tb, f: null })}
       actions={<>
         <Picker value={project} onChange={setProject} options={PROJECT_OPTS} mono={false} className="h-7 text-xs" width="220px" />
         <RangePicker ranges={RANGES} value={range} onChange={setRange} retentionDays={plan.retentionDays} retentionLabel={plan.retention} onGated={(r) => notify('warn', `${r.label} is beyond this plan's retention`, `currently ${plan.retention}`)} />

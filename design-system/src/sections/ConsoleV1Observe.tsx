@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { LogViewer, type LogLine } from '@/components/ui/log-viewer'
 import {
   Callout, ChartFooter, Columns, Detail, EchoDialog, Histogram, KeyValue, Ledger, Lede, LogLines, Metric, MetricGrid, Num, PageState, PageTitle, Phrase, RangePicker, Section, Segmented, Status, StatusLine, TimeChart, Waterfall, type Pct,
-  type LedgerRow, type Range, type State, type TimeRange, type Span as VizSpan,
+  type LedgerRow, type Range, type State, type Span as VizSpan,
 } from '@/components/op'
 import { fmtNum, fmtPct } from '@/components/op'
 import { matches } from './ConsoleV1Admin'
@@ -19,6 +19,7 @@ import { matches } from './ConsoleV1Admin'
    the pair of imports has no module-initialisation order to get wrong. */
 import { traceLogLines } from './ConsoleV1Logs'
 import { cn } from '@/lib/utils'
+import { useUrlState, useUrlText, useUrlWindow } from './console-url'
 
 /* ────────────────────────────────────────────────────────────────────────
    Observe + sandboxes on v1, using the real API shapes
@@ -71,7 +72,7 @@ const SBX_LOG: LogLine[] = [
 ]
 
 export function SandboxesScreen({ go, dense }: { go: (v: string) => void; dense: boolean }) {
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const list = SANDBOXES.filter((s) => matches(q, s.name, s.id, s.status, s.runtime, s.source_repo_url))
   const running = SANDBOXES.filter((s) => s.status === 'running').length
   const failed = SANDBOXES.find((s) => s.status === 'failed')
@@ -114,7 +115,7 @@ export function SandboxesScreen({ go, dense }: { go: (v: string) => void; dense:
 const SBX_TABS = ['overview', 'events', 'logs'] as const
 export function SandboxScreen({ id, notify, dense, go }: { id: string; notify: Notify; dense: boolean; go: (v: string) => void }) {
   const s0 = SANDBOXES.find((s) => s.id === id)
-  const [tab, setTab] = useState<(typeof SBX_TABS)[number]>('overview')
+  const [tab, setTab] = useUrlState<(typeof SBX_TABS)[number]>('tab', 'overview', { values: SBX_TABS })
   const [status, setStatus] = useState(s0?.status ?? 'stopped')
   const [lines, setLines] = useState<LogLine[]>([])
   useEffect(() => { let i = 0; const t = window.setInterval(() => setLines((p) => (i < SBX_LOG.length ? [...p, SBX_LOG[i++]] : p)), 400); return () => window.clearInterval(t) }, [])
@@ -247,13 +248,13 @@ const LATENCY = Array.from({ length: 48 }, (_, i) => ({ t: `${String(Math.floor(
 
 const TRACE_TABS = ['traces', 'operations'] as const
 export function TracesScreen({ go, dense, plan, notify }: { go: (v: string) => void; dense: boolean; plan: Plan; notify: Notify }) {
-  const [tab, setTab] = useState<(typeof TRACE_TABS)[number]>('traces')
-  const [q, setQ] = useState('')
-  const [only, setOnly] = useState<'all' | 'errors' | 'slow'>('all')
-  const [range, setRange] = useState('24h')
+  const [tab, setTab] = useUrlState<(typeof TRACE_TABS)[number]>('tab', 'traces', { values: TRACE_TABS })
+  const [q, setQ] = useUrlText()
+  const [only, setOnly] = useUrlState<'all' | 'errors' | 'slow'>('seg', 'all', { values: ['all', 'errors', 'slow'] })
+  const [range, setRange] = useUrlState('range', '24h')
   const [hot, setHot] = useState<string | null>(null)
   // Chart selection narrows the ledger: a trace belongs to the half-hour bucket its start_time falls in.
-  const [window_, setWindow] = useState<TimeRange | null>(null)
+  const [window_, setWindow] = useUrlWindow()
   const bucket = (hms: string) => `${hms.slice(0, 2)}:${Number(hms.slice(3, 5)) >= 30 ? '30' : '00'}`
   const idx = (t: string) => LATENCY.findIndex((p) => p.t === t)
   const inWindow = (t: Trace) => !window_ || (idx(bucket(t.start_time)) >= idx(window_.from) && idx(bucket(t.start_time)) <= idx(window_.to))
@@ -468,8 +469,8 @@ const BREAKDOWN = [['/checkout', 398, 1840], ['/api/products', 210, 12400], ['/a
 
 export function MetricsScreen({ dense, plan, notify }: { dense: boolean; plan: Plan; notify: Notify }) {
   const [metric, setMetric] = useState(METRICS[0])
-  const [q, setQ] = useState('')
-  const [range, setRange] = useState('24h')
+  const [q, setQ] = useUrlText()
+  const [range, setRange] = useUrlState('range', '24h')
   const [agg, setAgg] = useState<'p95' | 'p50' | 'avg' | 'max'>('p95')
   const [pct, setPct] = useState<Pct>('p95')
   const hist = useMemo(() => [5, 10, 25, 50, 100, 250, 500, 1000, 2500].map((le, i) => ({ le, count: [40, 180, 620, 1450, 1720, 980, 310, 90, 22][i] * (metric.name.includes('db') ? 0.4 : 1) })), [metric])

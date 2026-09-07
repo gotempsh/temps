@@ -13,6 +13,7 @@ import {
  type ReactNode,
 } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { forNewView, useUrlSort, useUrlState, useUrlText } from './console-url'
 import { toast } from 'sonner'
 import {
   Activity,
@@ -291,7 +292,9 @@ function NoteRow({ n, onUndo }: { n: Note; onUndo?: () => void }) {
 // ── Screens ────────────────────────────────────────────────────────────
 
 function ProjectsScreen({ go, dense }: { go: (v: string) => void; dense: boolean }) {
- const [q, setQ] = useState('')
+ const [q, setQ] = useUrlText()
+ // `Ledger` takes a controlled sort, so the column the reader chose is in the URL too.
+ const [sort, setSort] = useUrlSort()
  const plan = usePlan()
  const list = useMemo(() => PROJECTS.filter((p) => matches(q, p.name, p.note)).sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state]), [q])
  const attention = PROJECTS.filter((p) => p.state === 'warn' || p.state === 'error')
@@ -320,14 +323,15 @@ function ProjectsScreen({ go, dense }: { go: (v: string) => void; dense: boolean
         </StatusLine>
       }
  columns={[{ label: 'project', key: 'name' }, 'status', { label: 'last deploy', key: 'deployed' }, { label: 'visitors · 24h', key: 'visitors' }, { label: 'error rate', key: 'err', numeric: true }, { label: 'cert', key: 'cert', numeric: true }]} grid="1.4fr 1fr 1fr 140px 100px 80px"
- rows={rows} total={PROJECTS.length} filter={q} onFilter={setQ} placeholder="filter projects" hint="needs attention first, then last deploy" dense={dense}
+ rows={rows} total={PROJECTS.length} sort={sort} onSort={setSort} filter={q} onFilter={setQ} placeholder="filter projects" hint="needs attention first, then last deploy" dense={dense}
  action={<Button size="sm" className="op-primary h-8 text-xs"><Plus /> <span className="hidden sm:inline">new project</span></Button>}
     />
   )
 }
 
 function DatabasesScreen({ dense, go }: { dense: boolean; go: (v: string) => void }) {
- const [q, setQ] = useState('')
+ const [q, setQ] = useUrlText()
+ const [sort, setSort] = useUrlSort()
  const plan = usePlan()
  const list = DATABASES.filter((d) => matches(q, d.name, d.engine))
  const rows: LedgerRow[] = list.map((d) => ({
@@ -341,7 +345,7 @@ function DatabasesScreen({ dense, go }: { dense: boolean; go: (v: string) => voi
  title="Databases" meta={`3 managed · point-in-time recovery ${plan.pitr}`}
  status={<StatusLine state="warn"><Phrase>events-ch</Phrase> backup is 3 days old.</StatusLine>}
  columns={[{ label: 'database', key: 'name' }, 'status', { label: 'size', key: 'size', numeric: true }, { label: 'last backup', key: 'backup' }, 'pitr']} grid="1.4fr 1.4fr 100px 120px 100px"
- rows={rows} total={DATABASES.length} filter={q} onFilter={setQ} placeholder="filter databases" dense={dense}
+ rows={rows} total={DATABASES.length} sort={sort} onSort={setSort} filter={q} onFilter={setQ} placeholder="filter databases" dense={dense}
  action={<Button size="sm" className="op-primary h-8 text-xs"><Plus /> <span className="hidden sm:inline">new database</span></Button>}
     />
   )
@@ -354,7 +358,7 @@ const RANGES: readonly Range[] = [{ label: '24h', days: 1 }, { label: '7d', days
 function RequestsChart({ hot, onHot, compare, deploys }: { hot: string | null; onHot: (id: string | null) => void; compare: boolean; deploys: Deploy[] }) {
  const plan = usePlan()
  const notify = useNotify()
- const [range, setRange] = useState('24h')
+ const [range, setRange] = useUrlState('range', '24h')
  return (
     <Section title="Requests" meta="30 min buckets"
  action={<RangePicker ranges={RANGES} value={range} onChange={setRange} retentionDays={plan.retentionDays} retentionLabel={plan.retention}
@@ -398,7 +402,7 @@ function ProjectScreen({ name, dense, go }: { name: string; dense: boolean; go: 
  const notify = useNotify()
  const plan = usePlan()
  const project = PROJECTS.find((p) => p.name === name)
- const [tab, setTab] = useState<Tab>('overview')
+ const [tab, setTab] = useUrlState<Tab>('tab', 'overview', { values: TABS })
  const [hot, setHot] = useState<string | null>(null)
  const [compare, setCompare] = useState<'none' | 'yesterday'>('none')
  const [rolledBack, setRolledBack] = useState(false)
@@ -821,8 +825,11 @@ export function ConsoleV1({ view, go, fullHref, full, preview }: { view: string;
 export function ConsoleV1Page({ full = false }: { /** Render without the sandbox's layout and intro: the console as it would ship. Route `/console`. */ full?: boolean }) {
  const [params, setParams] = useSearchParams()
  const view = params.get('p') ?? 'projects'
+ /* A navigation, so it pushes — `back` returns to the screen you came from —
+    and it drops the view state of the screen being left: a `tab=deploys` from
+    a project record must not select the third facet of settings. */
  const go = useCallback((v: string) => {
- const p = new URLSearchParams(params)
+ const p = forNewView(params)
  if (v === 'projects') p.delete('p')
  else p.set('p', v)
  setParams(p)

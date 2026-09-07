@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { CalendarHeatmap, Columns, EchoDialog, Kbd, KbdPair, Ledger, PageState, Phrase, Picker, Section, SecretValue, Stages, Status, StatusLine, type LedgerRow, type Stage, type State } from '@/components/op'
 import { cn } from '@/lib/utils'
+import { useUrlState, useUrlText } from './console-url'
 
 /* ────────────────────────────────────────────────────────────────────────
    Redesign of three existing console surfaces, on v1, using the real API
@@ -107,7 +108,7 @@ function promotable(deps: Dep[]) {
 
 export function EnvironmentsTab({ notify, dense }: { notify: Notify; dense: boolean }) {
   const [deps, setDeps] = useState(DEPS)
-  const [q, setQ] = useState('')
+  const [q, setQ] = useUrlText()
   const p = promotable(deps)
   const promote = () => {
     if (!p) return
@@ -209,8 +210,12 @@ const ACTIVITY = Array.from({ length: 12 * 7 }, (_, i) => {
 })
 
 export function DeploysTab({ notify, dense, go }: { notify: Notify; dense: boolean; go: (v: string) => void }) {
-  const [q, setQ] = useState('')
-  const [env, setEnv] = useState<number | 'all'>('all')
+  const [q, setQ] = useUrlText()
+  /* The scope Picker, read as a sentence ("in production"). It is written as
+     the id the Picker already stringifies, so the URL and the control agree. */
+  const [envParam, setEnvParam] = useUrlState('env', 'all')
+  const env: number | 'all' = envParam === 'all' ? 'all' : Number(envParam)
+  const setEnv = (v: number | 'all') => setEnvParam(String(v))
   const [deps, setDeps] = useState(DEPS)
   const p = promotable(deps)
   const list = deps.filter((d) => (env === 'all' || d.environment_id === env) && matches(q, d.tag, d.commit_message, d.commit_hash, d.commit_author))
@@ -267,8 +272,10 @@ export function DeploysTab({ notify, dense, go }: { notify: Notify; dense: boole
 type VarView = 'matrix' | number
 export function VariablesTab({ notify, dense }: { notify: Notify; dense: boolean }) {
   const [vars, setVars] = useState(VARS0)
-  const [view, setView] = useState<VarView>(1)
-  const [q, setQ] = useState('')
+  const [viewParam, setViewParam] = useUrlState('env', '1')
+  const view: VarView = viewParam === 'matrix' ? 'matrix' : Number(viewParam)
+  const setView = (v: VarView) => setViewParam(String(v))
+  const [q, setQ] = useUrlText()
   const [sel, setSel] = useState<Set<number>>(new Set())
   const [cursor, setCursor] = useState(0)
   const [reveal, setReveal] = useState<Set<number>>(new Set())

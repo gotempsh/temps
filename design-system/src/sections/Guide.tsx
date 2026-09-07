@@ -26,6 +26,7 @@ import { FormBlocks } from './blocks/FormBlocks'
 import { GenUiBlocks, GENUI_TOC } from './blocks/GenUiBlocks'
 import { NotificationBlocks } from './blocks/NotificationBlocks'
 import { IconsBlock, MotionBlock, TokensBlock } from './blocks/TokenBlocks'
+import { UrlStateDemo } from './blocks/UrlStateBlocks'
 
 import brandMd from '../../docs/brand-guidelines.md?raw'
 import handoffMd from '../../docs/design-system-handoff.md?raw'
@@ -39,6 +40,7 @@ import dataVizMd from '../../docs/data-viz.md?raw'
 import generativeUiMd from '../../docs/generative-ui.md?raw'
 import motionMd from '../../docs/motion.md?raw'
 import iconsMd from '../../docs/icons.md?raw'
+import requirementsMd from '../../docs/requirements.md?raw'
 
 /* ────────────────────────────────────────────────────────────────────────
    /guide — the consolidated design-system guide. One page that reads the
@@ -113,6 +115,7 @@ const RULES_BODY = withoutTitle(rulesMd)
  * except `icons.md`, whose vocabulary table is the block itself, so the doc is
  * cut around it.
  */
+const DOC_REQUIREMENTS = withoutTitle(requirementsMd)
 const DOC_CONTENT = withoutTitle(contentMd)
 const DOC_LOCALE = withoutTitle(localisationMd)
 const DOC_FORMS = withoutTitle(formsMd)
@@ -831,6 +834,11 @@ const genui = (id: string) => <OneDemo id={use(id)}><GenUiBlocks /></OneDemo>
 const form = (id: string) => <OneDemo id={use(id)}><FormBlocks /></OneDemo>
 const notify = (id: string) => <OneDemo id={use(id)}><NotificationBlocks /></OneDemo>
 const content = (id: string) => <OneDemo id={use(id)}><ContentBlocks /></OneDemo>
+
+/** The one live block the requirements document needs: an address, and a view rebuilt from it. */
+const DEMOS_REQUIREMENTS: Record<string, ReactNode> = {
+  'The URL is the state': <UrlStateDemo />,
+}
 
 const DEMOS_DATAVIZ: Record<string, ReactNode> = {
   '1. Pick the chart from the question': viz1('viz-choice'),
@@ -2008,6 +2016,16 @@ const SECTIONS: readonly Section[] = [
       ['ship--responsive', 'Responsive rules the sweep checks'],
     ],
     body: <BeforeShipSection />,
+  },
+  {
+    // After "Before you ship" and before the reference sections: it is the last
+    // thing to check on a screen, and the first thing that is wrong when a
+    // reader reloads and loses their place.
+    id: 'requirements',
+    label: 'Requirements',
+    source: 'requirements.md · the hook is src/sections/console-url.ts, the test is e2e/state.spec.ts',
+    md: [DOC_REQUIREMENTS],
+    body: <DocSections prefix="requirements" md={DOC_REQUIREMENTS} depth={2} demos={DEMOS_REQUIREMENTS} />,
   },
   {
     id: 'brand',

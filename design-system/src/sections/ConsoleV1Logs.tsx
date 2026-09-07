@@ -352,27 +352,44 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
   }, [params])
   const view = (VIEWS.find(([v]) => v === params.get('lv'))?.[0] ?? 'list') as ViewId
 
+  /* Through `setParams`'s functional form: two keystrokes can land before React
+     re-renders, and a patch built from this render's `params` would compute the
+     second from the state before the first — a query bar that drops letters. */
   const patch = useCallback((next: Record<string, string | null>) => {
-    const p = new URLSearchParams(params)
-    for (const [k, v] of Object.entries(next)) { if (v === null) p.delete(k); else p.set(k, v) }
-    setParams(p, { replace: true })
-  }, [params, setParams])
-  const setQuery = useCallback((ts: Token[], txt: string) => { patch({ q: writeQuery(ts, txt) || null }); setPage(1) }, [patch])
+    setParams(() => {
+      const p = new URLSearchParams(window.location.search)
+      for (const [k, v] of Object.entries(next)) { if (v === null) p.delete(k); else p.set(k, v) }
+      return p
+    }, { replace: true })
+  }, [setParams])
+  // One patch, not two writes: `setParams` twice in a handler computes both from
+  // the same snapshot, so the second would drop the first.
+  const setQuery = useCallback((ts: Token[], txt: string) => patch({ q: writeQuery(ts, txt) || null, page: null }), [patch])
   const add = useCallback((t: Token) => { if (!tokens.some((x) => same(x, t))) setQuery([...tokens, t], text) }, [tokens, text, setQuery])
   const drop = (t: Token) => setQuery(tokens.filter((x) => !same(x, t)), text)
   const replace = (k: Key, v: string | null) => setQuery([...tokens.filter((x) => x.k !== k), ...(v ? [{ k, v }] : [])], text)
 
-  const [range, setRange] = useState('24h')
-  const [win, setWin] = useState({ from: '', to: '' })
-  const [window_, setWindow] = useState<TimeRange | null>(null)
+  /* The window is view state like the query. `?range=`, `?win=` (a custom
+     from~to), `?sel=` (the stretch brushed on the histogram) and `?page=` sit
+     beside `?q=`, so a reload and a pasted link land on the same lines. */
+  const range = params.get('range') ?? '24h'
+  const win = useMemo(() => { const [from = '', to = ''] = (params.get('win') ?? '').split('~'); return { from, to } }, [params])
+  const window_ = useMemo<TimeRange | null>(() => {
+    const [from, to] = (params.get('sel') ?? '').split('~')
+    return from && to ? { from, to } : null
+  }, [params])
+  const setWindow = useCallback((w: TimeRange | null) => patch({ sel: w ? `${w.from}~${w.to}` : null, page: null }), [patch])
+  const setRange = useCallback((r: string) => patch({ range: r === '24h' ? null : r, sel: null, page: null }), [patch])
   const [live, setLive] = useState(false)
   const [tail, setTail] = useState<Log[]>([])
   const [held, setHeld] = useState<Log[]>([])
   const [expanded, setExpanded] = useState<string | null>(null)
-  /* The row read beside the list. `⏎` opens it, `j`/`k` keep moving the ledger's
-     cursor and the panel follows; `log:<id>` stays the deep link and the panel's
-     `open` is how you get there. */
-  const [inspect, setInspect] = useState<string | null>(null)
+  /* The row read beside the list, in the URL like everything else on screen:
+     `?row=<id>` beside the query, so a reload comes back with the same line
+     open. `⏎` opens it, `j`/`k` keep moving the ledger's cursor and the panel
+     follows; `log:<id>` stays the record page and the panel's `open` goes there. */
+  const inspect = params.get('row')
+  const setInspect = useCallback((id: string | null) => patch({ row: id }), [patch])
   const [facetsOpen, setFacetsOpen] = useState(false)
   const [facetQ, setFacetQ] = useState('')
   const [colsOpen, setColsOpen] = useState(false)
@@ -381,7 +398,8 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
   const [saveName, setSaveName] = useState('')
   const [saved, setSaved] = useState<Saved[]>(BUILT_IN)
   const [wide, setWide] = useState(true)
-  const [page, setPage] = useState(1)
+  const page = Math.max(1, Math.floor(Number(params.get('page'))) || 1)
+  const setPage = useCallback((n: number) => patch({ page: n === 1 ? null : String(n) }), [patch])
   const [suggestOpen, setSuggestOpen] = useState(false)
   const [draft, setDraft] = useState('')
   const [sugCursor, setSugCursor] = useState(0)
@@ -660,17 +678,18 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
     return () => window.removeEventListener('keydown', onKey)
   }, [expandFocused, openTrace, inspect])
   /* The panel follows the ledger's cursor: the cursor is the focus, so a row taking
-     focus is the cursor moving. The functional update keeps a closing panel closed —
-     `esc` returns focus to the row it came from, and that focus must not reopen it. */
+     focus is the cursor moving. The effect only runs while a row is in `?row=`, and
+     re-checks it before writing — `esc` returns focus to the row it came from, and
+     that focus must not reopen the panel it just closed. */
   useEffect(() => {
     if (!inspect) return
     const onFocusIn = (e: FocusEvent) => {
       const el = (e.target as HTMLElement | null)?.closest('.op-row') as HTMLElement | null
-      if (el?.id?.startsWith('row-')) setInspect((prev) => (prev ? el.id.slice(4) : prev))
+      if (el?.id?.startsWith('row-') && inspect) setInspect(el.id.slice(4))
     }
     window.addEventListener('focusin', onFocusIn)
     return () => window.removeEventListener('focusin', onFocusIn)
-  }, [inspect])
+  }, [inspect, setInspect])
 
   // ── Suggestions ──
   const [sugKey, sugPrefix] = draft.includes(':') ? [draft.slice(0, draft.indexOf(':')), draft.slice(draft.indexOf(':') + 1)] : ['', draft]
@@ -709,7 +728,7 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
             { key: 'debug', name: 'debug', stroke: 'dotted', weight: 'thin' },
           ]}
           markers={[{ id: 'dep_31c', x: bucketLabel(DEPLOY_AT), note: 'billing-worker' }, { id: 'dep_91a', x: '20:30', note: 'api-gateway' }]}
-          selection={window_} onSelect={(w) => { setWindow(w); setPage(1) }}
+          selection={window_} onSelect={setWindow}
           onOpen={(dep) => go(`deploy:${dep}`)}
           readoutFormat={(p) => `${p.t} ${ZONE} · ${p.error} error · ${p.warn} warn · ${p.info} info · ${p.debug} debug`}
           title="log volume by level" range={`last ${rangeLabel}`}
@@ -784,10 +803,10 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
           onChange={(name) => { const s = saved.find((x) => x.name === name); if (s) { const r = readQuery(s.query); setQuery(r.tokens, r.text) } }}
           options={[...(saved.some((s) => s.query === q) ? [] : [{ value: 'this query', label: 'this query', meta: 'not saved' }]), ...saved.map((s) => ({ value: s.name, label: s.name, meta: s.query || 'no tokens' }))]} />
         <RangePicker
-          ranges={RANGES} value={range} onChange={(r) => { setRange(r); setWindow(null); setPage(1) }}
+          ranges={RANGES} value={range} onChange={setRange}
           retentionDays={retentionDays} retentionLabel={retentionLabel}
           onGated={(r) => notify('warn', `${r.label} is past this plan's retention`, `logs are kept ${retentionLabel}; older lines were deleted, not hidden`)}
-          custom={{ from: win.from, to: win.to, zone: ZONE, onChange: (f, t) => { setWin({ from: f, to: t }); setRange('custom'); setPage(1) } }} />
+          custom={{ from: win.from, to: win.to, zone: ZONE, onChange: (f, t) => patch({ win: `${f}~${t}`, range: 'custom', sel: null, page: null }) }} />
         <span className="font-mono text-[11px] text-muted-foreground">times are {ZONE}</span>
         {/* Live pins the newest line at the top of the list until the reader scrolls away from it; then it holds and counts. */}
         <Live every="2s" paused={!live} onToggle={() => setLive((v) => !v)} />
@@ -907,10 +926,10 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
       ) : rows.length === 0 ? (
         <PageState state="empty" title="No line matches this query"
           reason={`${fmtCount(inWindow.length, 'line')} in ${rangeLabel}, none matching ${writeQuery(tokens, text) || 'the window'}. Lines older than ${retentionLabel} were deleted, not hidden.`}
-          next={<Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => { setQuery([], ''); setWindow(null) }}>clear the query</Button>} />
+          next={<Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => patch({ q: null, sel: null, page: null })}>clear the query</Button>} />
       ) : undefined}
       footer={view === 'list'
-        ? <span>showing {fmtNum(rows.length)} of {fmtNum(list.length)} matching · {fmtNum(TOTAL_KEPT)} kept for {retentionLabel} · <Kbd keys="t" className="mx-1" /> opens the trace{range !== '90d' && <> · <button type="button" className="underline underline-offset-4 hover:text-foreground" onClick={() => { const i = RANGES.findIndex((r) => r.label === range); setRange(RANGES[Math.min(RANGES.length - 1, i + 1)].label); setWindow(null); setPage(1) }}>load older</button></>}</span>
+        ? <span>showing {fmtNum(rows.length)} of {fmtNum(list.length)} matching · {fmtNum(TOTAL_KEPT)} kept for {retentionLabel} · <Kbd keys="t" className="mx-1" /> opens the trace{range !== '90d' && <> · <button type="button" className="underline underline-offset-4 hover:text-foreground" onClick={() => { const i = RANGES.findIndex((r) => r.label === range); setRange(RANGES[Math.min(RANGES.length - 1, i + 1)].label) }}>load older</button></>}</span>
         : <span>{fmtNum(rows.length)} {view === 'patterns' ? 'patterns' : 'containers'} over {fmtNum(list.length)} matching lines · <KbdPair keys={['j', 'k']} does={['down', 'up']} className="mx-1" /> · <Kbd keys="⏎" className="mx-1" /> narrow</span>} />
   )
 
@@ -953,7 +972,10 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
             meta={`${fmtAbsolute(inspectLine.ts, { tz: ZONE, seconds: true })} · ${inspectLine.deploy}`}
             anchors={LOG_ANCHORS}
             onOpen={() => go(`log:${inspectLine.id}`)}
-            copyLink={`${window.location.origin}${window.location.pathname}?p=log:${inspectLine.id}`}
+            /* The address you are on, whole: the query that found the line and the
+               line itself. A copy that handed over a bare record link would open a
+               different screen from the one the reader is looking at. */
+            copyLink={window.location.href}
             onClose={() => setInspect(null)}
             returnFocus={() => document.getElementById(`row-${inspectLine.id}`)}
           >
