@@ -1220,7 +1220,7 @@ function SignatureSection() {
 
 // ── build a screen ─────────────────────────────────────────────────────
 
-const LEDGER_SNIPPET = `import { Ledger, PageState, StatusLine, Status } from '@temps-sdk/op'
+const LEDGER_SNIPPET = `import { Ledger, PageState, StatusLine, Status } from '@temps-sdk/ds'
 
 <Ledger
   title="Projects"
@@ -1239,7 +1239,7 @@ const LEDGER_SNIPPET = `import { Ledger, PageState, StatusLine, Status } from '@
   state={rows.length === 0 ? <PageState state="empty" … /> : undefined}
 />`
 
-const RECORD_SNIPPET = `import { Detail, Columns, Lede, Section, KeyValue, Timeline, StatusLine } from '@temps-sdk/op'
+const RECORD_SNIPPET = `import { Detail, Columns, Lede, Section, KeyValue, Timeline, StatusLine } from '@temps-sdk/ds'
 
 <Detail
   title="acme-storefront"                       // 1. title + meta place the record
@@ -1264,7 +1264,7 @@ const RECORD_SNIPPET = `import { Detail, Columns, Lede, Section, KeyValue, Timel
   </Columns>
 </Detail>`
 
-const SETTINGS_SNIPPET = `import { Settings, Field, EchoDialog, StatusLine } from '@temps-sdk/op'
+const SETTINGS_SNIPPET = `import { Settings, Field, EchoDialog, StatusLine } from '@temps-sdk/ds'
 
 <Settings
   title="Build & deploy"
@@ -1695,9 +1695,9 @@ function BuildScreenSection() {
         2. Paste the skeleton
       </h3>
       <p className="op-prose mt-2 max-w-[72ch] text-sm text-muted-foreground">
-        All four import from <code className="font-mono">@temps-sdk/op</code>. Put{' '}
+        All four import from <code className="font-mono">@temps-sdk/ds</code>. Put{' '}
         <code className="font-mono">operator ink v1</code> on the root element and import{' '}
-        <code className="font-mono">@temps-sdk/op/op.css</code> before any other rule.
+        <code className="font-mono">@temps-sdk/ds/op.css</code> before any other rule.
       </p>
       <Snippet title="ledger — many records of one kind" code={LEDGER_SNIPPET} />
       <Snippet title="record — title + meta → status → lede → columns → sections" code={RECORD_SNIPPET} />

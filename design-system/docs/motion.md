@@ -5,9 +5,9 @@ Motion here has one job: tell the reader that *they* caused something, or that
 a value they are watching just changed. It never introduces anything, never
 decorates, and never asks to be waited for.
 
-The tokens are in `web/packages/op/tokens.json` (`base.duration.*`,
+The tokens are in `web/packages/ds/tokens.json` (`base.duration.*`,
 `base.easing.standard`) and declared on `.operator.ink` in `op.css`.
-`node web/packages/op/scripts/tokens.mjs check` fails if the two disagree.
+`node web/packages/ds/scripts/tokens.mjs check` fails if the two disagree.
 
 ## The tokens
 
@@ -193,7 +193,7 @@ duration comes from the token.
 
 - The sandbox's own `globals.css` still hand-rolls `.fade-in-0`, `.zoom-in-95`
   and friends at literal `150ms`, and `system-map-section.tsx` uses
-  `duration-300`. Those are sandbox call sites, outside `@temps-sdk/op`, and
+  `duration-300`. Those are sandbox call sites, outside `@temps-sdk/ds`, and
   are listed for the coordinator rather than changed here.
 - The dialog primitives now carry
   `[transition-duration:var(--op-duration-slow)]` instead of `duration-200`,
@@ -202,7 +202,7 @@ duration comes from the token.
 
 ---
 
-Rules digest: `RULES.md` §Motion. Tokens: `web/packages/op/tokens.json`.
+Rules digest: `RULES.md` §Motion. Tokens: `web/packages/ds/tokens.json`.
 Reference: `/op-components`, `/v1`.
 
 ## Floating content appears in place

@@ -304,8 +304,8 @@ that leaves the client unable to distinguish "not built" from
 
 ## Use the design system for redesigned UI
 
-UI built on the operator design system (`@temps-sdk/op` in
-`web/packages/op`, mockups and docs in `design-system/`) follows
+UI built on the operator design system (`@temps-sdk/ds` in
+`web/packages/ds`, mockups and docs in `design-system/`) follows
 `design-system/docs/RULES.md`. The `temps-design-system` skill
 (`.agents/skills/temps-design-system/SKILL.md`) gives the procedure, the
 verification (`bun run lint`, `bun run e2e` in `design-system/`) and the

@@ -22,6 +22,9 @@
 
 ## 0.1.2
 
+- The package is `@temps-sdk/ds` (folder `web/packages/ds`); it was `@temps-sdk/op`
+  before it was ever published. Class prefixes (`op-*`) and the skin class
+  `operator ink v1` are unchanged.
 - `.op-prose` is the whole look of a body of long-form prose, not just "the
   sans face": measure (`--op-measure`, ~68ch, capped inside the frame and
   never by narrowing it), headings on the type ladder (h2 carries a rule, h5/h6
@@ -277,7 +280,7 @@
   in both cases.
 
 - The token layer is data. `tokens.json` (W3C DTCG, exported as
-  `@temps-sdk/op/tokens.json`) carries two layers: `base` — the paper/ink pair,
+  `@temps-sdk/ds/tokens.json`) carries two layers: `base` — the paper/ink pair,
   the five state hues, the faces, radius, border, the 4/8/12/16/20/24/32 scale,
   the six type tiers, and motion — and `semantic`, which is exactly the custom
   properties `.operator.ink` declares, light and dark, aliased to base with

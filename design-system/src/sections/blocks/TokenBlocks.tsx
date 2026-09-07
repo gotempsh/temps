@@ -3,9 +3,9 @@
 
 // Tokens, motion and iconography, rendered from the data that defines them.
 //
-// The token table below is built from `web/packages/op/tokens.json` at build
+// The token table below is built from `web/packages/ds/tokens.json` at build
 // time — not from a copy of it — so a token that exists here exists in the
-// stylesheet too (`node web/packages/op/scripts/tokens.mjs check` proves the
+// stylesheet too (`node web/packages/ds/scripts/tokens.mjs check` proves the
 // third side of that triangle). Adding a token means editing one file.
 //
 // Docs: design-system/docs/motion.md, design-system/docs/icons.md.
@@ -24,7 +24,7 @@ import {
   Terminal, ThumbsUp, Timer, Trash2, TriangleAlert, Upload, User, Users, Video, Waypoints, X,
   Zap, type LucideIcon,
 } from 'lucide-react'
-import tokens from '../../../../web/packages/op/tokens.json'
+import tokens from '../../../../web/packages/ds/tokens.json'
 
 /* ── local Block / Demo, in the shape OpComponents.tsx uses ─────────────── */
 
@@ -330,11 +330,11 @@ export function TokensBlock() {
         id="tokens-table"
         title="Tokens"
         api={`// the same file the stylesheet is checked against
-import tokens from '@temps-sdk/op/tokens.json'
+import tokens from '@temps-sdk/ds/tokens.json'
 
 // enforcement, in \`bun run lint\`:
-node web/packages/op/scripts/tokens.mjs check
-node web/packages/op/scripts/tokens.mjs build  // prints, does not write`}
+node web/packages/ds/scripts/tokens.mjs check
+node web/packages/ds/scripts/tokens.mjs build  // prints, does not write`}
         rule={
           <>
             <p>

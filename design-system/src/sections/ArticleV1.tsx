@@ -34,7 +34,7 @@ import postMd from '../../content/sample-post.md?raw'
    body. That is the smallest vocabulary that works in both: MDX writes
    `<TimeChart …/>`, this writes ```chart, and both land on the same
    primitive. Nothing here invents a look; every block is a component from
-   `@temps-sdk/op`.
+   `@temps-sdk/ds`.
    ──────────────────────────────────────────────────────────────────────── */
 
 /** The `key: value` block at the top of the file, and the body after it. */

@@ -15,11 +15,11 @@ import {
   type LedgerRow, type State,
 } from '@/components/op'
 // `Inspector` is not re-exported from the package barrel yet (that one line in
-// `web/packages/op/src/index.ts` belongs to whoever owns the package this pass),
+// `web/packages/ds/src/index.ts` belongs to whoever owns the package this pass),
 // so it is reached by path. Swap this for `@/components/op` the moment the
 // barrel carries it — nothing else about the block changes.
-import { Inspector, type InspectorAnchor } from '../../../web/packages/op/src/inspector'
-import { CopyAction } from '../../../web/packages/op/src/copy'
+import { Inspector, type InspectorAnchor } from '../../../web/packages/ds/src/inspector'
+import { CopyAction } from '../../../web/packages/ds/src/copy'
 import { Article, CodeBlock, ImageFigure } from '@/components/op'
 import { BRANCHES } from './ConsoleV1'
 // The five blocks files are the live half of docs/{forms,notifications,content,
@@ -226,7 +226,7 @@ function PagedLedgerDemo() {
 /**
  * `Inspector` inspects a ledger row beside the list instead of navigating away
  * from it. Drawn here against the documented shape while the primitive lands in
- * `@temps-sdk/op`: ~520px pushing the main column on `xl`, an overlay sheet
+ * `@temps-sdk/ds`: ~520px pushing the main column on `xl`, an overlay sheet
  * with a scrim below `xl`, full-screen below `md`; an ink rule on its left
  * edge; a header of glyph + word, mono title, meta and three actions; stacked
  * `Section`s under a small in-panel toc row.
@@ -352,7 +352,7 @@ export function OpComponentsPage() {
 
   return (
     <DocPage
-      eyebrow="operator components · @temps-sdk/op"
+      eyebrow="operator components · @temps-sdk/ds"
       intro={<>
         The components the three page templates are built from. Each block: the rule, the props that matter, every state. <Link to="/v1" className="underline underline-offset-4">/v1</Link> is these assembled into a console; the handoff document is <span className="font-mono">docs/design-system-handoff.md</span>. The last five groups — forms, notifications, charts, content and the token, motion and icon tables — are the same blocks <Link to="/guide#forms" className="underline underline-offset-4">/guide</Link> mounts beside their documents.
       </>}

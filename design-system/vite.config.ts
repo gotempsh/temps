@@ -11,17 +11,17 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
-      // The op primitives live in the @temps-sdk/op workspace package under
+      // The op primitives live in the @temps-sdk/ds workspace package under
       // ../web. The sandbox consumes them by source (no build step, HMR
       // still works) rather than declaring a dependency, so design-system's
       // package.json stays untouched.
       // More specific first: object aliases are prefix matches, so
-      // '@temps-sdk/op' would otherwise swallow the '/op.css' subpath.
-      '@temps-sdk/op/op.css': fileURLToPath(
-        new URL('../web/packages/op/src/op.css', import.meta.url)
+      // '@temps-sdk/ds' would otherwise swallow the '/op.css' subpath.
+      '@temps-sdk/ds/op.css': fileURLToPath(
+        new URL('../web/packages/ds/src/op.css', import.meta.url)
       ),
-      '@temps-sdk/op': fileURLToPath(
-        new URL('../web/packages/op/src/index.ts', import.meta.url)
+      '@temps-sdk/ds': fileURLToPath(
+        new URL('../web/packages/ds/src/index.ts', import.meta.url)
       ),
     },
     // The aliased package sits inside ../web, so Vite would happily resolve

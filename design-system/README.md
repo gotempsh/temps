@@ -2,7 +2,7 @@
 
 Standalone, browsable reference for the Temps operator design system: every
 foundation, component state and page pattern, rendered with the real
-primitives from [`@temps-sdk/op`](../web/packages/op) under the v1 skin
+primitives from [`@temps-sdk/ds`](../web/packages/ds) under the v1 skin
 (`operator ink v1`). What you see here is what shipping it in `temps/web`
 looks like — not a redrawn approximation.
 
@@ -20,8 +20,8 @@ bun run dev      # http://localhost:5183
 
 `bun run build` and `bun run lint` also work standalone. `lint` is three
 checks: `tsc --noEmit`, `scripts/audit-records.mjs` (the eight record rules)
-and `node ../web/packages/op/scripts/tokens.mjs check`, which reads
-`web/packages/op/tokens.json` against `op.css` and fails with a diff when a
+and `node ../web/packages/ds/scripts/tokens.mjs check`, which reads
+`web/packages/ds/tokens.json` against `op.css` and fails with a diff when a
 value, a name or the order of the two disagrees (`bun run tokens:check` runs
 it alone).
 
@@ -33,7 +33,7 @@ it alone).
 | `/brand` | The decided brand: positioning, plan ladder as design input, paper + ink, type role, signature moves, voice |
 | `/foundations` | Type hierarchy by weight, paper/ink tokens (light + dark), colour = status (five states), density and rhythm, radius 0.25rem, motion, responsive rules |
 | `/components` | The primitives under ink: button, input, picker vs select, checkbox/switch, tabs vs segmented, rows, palette, popover/menu, dialog, toast, skeleton, breadcrumb + page title, plus the banned list with replacements |
-| `/op-components` | Every operator component in `@temps-sdk/op`, every state, with props |
+| `/op-components` | Every operator component in `@temps-sdk/ds`, every state, with props |
 | `/patterns` | The three page templates live (Ledger, Detail, Settings), PageState, promote/roll back, per-environment variables with bulk association, time and retention, keyboard model, responsive folds |
 | `/kitchen-sink` | Stress test: the whole v1 console at 390/768/1024/1280, pathological data, every state of every component, dark, dense, charts and forms at the limit, and the banned gallery (the old look, greyed, each item naming its replacement) |
 | `/v1` | Operator console v1 (three templates, PageState, sampled status; the plan is a fixture, Cloud Starter) |
@@ -56,7 +56,7 @@ the header — every surface should look correct in both.
 ## The package
 
 The operator primitives are **not** copied into this app. They live in
-[`web/packages/op`](../web/packages/op) as the `@temps-sdk/op` workspace
+[`web/packages/ds`](../web/packages/ds) as the `@temps-sdk/ds` workspace
 package (components plus `op.css`, the whole skin), and the sandbox consumes
 them by source through a Vite alias in `vite.config.ts` — so there is no
 build step between editing a primitive and seeing it here, and no drift

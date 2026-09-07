@@ -72,7 +72,7 @@ Gotchas that cost time:
 ### The package
 
 The primitives are no longer the sandbox's: they live in
-`temps/web/packages/op` as **`@temps-sdk/op`** (a bun workspace of the
+`temps/web/packages/ds` as **`@temps-sdk/ds`** (a bun workspace of the
 console), with the tokens and every `.op-*` rule in `op.css`. The sandbox
 consumes it through a Vite alias (`vite.config.ts`) plus `resolve.dedupe`
 for react/react-dom/react-router and a `paths` pin for the React types in
@@ -80,19 +80,19 @@ for react/react-dom/react-router and a `paths` pin for the React types in
 incompatible `CSSProperties` at type level. `src/components/op/index.ts`
 is a one-line re-export so `@/components/op` imports keep working.
 
-A consumer imports `@temps-sdk/op/op.css` at the top of its stylesheet
+A consumer imports `@temps-sdk/ds/op.css` at the top of its stylesheet
 (imports must precede rules) and puts `operator ink v1` on the root element
 it wants skinned — all three words, because the CSS chains them
 (`.operator.ink.v1`). The skin is scoped to `.operator`, nothing outside it
-changes. Version and changes: `web/packages/op/CHANGELOG.md`.
+changes. Version and changes: `web/packages/ds/CHANGELOG.md`.
 
-The package is publish-ready: `bun run build` in `web/packages/op` emits
+The package is publish-ready: `bun run build` in `web/packages/ds` emits
 bundler-targeted ESM plus `.d.ts` to `dist/` (git-ignored), `exports` points
 `.` at `dist` with a `"source"` condition for bundlers that prefer the TSX,
 and everything the source imports is a dependency or a peer dependency rather
 than something that only resolves through the monorepo root. An installed copy
 publishes `dist/`, not `src/`, so a consumer's Tailwind must scan the package
-itself — `@source "../node_modules/@temps-sdk/op/dist"`. `README.md` is the
+itself — `@source "../node_modules/@temps-sdk/ds/dist"`. `README.md` is the
 consumer setup; nothing is published from this branch.
 
 ### Tests
@@ -143,7 +143,7 @@ in `e2e/__screenshots__/` and are committed; `test-results/` and
 The mechanical half, in order. Skipping step 3 is how a block stops being
 shot without anything going red.
 
-1. **Build it in the package**: `web/packages/op/src/*.tsx`, exported from
+1. **Build it in the package**: `web/packages/ds/src/*.tsx`, exported from
    `src/index.ts`.
 2. **Give it a gallery block**: a `<section id="…">` in
    `design-system/src/sections/blocks/*.tsx` (a new rule set gets its own
@@ -161,7 +161,7 @@ shot without anything going red.
 5. **Write the §6 entry** in this file: what it is for, what it refuses to do,
    and the states it has. A primitive with no entry is a primitive nobody
    finds.
-6. **Add the `CHANGELOG.md` line** in `web/packages/op/`.
+6. **Add the `CHANGELOG.md` line** in `web/packages/ds/`.
 
 `a11y.spec.ts`'s `KNOWN` map is a debt register, not a mute button: each entry
 names the rule and what causes it, a test fails if an entry stops firing (so
@@ -225,14 +225,14 @@ console loaded, not the Tailwind build that generated the utilities the
 primitives use. A plugin that assumes it inherits the skin renders unstyled.
 
 So a plugin sets the system up for itself, exactly as any outside app does
-(`web/packages/op/README.md` is the setup):
+(`web/packages/ds/README.md` is the setup):
 
-1. **Bundle the package.** `bun add @temps-sdk/op` plus its peer dependencies.
+1. **Bundle the package.** `bun add @temps-sdk/ds` plus its peer dependencies.
    A plugin UI is a plain Vite + React app (`examples/example-plugin/web/` is
    the shape), so the Vite/Tailwind v4 setup in the README applies verbatim.
-2. **Import the skin and scan the package.** `@import '@temps-sdk/op/op.css'`
+2. **Import the skin and scan the package.** `@import '@temps-sdk/ds/op.css'`
    at the top of the entry stylesheet, and
-   `@source "../node_modules/@temps-sdk/op/dist"` so Tailwind generates the
+   `@source "../node_modules/@temps-sdk/ds/dist"` so Tailwind generates the
    utilities the primitives render.
 3. **Put `operator ink v1` on the plugin's own root**, and on any portalled
    content it renders.
@@ -242,7 +242,7 @@ So a plugin sets the system up for itself, exactly as any outside app does
    from the parent is a follow-up (§15).
 5. **Pin the version the console ships.** Two versions of the skin side by
    side drift in a way that reads as "this page looks slightly wrong" rather
-   than as a bug. `web/packages/op/CHANGELOG.md` is the record.
+   than as a bug. `web/packages/ds/CHANGELOG.md` is the record.
 6. **Use the same conventions as a console screen**: `CopyAction` for a copy
    (it answers on the control, never a toast), `Button busy` for an action in
    flight, `useUrlState` for the view — a plugin route is mirrored into the
@@ -255,7 +255,7 @@ accident.
 
 ## 4. Tokens
 
-All in `op.css`, shipped with the components in `@temps-sdk/op`; the sandbox's
+All in `op.css`, shipped with the components in `@temps-sdk/ds`; the sandbox's
 `src/globals.css` imports it. Blocks, in cascade order:
 
 **Hover and selection lift the whole row.** A hovered, selected or focused
@@ -267,12 +267,12 @@ icons all step up together. Without it the right-hand side of a row stays at
 resting muted while the fill moves under it, and the half of the row the reader
 is pointing at is the dimmest thing on the screen.
 
-`web/packages/op/tokens.json` is the same layer as data (W3C DTCG, exported as
-`@temps-sdk/op/tokens.json`): `base` is the raw material — the paper/ink pair,
+`web/packages/ds/tokens.json` is the same layer as data (W3C DTCG, exported as
+`@temps-sdk/ds/tokens.json`): `base` is the raw material — the paper/ink pair,
 the five state hues, the faces, radius, border, the 4/8/12/16/20/24/32 scale,
 the six type tiers and motion — and `semantic` is exactly the custom properties
 `.operator.ink` declares, light and dark, aliased to base with `{base.x.y}`.
-`node web/packages/op/scripts/tokens.mjs check` parses both files and fails with
+`node web/packages/ds/scripts/tokens.mjs check` parses both files and fails with
 a diff on any differing value, any name present on one side only, and any
 ordering difference; it runs inside the design system's `bun run lint`
 (`bun run tokens:check` alone). `tokens.mjs build` prints the block it would
@@ -411,7 +411,7 @@ change, and is outranked by anything that has already gone wrong.
 
 ## 6. Components
 
-All in the `@temps-sdk/op` package (`web/packages/op`), imported through the
+All in the `@temps-sdk/ds` package (`web/packages/ds`), imported through the
 one-line re-export at `src/components/op/index.ts`. Reference page with
 every state: `/op-components`. These are what a new screen reaches for first;
 shadcn primitives are for what these do not cover.
@@ -817,7 +817,7 @@ it keeps its tile and states why there is no number.
 
 ### ToolRow, Proposal, Provenance, StreamBlock, AgentQuestion, AgentSources, RunAside
 
-The agent surface (`web/packages/op/src/agent.tsx`); the whole rule set is
+The agent surface (`web/packages/ds/src/agent.tsx`); the whole rule set is
 `docs/generative-ui.md`, drawn on `/agent` and `/op-components#genui-ledger`.
 
 `ToolRow({ name, arg, kind, state, ms, input, output, diff, error, meta,
@@ -942,7 +942,7 @@ in `.op-raw`. See `docs/content-pages.md`.
 
 ### useUrlState
 
-`web/packages/op/src/url-state.ts`, exported from `@temps-sdk/op`. Not a
+`web/packages/ds/src/url-state.ts`, exported from `@temps-sdk/ds`. Not a
 component: the six hooks that keep the view the reader is on in the address,
 which is the requirement in `docs/requirements.md` and the thing a screen is
 most likely to get wrong.
@@ -973,7 +973,7 @@ first — which is how a filter box silently loses letters.
 Replace on a view change, push on a navigation. Live block: `/op-components`
 → the URL-state section (`src/sections/blocks/UrlStateBlocks.tsx`). The
 sandbox's `src/sections/console-url.ts` is now a one-line re-export of the
-package; new code imports from `@temps-sdk/op`.
+package; new code imports from `@temps-sdk/ds`.
 
 ---
 
@@ -2098,7 +2098,7 @@ The Vercel AI Elements vocabulary (Message, Reasoning / ChainOfThought, Plan,
 Tool with its six states, Confirmation, Task, Queue, Checkpoint, Sources,
 Actions, Suggestion, Context, PromptInput) drawn with the v1 rules, in
 `src/sections/AgentChat.tsx`. Every block is now a primitive in
-`@temps-sdk/op` (`agent.tsx`, §6), and the whole rule set is
+`@temps-sdk/ds` (`agent.tsx`, §6), and the whole rule set is
 `docs/generative-ui.md`.
 
 **Two scenarios, one ledger**, chosen with a `Segmented` in the page header,
@@ -2374,7 +2374,7 @@ direction will drift the way the console already has.
 - A rule changes only by editing the doc and the reference page in one PR.
 
 What exists today, in `bun run lint`: `tsc --noEmit`, `scripts/audit-records.mjs`
-(the record recipe rules), and `node ../web/packages/op/scripts/tokens.mjs check`
+(the record recipe rules), and `node ../web/packages/ds/scripts/tokens.mjs check`
 (`tokens.json` against `op.css`, value by value and name by name, in order).
 The token check is the first of these that guards a token rather than a
 structure, and it fails with a printed diff rather than a count.
@@ -2455,7 +2455,7 @@ design-system/
       form.tsx  FormErrors, the multi-field submit summary
       datetime.tsx  date, time, range, duration and schedule fields, and the
                     Strip that RangePicker shares with them (forms.md)
-    ../web/packages/op/src/       the package itself; the files above re-export it
+    ../web/packages/ds/src/       the package itself; the files above re-export it
       agent.tsx     ToolRow, Proposal, Provenance, StreamBlock, AgentQuestion, AgentSources, RunAside (generative-ui.md)
       inspector.tsx the panel that reads one ledger row beside the list, following its cursor (§6, §7)
       viz-ink.tsx   the shared ink vocabulary every figure is built from: Figure, DataTable, InkPatterns, StateWord, the readout, the five density steps
@@ -2463,8 +2463,8 @@ design-system/
       viz-grid.tsx  PercentileLadder, CohortGrid, DeltaTable — the figures that are tables first
       viz-graph.tsx PathTree and Topology, each with the same nodes as a list beneath it
       viz-usage.tsx UsageBar and Gauge: a measure against an allowance, and a machine's pressure
-    ../web/packages/op/tokens.json    the token layer as data (§4)
-    ../web/packages/op/scripts/tokens.mjs  check / build, wired into bun run lint
+    ../web/packages/ds/tokens.json    the token layer as data (§4)
+    ../web/packages/ds/scripts/tokens.mjs  check / build, wired into bun run lint
     components/ui/                shadcn primitives + sparkline, log-viewer, empty-placeholder
     components/platform-logos.tsx, system-map-section.tsx
                                   copied verbatim from temps-landing; do not edit here
@@ -2505,7 +2505,7 @@ design-system/
    once the landing stops using it.
 7b. **Theme sync into a plugin iframe.** `PluginPage.tsx` syncs the plugin's
    route (hash or `postMessage`) and nothing else, so a plugin on
-   `@temps-sdk/op` cannot follow the console between light and dark: it reads
+   `@temps-sdk/ds` cannot follow the console between light and dark: it reads
    `prefers-color-scheme` and is wrong for every reader whose console theme is
    not their OS theme (§3b). The fix is a `{ type: 'temps:theme', theme }`
    message on mount and on every change, and a matching listener in the plugin

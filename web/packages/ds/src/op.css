@@ -2,11 +2,11 @@
 /* SPDX-License-Identifier: MIT OR Apache-2.0 */
 
 /* ────────────────────────────────────────────────────────────────────────
-   @temps-sdk/op — the skin.
+   @temps-sdk/ds — the skin.
 
    Import this once, anywhere in your Tailwind v4 entry CSS:
 
-       @import '@temps-sdk/op/op.css';
+       @import '@temps-sdk/ds/op.css';
 
    It carries the operator token layer and every `.op-*` utility the
    primitives in this package render. Without it the components still
@@ -14,13 +14,13 @@
 
    `@source "./"` is relative to THIS file: it tells Tailwind to scan the
    package's own TSX for utility classes, so the utilities used inside
-   `@temps-sdk/op` get generated in whatever app imports this stylesheet.
+   `@temps-sdk/ds` get generated in whatever app imports this stylesheet.
    That covers a consumer that resolves the package to SOURCE (the monorepo,
    and the sandbox through its Vite alias), where the TSX sits beside this
    file. An installed copy publishes `dist/` and this stylesheet, not `src/`,
    so a consumer on the tarball must scan the built package itself:
 
-       @source "../node_modules/@temps-sdk/op/dist";
+       @source "../node_modules/@temps-sdk/ds/dist";
 
    The package renders Tailwind utility classes; without one of those two
    scans the components mount with tokens applied and no layout.

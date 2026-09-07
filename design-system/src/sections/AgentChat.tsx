@@ -20,7 +20,7 @@ import { writeToClipboard } from '@/lib/clipboard'
    Checkpoint, Sources, Actions, Suggestion, Context, PromptInput) re-drawn
    with the five rules: paper and ink, every border ink, one raised element,
    colour only through the five state glyphs, dense. Every block below is a
-   small component so it can move into @temps-sdk/op when the console
+   small component so it can move into @temps-sdk/ds when the console
    grows an agent surface.
 
    Rules specific to this surface:

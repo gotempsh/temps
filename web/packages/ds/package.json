@@ -1,5 +1,5 @@
 {
-  "name": "@temps-sdk/op",
+  "name": "@temps-sdk/ds",
   "version": "0.1.2",
   "type": "module",
   "description": "The Temps operator design system — the op primitives (records, ledgers, status, viz, page templates) plus the skin they render in, as one self-contained package.",

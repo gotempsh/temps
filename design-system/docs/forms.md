@@ -46,7 +46,7 @@ are from the mockups (`/v1?p=settings`, `/v1?p=email`, `/v1?p=env`,
 ## Dates, times and ranges
 
 Components: `DateTimeField`, `DateField`, `TimeField`, `DateTimeRangeField`,
-`DurationField`, `ScheduleField` (`web/packages/op/src/datetime.tsx`), live at
+`DurationField`, `ScheduleField` (`web/packages/ds/src/datetime.tsx`), live at
 `/guide#forms` and `/op-components#form-datetime`.
 
 - Make every date and time a text input the reader can type into, with the

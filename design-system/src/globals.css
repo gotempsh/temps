@@ -4,7 +4,7 @@
 @import 'tailwindcss';
 /* The op skin: operator tokens + every .op-* rule, shipped with the
    components that use them. Must stay with the other @imports. */
-@import '@temps-sdk/op/op.css';
+@import '@temps-sdk/ds/op.css';
 @plugin '@tailwindcss/typography';
 
 @source '.';
@@ -13,7 +13,7 @@
 @import url('https://fonts.googleapis.com/css2?family=Geist:wght@100..900&display=swap');
 @import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&display=swap');
 
-/* Space Grotesk backs the `.operator.hardline` skin in @temps-sdk/op; IBM Plex
+/* Space Grotesk backs the `.operator.hardline` skin in @temps-sdk/ds; IBM Plex
    Mono is the --font-serif fallback below. Nothing else here loads a face
    outside the Geist pair. */
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400..700&display=swap');
@@ -554,6 +554,6 @@ body {
   color: color-mix(in oklch, var(--muted-foreground) 40%, transparent);
   user-select: none;
 }
-/* The operator token layer and every `.op-*` rule live in @temps-sdk/op,
+/* The operator token layer and every `.op-*` rule live in @temps-sdk/ds,
    next to the components that use them — see the @import at the top of this
    file. Do not re-add copies here. */

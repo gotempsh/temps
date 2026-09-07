@@ -1,4 +1,4 @@
-# @temps-sdk/op
+# @temps-sdk/ds
 
 The Temps **operator design system**: the primitives every console screen is
 built from, plus the skin they render in, as one self-contained package.
@@ -15,7 +15,7 @@ Inside this repo it is a bun workspace of `web`, so the console and the
 sandbox get it for nothing. Outside it:
 
 ```bash
-bun add @temps-sdk/op
+bun add @temps-sdk/ds
 ```
 
 The peer dependencies are the libraries that must be a single copy in the app:
@@ -37,8 +37,8 @@ rules must precede every rule):
 
 ```css
 @import 'tailwindcss';
-@import '@temps-sdk/op/op.css';
-@source "../node_modules/@temps-sdk/op/dist";
+@import '@temps-sdk/ds/op.css';
+@source "../node_modules/@temps-sdk/ds/dist";
 ```
 
 The `@source` line is not optional and it is the step that gets forgotten.
@@ -74,7 +74,7 @@ the root, so their content needs the class too:
 Then import primitives:
 
 ```tsx
-import { Ledger, Status, Metric, TimeChart, useUrlState } from '@temps-sdk/op'
+import { Ledger, Status, Metric, TimeChart, useUrlState } from '@temps-sdk/ds'
 ```
 
 ### Fonts
@@ -92,7 +92,7 @@ Match the version the console ships. A plugin or a downstream app that renders
 beside the console and pins a different minor will drift visibly — a token
 value, a glyph, a row height — and the drift shows up as "this page looks
 slightly wrong", which is the hardest kind of bug to report. The console's
-`web/package.json` (and, in this repo, `web/packages/op/package.json`) is the
+`web/package.json` (and, in this repo, `web/packages/ds/package.json`) is the
 number to match; `CHANGELOG.md` in this package is the record of what changed
 between two of them.
 
@@ -118,8 +118,8 @@ bun run build   # tsc -p tsconfig.build.json → dist/ (ESM + .d.ts + maps)
 ```
 
 `dist/` is generated and git-ignored. `op.css` and `tokens.json` are published
-from their source paths, so `@temps-sdk/op/op.css` and
-`@temps-sdk/op/tokens.json` resolve the same whether the consumer is on the
+from their source paths, so `@temps-sdk/ds/op.css` and
+`@temps-sdk/ds/tokens.json` resolve the same whether the consumer is on the
 tarball or on the workspace.
 
 ## Read these three before adding a primitive

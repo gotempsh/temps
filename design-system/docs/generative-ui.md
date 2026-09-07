@@ -8,8 +8,8 @@ conversation"), `forms.md` and `notifications.md`. Rules digest:
 scenarios: coding agent · console assistant) and `/op-components#genui-ledger`.
 
 Primitives: `ToolRow`, `Proposal`, `Provenance`, `StreamBlock`,
-`AgentQuestion`, `AgentSources`, `RunAside` in `@temps-sdk/op`
-(`web/packages/op/src/agent.tsx`).
+`AgentQuestion`, `AgentSources`, `RunAside` in `@temps-sdk/ds`
+(`web/packages/ds/src/agent.tsx`).
 
 ---
 
@@ -223,4 +223,4 @@ The agent writes like the console (`content.md`).
 ---
 
 Rules digest: `RULES.md` §"Generative UI". Reference: `/agent`,
-`/op-components#genui-ledger`. Primitives: `web/packages/op/src/agent.tsx`.
+`/op-components#genui-ledger`. Primitives: `web/packages/ds/src/agent.tsx`.

@@ -2,7 +2,7 @@
 name: temps-design-system
 description: >
   Build or review console UI so it reads as Temps: the paper-and-ink operator
-  design system (`@temps-sdk/op` primitives, the `operator ink v1` skin,
+  design system (`@temps-sdk/ds` primitives, the `operator ink v1` skin,
   the Ledger / Detail / Settings page templates, the status vocabulary and
   the record recipe). Invoke when a task adds or redesigns a console screen,
   a landing section or a status page on the new design system, when the user
@@ -22,27 +22,27 @@ task needs is in the repo; do not invent tokens, colours or page shapes.
 | Rules digest for agents (read first, imperative, short) | `design-system/docs/RULES.md` |
 | Brand guidelines (why the rules exist) | `design-system/docs/brand-guidelines.md` |
 | Handoff: tokens, primitive catalogue, page templates, responsive, keyboard | `design-system/docs/design-system-handoff.md` |
-| Component package consumed by screens | `web/packages/op` (`@temps-sdk/op`) |
-| Consumer setup (a plugin, an outside app): install, `op.css`, `@source`, the skin class, fonts | `web/packages/op/README.md` |
+| Component package consumed by screens | `web/packages/ds` (`@temps-sdk/ds`) |
+| Consumer setup (a plugin, an outside app): install, `op.css`, `@source`, the skin class, fonts | `web/packages/ds/README.md` |
 | Reference implementation of every screen | `design-system/src/sections/ConsoleV1*.tsx` |
 | Browsable guide, component gallery, console mockups | `cd design-system && bun install && bun run dev` → `/guide`, `/op-components`, `/v1` |
 
 ## Scope boundary
 
 What exists today, stated plainly so nobody assumes more: **the production
-console (`web/src`, rsbuild) does not import `@temps-sdk/op` yet.** What is
+console (`web/src`, rsbuild) does not import `@temps-sdk/ds` yet.** What is
 built is the system (the docs), the package, and the sandbox that renders every
 primitive and every screen shape against it. Console migration happens screen by
 screen, on a schedule, not as a side effect of another task.
 
-- **Redesign work** (new screens on `@temps-sdk/op`, the sandbox, the landing
+- **Redesign work** (new screens on `@temps-sdk/ds`, the sandbox, the landing
   and status page mockups): this skill applies in full.
 - **Legacy console** (`web/src/**` on shadcn/ui): follow the frontend rules in
   `CLAUDE.md`. Do not restyle legacy screens piecemeal to the new system; a
   screen moves to the new system whole, when its migration is scheduled.
 - **Plugin UI** (a separate document in an iframe): see "Plugin UI" below. It
   gets the system by bundling the package, not by inheriting anything.
-- **The package** (`web/packages/op`): change a primitive only together with
+- **The package** (`web/packages/ds`): change a primitive only together with
   its entry in the handoff doc §6, the gallery on `/op-components` and the
   `CHANGELOG.md` of the package.
 
@@ -59,8 +59,8 @@ screen, on a schedule, not as a side effect of another task.
    (`ConsoleV1Nodes.tsx`), Database (`ConsoleV1Database.tsx`) and Settings
    (`ConsoleV1Settings.tsx`) cover the record, list, tool and configuration
    cases.
-4. Build with primitives from `@temps-sdk/op` only. Import the skin once
-   (`@import '@temps-sdk/op/op.css'`) and put `operator ink v1` on the
+4. Build with primitives from `@temps-sdk/ds` only. Import the skin once
+   (`@import '@temps-sdk/ds/op.css'`) and put `operator ink v1` on the
    root you want skinned, including portalled content.
 5. Apply the record recipe: title + meta → status verdict → `Lede` with four
    to six facts → `Columns` (main: the thing and its timeline; aside: what is
@@ -74,7 +74,7 @@ screen, on a schedule, not as a side effect of another task.
 
 ## Adding a primitive
 
-1. Build it in `web/packages/op/src/*.tsx` and export it from `src/index.ts`.
+1. Build it in `web/packages/ds/src/*.tsx` and export it from `src/index.ts`.
 2. Give it a gallery block: a `<section id="…">` in
    `design-system/src/sections/blocks/*.tsx`, or in `OpComponents.tsx` for a
    primitive that belongs to no rule document. Show every state, not a happy
@@ -91,7 +91,7 @@ screen, on a schedule, not as a side effect of another task.
    noise and the diff you were meant to read drowns.
 5. Write the handoff §6 entry: what it is for, what it refuses to do, its
    states.
-6. Add the `CHANGELOG.md` line in `web/packages/op/`.
+6. Add the `CHANGELOG.md` line in `web/packages/ds/`.
 
 ## Before you ship
 
@@ -139,13 +139,13 @@ assumes it inherits the skin renders unstyled.
 
 So a plugin sets the system up for itself, like any outside app. It is a plain
 Vite + React app (`examples/example-plugin/web/` is the shape), so
-`web/packages/op/README.md` is the setup, verbatim:
+`web/packages/ds/README.md` is the setup, verbatim:
 
-1. `bun add @temps-sdk/op` plus its peer dependencies, and **pin the version
+1. `bun add @temps-sdk/ds` plus its peer dependencies, and **pin the version
    the console ships** — two versions of the skin side by side drift in a way
    that reads as "this page looks slightly wrong", not as a bug.
-2. `@import '@temps-sdk/op/op.css'` at the top of the entry stylesheet, and
-   `@source "../node_modules/@temps-sdk/op/dist"` so the consumer's Tailwind
+2. `@import '@temps-sdk/ds/op.css'` at the top of the entry stylesheet, and
+   `@source "../node_modules/@temps-sdk/ds/dist"` so the consumer's Tailwind
    scans the package and generates the utilities it renders.
 3. `operator ink v1` on the plugin's own root, and on any portalled content.
 4. **Theme:** there is no theme channel today. `PluginPage.tsx` syncs the route

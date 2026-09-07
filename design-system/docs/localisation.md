@@ -5,7 +5,7 @@ that shipping a second locale later is a translation job and not a redesign.
 Every rule here costs nothing today.
 
 Companion to `content.md` (the words) and `design-system-handoff.md` §8 (the
-data rules). Formatting is enforced by `@temps-sdk/op` → `src/fmt.ts`.
+data rules). Formatting is enforced by `@temps-sdk/ds` → `src/fmt.ts`.
 
 ---
 

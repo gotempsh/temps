@@ -8,9 +8,9 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 
 ## Setup
 
-- Import `@temps-sdk/op/op.css` before any rule in the stylesheet.
+- Import `@temps-sdk/ds/op.css` before any rule in the stylesheet.
 - Put `operator ink v1` on the root element you want skinned.
-- Import primitives from `@temps-sdk/op`. Do not edit the package from a consumer.
+- Import primitives from `@temps-sdk/ds`. Do not edit the package from a consumer.
 - Pass the skin class to portalled content (dialogs, toasts, command palettes).
 - Restart the dev server after introducing a Tailwind class new to the codebase.
 
@@ -37,14 +37,14 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Write several keys in one patch. Two `setParams` calls in one handler compute from the same snapshot, so the second drops the first.
 - Emit complete links: every row, every "open in …", and `copy link` carries the view the reader is on, not the bare record.
 - Keep only the moment local: a hover, an open menu, a two-second `copied`, an unsubmitted draft — and say so before a reload would lose the draft.
-- Do not hand-roll any of this. `useUrlState`, `useUrlNumber`, `useUrlPatch`, `useUrlWindow`, `useUrlSort` and `useUrlText` from `@temps-sdk/op` already enforce it: typed keys (`VIEW_KEYS`), defaults omitted, unknown values falling back, replace-not-push, and one patch per handler. `forNewView(params)` drops the view on a navigation. Catalogue: handoff §6 "useUrlState".
+- Do not hand-roll any of this. `useUrlState`, `useUrlNumber`, `useUrlPatch`, `useUrlWindow`, `useUrlSort` and `useUrlText` from `@temps-sdk/ds` already enforce it: typed keys (`VIEW_KEYS`), defaults omitted, unknown values falling back, replace-not-push, and one patch per handler. `forNewView(params)` drops the view on a navigation. Catalogue: handoff §6 "useUrlState".
 
 ## Tokens
 
 - A hover or a selection lifts the whole row: muted text, state glyphs and icons step up with the fill, never dimmer under the reader. One variable (`--muted-foreground`) does it, so nothing is left behind.
 - Take every value from a token. A hex, an `oklch()` or a `ms` literal in a tsx file is a bug.
 - Name only semantic tokens in a component (`--muted-foreground`), never a base token.
-- Edit `web/packages/op/tokens.json` and `op.css` in one commit. `bun run lint` fails when they disagree.
+- Edit `web/packages/ds/tokens.json` and `op.css` in one commit. `bun run lint` fails when they disagree.
 - Add a token to light; add it to dark only when the value actually changes. Dark cascades.
 - Keep the scale closed: radius 0.25rem, borders 1px, spacing 4/8/12/16/20/24/32, six type tiers, three durations.
 

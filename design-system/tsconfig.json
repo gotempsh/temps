@@ -17,8 +17,8 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"],
-      "@temps-sdk/op": ["../web/packages/op/src/index.ts"],
-      // @temps-sdk/op lives under ../web, so TS would resolve ITS `react`
+      "@temps-sdk/ds": ["../web/packages/ds/src/index.ts"],
+      // @temps-sdk/ds lives under ../web, so TS would resolve ITS `react`
       // types against web/node_modules/@types/react — a different patch
       // release than the sandbox's, which makes every CSSProperties in a
       // package component structurally incompatible. Pin all three to the

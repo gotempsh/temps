@@ -4,11 +4,11 @@
 /**
  * Operator component library ("op").
  *
- * The primitives themselves now live in the `@temps-sdk/op` package
- * (temps/web/packages/op) so the console and the sandbox render the exact
+ * The primitives themselves now live in the `@temps-sdk/ds` package
+ * (temps/web/packages/ds) so the console and the sandbox render the exact
  * same components. This file stays as a thin re-export so the ~30
  * `@/components/op` imports across the sandbox keep resolving.
  *
  * See docs/design-system-handoff.md §6 and docs/brand-guidelines.md §6.
  */
-export * from '@temps-sdk/op'
+export * from '@temps-sdk/ds'

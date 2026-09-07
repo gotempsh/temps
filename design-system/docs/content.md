@@ -9,7 +9,7 @@ adjectives the reader cannot verify. A fact appears once. The reader is an
 operator at 02:00 with nobody to ask.
 
 Rules are imperative and one line. Enforcement for the number, date and
-duration rules lives in `@temps-sdk/op` → `src/fmt.ts`.
+duration rules lives in `@temps-sdk/ds` → `src/fmt.ts`.
 
 ---
 

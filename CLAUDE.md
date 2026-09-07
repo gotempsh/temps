@@ -1022,7 +1022,7 @@ Key API changes from older Bollard: `bollard::container::*` -> `bollard::query_p
 - Package manager: `bun` (not npm/yarn)
 
 ### Design system (redesign)
-- New screens on the operator design system use `@temps-sdk/op` (`web/packages/op`) and follow `design-system/docs/RULES.md`. Use the `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) for the procedure and the scope boundary; the rules below still govern the legacy `web/src` console.
+- New screens on the operator design system use `@temps-sdk/ds` (`web/packages/ds`) and follow `design-system/docs/RULES.md`. Use the `temps-design-system` skill (`.agents/skills/temps-design-system/SKILL.md`) for the procedure and the scope boundary; the rules below still govern the legacy `web/src` console.
 
 ### Critical React Rules
 

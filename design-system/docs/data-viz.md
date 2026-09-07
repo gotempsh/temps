@@ -2,7 +2,7 @@
 
 How Temps draws data. Companion to `brand-guidelines.md` §6 (colour is status,
 "a legend does not license colour") and `design-system-handoff.md` §6 and §8.
-The primitives live in `@temps-sdk/op`: `TimeChart`, `Breakdown`, `Funnel`,
+The primitives live in `@temps-sdk/ds`: `TimeChart`, `Breakdown`, `Funnel`,
 `Flow`, `StatusStrip`, `ScoreRing`, `CalendarHeatmap`, `Waterfall`,
 `Histogram`, `Sparkline`, `GeoMap`, and the second wave in §§9–21:
 `BandChart`, `TimeChart`'s `compare`, `StackedInk`, `LatencyHeatmap`,

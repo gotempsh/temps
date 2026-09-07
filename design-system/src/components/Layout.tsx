@@ -173,7 +173,7 @@ export function Layout({ children }: { children: ReactNode }) {
           <LogoMark size={18} />
           <h1 className="shrink-0 text-sm font-semibold tracking-tight">Temps design system</h1>
           <span className="hidden text-xs text-muted-foreground lg:block">
-            guide, components and console mockups on @temps-sdk/op
+            guide, components and console mockups on @temps-sdk/ds
           </span>
           <div className="ml-auto flex items-center gap-2">
             <label className="flex h-7 items-center gap-2 border px-2 focus-within:outline-2 focus-within:-outline-offset-2 focus-within:outline-ring">

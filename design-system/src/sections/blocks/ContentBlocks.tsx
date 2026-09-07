@@ -178,7 +178,7 @@ export function ContentBlocks() {
           <>
             <p>
               The number, date and duration rules of <code>docs/content.md</code>, written once in{' '}
-              <code>@temps-sdk/op</code> so no screen has to remember them. Pure functions: no React,
+              <code>@temps-sdk/ds</code> so no screen has to remember them. Pure functions: no React,
               no state, one locale argument.
             </p>
             <Rule state="ok">Bytes decimal by default, binary where the kernel counts (`MiB`).</Rule>
