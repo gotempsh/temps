@@ -35,7 +35,51 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // up() is now a no-op, so on a database that first ran this
+        // migration's current version there is nothing to restore. But a
+        // database that already ran the previous, destructive up() (before
+        // this fix) has a populated
+        // `_temps_m20260904_managed_monitor_ownership_backup` table and
+        // demoted ownership from that run; rolling back on the new binary
+        // must still restore that captured state and drop the table,
+        // otherwise those monitors stay demoted forever and reconciliation
+        // creates a replacement.
+        let connection = manager.get_connection();
+        let backup_table_exists = connection
+            .query_one(sea_orm::Statement::from_string(
+                manager.get_database_backend(),
+                "SELECT to_regclass('_temps_m20260904_managed_monitor_ownership_backup') IS NOT NULL AS exists"
+                    .to_string(),
+            ))
+            .await?
+            .map(|row| row.try_get::<bool>("", "exists"))
+            .transpose()?
+            .unwrap_or(false);
+
+        if !backup_table_exists {
+            return Ok(());
+        }
+
+        connection
+            .execute_unprepared(
+                "UPDATE status_monitors AS current \
+                 SET is_managed = FALSE \
+                 WHERE current.is_managed = TRUE \
+                   AND EXISTS ( \
+                       SELECT 1 \
+                       FROM _temps_m20260904_managed_monitor_ownership_backup AS backup \
+                       JOIN status_monitors AS original ON original.id = backup.monitor_id \
+                       WHERE original.environment_id = current.environment_id \
+                   ); \
+                 UPDATE status_monitors AS monitor \
+                 SET is_managed = TRUE \
+                 FROM _temps_m20260904_managed_monitor_ownership_backup AS backup \
+                 WHERE monitor.id = backup.monitor_id; \
+                 DROP TABLE _temps_m20260904_managed_monitor_ownership_backup",
+            )
+            .await?;
+
         Ok(())
     }
 }

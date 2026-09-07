@@ -470,6 +470,114 @@ async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> a
 }
 
 #[tokio::test]
+async fn test_managed_monitor_migration_down_restores_state_from_previous_up_implementation(
+) -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping managed-monitor mixed-version rollback test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping managed-monitor mixed-version rollback test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    // Run every migration, including the current no-op up() for
+    // m20260904_000001, so it's recorded as applied.
+    Migrator::up(&db, None).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-rollback-test', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'monitor-rollback-test')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-rollback-test-production', 'monitor-rollback.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-rollback-test'",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', 60, true, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-rollback-test-production'",
+    )
+    .await?;
+
+    // Simulate a database that already ran the previous, destructive up()
+    // implementation of this migration before the current no-op fix
+    // shipped: it backed up the managed monitor's id and demoted it.
+    db.execute_unprepared(
+        "CREATE TABLE _temps_m20260904_managed_monitor_ownership_backup ( \
+             monitor_id INTEGER PRIMARY KEY REFERENCES status_monitors(id) ON DELETE CASCADE \
+         ); \
+         INSERT INTO _temps_m20260904_managed_monitor_ownership_backup (monitor_id) \
+         SELECT id FROM status_monitors WHERE name = 'production Monitor'; \
+         UPDATE status_monitors SET is_managed = FALSE WHERE name = 'production Monitor'",
+    )
+    .await?;
+
+    Migrator::down(&db, Some(1)).await?;
+
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("previously managed monitor remains present");
+    assert!(
+        restored.try_get::<bool>("", "is_managed")?,
+        "rolling back on the current no-op up() must still restore ownership captured by a \
+         previous, destructive up()"
+    );
+
+    let backup_table_dropped = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('_temps_m20260904_managed_monitor_ownership_backup') IS NULL AS dropped"
+                .to_string(),
+        ))
+        .await?
+        .expect("regclass lookup row")
+        .try_get::<bool>("", "dropped")?;
+    assert!(
+        backup_table_dropped,
+        "the backup table must be cleaned up after restoring"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Result<()> {
     if external_db_configured() {
         println!(
