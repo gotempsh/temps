@@ -6,6 +6,7 @@ import { X } from 'lucide-react'
 import { cn } from './lib/cn'
 import { Kbd } from './kbd'
 import { Status, type State } from './status'
+import { CopyAction } from './copy'
 
 /**
  * The row read beside the list. A tool screen (logs, proxy access, the audit
@@ -58,7 +59,7 @@ export type InspectorAnchor = { id: string; label: string }
 
 export function Inspector({
   open, label, state, word, title, meta,
-  anchors = [], onOpen, openLabel = 'open', onCopyLink, onClose, returnFocus,
+  anchors = [], onOpen, openLabel = 'open', copyLink, onCopied, onClose, returnFocus,
   children, className,
 }: {
   open: boolean
@@ -77,7 +78,9 @@ export function Inspector({
   /** Go to the full record page. A panel is a reading of a record, not a replacement for it. */
   onOpen?: () => void
   openLabel?: string
-  onCopyLink?: () => void
+  /** The address of this row. The control copies it itself and says `copied` in place; a toast is not where the reader is looking. */
+  copyLink?: string
+  onCopied?: (link: string) => void
   onClose: () => void
   /** The row to hand focus back to on `esc`; re-read on close, because the cursor may have moved. */
   returnFocus?: () => HTMLElement | null | undefined
@@ -136,7 +139,7 @@ export function Inspector({
           {meta && <span className="hidden min-w-0 shrink-[2] truncate font-mono text-[11px] text-muted-foreground sm:block">{meta}</span>}
           <span className="ms-auto flex shrink-0 items-center gap-1">
             {onOpen && <button type="button" onClick={onOpen} className="inline-flex h-6 items-center border px-2 text-[11px] hover:bg-muted">{openLabel}</button>}
-            {onCopyLink && <button type="button" onClick={onCopyLink} className="inline-flex h-6 items-center border px-2 text-[11px] hover:bg-muted">copy link</button>}
+            {copyLink && <CopyAction value={copyLink} onCopied={onCopied}>copy link</CopyAction>}
             <button type="button" onClick={close} aria-label="close the inspector" className="inline-flex h-6 w-6 items-center justify-center text-muted-foreground hover:text-foreground">
               <X aria-hidden className="h-3.5 w-3.5" />
             </button>

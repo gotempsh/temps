@@ -43,3 +43,5 @@ export { ToolRow, Proposal, Provenance, StreamBlock, AgentQuestion, AgentSources
 /* Inspect a ledger row beside the list: a tool screen inspects in a panel,
    a record is a page. See design-system/docs/design-system-handoff.md §6. */
 export { Inspector, type InspectorAnchor } from './inspector'
+/* A copy answers on the control it was pressed on. See notifications.md. */
+export { CopyAction, useCopy, CopyIcon, COPY_HOLD_MS, type CopyState } from './copy'

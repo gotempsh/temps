@@ -14,6 +14,7 @@ Components: `StatusLine` / `AttentionHost`, `Callout`, the sandbox's
 | --- | --- | --- | --- | --- | --- |
 | A verdict about the page the reader is on | `StatusLine` (portals into the header's attention slot; inline outside a shell) | While the page is open; recomputed on every load | `ok` `warn` `error` `idle` `sampled` | One `Phrase`, on the thing to act on | `× billing-worker is failing health checks.` with `+1 warning` |
 | A fault or a warning that belongs to one thing on the page | `Callout`, inline directly above what it applies to | Until it is fixed; it is state, not an event | `error` `warn`; `ok` only when it carries proof | One action button, right of the text | `× the git connection to github/acme expired` above the deployments ledger, with `reconnect` |
+| An answer the pressed control can give itself: copied, saving…, noted | The control (`CopyAction`, `Button busy`, an agent's answer actions) | ~2s, then the verb again | `ok`, or red for a failure | No; it is the answer | `copy link` → `✓ copied` on the same button |
 | The result of an action the reader just took | Toast (`notify()`) | ~6s, auto-dismiss, stackable | `ok` `warn` `err` | An undo, and never the only one | `ok · api-gateway deploying · dep_93a` |
 | Something that happened while the reader was elsewhere | The bell / `AttentionHost`, counted by state | Until read | `error` and `warn` counted; `ok` is the quiet glyph | Each entry links to its page | `× 2 ◐ 1` in the header, opening to one line per item |
 | A decision that must be made before anything else happens | `EchoDialog` | Until answered | Red only when the loss is irreversible | The action is the whole point | `Remove mail.acme.sh` — typed echo, then three steps |
@@ -21,6 +22,8 @@ Components: `StatusLine` / `AttentionHost`, `Callout`, the sandbox's
 ## Rules
 
 - One surface per message. Never a toast and a Callout for the same event.
+- Every action answers, where the reader is looking. The eye is on the control that was pressed, so an answer that fits on it goes on it: `copied`, `saving…`, `noted`. A toast is for a result that lives elsewhere (a deploy that started on another page, a row that is now gone), not for what the button could have said. A press that changes nothing visible is an unwired control (brand §6).
+- A copy is `CopyAction`. It writes the clipboard, says `copied` on the button for two seconds, and says `couldn't copy` in red with the reason on hover when the clipboard is unavailable (plain http on a LAN address has no `navigator.clipboard`). Never `notify('ok', 'link copied')`: the toast lands in a corner and says copied whether or not anything reached the clipboard, which is discovered later by pasting the wrong thing.
 - A fault that persists is a Callout. A toast that has to be read is a bug: it will be gone before the reader looks up.
 - Write a toast as state · headline · fact: `ok`, `settings saved`, `applies to emails sent from now on`.
 - Keep the headline to six words or fewer and name the object in it: `api-gateway deploying · dep_93a`, never `Success!`.

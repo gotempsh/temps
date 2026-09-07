@@ -85,7 +85,7 @@ function masks(page: Page) {
  * `<section id>` children, which are not library components.
  */
 const BLOCKS: readonly string[] = [
-  'status', 'num', 'page-state', 'button-busy', 'kbd', 'echo', 'chart', 'ledger', 'inspector', 'detail',
+  'status', 'num', 'page-state', 'button-busy', 'copy-action', 'kbd', 'echo', 'chart', 'ledger', 'inspector', 'detail',
   'picker', 'settings', 'mark', 'breakdown', 'callout', 'strip', 'trace', 'logs',
   // The blocks files (src/sections/blocks/), mounted here and in /guide.
   'form-field', 'form-validation', 'form-datetime', 'form-range-schedule', 'form-disabled',

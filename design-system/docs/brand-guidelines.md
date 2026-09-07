@@ -308,6 +308,12 @@ the same way every time.
   An action does something: copy, deploy, back up, resolve. A facet is
   somewhere to go, and it is already in the tab row; a button that only
   switches tabs is the same door drawn twice.
+- **Every action answers.** A press the reader cannot see the result of
+  is indistinguishable from a press that did nothing, and the reader presses
+  again. The answer goes where the eye already is: on the control (`copied`,
+  `saving…`), and only in a toast when the result lives on another screen.
+  A copy that toasts "copied" from a corner, without having written the
+  clipboard, is the pattern this rule exists to end.
 - **A drawn control is a wired control.** A filter box, a Segmented, a link
   or a button that cannot change anything is a lie the page tells with a
   straight face, and the reader spends their trust on it before they find

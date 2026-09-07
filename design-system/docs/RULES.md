@@ -69,6 +69,7 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - `pl-*` / `pr-*` / `left-*` / `right-*` / `text-left` in layout, and any fixed-width text container.
 - A toast for a fault that persists. If it has to be read, it is a Callout.
 - A toast and a Callout for the same event. A red dot with no count.
+- A toast for a copy, or any answer the pressed control could have given itself. A button that does something and says nothing.
 - A disabled control with no reason beside it. A save button disabled because the form is invalid.
 - Validation on every keystroke, before the field has ever been left.
 - A calendar as the only way to enter a date. A time with no zone beside it.
@@ -214,6 +215,8 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 ## Notifications
 
 - One surface per message: verdict → `StatusLine`; fault in context → `Callout`; result of an action → toast; missed while away → the bell; blocking decision → `EchoDialog`.
+- Every action answers, and it answers where the reader is looking. A control that says what it did (`copied`, `saving…`, `noted`) answers on itself; only an action whose result is elsewhere (a deploy started, a row removed) gets a toast. A press with no answer is an unwired control.
+- A copy is `CopyAction`: it writes the clipboard, says `copied` on the button for two seconds, or `couldn't copy` in red with the reason. Never `notify('ok', 'copied')`: a toast lands in a corner and says copied whether or not anything was.
 - Write a toast as state · headline · fact, six words or fewer, naming the object: `api-gateway deploying · dep_93a`.
 - Use `ok` `warn` `error` and their glyphs (● ◐ ×) and no other severity words.
 - Count unread by state in the bell, with a number. Quiet is one green glyph and nothing else.

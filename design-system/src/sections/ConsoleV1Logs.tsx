@@ -10,7 +10,7 @@ import {
   Phrase, Picker, ProjectMark, RangePicker, Section, Segmented, Sparkline, Status, StatusLine, TimeChart, Waterfall, worst,
   fmtAbsolute, fmtCount, fmtNum, fmtRelative,
   type BreakdownRow, type KV, type LedgerColumn, type LedgerRow, type LogLine, type Range, type Span as VizSpan, type State, type TimePoint, type TimeRange,
-  Inspector, type InspectorAnchor,
+  Inspector, type InspectorAnchor, CopyAction,
 } from '@/components/op'
 import { checkoutTrace, type Notify, type Plan } from './ConsoleV1Observe'
 import { useFresh } from './console-fresh'
@@ -854,7 +854,7 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
           </Drop>
         </div>
       )}
-      <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => notify('ok', 'query copied', writeQuery(tokens, text) || 'no tokens: everything in the window')}><Copy /> copy query</Button>
+      <CopyAction className="h-7 gap-1.5 px-2.5 text-xs" value={() => writeQuery(tokens, text)}><Copy aria-hidden className="h-3.5 w-3.5" /> copy query</CopyAction>
       <div className="relative">
         <button ref={saveBtn} type="button" onClick={() => setSaveOpen((o) => !o)} aria-expanded={saveOpen} className="inline-flex h-7 items-center gap-1.5 border px-2 text-xs hover:bg-muted">save view</button>
         <Drop anchor={saveBtn} open={saveOpen} width={320} label="save this query">
@@ -953,7 +953,7 @@ export function LogsScreen({ go, dense, notify, plan, preset }: { go: (v: string
             meta={`${fmtAbsolute(inspectLine.ts, { tz: ZONE, seconds: true })} · ${inspectLine.deploy}`}
             anchors={LOG_ANCHORS}
             onOpen={() => go(`log:${inspectLine.id}`)}
-            onCopyLink={() => notify('ok', 'link copied', `?p=log:${inspectLine.id}`)}
+            copyLink={`${window.location.origin}${window.location.pathname}?p=log:${inspectLine.id}`}
             onClose={() => setInspect(null)}
             returnFocus={() => document.getElementById(`row-${inspectLine.id}`)}
           >
@@ -1151,7 +1151,7 @@ export function LogRecord({ id, go, notify }: { id: string; go: (v: string) => v
       status={verdict}
       lede={<Lede state={LEVEL_STATE[l.level]} word={l.level} facts={facts}>{l.source} line, {fmtAbsolute(l.ts, { tz: ZONE, seconds: true })}</Lede>}
       actions={<>
-        <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => notify('ok', 'line copied', l.id)}><Copy /> copy line</Button>
+        <CopyAction className="h-7 gap-1.5 px-2.5 text-xs" value={`${fmtAbsolute(l.ts, { tz: ZONE, seconds: true })} ${l.level} ${l.service} ${l.msg}`}><Copy aria-hidden className="h-3.5 w-3.5" /> copy line</CopyAction>
         {l.trace && <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => go(`trace:${l.trace}`)}><Waypoints /> open in trace</Button>}
         <Button size="sm" className="op-primary h-7 text-xs" onClick={() => notify('ok', 'alert created', `level:error service:${l.service} · notifies #ops · remove it on Settings › Alerts`)}><Bell /> create alert from this query</Button>
       </>}

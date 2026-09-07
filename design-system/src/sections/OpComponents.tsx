@@ -19,6 +19,7 @@ import {
 // so it is reached by path. Swap this for `@/components/op` the moment the
 // barrel carries it — nothing else about the block changes.
 import { Inspector, type InspectorAnchor } from '../../../web/packages/op/src/inspector'
+import { CopyAction } from '../../../web/packages/op/src/copy'
 import { BRANCHES } from './ConsoleV1'
 // The five blocks files are the live half of docs/{forms,notifications,content,
 // data-viz,motion,icons}.md. The guide mounts the same components section by
@@ -102,6 +103,7 @@ const TOC = [
   ['num', 'Num · Metric'],
   ['page-state', 'PageState'],
   ['button-busy', 'Button · busy'],
+  ['copy-action', 'CopyAction'],
   ['kbd', 'Kbd'],
   ['echo', 'EchoDialog'],
   ['chart', 'TimeChart · RangePicker'],
@@ -282,7 +284,8 @@ function InspectorDemo() {
         meta={row.meta}
         anchors={ANCHORS}
         onOpen={() => setLog(`open ${row.id} · the full record page`)}
-        onCopyLink={() => setLog(`link to ${row.id} copied`)}
+        copyLink={`${window.location.origin}/op-components?inspect=${row.id}`}
+        onCopied={() => setLog(`link to ${row.id} on the clipboard · the control said so, not a toast`)}
         onClose={() => setOpen(null)}
         returnFocus={() => rowRefs.current[row.id]}
       >
@@ -453,6 +456,32 @@ export function OpComponentsPage() {
             </Demo>
           </Block>
 
+          <Block id="copy-action" title="CopyAction" api={`<CopyAction value={link}>
+  <LinkIcon /> copy link
+</CopyAction>
+
+// value may be a function, built at press time
+<CopyAction value={() => writeQuery(tokens)}>copy query</CopyAction>`}
+            rule={<>
+              <p>
+                A copy answers <em>on the control that was pressed</em>: “copied” for two seconds, or “couldn't copy” in red
+                with the reason on hover. The eye is already on the button; a toast lands in a corner the reader is not
+                looking at, and it says “copied” whether or not anything reached the clipboard.
+              </p>
+              <Rule state="ok">The idle label sets the width and stays in the layout invisibly while the answer shows, so the row never moves.</Rule>
+              <Rule state="ok">A failure is never dressed as a success. Plain http on a LAN address has no <code>navigator.clipboard</code>; the control says so, in red, and the reader selects the text instead.</Rule>
+              <Rule state="ok">The answer is a polite live region, so a screen reader hears “copied” without the focus moving.</Rule>
+              <Rule state="error">A toast for a copy. <code>notify('ok', 'link copied')</code> is the control’s job, done in the wrong place.</Rule>
+            </>}>
+            <Demo label="press one · the control answers in place">
+              <div className="flex flex-wrap items-center gap-3">
+                <CopyAction value={`${window.location.origin}/op-components#copy-action`}><LinkIcon aria-hidden className="h-3 w-3" /> copy link</CopyAction>
+                <CopyAction className="h-7 gap-1.5 px-2.5 text-xs" value={() => `level:error service:billing-worker since:${new Date().toISOString().slice(0, 10)}`}><Search aria-hidden className="h-3.5 w-3.5" /> copy query</CopyAction>
+                <span className="font-mono text-[11px] text-muted-foreground">copied · 2s · back to the verb</span>
+              </div>
+            </Demo>
+          </Block>
+
           <Block id="kbd" title="Kbd" api={`<Kbd keys={['⌘', '⏎']} />   ⌘⏎ on macOS, Ctrl⏎ elsewhere
 <Kbd keys="j" />`}
             rule={<><p>Key badge, platform-aware. Lives inside primary buttons, in ledger footers, next to inputs. Always an accelerator, never the only entry point.</p></>}>
@@ -520,7 +549,7 @@ rows={[{ id, state, icon: <Box />, cells, mobile, onOpen }]}   // icon = the row
           <Block id="inspector" title="Inspector" api={`<Inspector open={row} onClose={() => setOpen(null)}
   state="error" word="error" title="health check GET /healthz timed out"
   meta="billing-worker · production · 31m ago"
-  actions={{ onOpen, onCopyLink }}
+  onOpen={openRecord} copyLink={link}   // the control copies and says "copied" itself
   panes={[{ id: 'fields', title: 'Fields' }, { id: 'trace' }, { id: 'request' }, { id: 'context' }]}>
   <Section title="Fields">…</Section>
 </Inspector>

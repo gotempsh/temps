@@ -773,6 +773,22 @@ rows })` is the run as reference facts — model · workspace · permission mode
 context with its percent · checkpoints, plus whatever else this run needs
 stated (tools, proposals, cost).
 
+### CopyAction
+
+The copy control. `value` is the string or a function that builds it at press
+time (a query from the current tokens). It writes the clipboard itself and
+answers **on the button**: `✓ copied` for two seconds, then the verb again; or
+`× couldn't copy` in red with the reason as the title when the clipboard is
+unavailable (plain http on a LAN address has no `navigator.clipboard`; the
+fallback selection copy can refuse too). The idle label stays in the layout
+invisibly under the answer so the width never moves; the answer is a polite
+live region so a screen reader hears it without the focus moving. Pass the
+row's sizing classes (`h-7 text-xs`); the border, hover and states are its
+own. `useCopy(value)` is the hook underneath, for a control that is not a
+button (the name badge on a record title). A copy never toasts.
+
+---
+
 ### Inspector
 
 The panel that reads one row **beside** the list. ~520px at `xl`, where it
@@ -781,7 +797,8 @@ overlay sheet with a scrim; below md it is full screen. An ink border on its
 left edge, no card and no shadow — it is a region of the page, not a thing
 floating over it. The header is state glyph + word · the title as a mono id ·
 the meta (the time, with the deploy id beside it) · `open` (go to the full
-record page), `copy link`, and `×`. The body is stacked `Section`s and **no
+record page), `copy link` (a `CopyAction`: it copies the row's address and
+says `copied` on itself), and `×`. The body is stacked `Section`s and **no
 tabs**, with a small in-panel toc row above them — `fields · trace · request ·
 context` — whose entries are anchors reachable with `1`–`4`.
 `role="complementary"` with an `aria-label`, and the title is

@@ -2,6 +2,11 @@
 
 ## 0.1.2
 
+- `CopyAction` and `useCopy`: a copy answers on the control that was pressed
+  (`✓ copied` for two seconds, `× couldn't copy` in red with the reason), never
+  in a toast. The idle label holds the width under the answer. `Inspector` takes
+  `copyLink` (the row's address) and copies it itself; `onCopyLink` is gone,
+  `onCopied` fires after a successful copy.
 - Scrollbars belong to the skin: thin, square, ink at 30% on a transparent
   track (55% under the pointer), the document scrollbar included when the
   skin owns the page; sideways strips (`.op-scroll-x`) show no bar.
