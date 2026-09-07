@@ -99,6 +99,18 @@ impl From<EmailError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            // The service layer (`ProviderService::list_provider_domains`)
+            // is expected to catch this and turn it into a typed
+            // `supported: false` response instead of propagating it here —
+            // present only as a defensive fallback so an unhandled case
+            // still fails loud with an accurate status instead of a bare
+            // 500.
+            EmailError::UnsupportedOperation { .. } => {
+                problemdetails::new(StatusCode::NOT_IMPLEMENTED)
+                    .with_title("Operation Not Supported")
+                    .with_detail(error.to_string())
+            }
+
             EmailError::Database(_)
             | EmailError::ProviderError(_)
             | EmailError::ProviderDeliveryUnknown(_)

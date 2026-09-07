@@ -10,7 +10,8 @@ use tracing::{debug, error};
 
 use super::traits::{
     DnsRecord, DnsRecordStatus, DomainIdentity, DomainIdentityDetails, EmailProvider,
-    EmailProviderType, SendEmailRequest, SendEmailResponse, VerificationStatus,
+    EmailProviderType, ProviderDomainIdentity, SendEmailRequest, SendEmailResponse,
+    VerificationStatus,
 };
 use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
@@ -195,6 +196,33 @@ struct ScalewayDomainResponse {
     last_error: Option<String>,
     /// Ready-to-publish DNS records. Present on all current API responses.
     records: Option<ScalewayDomainRecords>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScalewayListDomainsResponse {
+    domains: Vec<ScalewayDomainResponse>,
+}
+
+/// Maps a single domain from Scaleway's list response to the provider-agnostic
+/// summary type. Pure and free of I/O so it's unit-testable without a live
+/// Scaleway connection — see the `send()` status-classification tests below
+/// for the same pattern.
+fn scaleway_domain_to_identity(domain: ScalewayDomainResponse) -> ProviderDomainIdentity {
+    let status = match domain.status.as_str() {
+        "checked" | "verified" => VerificationStatus::Verified,
+        "pending" | "unchecked" => VerificationStatus::Pending,
+        "invalid" => VerificationStatus::Failed(
+            domain
+                .last_error
+                .unwrap_or_else(|| "DNS verification failed".to_string()),
+        ),
+        _ => VerificationStatus::NotStarted,
+    };
+    ProviderDomainIdentity {
+        domain: domain.name,
+        provider_identity_id: domain.id,
+        status,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +841,49 @@ impl EmailProvider for ScalewayProvider {
     fn provider_type(&self) -> EmailProviderType {
         EmailProviderType::Scaleway
     }
+
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+        debug!("Listing Scaleway domains for project {}", self.project_id);
+
+        // A single page is enough for an interactive "pick a domain to
+        // import" picker — self-hosted TEM projects registering more than
+        // 100 domains are not the case this UI is built for, and the
+        // alternative (looping every page up front) risks an unbounded
+        // number of requests for an operation triggered on every page load.
+        let response = self
+            .client
+            .get(self.api_url("/domains"))
+            .query(&[
+                ("project_id", self.project_id.as_str()),
+                ("page_size", "100"),
+            ])
+            .header("X-Auth-Token", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| EmailError::Scaleway(format!("Failed to list domains: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(EmailError::Scaleway(format!(
+                "Failed to list domains ({}): {}",
+                status, body
+            )));
+        }
+
+        let list_response: ScalewayListDomainsResponse = response.json().await.map_err(|e| {
+            EmailError::Scaleway(format!("Failed to parse domain list response: {}", e))
+        })?;
+
+        Ok(list_response
+            .domains
+            .into_iter()
+            .map(scaleway_domain_to_identity)
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1047,5 +1118,70 @@ mod tests {
         let deserialized: ScalewayCredentials = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.api_key, creds.api_key);
         assert_eq!(deserialized.project_id, creds.project_id);
+    }
+
+    // ── scaleway_domain_to_identity ──────────────────────────────────────────
+
+    fn domain_response(status: &str) -> ScalewayDomainResponse {
+        ScalewayDomainResponse {
+            id: "12345678-1234-1234-1234-123456789012".to_string(),
+            name: "example.com".to_string(),
+            status: status.to_string(),
+            spf_config: None,
+            dkim_config: None,
+            last_error: None,
+            records: None,
+        }
+    }
+
+    #[test]
+    fn scaleway_domain_to_identity_maps_checked_to_verified() {
+        let identity = scaleway_domain_to_identity(domain_response("checked"));
+        assert_eq!(identity.domain, "example.com");
+        assert_eq!(
+            identity.provider_identity_id,
+            "12345678-1234-1234-1234-123456789012"
+        );
+        assert!(matches!(identity.status, VerificationStatus::Verified));
+    }
+
+    #[test]
+    fn scaleway_domain_to_identity_maps_unchecked_to_pending() {
+        let identity = scaleway_domain_to_identity(domain_response("unchecked"));
+        assert!(matches!(identity.status, VerificationStatus::Pending));
+    }
+
+    #[test]
+    fn scaleway_domain_to_identity_maps_invalid_to_failed_with_reason() {
+        let mut response = domain_response("invalid");
+        response.last_error = Some("SPF record missing".to_string());
+
+        let identity = scaleway_domain_to_identity(response);
+
+        match identity.status {
+            VerificationStatus::Failed(reason) => assert_eq!(reason, "SPF record missing"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scaleway_list_domains_response_deserializes() {
+        let json = r#"{
+            "domains": [
+                {
+                    "id": "12345678-1234-1234-1234-123456789012",
+                    "name": "example.com",
+                    "status": "checked",
+                    "spf_config": null,
+                    "dkim_config": null,
+                    "last_error": null
+                }
+            ],
+            "total_count": 1
+        }"#;
+
+        let parsed: ScalewayListDomainsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.domains.len(), 1);
+        assert_eq!(parsed.domains[0].name, "example.com");
     }
 }

@@ -194,6 +194,20 @@ pub struct SendEmailResponse {
 /// Default MAIL FROM subdomain used for split architecture
 pub const DEFAULT_MAIL_FROM_SUBDOMAIN: &str = "send";
 
+/// Summary of a domain identity already registered on the provider's side,
+/// returned by `list_identities` for populating an "import existing domain"
+/// picker.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderDomainIdentity {
+    /// The domain name as registered with the provider
+    pub domain: String,
+    /// Provider-internal identity identifier (e.g. Scaleway's domain UUID;
+    /// SES uses the domain name itself)
+    pub provider_identity_id: String,
+    /// The provider's current verification status for this domain
+    pub status: VerificationStatus,
+}
+
 /// Email provider trait for abstracting different email services
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
@@ -241,6 +255,17 @@ pub trait EmailProvider: Send + Sync {
 
     /// Get the provider type
     fn provider_type(&self) -> EmailProviderType;
+
+    /// List domain identities already registered on the provider's side, to
+    /// populate an "import existing domain" picker instead of requiring the
+    /// operator to type the domain name (and, for Scaleway, its internal
+    /// UUID) by hand.
+    ///
+    /// Returns `Err(EmailError::UnsupportedOperation { .. })` for providers
+    /// with no domain-management API to list against (SMTP) — callers must
+    /// treat that as "this provider type can never support the picker", not
+    /// a transient failure worth retrying, and fall back to manual entry.
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError>;
 }
 
 #[cfg(test)]

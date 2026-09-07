@@ -5,8 +5,8 @@
 
 use crate::providers::{EmailProviderType, SmtpEncryption};
 use crate::services::{
-    DomainService, EmailService, ProviderService, TrackingService, TrackingSetupService,
-    ValidationService,
+    DomainService, EmailService, ListProviderDomainsResult, ProviderService, TrackingService,
+    TrackingSetupService, ValidationService,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -228,6 +228,55 @@ pub struct EmailProviderResponse {
     pub created_at: String,
     #[schema(example = "2025-12-03T10:30:00Z")]
     pub updated_at: String,
+}
+
+/// A single domain identity already registered on the provider's side,
+/// offered for import.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderDomainIdentityResponse {
+    #[schema(example = "example.com")]
+    pub domain: String,
+    #[schema(example = "12345678-1234-1234-1234-123456789012")]
+    pub provider_identity_id: String,
+    /// The provider's current verification status for this domain
+    /// ("verified", "pending", "failed", "not_started", "temporary_failure")
+    #[schema(example = "verified")]
+    pub status: String,
+}
+
+impl From<crate::providers::ProviderDomainIdentity> for ProviderDomainIdentityResponse {
+    fn from(identity: crate::providers::ProviderDomainIdentity) -> Self {
+        Self {
+            domain: identity.domain,
+            provider_identity_id: identity.provider_identity_id,
+            status: identity.status.to_string(),
+        }
+    }
+}
+
+/// Domains discoverable on a provider's side for the "import existing
+/// domain" picker.
+///
+/// `supported: false` means this provider type has no domain-listing API at
+/// all (SMTP) — the UI must fall back to manual domain entry rather than
+/// treat it as an error to retry. `error` is set when `supported` is `true`
+/// but the live fetch still failed (network, revoked credentials); the same
+/// manual-entry fallback applies, but it's worth surfacing as a warning.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListProviderDomainsResponse {
+    pub supported: bool,
+    pub domains: Vec<ProviderDomainIdentityResponse>,
+    pub error: Option<String>,
+}
+
+impl From<ListProviderDomainsResult> for ListProviderDomainsResponse {
+    fn from(result: ListProviderDomainsResult) -> Self {
+        Self {
+            supported: result.supported,
+            domains: result.domains.into_iter().map(Into::into).collect(),
+            error: result.error,
+        }
+    }
 }
 
 /// Live status of the SES event-tracking pipeline for one provider.

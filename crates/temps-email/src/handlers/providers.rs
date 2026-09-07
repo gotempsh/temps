@@ -26,8 +26,8 @@ use super::audit::{
 };
 use super::types::{
     AppState, CreateEmailProviderRequest, EmailProviderResponse, EmailProviderTypeRoute,
-    EmailTrackingSetupResponse, EmailTrackingStatusResponse, TestEmailRequest, TestEmailResponse,
-    UpdateEmailProviderRequest,
+    EmailTrackingSetupResponse, EmailTrackingStatusResponse, ListProviderDomainsResponse,
+    TestEmailRequest, TestEmailResponse, UpdateEmailProviderRequest,
 };
 use crate::providers::{EmailProviderType, ScalewayCredentials, SesCredentials, SmtpCredentials};
 use crate::services::{CreateProviderRequest, ProviderCredentials, UpdateProviderRequest};
@@ -46,6 +46,10 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .delete(delete_email_provider),
         )
         .route("/email-providers/{id}/test", post(test_provider))
+        .route(
+            "/email-providers/{id}/discoverable-domains",
+            get(list_discoverable_domains),
+        )
         .route(
             "/email-providers/{id}/tracking/status",
             get(get_email_tracking_status),
@@ -300,6 +304,62 @@ pub async fn get_email_provider(
     };
 
     Ok(Json(response))
+}
+
+/// List domain identities already registered on a provider's side, for
+/// populating an "import existing domain" picker instead of requiring the
+/// operator to type the domain name (and, for Scaleway, its internal UUID)
+/// by hand.
+///
+/// Always returns `200`, even when the provider type has no domain-listing
+/// API (SMTP) or the live fetch failed — `supported: false` or a non-null
+/// `error` signal the caller to fall back to manual entry instead of
+/// treating this as a hard failure. Only a genuine failure to resolve the
+/// provider itself (not found, undecryptable credentials) returns an error
+/// status.
+#[utoipa::path(
+    tag = "Email Providers",
+    get,
+    path = "/email-providers/{id}/discoverable-domains",
+    responses(
+        (status = 200, description = "Discoverable domains (see `supported`/`error` for fallback state)", body = ListProviderDomainsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Provider ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_discoverable_domains(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailProvidersRead);
+
+    let result = state
+        .provider_service
+        .list_provider_domains(id)
+        .await
+        .map_err(|e| match e {
+            crate::EmailError::ProviderNotFound(_) => {
+                not_found().detail("Provider not found").build()
+            }
+            e => {
+                error!(
+                    "Failed to list discoverable domains for provider {}: {}",
+                    id, e
+                );
+                internal_server_error()
+                    .detail(format!("Failed to list discoverable domains: {}", e))
+                    .build()
+            }
+        })?;
+
+    Ok(Json(ListProviderDomainsResponse::from(result)))
 }
 
 /// Update an email provider

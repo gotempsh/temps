@@ -15,8 +15,8 @@ use tracing::{debug, error, info};
 use crate::errors::EmailError;
 use crate::providers::{
     verify_scaleway_credentials, verify_ses_credentials, EmailProvider, EmailProviderType,
-    ScalewayCredentials, ScalewayProvider, SesCredentials, SesProvider, SmtpCredentials,
-    SmtpProvider,
+    ProviderDomainIdentity, ScalewayCredentials, ScalewayProvider, SesCredentials, SesProvider,
+    SmtpCredentials, SmtpProvider,
 };
 
 /// Service for managing email providers
@@ -73,6 +73,42 @@ pub struct UpdateProviderRequest {
 pub struct UpdateProviderOutcome {
     pub provider: email_providers::Model,
     pub changed_fields: Vec<String>,
+}
+
+/// Result of listing a provider's registered domains for an "import
+/// existing domain" picker. See `ProviderService::list_provider_domains`
+/// for how `supported` and `error` are distinguished.
+#[derive(Debug, Clone)]
+pub struct ListProviderDomainsResult {
+    pub supported: bool,
+    pub domains: Vec<ProviderDomainIdentity>,
+    pub error: Option<String>,
+}
+
+/// Call `list_identities` and fold "this provider type can't list domains"
+/// vs. "listing is supported but this attempt failed" into the typed
+/// result. Free function over `&dyn EmailProvider` (rather than a
+/// `ProviderService` method) so it's unit-testable against
+/// `MockEmailProvider` without a live provider connection — mirroring
+/// `refresh_identity_details` in `domain_service.rs`.
+async fn collect_provider_domains(provider: &dyn EmailProvider) -> ListProviderDomainsResult {
+    match provider.list_identities().await {
+        Ok(domains) => ListProviderDomainsResult {
+            supported: true,
+            domains,
+            error: None,
+        },
+        Err(EmailError::UnsupportedOperation { .. }) => ListProviderDomainsResult {
+            supported: false,
+            domains: Vec::new(),
+            error: None,
+        },
+        Err(e) => ListProviderDomainsResult {
+            supported: true,
+            domains: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
 }
 
 /// Result of sending a test email
@@ -510,6 +546,29 @@ impl ProviderService {
                 Ok(Box::new(smtp_provider))
             }
         }
+    }
+
+    /// List domain identities registered on a provider's side, for
+    /// populating an "import existing domain" picker.
+    ///
+    /// Never returns `Err` for "this provider type can't list domains" or
+    /// "the live fetch failed" -- both are folded into the typed result so
+    /// callers (the frontend) can render an honest fallback instead of a
+    /// bare error: `supported: false` means this provider type has no
+    /// listing API at all (SMTP) and manual entry is the only option;
+    /// `error: Some(_)` means listing is supported but this particular
+    /// attempt failed (network, revoked credentials), which is also a
+    /// manual-entry fallback but worth surfacing as a warning rather than
+    /// silently pretending nothing is available. Only a genuine failure to
+    /// resolve the provider itself (not found, undecryptable credentials)
+    /// still propagates as `Err`.
+    pub async fn list_provider_domains(
+        &self,
+        provider_id: i32,
+    ) -> Result<ListProviderDomainsResult, EmailError> {
+        let provider = self.get(provider_id).await?;
+        let provider_instance = self.create_provider_instance(&provider).await?;
+        Ok(collect_provider_domains(provider_instance.as_ref()).await)
     }
 
     /// Send a test email to verify provider configuration
@@ -2228,6 +2287,105 @@ mod tests {
                 // Some LocalStack versions may not fully support SESv2
                 println!("Identity creation failed (may be expected): {}", e);
             }
+        }
+    }
+
+    // ── collect_provider_domains ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn collect_provider_domains_returns_domains_when_supported() {
+        let mock = crate::providers::MockEmailProvider::new().with_list_identities_response(vec![
+            ProviderDomainIdentity {
+                domain: "example.com".to_string(),
+                provider_identity_id: "example.com".to_string(),
+                status: crate::providers::VerificationStatus::Verified,
+            },
+        ]);
+
+        let result = collect_provider_domains(&mock).await;
+
+        assert!(result.supported);
+        assert!(result.error.is_none());
+        assert_eq!(result.domains.len(), 1);
+        assert_eq!(result.domains[0].domain, "example.com");
+    }
+
+    /// The picker's fallback path: a provider type with no listing API
+    /// (SMTP, mimicked here) must report `supported: false` with no error —
+    /// this is a permanent "not available for this provider type", not a
+    /// transient failure worth retrying or alarming the operator about.
+    #[tokio::test]
+    async fn collect_provider_domains_reports_unsupported_without_error() {
+        let mock = crate::providers::MockEmailProvider::new().with_list_identities_unsupported();
+
+        let result = collect_provider_domains(&mock).await;
+
+        assert!(!result.supported);
+        assert!(result.error.is_none());
+        assert!(result.domains.is_empty());
+    }
+
+    /// A supported provider whose live fetch still fails (network, revoked
+    /// credentials) must fall back the same way as "unsupported" — empty
+    /// domains, never an `Err` bubbling to the caller — but with `error` set
+    /// so the UI can show *why*, distinct from "this provider type can
+    /// never do this".
+    #[tokio::test]
+    async fn collect_provider_domains_falls_back_with_reason_on_failure() {
+        let result = collect_provider_domains(&FailingListProvider).await;
+
+        assert!(result.supported);
+        assert!(result.error.is_some());
+        assert!(result.domains.is_empty());
+    }
+
+    /// Minimal `EmailProvider` whose `list_identities` always fails with a
+    /// generic provider error (not `UnsupportedOperation`), to exercise the
+    /// "supported but this attempt failed" branch of `collect_provider_domains`.
+    struct FailingListProvider;
+
+    #[async_trait::async_trait]
+    impl EmailProvider for FailingListProvider {
+        async fn create_identity(
+            &self,
+            _domain: &str,
+        ) -> Result<crate::providers::DomainIdentity, EmailError> {
+            unimplemented!()
+        }
+        async fn verify_identity(
+            &self,
+            _domain: &str,
+            _provider_identity_id: Option<&str>,
+        ) -> Result<crate::providers::VerificationStatus, EmailError> {
+            unimplemented!()
+        }
+        async fn get_identity_details(
+            &self,
+            _domain: &str,
+            _provider_identity_id: Option<&str>,
+        ) -> Result<crate::providers::DomainIdentityDetails, EmailError> {
+            unimplemented!()
+        }
+        async fn delete_identity(
+            &self,
+            _domain: &str,
+            _provider_identity_id: Option<&str>,
+        ) -> Result<(), EmailError> {
+            unimplemented!()
+        }
+        async fn send(
+            &self,
+            _email: &crate::providers::SendEmailRequest,
+        ) -> Result<crate::providers::SendEmailResponse, EmailError> {
+            unimplemented!()
+        }
+        fn provider_type(&self) -> EmailProviderType {
+            EmailProviderType::Smtp
+        }
+        async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+            Err(EmailError::ProviderError(
+                "simulated network failure".to_string(),
+            ))
         }
     }
 }
