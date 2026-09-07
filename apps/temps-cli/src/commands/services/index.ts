@@ -771,6 +771,13 @@ async function showService(options: ShowOptions): Promise<void> {
   }
   keyValue('Created', new Date(service.created_at).toLocaleString())
   keyValue('Updated', new Date(service.updated_at).toLocaleString())
+  if (service.continuous_archive_s3_source_id != null) {
+    keyValue('Continuous archive S3 source', String(service.continuous_archive_s3_source_id))
+    if (service.continuous_archive_pinned_at) {
+      keyValue('  pinned at', new Date(service.continuous_archive_pinned_at).toLocaleString())
+    }
+    info('Change with: temps services repoint-continuous-archive-source --id <id> --s3-source <id>')
+  }
 
   if (details.current_parameters && Object.keys(details.current_parameters).length > 0) {
     newline()
