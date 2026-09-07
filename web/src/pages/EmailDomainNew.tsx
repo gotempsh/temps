@@ -4,11 +4,13 @@
 import {
   createEmailDomain as createEmailDomainSdk,
   importEmailDomain as importEmailDomainSdk,
+  listDiscoverableDomains as listDiscoverableDomainsSdk,
   listEmailProviders as listEmailProvidersSdk,
   type CreateEmailDomainRequest,
   type EmailDomainWithDnsResponse,
   type EmailProviderResponse,
   type ImportEmailDomainRequest,
+  type ListProviderDomainsResponse,
 } from '@/api/client'
 import { EmailProviderLogo, type EmailProviderType } from '@/components/ui/email-provider-logo'
 import { problemMessage } from '@/components/email/sharedUtils'
@@ -29,11 +31,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   Check,
@@ -41,6 +45,7 @@ import {
   Globe,
   Loader2,
   Plus,
+  Sparkles,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -125,6 +130,18 @@ async function listEmailProviders(): Promise<EmailProvider[]> {
     throw new Error(problemMessage(response.error, 'Failed to fetch email providers'))
   }
   return response.data ?? []
+}
+
+async function listDiscoverableDomains(
+  providerId: number
+): Promise<ListProviderDomainsResponse> {
+  const response = await listDiscoverableDomainsSdk({ path: { id: providerId } })
+  if (response.error || !response.data) {
+    throw new Error(
+      problemMessage(response.error, 'Failed to list domains from provider')
+    )
+  }
+  return response.data
 }
 
 // ============================================================================
@@ -306,6 +323,8 @@ function ConfigureStep({
   onProviderChange,
   onDomainChange,
   onProviderIdentityIdChange,
+  discoverableDomains,
+  isLoadingDiscoverableDomains,
 }: {
   mode: DomainMode
   providers: EmailProvider[]
@@ -316,9 +335,20 @@ function ConfigureStep({
   onProviderChange: (id: number) => void
   onDomainChange: (value: string) => void
   onProviderIdentityIdChange: (value: string) => void
+  discoverableDomains: ListProviderDomainsResponse | undefined
+  isLoadingDiscoverableDomains: boolean
 }) {
   const selectedProvider = providers.find((p) => p.id === providerId)
   const isScaleway = selectedProvider?.provider_type === 'scaleway'
+  const [manualEntry, setManualEntry] = useState(false)
+
+  const hasPickerOptions =
+    mode === 'import' &&
+    discoverableDomains?.supported === true &&
+    !discoverableDomains.error &&
+    discoverableDomains.domains.length > 0
+
+  const showPicker = mode === 'import' && hasPickerOptions && !manualEntry
 
   return (
     <Card>
@@ -367,61 +397,137 @@ function ConfigureStep({
           </p>
         </div>
 
-        {/* Domain input */}
-        <div className="space-y-2">
-          <Label htmlFor="domain-input">Domain</Label>
-          <Input
-            id="domain-input"
-            placeholder="send.example.com"
-            value={domain}
-            onChange={(e) => onDomainChange(e.target.value)}
-            className={errors.domain ? 'border-destructive' : ''}
-            autoComplete="off"
-          />
-          {errors.domain && (
-            <p className="text-sm text-destructive">{errors.domain}</p>
-          )}
-          <p className="text-sm text-muted-foreground">
-            {mode === 'create'
-              ? 'Use a subdomain (e.g., send.example.com) to isolate your email sending reputation and protect your primary domain.'
-              : 'The domain name as it appears in your email provider.'}
-          </p>
-        </div>
-
-        {/* Provider identity ID — import mode only */}
-        {mode === 'import' && (
+        {/* Domain — import mode with a discoverable list gets a searchable
+            picker that fills in both fields at once; everything else falls
+            back to manual entry. */}
+        {mode === 'import' && providerId !== undefined && isLoadingDiscoverableDomains ? (
           <div className="space-y-2">
-            <Label htmlFor="identity-id-input">
-              Provider identity ID{' '}
-              {isScaleway ? (
-                <span className="font-normal text-muted-foreground">
-                  (required for Scaleway)
-                </span>
-              ) : (
-                <span className="font-normal text-muted-foreground">
-                  (optional)
-                </span>
-              )}
-            </Label>
-            <Input
-              id="identity-id-input"
-              placeholder="12345678-1234-1234-1234-123456789012"
-              value={providerIdentityId}
-              onChange={(e) => onProviderIdentityIdChange(e.target.value)}
-              className={errors.provider_identity_id ? 'border-destructive' : ''}
-              autoComplete="off"
-            />
-            {errors.provider_identity_id && (
-              <p className="text-sm text-destructive">
-                {errors.provider_identity_id}
-              </p>
-            )}
+            <Label>Domain</Label>
+            <div className="h-10 animate-pulse rounded-md bg-muted" />
             <p className="text-sm text-muted-foreground">
-              {isScaleway
-                ? 'The domain UUID shown in the Scaleway console (Transactional Email → Domains). Required so Temps can look up the correct identity.'
-                : 'The provider-internal UUID for this domain identity. Required for Scaleway; not needed for SES (which uses the domain name for lookups).'}
+              Looking up domains already registered with this provider…
             </p>
           </div>
+        ) : showPicker ? (
+          <div className="space-y-2">
+            <Label htmlFor="domain-picker">Domain</Label>
+            <SearchableSelect
+              value={domain || undefined}
+              onValueChange={(value) => {
+                const match = discoverableDomains?.domains.find(
+                  (d) => d.domain === value
+                )
+                onDomainChange(value)
+                onProviderIdentityIdChange(match?.provider_identity_id ?? '')
+              }}
+              options={(discoverableDomains?.domains ?? []).map((d) => ({
+                value: d.domain,
+                label: d.domain,
+                keywords: d.status,
+              }))}
+              placeholder="Select a domain from your provider"
+              searchPlaceholder="Search domains..."
+              emptyText="No matching domain."
+            />
+            {errors.domain && (
+              <p className="text-sm text-destructive">{errors.domain}</p>
+            )}
+            <p className="text-sm text-muted-foreground">
+              <Sparkles className="mr-1 inline size-3.5" />
+              Fetched from your provider — selecting a domain also fills in its
+              identity ID.{' '}
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:text-foreground"
+                onClick={() => setManualEntry(true)}
+              >
+                Enter manually instead
+              </button>
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="space-y-2">
+              <Label htmlFor="domain-input">Domain</Label>
+              <Input
+                id="domain-input"
+                placeholder="send.example.com"
+                value={domain}
+                onChange={(e) => onDomainChange(e.target.value)}
+                className={errors.domain ? 'border-destructive' : ''}
+                autoComplete="off"
+              />
+              {errors.domain && (
+                <p className="text-sm text-destructive">{errors.domain}</p>
+              )}
+              {mode === 'import' && discoverableDomains && !discoverableDomains.supported ? (
+                <p className="text-sm text-muted-foreground">
+                  {selectedProvider?.provider_type ?? 'This provider'} does not
+                  support listing registered domains — enter the domain name as
+                  it appears in your provider console.
+                </p>
+              ) : mode === 'import' && discoverableDomains?.error ? (
+                <p className="flex items-start gap-1.5 text-sm text-amber-600 dark:text-amber-500">
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                  Couldn't list domains from your provider ({discoverableDomains.error}).
+                  Enter the domain name manually below.
+                </p>
+              ) : mode === 'import' && hasPickerOptions && manualEntry ? (
+                <p className="text-sm text-muted-foreground">
+                  Entering manually.{' '}
+                  <button
+                    type="button"
+                    className="underline underline-offset-2 hover:text-foreground"
+                    onClick={() => setManualEntry(false)}
+                  >
+                    Pick from your provider's domains instead
+                  </button>
+                </p>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  {mode === 'create'
+                    ? 'Use a subdomain (e.g., send.example.com) to isolate your email sending reputation and protect your primary domain.'
+                    : 'The domain name as it appears in your email provider.'}
+                </p>
+              )}
+            </div>
+
+            {/* Provider identity ID — import mode only */}
+            {mode === 'import' && (
+              <div className="space-y-2">
+                <Label htmlFor="identity-id-input">
+                  Provider identity ID{' '}
+                  {isScaleway ? (
+                    <span className="font-normal text-muted-foreground">
+                      (required for Scaleway)
+                    </span>
+                  ) : (
+                    <span className="font-normal text-muted-foreground">
+                      (optional)
+                    </span>
+                  )}
+                </Label>
+                <Input
+                  id="identity-id-input"
+                  placeholder="12345678-1234-1234-1234-123456789012"
+                  value={providerIdentityId}
+                  onChange={(e) => onProviderIdentityIdChange(e.target.value)}
+                  className={errors.provider_identity_id ? 'border-destructive' : ''}
+                  autoComplete="off"
+                />
+                {errors.provider_identity_id && (
+                  <p className="text-sm text-destructive">
+                    {errors.provider_identity_id}
+                  </p>
+                )}
+                <p className="text-sm text-muted-foreground">
+                  {isScaleway
+                    ? 'The domain UUID shown in the Scaleway console (Transactional Email → Domains). Required so Temps can look up the correct identity.'
+                    : 'The provider-internal UUID for this domain identity. Required for Scaleway; not needed for SES (which uses the domain name for lookups).'}
+                </p>
+              </div>
+            )}
+          </>
         )}
       </CardContent>
     </Card>
@@ -549,6 +655,16 @@ export function EmailDomainNew() {
   })
   const isSelectedProviderScaleway =
     providers.find((p) => p.id === providerId)?.provider_type === 'scaleway'
+
+  // Discoverable-domains picker — only fetched in import mode, once a
+  // provider is chosen. Always resolves (never throws) per the endpoint's
+  // contract: `supported`/`error` drive the manual-entry fallback in
+  // ConfigureStep rather than an error boundary.
+  const { data: discoverableDomains, isLoading: isLoadingDiscoverableDomains } = useQuery({
+    queryKey: ['discoverable-domains', providerId],
+    queryFn: () => listDiscoverableDomains(providerId as number),
+    enabled: mode === 'import' && providerId !== undefined,
+  })
 
   const createMutation = useMutation({
     mutationFn: createEmailDomain,
@@ -778,6 +894,8 @@ export function EmailDomainNew() {
                         provider_identity_id: undefined,
                       }))
                     }}
+                    discoverableDomains={discoverableDomains}
+                    isLoadingDiscoverableDomains={isLoadingDiscoverableDomains}
                   />
                 )}
               </div>
