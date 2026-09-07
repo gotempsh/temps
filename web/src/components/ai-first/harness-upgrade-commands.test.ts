@@ -29,13 +29,13 @@ describe('harnessUpgradeCommands', () => {
     const codex = harnessUpgradeCommands('sbx_0123456789abcdef')[1]
 
     expect(codex.cliCommand).toBe(
-      `temps sandbox exec sbx_0123456789abcdef -- sh -lc 'BUN_INSTALL="$HOME/.bun" BUN_INSTALL_BIN="$HOME/.bun/bin" bun add -g @openai/codex@latest && codex --version'`
+      `bunx @temps-sdk/cli sandbox exec sbx_0123456789abcdef -- sh -lc 'BUN_INSTALL="$HOME/.bun" BUN_INSTALL_BIN="$HOME/.bun/bin" bun add -g @openai/codex@latest && codex --version'`
     )
   })
 
   test('builds the existing reattachable CLI shell command', () => {
     expect(sandboxShellCommand('sbx_0123456789abcdef')).toBe(
-      'temps sandbox shell sbx_0123456789abcdef'
+      'bunx @temps-sdk/cli sandbox shell sbx_0123456789abcdef'
     )
   })
 

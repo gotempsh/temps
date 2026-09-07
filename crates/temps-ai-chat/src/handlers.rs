@@ -31,6 +31,8 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -84,6 +86,9 @@ pub struct AppState {
     /// Derives the durable, Temps-owned directory mounted into an application
     /// harness sandbox. This never accepts a browser-supplied host path.
     pub application_workspaces: Arc<ApplicationWorkspaceService>,
+    /// Runtime workspace transfer/preview policy. Optional only for minimal
+    /// test/plugin wirings; production always supplies ConfigService.
+    pub config_service: Option<Arc<temps_config::ConfigService>>,
     /// Optional because minimal/test server wiring may omit the standalone
     /// sandbox plugin. Application preview links fail closed when absent.
     pub application_sandboxes: Option<Arc<temps_sandbox::SandboxService>>,
@@ -394,6 +399,10 @@ pub struct ApplicationWorkspaceDirectoryResponse {
 pub struct ApplicationWorkspaceFileContentResponse {
     pub path: String,
     pub content: Option<String>,
+    /// Base64-encoded raster image bytes when this file has a verified,
+    /// browser-safe image signature and is within the configured preview cap.
+    pub content_b64: Option<String>,
+    pub media_type: Option<String>,
     pub binary: bool,
     pub size_bytes: u64,
     pub truncated: bool,
@@ -472,13 +481,6 @@ pub struct WriteApplicationWorkspaceFilesRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WriteApplicationWorkspaceFilesResponse {
     pub written: usize,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DownloadWorkspaceFileResponse {
-    pub file_name: String,
-    pub contents_b64: String,
-    pub size_bytes: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -3202,16 +3204,82 @@ const WORKSPACE_DEFAULT_PAGE_SIZE: usize = 100;
 const WORKSPACE_MAX_PAGE_SIZE: usize = 200;
 const WORKSPACE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const WORKSPACE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST: usize = 32;
-const WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST: usize = 4 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
+const WORKSPACE_IMPORT_ABSOLUTE_MAX_FILES_PER_REQUEST: usize = 100;
+const WORKSPACE_IMPORT_ABSOLUTE_MAX_BYTES_PER_REQUEST: usize = 32 * MIB;
+const WORKSPACE_ABSOLUTE_MAX_BYTES: u64 = 2_048 * 1024 * 1024;
+const WORKSPACE_ABSOLUTE_MAX_ENTRIES: usize = 50_000;
+const WORKSPACE_ABSOLUTE_MAX_TEXT_PREVIEW_BYTES: usize = MIB;
+const WORKSPACE_ABSOLUTE_MAX_IMAGE_PREVIEW_BYTES: usize = 16 * MIB;
+const WORKSPACE_ABSOLUTE_MAX_DOWNLOAD_BYTES: usize = 32 * MIB;
 // The request carries file bytes as base64 plus bounded paths and JSON syntax.
 // Keep this route-specific limit above that encoded maximum while retaining a
 // small, explicit cap rather than inheriting Axum's 2 MiB JSON default.
-const WORKSPACE_IMPORT_BODY_LIMIT: usize = 6 * 1024 * 1024;
-const WORKSPACE_IMPORT_MAX_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
-const WORKSPACE_IMPORT_MAX_AGGREGATE_ENTRIES: usize = 5_000;
-const WORKSPACE_DOWNLOAD_MAX_BYTES: usize = 32 * 1024 * 1024;
+const WORKSPACE_IMPORT_BODY_LIMIT: usize = 46 * MIB;
 type WorkspaceFileWrite = (std::path::PathBuf, Vec<u8>, Option<u32>);
+
+async fn workspace_file_limits(
+    state: &AppState,
+) -> Result<temps_core::AiWorkspaceFileLimitsSettings, Problem> {
+    let Some(config) = &state.config_service else {
+        return Ok(temps_core::AiWorkspaceFileLimitsSettings::default());
+    };
+    config
+        .get_settings()
+        .await
+        .map(|settings| effective_workspace_file_limits(settings.ai_workspace_file_limits))
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Workspace File Policy Unavailable")
+                .with_detail(format!("Could not load the workspace file limits: {error}"))
+        })
+}
+
+fn effective_workspace_file_limits(
+    mut limits: temps_core::AiWorkspaceFileLimitsSettings,
+) -> temps_core::AiWorkspaceFileLimitsSettings {
+    limits.max_files_per_upload = limits
+        .max_files_per_upload
+        .min(WORKSPACE_IMPORT_ABSOLUTE_MAX_FILES_PER_REQUEST as u32);
+    limits.max_file_size_mb = limits.max_file_size_mb.min(32);
+    limits.max_upload_size_mb = limits.max_upload_size_mb.min(32);
+    limits.max_workspace_size_mb = limits.max_workspace_size_mb.min(2_048);
+    limits.max_workspace_entries = limits.max_workspace_entries.min(50_000);
+    limits.max_text_preview_kb = limits.max_text_preview_kb.min(1_024);
+    limits.max_image_preview_size_mb = limits.max_image_preview_size_mb.min(16);
+    limits.max_download_size_mb = limits.max_download_size_mb.min(32);
+    limits
+}
+
+fn require_workspace_file_policy_access(auth: &AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesRead);
+    deny_deployment_token!(auth);
+    Ok(())
+}
+
+#[utoipa::path(
+    get, tag = "AI Chat",
+    path = "/ai/workspace/file-limits",
+    operation_id = "get_workspace_file_limits",
+    summary = "Get effective AI workspace file limits",
+    description = "Returns the non-sensitive effective transfer and preview policy for the current workspace user.",
+    responses((status = 200, body = temps_core::AiWorkspaceFileLimitsSettings), (status = 401), (status = 403), (status = 500)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_workspace_file_limits(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<temps_core::AiWorkspaceFileLimitsSettings>, Problem> {
+    require_workspace_file_policy_access(&auth)?;
+    Ok(Json(workspace_file_limits(&state).await?))
+}
+
+fn mb_bytes(value: u32) -> usize {
+    usize::try_from(value)
+        .unwrap_or(usize::MAX / MIB)
+        .saturating_mul(MIB)
+}
 
 fn validate_workspace_import_path(path: &str) -> Result<(), Problem> {
     if path.is_empty()
@@ -3235,13 +3303,21 @@ fn validate_workspace_import_path(path: &str) -> Result<(), Problem> {
 
 fn decode_workspace_file_writes(
     request: WriteApplicationWorkspaceFilesRequest,
+    limits: &temps_core::AiWorkspaceFileLimitsSettings,
 ) -> Result<Vec<WorkspaceFileWrite>, Problem> {
-    if request.files.len() > WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST {
+    let max_files = usize::try_from(limits.max_files_per_upload)
+        .unwrap_or(WORKSPACE_IMPORT_ABSOLUTE_MAX_FILES_PER_REQUEST)
+        .min(WORKSPACE_IMPORT_ABSOLUTE_MAX_FILES_PER_REQUEST);
+    let max_file_bytes =
+        mb_bytes(limits.max_file_size_mb).min(WORKSPACE_IMPORT_ABSOLUTE_MAX_BYTES_PER_REQUEST);
+    let max_request_bytes =
+        mb_bytes(limits.max_upload_size_mb).min(WORKSPACE_IMPORT_ABSOLUTE_MAX_BYTES_PER_REQUEST);
+    if request.files.len() > max_files {
         return Err(Problem::from(
             temps_sandbox::error::SandboxError::Validation {
                 message: format!(
                     "workspace import accepts at most {} files per request",
-                    WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST
+                    max_files
                 ),
             },
         ));
@@ -3269,17 +3345,27 @@ fn decode_workspace_file_writes(
                 ),
             })
         })?;
+        if contents.len() > max_file_bytes {
+            return Err(Problem::from(
+                temps_sandbox::error::SandboxError::Validation {
+                    message: format!(
+                        "workspace file '{}' exceeds the configured {} byte file limit",
+                        file.path, max_file_bytes
+                    ),
+                },
+            ));
+        }
         total_bytes = total_bytes.checked_add(contents.len()).ok_or_else(|| {
             Problem::from(temps_sandbox::error::SandboxError::Validation {
                 message: "workspace import byte count overflowed".to_string(),
             })
         })?;
-        if total_bytes > WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST {
+        if total_bytes > max_request_bytes {
             return Err(Problem::from(
                 temps_sandbox::error::SandboxError::Validation {
                     message: format!(
                         "workspace import accepts at most {} bytes per request",
-                        WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST
+                        max_request_bytes
                     ),
                 },
             ));
@@ -3392,7 +3478,7 @@ pub async fn import_application_workspace_git(
     path = "/ai/applications/{application_public_id}/projects/{project_id}/workspace/files",
     operation_id = "write_application_workspace_files",
     summary = "Write a bounded batch of local files into an application project",
-    description = "Re-authorizes every linked project and writes at most 32 project-relative files and 4 MiB per request into the selected persistent workspace directory.",
+    description = "Re-authorizes every linked project and writes a configured, bounded batch of project-relative files into the selected persistent workspace directory.",
     params(
         ("application_public_id" = String, Path,),
         ("project_id" = i32, Path,),
@@ -3414,15 +3500,20 @@ pub async fn write_application_workspace_files(
     let (application, _sandbox_public_id) =
         application_workspace_sandbox(&state, &auth, &application_public_id).await?;
     let project = application_project(&application, project_id)?;
-    let entries = decode_workspace_file_writes(request)?;
+    let limits = workspace_file_limits(&state).await?;
+    let entries = decode_workspace_file_writes(request, &limits)?;
     let written = state
         .application_workspaces
         .store_project_files_bounded(
             &application.application.public_id,
             &project.slug,
             entries,
-            WORKSPACE_IMPORT_MAX_AGGREGATE_BYTES,
-            WORKSPACE_IMPORT_MAX_AGGREGATE_ENTRIES,
+            u64::try_from(mb_bytes(limits.max_workspace_size_mb))
+                .unwrap_or(WORKSPACE_ABSOLUTE_MAX_BYTES)
+                .min(WORKSPACE_ABSOLUTE_MAX_BYTES),
+            usize::try_from(limits.max_workspace_entries)
+                .unwrap_or(WORKSPACE_ABSOLUTE_MAX_ENTRIES)
+                .min(WORKSPACE_ABSOLUTE_MAX_ENTRIES),
         )
         .await
         .map_err(Problem::from)?;
@@ -3442,14 +3533,19 @@ async fn store_workspace_files(
     workspace_id: &str,
     request: WriteApplicationWorkspaceFilesRequest,
 ) -> Result<usize, Problem> {
-    let entries = decode_workspace_file_writes(request)?;
+    let limits = workspace_file_limits(state).await?;
+    let entries = decode_workspace_file_writes(request, &limits)?;
     state
         .application_workspaces
         .store_workspace_files_bounded(
             workspace_id,
             entries,
-            WORKSPACE_IMPORT_MAX_AGGREGATE_BYTES,
-            WORKSPACE_IMPORT_MAX_AGGREGATE_ENTRIES,
+            u64::try_from(mb_bytes(limits.max_workspace_size_mb))
+                .unwrap_or(WORKSPACE_ABSOLUTE_MAX_BYTES)
+                .min(WORKSPACE_ABSOLUTE_MAX_BYTES),
+            usize::try_from(limits.max_workspace_entries)
+                .unwrap_or(WORKSPACE_ABSOLUTE_MAX_ENTRIES)
+                .min(WORKSPACE_ABSOLUTE_MAX_ENTRIES),
         )
         .await
         .map_err(Problem::from)
@@ -3460,7 +3556,7 @@ async fn store_workspace_files(
     path = "/ai/applications/{application_public_id}/workspace/files",
     operation_id = "upload_application_workspace_files",
     summary = "Upload files into an application workspace",
-    description = "Writes at most 32 safe workspace-relative files and 4 MiB per request into the persistent workspace without waking compute.",
+    description = "Writes a configured, bounded batch of safe workspace-relative files into the persistent workspace without waking compute.",
     params(("application_public_id" = String, Path,)),
     request_body = WriteApplicationWorkspaceFilesRequest,
     responses((status = 200, body = WriteApplicationWorkspaceFilesResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
@@ -3506,7 +3602,7 @@ pub async fn upload_application_workspace_files(
     path = "/ai/workspace/files",
     operation_id = "upload_global_workspace_files",
     summary = "Upload files into the global AI workspace",
-    description = "Writes at most 32 safe workspace-relative files and 4 MiB per request into the user's persistent global workspace without waking compute.",
+    description = "Writes a configured, bounded batch of safe workspace-relative files into the user's persistent global workspace without waking compute.",
     request_body = WriteApplicationWorkspaceFilesRequest,
     responses((status = 200, body = WriteApplicationWorkspaceFilesResponse), (status = 400), (status = 401), (status = 403), (status = 413), (status = 500)),
     security(("bearer_auth" = []))
@@ -3540,21 +3636,51 @@ async fn workspace_file_download_response(
     state: &AppState,
     workspace_id: &str,
     path: String,
-) -> Result<DownloadWorkspaceFileResponse, Problem> {
-    let bytes = state
+) -> Result<Response, Problem> {
+    let limits = workspace_file_limits(state).await?;
+    let max_bytes =
+        mb_bytes(limits.max_download_size_mb).min(WORKSPACE_ABSOLUTE_MAX_DOWNLOAD_BYTES);
+    let download = state
         .application_workspaces
-        .read_file_download(workspace_id, &path, WORKSPACE_DOWNLOAD_MAX_BYTES)
+        .open_file_download(workspace_id, &path, max_bytes)
         .await?;
     let file_name = FsPath::new(&path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("workspace-file")
-        .to_string();
-    Ok(DownloadWorkspaceFileResponse {
-        file_name,
-        size_bytes: bytes.len(),
-        contents_b64: B64.encode(bytes),
-    })
+        .unwrap_or("workspace-file");
+    let safe_file_name = file_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let disposition = format!("attachment; filename=\"{safe_file_name}\"");
+    let stream = ReaderStream::new(download.file.take(max_bytes as u64));
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Invalid Workspace File Name")
+                .with_detail(format!("Could not encode the download file name: {error}"))
+        })?,
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -3563,7 +3689,7 @@ async fn workspace_file_download_response(
     operation_id = "download_application_workspace_file",
     summary = "Download one application workspace file",
     params(("application_public_id" = String, Path,), ("path" = String, Query,)),
-    responses((status = 200, body = DownloadWorkspaceFileResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
+    responses((status = 200, body = Vec<u8>, content_type = "application/octet-stream"), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
     security(("bearer_auth" = []))
 )]
 pub async fn download_application_workspace_file(
@@ -3571,7 +3697,7 @@ pub async fn download_application_workspace_file(
     State(state): State<Arc<AppState>>,
     Path(application_public_id): Path<String>,
     Query(query): Query<ApplicationWorkspaceFileQuery>,
-) -> Result<Json<DownloadWorkspaceFileResponse>, Problem> {
+) -> Result<Response, Problem> {
     permission_guard!(auth, ProjectsRead);
     permission_guard!(auth, SandboxesRead);
     deny_deployment_token!(auth);
@@ -3587,10 +3713,7 @@ pub async fn download_application_workspace_file(
         .application_workspaces
         .ensure(&application.application.public_id, &application.projects)
         .await?;
-    Ok(Json(
-        workspace_file_download_response(&state, &application.application.public_id, query.path)
-            .await?,
-    ))
+    workspace_file_download_response(&state, &application.application.public_id, query.path).await
 }
 
 #[utoipa::path(
@@ -3599,14 +3722,14 @@ pub async fn download_application_workspace_file(
     operation_id = "download_global_workspace_file",
     summary = "Download one global AI workspace file",
     params(("path" = String, Query,)),
-    responses((status = 200, body = DownloadWorkspaceFileResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
+    responses((status = 200, body = Vec<u8>, content_type = "application/octet-stream"), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413), (status = 500)),
     security(("bearer_auth" = []))
 )]
 pub async fn download_global_workspace_file(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ApplicationWorkspaceFileQuery>,
-) -> Result<Json<DownloadWorkspaceFileResponse>, Problem> {
+) -> Result<Response, Problem> {
     permission_guard!(auth, ProjectsRead);
     permission_guard!(auth, SandboxesRead);
     deny_deployment_token!(auth);
@@ -3615,9 +3738,7 @@ pub async fn download_global_workspace_file(
         .application_workspaces
         .ensure(&workspace_id, &[])
         .await?;
-    Ok(Json(
-        workspace_file_download_response(&state, &workspace_id, query.path).await?,
-    ))
+    workspace_file_download_response(&state, &workspace_id, query.path).await
 }
 
 fn parse_workspace_status(value: &str) -> Vec<ApplicationWorkspaceFileResponse> {
@@ -3966,20 +4087,91 @@ async fn workspace_directory_response(
     })
 }
 
+fn verified_workspace_image_media_type(path: &str, bytes: &[u8]) -> Option<&'static str> {
+    let extension = FsPath::new(path)
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => Some("image/png"),
+        "jpg" | "jpeg" if bytes.starts_with(&[0xff, 0xd8, 0xff]) => Some("image/jpeg"),
+        "gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => Some("image/gif"),
+        "webp"
+            if bytes.len() >= 12
+                && bytes.starts_with(b"RIFF")
+                && bytes.get(8..12) == Some(b"WEBP") =>
+        {
+            Some("image/webp")
+        }
+        _ => None,
+    }
+}
+
+fn workspace_image_extension(path: &str) -> bool {
+    FsPath::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp"
+            )
+        })
+}
+
+fn cap_unverified_workspace_image_as_text(
+    preview: &mut crate::applications::WorkspaceFilePreview,
+    image_candidate: bool,
+    verified_media_type: Option<&str>,
+    text_max_bytes: usize,
+) {
+    if image_candidate && verified_media_type.is_none() && preview.bytes.len() > text_max_bytes {
+        preview.bytes.truncate(text_max_bytes);
+        preview.truncated = true;
+    }
+}
+
 async fn workspace_file_response(
     state: &AppState,
     workspace_id: &str,
     path: String,
 ) -> Result<ApplicationWorkspaceFileContentResponse, Problem> {
-    let preview = state
+    let limits = workspace_file_limits(state).await?;
+    let image_candidate = workspace_image_extension(&path);
+    let text_max_bytes = usize::try_from(limits.max_text_preview_kb)
+        .unwrap_or(1_024)
+        .saturating_mul(1024)
+        .min(WORKSPACE_ABSOLUTE_MAX_TEXT_PREVIEW_BYTES);
+    let max_bytes = if image_candidate {
+        mb_bytes(limits.max_image_preview_size_mb).min(WORKSPACE_ABSOLUTE_MAX_IMAGE_PREVIEW_BYTES)
+    } else {
+        text_max_bytes
+    };
+    let mut preview = state
         .application_workspaces
-        .read_file_preview(workspace_id, &path)
+        .read_file_preview_with_limit(workspace_id, &path, max_bytes)
         .await?;
-    let content = String::from_utf8(preview.bytes).ok();
+    let media_type = verified_workspace_image_media_type(&path, &preview.bytes);
+    cap_unverified_workspace_image_as_text(
+        &mut preview,
+        image_candidate,
+        media_type,
+        text_max_bytes,
+    );
+    let content_b64 = media_type
+        .filter(|_| !preview.truncated)
+        .map(|_| B64.encode(&preview.bytes));
+    let content = if media_type.is_some() {
+        None
+    } else {
+        String::from_utf8(preview.bytes).ok()
+    };
     Ok(ApplicationWorkspaceFileContentResponse {
         path,
-        binary: content.is_none(),
+        binary: media_type.is_some() || content.is_none(),
         content,
+        content_b64,
+        media_type: media_type.map(str::to_string),
         size_bytes: preview.size_bytes,
         truncated: preview.truncated,
     })
@@ -8075,6 +8267,7 @@ async fn sandbox_tools_mcp(
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/ai/workspace", get(get_global_ai_workspace))
+        .route("/ai/workspace/file-limits", get(get_workspace_file_limits))
         .route(
             "/ai/workspace/preview-link",
             post(create_global_workspace_preview_link),
@@ -8337,6 +8530,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_application,
         create_application_preview_link,
         create_global_workspace_preview_link,
+        get_workspace_file_limits,
         get_application_workspace_changes,
         get_global_workspace_changes,
         get_application_workspace_directory,
@@ -8407,7 +8601,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ApplicationWorkspaceFileWrite,
         WriteApplicationWorkspaceFilesRequest,
         WriteApplicationWorkspaceFilesResponse,
-        DownloadWorkspaceFileResponse,
         CreateApplicationRequest,
         CreateApplicationProjectRequest,
         DeployApplicationProjectRequest,
@@ -8450,12 +8643,13 @@ mod tests {
     use super::*;
     use crate::PendingPermissionEntry;
     use axum::http::{StatusCode, Uri};
+    use temps_auth::permissions::Role;
 
     #[test]
     fn workspace_import_body_limit_fits_the_bounded_base64_request() {
-        let encoded_file_bytes = WORKSPACE_IMPORT_MAX_BYTES_PER_REQUEST.div_ceil(3) * 4;
+        let encoded_file_bytes = WORKSPACE_IMPORT_ABSOLUTE_MAX_BYTES_PER_REQUEST.div_ceil(3) * 4;
         let maximum_path_and_json_overhead =
-            WORKSPACE_IMPORT_MAX_FILES_PER_REQUEST * (512 + 64) + 32;
+            WORKSPACE_IMPORT_ABSOLUTE_MAX_FILES_PER_REQUEST * (512 + 64) + 32;
 
         assert!(
             WORKSPACE_IMPORT_BODY_LIMIT >= encoded_file_bytes + maximum_path_and_json_overhead,
@@ -8463,7 +8657,7 @@ mod tests {
         );
         const {
             assert!(
-                WORKSPACE_IMPORT_BODY_LIMIT <= 8 * 1024 * 1024,
+                WORKSPACE_IMPORT_BODY_LIMIT <= 48 * MIB,
                 "workspace import route must retain an explicit bounded JSON body"
             );
         }
@@ -8471,13 +8665,17 @@ mod tests {
 
     #[test]
     fn workspace_file_upload_decodes_only_safe_bounded_paths() {
-        let decoded = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
-            files: vec![ApplicationWorkspaceFileWrite {
-                path: "projects/demo/README.md".to_string(),
-                contents_b64: B64.encode("hello"),
-                mode: Some(0o644),
-            }],
-        })
+        let limits = temps_core::AiWorkspaceFileLimitsSettings::default();
+        let decoded = decode_workspace_file_writes(
+            WriteApplicationWorkspaceFilesRequest {
+                files: vec![ApplicationWorkspaceFileWrite {
+                    path: "projects/demo/README.md".to_string(),
+                    contents_b64: B64.encode("hello"),
+                    mode: Some(0o644),
+                }],
+            },
+            &limits,
+        )
         .expect("safe workspace upload");
 
         assert_eq!(decoded.len(), 1);
@@ -8485,47 +8683,56 @@ mod tests {
         assert_eq!(decoded[0].1, b"hello");
         assert_eq!(decoded[0].2, Some(0o644));
 
-        let error = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
-            files: vec![ApplicationWorkspaceFileWrite {
-                path: "projects/demo/.env".to_string(),
-                contents_b64: B64.encode("SECRET=value"),
-                mode: None,
-            }],
-        })
+        let error = decode_workspace_file_writes(
+            WriteApplicationWorkspaceFilesRequest {
+                files: vec![ApplicationWorkspaceFileWrite {
+                    path: "projects/demo/.env".to_string(),
+                    contents_b64: B64.encode("SECRET=value"),
+                    mode: None,
+                }],
+            },
+            &limits,
+        )
         .expect_err("sensitive workspace paths must be rejected");
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
 
-        let duplicate = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
-            files: vec![
-                ApplicationWorkspaceFileWrite {
-                    path: "projects/demo/README.md".to_string(),
-                    contents_b64: B64.encode("first"),
-                    mode: None,
-                },
-                ApplicationWorkspaceFileWrite {
-                    path: "projects/demo/README.md".to_string(),
-                    contents_b64: B64.encode("second"),
-                    mode: None,
-                },
-            ],
-        })
+        let duplicate = decode_workspace_file_writes(
+            WriteApplicationWorkspaceFilesRequest {
+                files: vec![
+                    ApplicationWorkspaceFileWrite {
+                        path: "projects/demo/README.md".to_string(),
+                        contents_b64: B64.encode("first"),
+                        mode: None,
+                    },
+                    ApplicationWorkspaceFileWrite {
+                        path: "projects/demo/README.md".to_string(),
+                        contents_b64: B64.encode("second"),
+                        mode: None,
+                    },
+                ],
+            },
+            &limits,
+        )
         .expect_err("duplicate workspace paths must not overwrite implicitly");
         assert_eq!(duplicate.into_response().status(), StatusCode::BAD_REQUEST);
 
-        let overlapping = decode_workspace_file_writes(WriteApplicationWorkspaceFilesRequest {
-            files: vec![
-                ApplicationWorkspaceFileWrite {
-                    path: "projects/demo/tree".to_string(),
-                    contents_b64: B64.encode("file"),
-                    mode: None,
-                },
-                ApplicationWorkspaceFileWrite {
-                    path: "projects/demo/tree/child.txt".to_string(),
-                    contents_b64: B64.encode("child"),
-                    mode: None,
-                },
-            ],
-        })
+        let overlapping = decode_workspace_file_writes(
+            WriteApplicationWorkspaceFilesRequest {
+                files: vec![
+                    ApplicationWorkspaceFileWrite {
+                        path: "projects/demo/tree".to_string(),
+                        contents_b64: B64.encode("file"),
+                        mode: None,
+                    },
+                    ApplicationWorkspaceFileWrite {
+                        path: "projects/demo/tree/child.txt".to_string(),
+                        contents_b64: B64.encode("child"),
+                        mode: None,
+                    },
+                ],
+            },
+            &limits,
+        )
         .expect_err("ancestor and descendant paths must be rejected before writing");
         assert_eq!(
             overlapping.into_response().status(),
@@ -8534,16 +8741,86 @@ mod tests {
     }
 
     #[test]
+    fn workspace_file_upload_enforces_the_runtime_policy() {
+        let limits = temps_core::AiWorkspaceFileLimitsSettings {
+            max_file_size_mb: 1,
+            max_upload_size_mb: 2,
+            ..temps_core::AiWorkspaceFileLimitsSettings::default()
+        };
+        let oversized = decode_workspace_file_writes(
+            WriteApplicationWorkspaceFilesRequest {
+                files: vec![ApplicationWorkspaceFileWrite {
+                    path: "projects/demo/large.bin".to_string(),
+                    contents_b64: B64.encode(vec![0_u8; MIB + 1]),
+                    mode: None,
+                }],
+            },
+            &limits,
+        )
+        .expect_err("the configured per-file limit must be authoritative");
+        assert_eq!(oversized.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn oversized_workspace_download_maps_to_payload_too_large() {
         let error = Problem::from(ApplicationError::WorkspaceDownloadTooLarge {
             path: "large.bin".to_string(),
-            max_bytes: WORKSPACE_DOWNLOAD_MAX_BYTES,
+            max_bytes: mb_bytes(
+                temps_core::AiWorkspaceFileLimitsSettings::default().max_download_size_mb,
+            ),
         });
 
         assert_eq!(
             error.into_response().status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[test]
+    fn workspace_image_preview_requires_matching_extension_and_magic_bytes() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(b"payload");
+        assert_eq!(
+            verified_workspace_image_media_type("assets/logo.png", &png),
+            Some("image/png")
+        );
+        assert_eq!(
+            verified_workspace_image_media_type("assets/logo.svg", &png),
+            None
+        );
+        assert_eq!(
+            verified_workspace_image_media_type("assets/logo.png", b"<script>alert(1)</script>"),
+            None
+        );
+        assert!(workspace_image_extension("photo.JPEG"));
+        assert!(!workspace_image_extension("vector.svg"));
+
+        let mut renamed_text = crate::applications::WorkspaceFilePreview {
+            bytes: vec![b'a'; 2_048],
+            size_bytes: 2_048,
+            truncated: false,
+        };
+        cap_unverified_workspace_image_as_text(&mut renamed_text, true, None, 1_024);
+        assert_eq!(renamed_text.bytes.len(), 1_024);
+        assert!(renamed_text.truncated);
+    }
+
+    #[test]
+    fn normal_workspace_user_can_read_effective_file_policy_without_settings_access() {
+        let auth = AuthContext::new_session(test_user(), Role::User);
+
+        require_workspace_file_policy_access(&auth)
+            .expect("normal workspace users can read the non-sensitive effective policy");
+        assert!(auth.has_permission(&Permission::ProjectsRead));
+        assert!(auth.has_permission(&Permission::SandboxesRead));
+        assert!(!auth.has_permission(&Permission::SettingsRead));
+
+        let effective =
+            effective_workspace_file_limits(temps_core::AiWorkspaceFileLimitsSettings {
+                max_download_size_mb: 128,
+                ..temps_core::AiWorkspaceFileLimitsSettings::default()
+            });
+        assert_eq!(effective.max_download_size_mb, 32);
     }
 
     #[test]

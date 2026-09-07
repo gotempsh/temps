@@ -12,6 +12,7 @@ import {
   FolderOpen,
   Link2,
   Loader2,
+  Maximize2,
   RefreshCw,
   UploadCloud,
 } from 'lucide-react'
@@ -31,6 +32,13 @@ import {
 } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { HighlightedCode } from '@/components/ui/code-block'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import {
   batchLocalImportFiles,
@@ -38,8 +46,10 @@ import {
   prepareLocalImport,
 } from './workspace-import'
 import {
+  DEFAULT_WORKSPACE_IMPORT_LIMITS,
   MAX_LOCAL_IMPORT_PATH_BYTES,
   shouldSkipLocalImportPath,
+  type WorkspaceImportLimits,
 } from './workspace-import-policy'
 import { problemDetail } from './problem-detail'
 import { workspaceFileLanguage } from './workspace-file-language'
@@ -92,12 +102,14 @@ export function WorkspaceFileExplorer({
   onWorkspaceMutated,
   revision = 0,
   uploadRoot = '',
+  importLimits = DEFAULT_WORKSPACE_IMPORT_LIMITS,
 }: {
   applicationPublicId?: string
   changes: ApplicationWorkspaceFileResponse[]
   onWorkspaceMutated?: () => void
   revision?: number
   uploadRoot?: string
+  importLimits?: WorkspaceImportLimits
 }) {
   const [directories, setDirectories] = useState<
     Record<string, DirectoryState>
@@ -111,6 +123,7 @@ export function WorkspaceFileExplorer({
   const [transferError, setTransferError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
   const [downloading, setDownloading] = useState(false)
+  const [imageExpanded, setImageExpanded] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const folderInputRef = useRef<HTMLInputElement | null>(null)
   const generation = useRef(0)
@@ -227,6 +240,7 @@ export function WorkspaceFileExplorer({
     setPreview(null)
     setPreviewError(null)
     setPreviewLoading(false)
+    setImageExpanded(false)
     void loadDirectory('')
   }, [loadDirectory])
 
@@ -235,7 +249,9 @@ export function WorkspaceFileExplorer({
     setUploading(true)
     setTransferError(null)
     try {
-      const selection = prepareLocalImport(Array.from(selected))
+      const selection = prepareLocalImport(Array.from(selected), {
+        limits: importLimits,
+      })
       const files = selection.accepted.map((entry) => ({
         ...entry,
         path: uploadRoot ? `${uploadRoot}/${entry.path}` : entry.path,
@@ -249,7 +265,7 @@ export function WorkspaceFileExplorer({
         )
       }
       const result = await uploadWorkspaceBatches(
-        batchLocalImportFiles(files),
+        batchLocalImportFiles(files, importLimits),
         async (batch) => {
           const body = {
             files: await Promise.all(
@@ -313,14 +329,13 @@ export function WorkspaceFileExplorer({
             throwOnError: true,
           })
       if (!mounted.current) return
-      const binary = atob(data.contents_b64)
-      const bytes = Uint8Array.from(binary, (character) =>
-        character.charCodeAt(0)
-      )
-      const url = URL.createObjectURL(new Blob([bytes]))
+      if (!(data instanceof Blob)) {
+        throw new Error('The workspace download did not return a binary file.')
+      }
+      const url = URL.createObjectURL(data)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = data.file_name
+      anchor.download = selectedPath.split('/').pop() ?? 'workspace-file'
       anchor.click()
       globalThis.setTimeout(() => URL.revokeObjectURL(url), 0)
     } catch (cause) {
@@ -356,6 +371,15 @@ export function WorkspaceFileExplorer({
     })
     if (willExpand && !directories[path]?.loaded) void loadDirectory(path)
   }
+
+  const imagePreview =
+    preview?.content_b64 && preview.media_type
+      ? {
+          source: `data:${preview.media_type};base64,${preview.content_b64}`,
+          mediaType: preview.media_type,
+          sizeBytes: preview.size_bytes,
+        }
+      : null
 
   const renderDirectory = (path: string, depth: number) => {
     const directory = directories[path] ?? emptyDirectory()
@@ -477,7 +501,9 @@ export function WorkspaceFileExplorer({
         <div>
           <p className="text-xs font-medium">Workspace files</p>
           <p className="mt-0.5 text-[10px] text-muted-foreground">
-            Persistent files, available while compute sleeps
+            Persistent files, available while compute sleeps ·{' '}
+            {formatBytes(importLimits.maxFileBytes)} per file ·{' '}
+            {importLimits.maxBatchFiles} files per upload
           </p>
         </div>
         <div className="flex items-center gap-1">
@@ -593,9 +619,47 @@ export function WorkspaceFileExplorer({
             <p className="px-3 py-4 text-[10px] text-destructive" role="alert">
               {previewError}
             </p>
+          ) : imagePreview ? (
+            <>
+              <button
+                aria-label={`Expand image ${selectedPath}`}
+                className="group relative flex max-h-80 w-full items-center justify-center overflow-hidden bg-[linear-gradient(45deg,hsl(var(--muted))_25%,transparent_25%),linear-gradient(-45deg,hsl(var(--muted))_25%,transparent_25%),linear-gradient(45deg,transparent_75%,hsl(var(--muted))_75%),linear-gradient(-45deg,transparent_75%,hsl(var(--muted))_75%)] bg-[length:16px_16px] bg-[position:0_0,0_8px,8px_-8px,-8px_0] p-3"
+                onClick={() => setImageExpanded(true)}
+                type="button"
+              >
+                <img
+                  alt={selectedPath ?? 'Workspace image'}
+                  className="max-h-72 max-w-full object-contain"
+                  src={imagePreview.source}
+                />
+                <span className="absolute right-2 top-2 rounded bg-background/90 p-1.5 opacity-0 shadow-sm transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+                  <Maximize2 className="size-3.5" />
+                </span>
+              </button>
+              <Dialog onOpenChange={setImageExpanded} open={imageExpanded}>
+                <DialogContent className="max-h-[92vh] max-w-[92vw] overflow-auto">
+                  <DialogHeader>
+                    <DialogTitle className="truncate text-sm">
+                      {selectedPath}
+                    </DialogTitle>
+                    <DialogDescription>
+                      {formatBytes(imagePreview.sizeBytes)} ·{' '}
+                      {imagePreview.mediaType}
+                    </DialogDescription>
+                  </DialogHeader>
+                  <img
+                    alt={selectedPath ?? 'Expanded workspace image'}
+                    className="mx-auto max-h-[78vh] max-w-full object-contain"
+                    src={imagePreview.source}
+                  />
+                </DialogContent>
+              </Dialog>
+            </>
           ) : preview?.binary ? (
             <p className="px-3 py-4 text-[10px] text-muted-foreground">
-              Binary files cannot be previewed here.
+              {preview.media_type && preview.truncated
+                ? `This image exceeds the configured ${importLimits.maxImagePreviewMb} MB preview limit. Download it to view the full file.`
+                : 'Binary files cannot be previewed here.'}
             </p>
           ) : (
             <>
@@ -607,7 +671,8 @@ export function WorkspaceFileExplorer({
               </pre>
               {preview?.truncated && (
                 <p className="border-t border-border px-3 py-2 text-[9px] text-amber-600 dark:text-amber-300">
-                  Preview limited to the first 256 KB.
+                  Preview limited to the first {importLimits.maxTextPreviewKb}{' '}
+                  KB.
                 </p>
               )}
             </>

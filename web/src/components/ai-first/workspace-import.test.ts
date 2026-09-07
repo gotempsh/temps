@@ -10,6 +10,7 @@ import {
   prepareWorkspaceImport,
   shouldSkipLocalImportPath,
 } from './workspace-import'
+import { workspaceImportLimitsFromSettings } from './workspace-import-policy'
 
 function folderFile(path: string, contents = 'x'): File {
   const parts = path.split('/')
@@ -71,9 +72,17 @@ describe('workspace import', () => {
       },
     ]
 
-    expect(batchLocalImportFiles(files).map((batch) => batch.length)).toEqual([
-      1, 1,
-    ])
+    expect(
+      batchLocalImportFiles(files, {
+        maxFiles: 100,
+        maxBytes: 100 * 1024 * 1024,
+        maxFileBytes: 4 * 1024 * 1024,
+        maxBatchBytes: 4 * 1024 * 1024,
+        maxBatchFiles: 32,
+        maxTextPreviewKb: 256,
+        maxImagePreviewMb: 8,
+      }).map((batch) => batch.length)
+    ).toEqual([1, 1])
   })
 
   test('preserves multiple dropped roots instead of flattening their paths', () => {
@@ -256,6 +265,54 @@ describe('workspace import', () => {
     expect(() => prepareLocalImport([tooLarge])).toThrow(
       'contains no importable files'
     )
+  })
+
+  test('applies operator-configured file and aggregate limits', () => {
+    const mib = 1024 * 1024
+    const limits = {
+      maxFiles: 2,
+      maxBytes: 4 * mib,
+      maxFileBytes: 3 * mib,
+      maxBatchBytes: 4 * mib,
+      maxBatchFiles: 2,
+      maxTextPreviewKb: 128,
+      maxImagePreviewMb: 4,
+    }
+    const selection = prepareLocalImport(
+      [
+        folderFile('one.txt', '1'.repeat(2 * mib)),
+        folderFile('two.txt', '2'.repeat(2 * mib)),
+      ],
+      { limits }
+    )
+    expect(selection.totalBytes).toBe(4 * mib)
+    expect(() =>
+      prepareLocalImport(
+        [
+          folderFile('one.txt', '1'.repeat(2 * mib)),
+          folderFile('two.txt', '2'.repeat(3 * mib)),
+        ],
+        { limits }
+      )
+    ).toThrow('4 MB import limit')
+  })
+
+  test('derives preview limits while retaining an independent browser cap', () => {
+    const mib = 1024 * 1024
+    const limits = workspaceImportLimitsFromSettings({
+      max_files_per_upload: 16,
+      max_file_size_mb: 8,
+      max_upload_size_mb: 16,
+      max_workspace_size_mb: 2_048,
+      max_workspace_entries: 20_000,
+      max_text_preview_kb: 512,
+      max_image_preview_size_mb: 12,
+    })
+
+    expect(limits.maxBytes).toBe(256 * mib)
+    expect(limits.maxFiles).toBe(5_000)
+    expect(limits.maxTextPreviewKb).toBe(512)
+    expect(limits.maxImagePreviewMb).toBe(12)
   })
 
   test('skips paths longer than the backend import limit', () => {

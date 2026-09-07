@@ -41,7 +41,9 @@ describe('ApplicationWorkspaceSettingsPanel', () => {
     expect(html).toContain('@openai/codex@latest')
     expect(html).toContain('opencode upgrade --method curl')
     expect(html).toContain('/sandboxes/sbx_abcdef0123456789')
-    expect(html).toContain('temps sandbox shell sbx_abcdef0123456789')
+    expect(html).toContain(
+      'bunx @temps-sdk/cli sandbox shell sbx_abcdef0123456789'
+    )
     expect(html).toContain('Run as a one-shot CLI command')
   })
 

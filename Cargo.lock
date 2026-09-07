@@ -10471,6 +10471,7 @@ dependencies = [
  "temps-sandbox",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "unicode-casefold",
  "unicode-normalization",

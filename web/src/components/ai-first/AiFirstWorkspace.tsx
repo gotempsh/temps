@@ -70,6 +70,7 @@ import {
   getApplicationOptions,
   getApplicationWorkspaceOptions,
   getGlobalAiWorkspaceOptions,
+  getWorkspaceFileLimitsOptions,
   listApplicationsInfiniteOptions,
   listAllConversationsOptions,
   listApplicationConversationsOptions,
@@ -136,6 +137,11 @@ import {
   type LocalImportSelection,
   type WorkspaceSourceMode,
 } from './workspace-import'
+import {
+  DEFAULT_WORKSPACE_IMPORT_LIMITS,
+  type WorkspaceImportLimits,
+  workspaceImportLimitsFromSettings,
+} from './workspace-import-policy'
 
 import {
   workspaceHarnessOptions,
@@ -195,6 +201,13 @@ export function mergeConversationPages<T extends { public_id: string }>(
 export function AiFirstWorkspace() {
   const [searchParams, setSearchParams] = useSearchParams()
   const queryClient = useQueryClient()
+  const { data: workspaceFileLimits } = useQuery(
+    getWorkspaceFileLimitsOptions()
+  )
+  const workspaceImportLimits = useMemo(
+    () => workspaceImportLimitsFromSettings(workspaceFileLimits),
+    [workspaceFileLimits]
+  )
   const applicationFromUrl = searchParams.get('application')
   const threadFromUrl = searchParams.get('thread')
   const globalScopeFromUrl = searchParams.get('scope') === 'global'
@@ -1946,6 +1959,7 @@ export function AiFirstWorkspace() {
               onCreated={handleApplicationCreated}
               harnesses={harnesses}
               harnessesLoading={harnessesLoading}
+              importLimits={workspaceImportLimits}
             />
           ) : loading ? (
             <CenteredMessage
@@ -2071,6 +2085,7 @@ export function AiFirstWorkspace() {
                 onSelect={setSelectedWorkspacePath}
                 selectedPath={selectedWorkspacePath}
                 uploadRoot={primaryWorkspaceUploadRoot}
+                importLimits={workspaceImportLimits}
               />
             ) : rightView === 'projects' && activeApplication ? (
               <ApplicationProjectsPanel
@@ -2156,6 +2171,7 @@ export function AiFirstWorkspace() {
                 onSelect={setSelectedWorkspacePath}
                 selectedPath={selectedWorkspacePath}
                 uploadRoot={primaryWorkspaceUploadRoot}
+                importLimits={workspaceImportLimits}
               />
             ) : rightView === 'projects' && activeApplication ? (
               <ApplicationProjectsPanel
@@ -2403,6 +2419,7 @@ export function WorkspaceFilesPanel({
   onSelect,
   selectedPath,
   uploadRoot,
+  importLimits,
 }: {
   applicationPublicId?: string
   changes: ApplicationWorkspaceChangesResponse | null
@@ -2417,6 +2434,7 @@ export function WorkspaceFilesPanel({
   onSelect: (path: string) => void
   selectedPath: string | null
   uploadRoot?: string
+  importLimits?: WorkspaceImportLimits
 }) {
   return (
     <div className="space-y-4">
@@ -2466,6 +2484,7 @@ export function WorkspaceFilesPanel({
         onWorkspaceMutated={onRefresh}
         revision={explorerRevision}
         uploadRoot={uploadRoot}
+        importLimits={importLimits}
       />
 
       {!changes && loading ? (
@@ -2849,6 +2868,7 @@ export function ApplicationStartScreen({
   onCreated,
   harnesses,
   harnessesLoading,
+  importLimits = DEFAULT_WORKSPACE_IMPORT_LIMITS,
 }: {
   onCancel: () => void
   onCreated: (
@@ -2857,6 +2877,7 @@ export function ApplicationStartScreen({
   ) => void
   harnesses: HarnessOption[]
   harnessesLoading: boolean
+  importLimits?: WorkspaceImportLimits
 }) {
   const [name, setName] = useState('')
   const [provisionedApplication, setProvisionedApplication] =
@@ -2939,6 +2960,7 @@ export function ApplicationStartScreen({
       const selection = await prepareWorkspaceImport(files, {
         skipped,
         signal: controller.signal,
+        limits: importLimits,
       })
       if (requestId !== localImportRequestRef.current) return
       setLocalImport(selection)
@@ -3004,7 +3026,7 @@ export function ApplicationStartScreen({
         'Choose a ZIP archive, files, or a folder before creating the workspace.'
       )
     }
-    const batches = batchLocalImportFiles(localImport.accepted)
+    const batches = batchLocalImportFiles(localImport.accepted, importLimits)
     for (let index = 0; index < batches.length; index += 1) {
       setSavingStep(`Uploading local files ${index + 1}/${batches.length}…`)
       const files = await Promise.all(

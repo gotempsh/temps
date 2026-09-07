@@ -3,14 +3,12 @@
 
 import { Unzip, UnzipInflate, type UnzipFile } from 'fflate'
 import {
-  MAX_LOCAL_IMPORT_BYTES,
-  MAX_LOCAL_IMPORT_FILE_BYTES,
-  MAX_LOCAL_IMPORT_FILES,
+  type WorkspaceImportLimits,
   isSensitiveLocalImportPath,
   normalizedWorkspaceImportPath,
 } from './workspace-import-policy'
 
-type ExtractRequest = { archive: File }
+type ExtractRequest = { archive: File; limits: WorkspaceImportLimits }
 type ExtractResponse =
   | {
       type: 'entry'
@@ -35,7 +33,10 @@ function errorMessage(cause: unknown): string {
     : 'The ZIP archive could not be extracted.'
 }
 
-async function extract(archive: File): Promise<void> {
+async function extract(
+  archive: File,
+  limits: WorkspaceImportLimits
+): Promise<void> {
   const skipped: string[] = []
   const activeFiles = new Set<UnzipFile>()
   let discoveredEntries = 0
@@ -51,10 +52,10 @@ async function extract(archive: File): Promise<void> {
   const unzip = new Unzip((entry) => {
     if (failure) return
     discoveredEntries += 1
-    if (discoveredEntries > MAX_LOCAL_IMPORT_FILES) {
+    if (discoveredEntries > limits.maxFiles) {
       fail(
         new Error(
-          `This ZIP exceeds the ${MAX_LOCAL_IMPORT_FILES.toLocaleString()} entry import limit.`
+          `This ZIP exceeds the ${limits.maxFiles.toLocaleString()} entry import limit.`
         )
       )
       return
@@ -71,7 +72,7 @@ async function extract(archive: File): Promise<void> {
       isDirectory ||
       isSensitiveLocalImportPath(path) ||
       (entry.originalSize !== undefined &&
-        entry.originalSize > MAX_LOCAL_IMPORT_FILE_BYTES)
+        entry.originalSize > limits.maxFileBytes)
     const chunks: ArrayBuffer[] = []
     let fileBytes = 0
     activeFiles.add(entry)
@@ -83,16 +84,20 @@ async function extract(archive: File): Promise<void> {
       if (failure) return
 
       extractedBytes += chunk.byteLength
-      if (extractedBytes > MAX_LOCAL_IMPORT_BYTES) {
-        fail(new Error('The expanded ZIP exceeds the 256 MB import limit.'))
+      if (extractedBytes > limits.maxBytes) {
+        fail(
+          new Error(
+            `The expanded ZIP exceeds the ${Math.floor(limits.maxBytes / (1024 * 1024))} MB import limit.`
+          )
+        )
         return
       }
       if (!shouldSkip) {
         fileBytes += chunk.byteLength
-        if (fileBytes > MAX_LOCAL_IMPORT_FILE_BYTES) {
+        if (fileBytes > limits.maxFileBytes) {
           fail(
             new Error(
-              `The ZIP file “${path}” exceeds the ${MAX_LOCAL_IMPORT_FILE_BYTES / (1024 * 1024)} MB file limit.`
+              `The ZIP file “${path}” exceeds the ${limits.maxFileBytes / (1024 * 1024)} MB file limit.`
             )
           )
           return
@@ -156,7 +161,7 @@ async function extract(archive: File): Promise<void> {
 }
 
 workerScope.onmessage = (event) => {
-  void extract(event.data.archive).catch((cause) => {
+  void extract(event.data.archive, event.data.limits).catch((cause) => {
     workerScope.postMessage({ type: 'error', message: errorMessage(cause) })
   })
 }

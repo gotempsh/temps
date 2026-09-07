@@ -174,6 +174,14 @@ pub struct WorkspaceFilePreview {
     pub truncated: bool,
 }
 
+/// A securely opened regular file from a managed workspace. The descriptor is
+/// opened relative to the workspace root with `O_NOFOLLOW`, then handed to the
+/// HTTP layer for bounded streaming.
+pub struct WorkspaceFileDownload {
+    pub file: tokio::fs::File,
+    pub size_bytes: u64,
+}
+
 /// A project tree moved outside the mounted application workspace while its
 /// database link is removed. The opaque paths are only produced by
 /// [`ApplicationWorkspaceService`] after validating server-owned components.
@@ -242,12 +250,23 @@ impl ApplicationWorkspaceService {
         workspace_id: &str,
         relative_path: &str,
     ) -> Result<WorkspaceFilePreview, ApplicationError> {
-        self.read_file_limited(
+        self.read_file_preview_with_limit(
             workspace_id,
             relative_path,
             MAX_WORKSPACE_FILE_PREVIEW_BYTES,
         )
         .await
+    }
+
+    /// Read a preview candidate under a caller-supplied runtime policy.
+    pub async fn read_file_preview_with_limit(
+        &self,
+        workspace_id: &str,
+        relative_path: &str,
+        max_bytes: usize,
+    ) -> Result<WorkspaceFilePreview, ApplicationError> {
+        self.read_file_limited(workspace_id, relative_path, max_bytes)
+            .await
     }
 
     /// Read one regular workspace file without following symlinks. The caller
@@ -269,6 +288,43 @@ impl ApplicationWorkspaceService {
             });
         }
         Ok(result.bytes)
+    }
+
+    /// Open one regular workspace file without following symlinks. The size is
+    /// checked before returning the descriptor and the HTTP layer additionally
+    /// bounds the stream so a concurrently growing file cannot bypass the cap.
+    pub async fn open_file_download(
+        &self,
+        workspace_id: &str,
+        relative_path: &str,
+        max_bytes: usize,
+    ) -> Result<WorkspaceFileDownload, ApplicationError> {
+        validate_workspace_component(workspace_id)?;
+        validate_workspace_relative_path(relative_path, false)?;
+        let root = self.root.clone();
+        let workspace_id = workspace_id.to_string();
+        let relative_path = relative_path.to_string();
+        let error_path = relative_path.clone();
+        let task_error_path = self.root.join(&workspace_id);
+        let (file, size_bytes) = tokio::task::spawn_blocking(move || {
+            open_workspace_file_fd_relative(&root, &workspace_id, &relative_path)
+        })
+        .await
+        .map_err(|source| ApplicationError::Workspace {
+            path: task_error_path,
+            source: std::io::Error::other(format!("workspace open task failed: {source}")),
+        })?
+        .map_err(|source| map_workspace_read_error(error_path.clone(), source))?;
+        if size_bytes > max_bytes as u64 {
+            return Err(ApplicationError::WorkspaceDownloadTooLarge {
+                path: error_path,
+                max_bytes,
+            });
+        }
+        Ok(WorkspaceFileDownload {
+            file: tokio::fs::File::from_std(file),
+            size_bytes,
+        })
     }
 
     async fn read_file_limited(
@@ -1388,8 +1444,31 @@ fn read_workspace_file_fd_relative(
     relative_path: &str,
     max_bytes: usize,
 ) -> std::io::Result<WorkspaceFilePreview> {
+    let (mut file, size_bytes) =
+        open_workspace_file_fd_relative(root, workspace_id, relative_path)?;
+    let initial_capacity = usize::try_from(size_bytes)
+        .unwrap_or(max_bytes)
+        .min(max_bytes);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    Read::by_ref(&mut file)
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    Ok(WorkspaceFilePreview {
+        bytes,
+        size_bytes,
+        truncated,
+    })
+}
+
+#[cfg(unix)]
+fn open_workspace_file_fd_relative(
+    root: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+) -> std::io::Result<(std::fs::File, u64)> {
     use rustix::fs::{openat, Mode, OFlags};
-    use std::fs::File;
 
     let path = Path::new(relative_path);
     let file_name = path.file_name().ok_or_else(|| {
@@ -1407,7 +1486,7 @@ fn read_workspace_file_fd_relative(
         Mode::empty(),
     )
     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-    let mut file = File::from(file);
+    let file = std::fs::File::from(file);
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
@@ -1415,17 +1494,7 @@ fn read_workspace_file_fd_relative(
             "workspace path is not a regular file",
         ));
     }
-    let mut bytes = Vec::with_capacity(max_bytes.min(metadata.len() as usize));
-    Read::by_ref(&mut file)
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() > max_bytes;
-    bytes.truncate(max_bytes);
-    Ok(WorkspaceFilePreview {
-        bytes,
-        size_bytes: metadata.len(),
-        truncated,
-    })
+    Ok((file, metadata.len()))
 }
 
 #[cfg(not(unix))]
@@ -1449,6 +1518,18 @@ fn read_workspace_file_fd_relative(
     _relative_path: &str,
     _max_bytes: usize,
 ) -> std::io::Result<WorkspaceFilePreview> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure workspace browsing requires descriptor-relative filesystem support",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_workspace_file_fd_relative(
+    _root: &Path,
+    _workspace_id: &str,
+    _relative_path: &str,
+) -> std::io::Result<(std::fs::File, u64)> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "secure workspace browsing requires descriptor-relative filesystem support",
@@ -3571,6 +3652,17 @@ mod tests {
             .await
             .expect("workspace download");
         assert_eq!(downloaded, b"{}");
+
+        let mut streamed = service
+            .open_file_download("app_safe_123", "uploads/example.json", 1_024)
+            .await
+            .expect("secure streaming workspace download");
+        let mut streamed_bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut streamed.file, &mut streamed_bytes)
+            .await
+            .expect("stream workspace file");
+        assert_eq!(streamed.size_bytes, 2);
+        assert_eq!(streamed_bytes, b"{}");
 
         let too_large = service
             .read_file_download("app_safe_123", "uploads/example.json", 1)

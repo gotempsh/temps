@@ -3,11 +3,8 @@
 
 import type { DropFile } from '@/lib/drop-archive'
 import {
-  MAX_LOCAL_IMPORT_BYTES,
-  MAX_LOCAL_IMPORT_FILE_BYTES,
-  MAX_LOCAL_IMPORT_FILES,
-  MAX_WRITE_BATCH_BYTES,
-  MAX_WRITE_BATCH_FILES,
+  DEFAULT_WORKSPACE_IMPORT_LIMITS,
+  type WorkspaceImportLimits,
   isSensitiveLocalImportPath,
   normalizedWorkspaceImportPath,
   shouldSkipLocalImportPath,
@@ -74,8 +71,10 @@ export function prepareLocalImport(
     sourceKind?: LocalImportSelection['sourceKind']
     sourceLabel?: string
     skipped?: string[]
+    limits?: WorkspaceImportLimits
   } = {}
 ): LocalImportSelection {
+  const limits = options.limits ?? DEFAULT_WORKSPACE_IMPORT_LIMITS
   const accepted: LocalImportFile[] = []
   const skipped = [...(options.skipped ?? [])]
   let totalBytes = 0
@@ -102,7 +101,7 @@ export function prepareLocalImport(
     if (
       isSensitiveLocalImportPath(candidate.path) ||
       shouldSkipLocalImportPath(path) ||
-      candidate.file.size > MAX_LOCAL_IMPORT_FILE_BYTES
+      candidate.file.size > limits.maxFileBytes
     ) {
       skipped.push(path)
       continue
@@ -110,13 +109,15 @@ export function prepareLocalImport(
     if (seen.has(path)) {
       throw new Error(`The selection contains more than one file at “${path}”.`)
     }
-    if (accepted.length >= MAX_LOCAL_IMPORT_FILES) {
+    if (accepted.length >= limits.maxFiles) {
       throw new Error(
-        `This selection exceeds the ${MAX_LOCAL_IMPORT_FILES.toLocaleString()} file import limit.`
+        `This selection exceeds the ${limits.maxFiles.toLocaleString()} file import limit.`
       )
     }
-    if (totalBytes + candidate.file.size > MAX_LOCAL_IMPORT_BYTES) {
-      throw new Error('This selection exceeds the 256 MB import limit.')
+    if (totalBytes + candidate.file.size > limits.maxBytes) {
+      throw new Error(
+        `This selection exceeds the ${Math.floor(limits.maxBytes / (1024 * 1024))} MB import limit.`
+      )
     }
     seen.add(path)
     totalBytes += candidate.file.size
@@ -155,7 +156,10 @@ function archiveError(cause: unknown): Error {
     : new Error('The ZIP archive could not be read.')
 }
 
-async function validateZipCentralDirectory(archiveFile: File): Promise<void> {
+async function validateZipCentralDirectory(
+  archiveFile: File,
+  limits: WorkspaceImportLimits
+): Promise<void> {
   const tailStart = Math.max(0, archiveFile.size - MAX_ZIP_TRAILER_BYTES)
   const tail = new Uint8Array(await archiveFile.slice(tailStart).arrayBuffer())
   const tailView = new DataView(tail.buffer, tail.byteOffset, tail.byteLength)
@@ -188,9 +192,9 @@ async function validateZipCentralDirectory(archiveFile: File): Promise<void> {
   ) {
     throw new Error('Multi-disk and ZIP64 archives are not supported.')
   }
-  if (totalEntries > MAX_LOCAL_IMPORT_FILES) {
+  if (totalEntries > limits.maxFiles) {
     throw new Error(
-      `This ZIP exceeds the ${MAX_LOCAL_IMPORT_FILES.toLocaleString()} entry import limit.`
+      `This ZIP exceeds the ${limits.maxFiles.toLocaleString()} entry import limit.`
     )
   }
   if (centralBytes > MAX_ZIP_CENTRAL_DIRECTORY_BYTES) {
@@ -240,8 +244,10 @@ async function validateZipCentralDirectory(archiveFile: File): Promise<void> {
       throw new Error('ZIP64 archives are not supported.')
     }
     expandedBytes += uncompressedBytes
-    if (expandedBytes > MAX_LOCAL_IMPORT_BYTES) {
-      throw new Error('The expanded ZIP exceeds the 256 MB import limit.')
+    if (expandedBytes > limits.maxBytes) {
+      throw new Error(
+        `The expanded ZIP exceeds the ${Math.floor(limits.maxBytes / (1024 * 1024))} MB import limit.`
+      )
     }
     if (
       uncompressedBytes > 0 &&
@@ -259,13 +265,16 @@ async function validateZipCentralDirectory(archiveFile: File): Promise<void> {
 
 async function extractWorkspaceZip(
   archiveFile: File,
+  limits: WorkspaceImportLimits,
   signal?: AbortSignal
 ): Promise<{ files: DropFile[]; skipped: string[] }> {
   signal?.throwIfAborted()
-  if (archiveFile.size > MAX_LOCAL_IMPORT_BYTES) {
-    throw new Error('The ZIP archive exceeds the 256 MB upload limit.')
+  if (archiveFile.size > limits.maxBytes) {
+    throw new Error(
+      `The ZIP archive exceeds the ${Math.floor(limits.maxBytes / (1024 * 1024))} MB upload limit.`
+    )
   }
-  await validateZipCentralDirectory(archiveFile)
+  await validateZipCentralDirectory(archiveFile, limits)
   signal?.throwIfAborted()
 
   type WorkerResponse =
@@ -329,14 +338,19 @@ async function extractWorkspaceZip(
       abort()
       return
     }
-    worker.postMessage({ archive: archiveFile })
+    worker.postMessage({ archive: archiveFile, limits })
   })
 }
 
 export async function prepareWorkspaceImport(
   inputs: DropFile[],
-  options: { skipped?: string[]; signal?: AbortSignal } = {}
+  options: {
+    skipped?: string[]
+    signal?: AbortSignal
+    limits?: WorkspaceImportLimits
+  } = {}
 ): Promise<LocalImportSelection> {
+  const limits = options.limits ?? DEFAULT_WORKSPACE_IMPORT_LIMITS
   options.signal?.throwIfAborted()
   if (inputs.length === 0) {
     throw new Error('Choose a ZIP archive, files, or a folder to import.')
@@ -351,19 +365,25 @@ export async function prepareWorkspaceImport(
     isZip(selected.file) &&
     selectedPath === selected.file.name
   if (isTopLevelArchive) {
-    const extracted = await extractWorkspaceZip(selected.file, options.signal)
+    const extracted = await extractWorkspaceZip(
+      selected.file,
+      limits,
+      options.signal
+    )
     options.signal?.throwIfAborted()
     return prepareLocalImport(extracted.files, {
       skipped: [...(options.skipped ?? []), ...extracted.skipped],
       sourceKind: 'zip',
       sourceLabel: selected.file.name,
+      limits,
     })
   }
-  return prepareLocalImport(inputs, { skipped: options.skipped })
+  return prepareLocalImport(inputs, { skipped: options.skipped, limits })
 }
 
 export function batchLocalImportFiles(
-  files: LocalImportFile[]
+  files: LocalImportFile[],
+  limits: WorkspaceImportLimits = DEFAULT_WORKSPACE_IMPORT_LIMITS
 ): LocalImportFile[][] {
   const batches: LocalImportFile[][] = []
   let batch: LocalImportFile[] = []
@@ -371,8 +391,8 @@ export function batchLocalImportFiles(
   for (const file of files) {
     if (
       batch.length > 0 &&
-      (batch.length >= MAX_WRITE_BATCH_FILES ||
-        batchBytes + file.file.size > MAX_WRITE_BATCH_BYTES)
+      (batch.length >= limits.maxBatchFiles ||
+        batchBytes + file.file.size > limits.maxBatchBytes)
     ) {
       batches.push(batch)
       batch = []

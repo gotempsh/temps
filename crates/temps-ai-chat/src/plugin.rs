@@ -177,6 +177,7 @@ impl TempsPlugin for AiChatPlugin {
                 applications,
                 project_service,
                 application_workspaces,
+                config_service,
                 application_sandboxes: context.get_service::<temps_sandbox::SandboxService>(),
                 sandbox_snapshots: context
                     .get_service::<temps_sandbox::services::SnapshotService>(),
@@ -201,6 +202,7 @@ impl TempsPlugin for AiChatPlugin {
             applications: old.applications.clone(),
             project_service: old.project_service.clone(),
             application_workspaces: old.application_workspaces.clone(),
+            config_service: old.config_service.clone(),
             application_sandboxes: old.application_sandboxes.clone(),
             sandbox_snapshots: old.sandbox_snapshots.clone(),
             // Route assembly runs after every plugin has registered services.

@@ -38,6 +38,7 @@ async-stream = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }

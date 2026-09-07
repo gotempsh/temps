@@ -28,6 +28,7 @@ const UPGRADE_COMMANDS = [
 ] as const
 
 const SANDBOX_PUBLIC_ID = /^sbx_[0-9a-fA-F]{16}$/
+const TEMPS_CLI = 'bunx @temps-sdk/cli'
 
 /**
  * Return commands for both the web command console and the local Temps CLI.
@@ -43,13 +44,13 @@ export function harnessUpgradeCommands(
 
   return UPGRADE_COMMANDS.map((upgrade) => ({
     ...upgrade,
-    cliCommand: `temps sandbox exec ${sandboxPublicId} -- sh -lc ${shellQuote(upgrade.command)}`,
+    cliCommand: `${TEMPS_CLI} sandbox exec ${sandboxPublicId} -- sh -lc ${shellQuote(upgrade.command)}`,
   }))
 }
 
 export function sandboxShellCommand(sandboxPublicId: string): string {
   validateSandboxPublicId(sandboxPublicId)
-  return `temps sandbox shell ${sandboxPublicId}`
+  return `${TEMPS_CLI} sandbox shell ${sandboxPublicId}`
 }
 
 function validateSandboxPublicId(sandboxPublicId: string): void {

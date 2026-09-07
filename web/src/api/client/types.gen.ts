@@ -871,6 +871,24 @@ export type AiSummaryPreferenceDto = {
 };
 
 /**
+ * Runtime limits for workspace file transfer and browser previews.
+ *
+ * The HTTP layer additionally enforces absolute ceilings so a malformed or
+ * legacy settings row cannot turn a configurable limit into unbounded control
+ * plane memory use.
+ */
+export type AiWorkspaceFileLimitsSettings = {
+    max_download_size_mb?: number;
+    max_file_size_mb?: number;
+    max_files_per_upload?: number;
+    max_image_preview_size_mb?: number;
+    max_text_preview_kb?: number;
+    max_upload_size_mb?: number;
+    max_workspace_entries?: number;
+    max_workspace_size_mb?: number;
+};
+
+/**
  * Paginated list of alarms.
  */
 export type AlarmListResponse = {
@@ -1369,6 +1387,12 @@ export type AppSettings = {
     ai_chat_limits?: AiChatLimitsSettings;
     ai_config?: AiConfigSettings;
     /**
+     * Transfer and preview limits for files in persistent AI workspaces.
+     * These are runtime settings because operators have different control
+     * plane memory budgets and commonly work with very different asset sizes.
+     */
+    ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -1545,6 +1569,10 @@ export type AppSettingsResponse = {
      */
     ai_chat_limits: AiChatLimitsSettings;
     ai_config: AiConfigSettings;
+    /**
+     * Persistent AI workspace file transfer and preview limits.
+     */
+    ai_workspace_file_limits: AiWorkspaceFileLimitsSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
@@ -1760,6 +1788,12 @@ export type ApplicationWorkspaceDirectoryResponse = {
 export type ApplicationWorkspaceFileContentResponse = {
     binary: boolean;
     content?: string | null;
+    /**
+     * Base64-encoded raster image bytes when this file has a verified,
+     * browser-safe image signature and is within the configured preview cap.
+     */
+    content_b64?: string | null;
+    media_type?: string | null;
     path: string;
     size_bytes: number;
     truncated: boolean;
@@ -6790,12 +6824,6 @@ export type DomainResponse = {
     status: string;
     updated_at: number;
     verification_method: string;
-};
-
-export type DownloadWorkspaceFileResponse = {
-    contents_b64: string;
-    file_name: string;
-    size_bytes: number;
 };
 
 export type DrainNodeResponse = {
@@ -24224,7 +24252,7 @@ export type DownloadApplicationWorkspaceFileErrors = {
 };
 
 export type DownloadApplicationWorkspaceFileResponses = {
-    200: DownloadWorkspaceFileResponse;
+    200: Array<number>;
 };
 
 export type DownloadApplicationWorkspaceFileResponse = DownloadApplicationWorkspaceFileResponses[keyof DownloadApplicationWorkspaceFileResponses];
@@ -25658,6 +25686,25 @@ export type GetGlobalWorkspaceFileResponses = {
 
 export type GetGlobalWorkspaceFileResponse = GetGlobalWorkspaceFileResponses[keyof GetGlobalWorkspaceFileResponses];
 
+export type GetWorkspaceFileLimitsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/workspace/file-limits';
+};
+
+export type GetWorkspaceFileLimitsErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type GetWorkspaceFileLimitsResponses = {
+    200: AiWorkspaceFileLimitsSettings;
+};
+
+export type GetWorkspaceFileLimitsResponse = GetWorkspaceFileLimitsResponses[keyof GetWorkspaceFileLimitsResponses];
+
 export type DownloadGlobalWorkspaceFileData = {
     body?: never;
     path?: never;
@@ -25677,7 +25724,7 @@ export type DownloadGlobalWorkspaceFileErrors = {
 };
 
 export type DownloadGlobalWorkspaceFileResponses = {
-    200: DownloadWorkspaceFileResponse;
+    200: Array<number>;
 };
 
 export type DownloadGlobalWorkspaceFileResponse = DownloadGlobalWorkspaceFileResponses[keyof DownloadGlobalWorkspaceFileResponses];

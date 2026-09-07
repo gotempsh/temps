@@ -105,6 +105,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub ai_chat_limits: AiChatLimitsSettings,
 
+    /// Transfer and preview limits for files in persistent AI workspaces.
+    /// These are runtime settings because operators have different control
+    /// plane memory budgets and commonly work with very different asset sizes.
+    #[serde(default)]
+    pub ai_workspace_file_limits: AiWorkspaceFileLimitsSettings,
+
     /// Upstream request/connection timeouts applied by the proxy to customer
     /// app traffic. Provides a global hard ceiling plus global defaults for
     /// regular HTTP, SSE, and WebSocket traffic; projects and environments
@@ -325,6 +331,47 @@ impl AiChatLimitsSettings {
             self.turn_timeout_secs
                 .clamp(Self::MIN_TURN_TIMEOUT_SECS, Self::MAX_TURN_TIMEOUT_SECS) as u64,
         )
+    }
+}
+
+/// Runtime limits for workspace file transfer and browser previews.
+///
+/// The HTTP layer additionally enforces absolute ceilings so a malformed or
+/// legacy settings row cannot turn a configurable limit into unbounded control
+/// plane memory use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct AiWorkspaceFileLimitsSettings {
+    #[schema(minimum = 1, maximum = 100, example = 32)]
+    pub max_files_per_upload: u32,
+    #[schema(minimum = 1, maximum = 32, example = 16)]
+    pub max_file_size_mb: u32,
+    #[schema(minimum = 1, maximum = 32, example = 32)]
+    pub max_upload_size_mb: u32,
+    #[schema(minimum = 1, maximum = 2048, example = 256)]
+    pub max_workspace_size_mb: u32,
+    #[schema(minimum = 1, maximum = 50000, example = 5000)]
+    pub max_workspace_entries: u32,
+    #[schema(minimum = 1, maximum = 1024, example = 256)]
+    pub max_text_preview_kb: u32,
+    #[schema(minimum = 1, maximum = 16, example = 8)]
+    pub max_image_preview_size_mb: u32,
+    #[schema(minimum = 1, maximum = 32, example = 32)]
+    pub max_download_size_mb: u32,
+}
+
+impl Default for AiWorkspaceFileLimitsSettings {
+    fn default() -> Self {
+        Self {
+            max_files_per_upload: 32,
+            max_file_size_mb: 16,
+            max_upload_size_mb: 32,
+            max_workspace_size_mb: 256,
+            max_workspace_entries: 5_000,
+            max_text_preview_kb: 256,
+            max_image_preview_size_mb: 8,
+            max_download_size_mb: 32,
+        }
     }
 }
 
@@ -1283,6 +1330,7 @@ impl Default for AppSettings {
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             ai_chat_limits: AiChatLimitsSettings::default(),
+            ai_workspace_file_limits: AiWorkspaceFileLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
             connection_limits: ConnectionLimitSettings::default(),
             tenant_resource_ceilings: TenantResourceCeilings::default(),

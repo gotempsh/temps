@@ -120,13 +120,14 @@ pub use utils::*;
 // Re-export external dependencies
 pub use anyhow;
 pub use app_settings::{
-    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
-    CeilingEnforcement, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, ImageRetentionSettings,
-    LetsEncryptSettings, McpServerSettings, MetricsStoreKind, MonitoringSettings,
-    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
-    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
+    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
+    AppSettings, BuildLimitsSettings, CeilingEnforcement, ClusterDnsSettings,
+    ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
+    DockerRegistrySettings, ImageRetentionSettings, LetsEncryptSettings, McpServerSettings,
+    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
+    ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
+    TenantResourceCeilings,
 };
 pub use async_trait;
 pub use chrono;
