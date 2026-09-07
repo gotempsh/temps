@@ -3,17 +3,24 @@
 
 # Cal.diy is Cal.com's MIT-licensed, self-hosted community edition. Upstream
 # recommends it for personal/non-production use, not customer-facing booking
-# infrastructure -- see https://github.com/calcom/cal.diy. This template is
-# for self-hosting it as internal tooling (e.g. an onboarding "book a call"
-# step), not as a production dependency.
+# infrastructure -- see https://github.com/calcom/cal.diy. Image is published
+# under the project's pre-rename name, docker.io/calendso/calendso, pinned to
+# the v6.2.0 release (the latest cal.diy git tag at the time this was added).
 slug: cal-diy
-name: Cal.diy Scheduling
-kind: starter
-description: Self-hosted scheduling and booking pages -- Cal.com's open-source community edition. MIT-licensed, no license key. Upstream recommends personal/non-production use only.
+name: Cal.diy
+version: 6.2.0
+kind: service
+description: Self-hosted scheduling and booking pages backed by a Temps-managed PostgreSQL database -- Cal.com's open-source community edition. MIT-licensed, no license key. Upstream recommends personal/non-production use only.
 git:
   url: https://github.com/calcom/cal.diy.git
-  ref: main
+  ref: v6.2.0
 preset: dockerfile
+image: docker.io/calendso/calendso@sha256:ace3bb1219fb7306585ab9f4d94d41af7ee064c343db0498173436bbe857bd49
+resources:
+  cpu_request: 500000
+  cpu_limit: 1000000
+  memory_request: 512
+  memory_limit: 1024
 exposed_port: 3000
 health_check_path: /
 tags:
@@ -21,25 +28,18 @@ tags:
   - booking
   - calendar
   - self-hosted
-  - nextjs
 features:
   - Booking pages, availability rules, and buffers
   - Calendar sync with Google, Outlook, and Apple Calendar
   - "Team scheduling: round-robin and collective event types"
-  - Postgres-backed, MIT-licensed, no vendor lock-in
+  - PostgreSQL managed, backed up, and restored by Temps
 services:
   - postgres
+managed_service_bindings:
+  postgres:
+    DATABASE_URL: POSTGRES_URL
+    DATABASE_DIRECT_URL: POSTGRES_URL
 env_vars:
-  - name: DATABASE_URL
-    description: Postgres connection string. Set this to the POSTGRES_URL value shown on the linked Postgres service.
-    example: postgresql://user:password@host:5432/calendso
-    required: true
-    secret: true
-  - name: DATABASE_DIRECT_URL
-    description: Direct (non-pooled) Postgres connection string used for migrations. Same value as DATABASE_URL unless a connection pooler sits in front of Postgres.
-    example: postgresql://user:password@host:5432/calendso
-    required: true
-    secret: true
   - name: NEXT_PUBLIC_WEBAPP_URL
     description: Public URL this app is served on.
     required: true
@@ -49,12 +49,12 @@ env_vars:
     required: true
     default_generator: app_url
   - name: NEXTAUTH_SECRET
-    description: Session-signing secret for NextAuth. Generate with `openssl rand -base64 32`.
+    description: Session-signing secret for NextAuth.
     required: true
     secret: true
     default_generator: random_secret
   - name: CALENDSO_ENCRYPTION_KEY
-    description: Symmetric key (AES-256, 32 bytes) used to encrypt stored calendar credentials. Generate with `openssl rand -base64 24`.
+    description: Symmetric key (AES-256, 32 bytes) used to encrypt stored calendar credentials.
     required: true
     secret: true
     default_generator: random_secret
@@ -70,5 +70,5 @@ env_vars:
     example: "587"
     required: false
 is_public: true
-is_featured: false
-sort_order: 3
+is_featured: true
+sort_order: 2
