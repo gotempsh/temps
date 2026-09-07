@@ -677,13 +677,8 @@ async fn mirror_native_backup(
     let version = service_engine_version(resources.encryption, service);
 
     let (root, selected, engine, format, compression, identity) = match service_type.as_str() {
-        "mongodb" | "mongo" | "redis" => {
+        "mongodb" | "mongo" | "redis" if location_key.trim_end_matches('/').ends_with("/walg") => {
             let root = location_key.trim_end_matches('/').to_string();
-            if !root.ends_with("/walg") {
-                return Err(StageError::Unsupported(format!(
-                    "{service_type} Cloud backups require the WAL-G stream path; got {location}"
-                )));
-            }
             let all = resources
                 .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
                 .await?;
@@ -738,6 +733,56 @@ async fn mirror_native_backup(
                     },
                 )
             }
+        }
+        // No WAL-G in the container at backup time: temps-backup's
+        // RedisEngine/MongodbEngine fall back to a one-shot `redis-cli
+        // --rdb`/`mongodump --archive` dump, gzip it, and upload exactly one
+        // dump object plus a `metadata.json` sidecar -- the same shape
+        // postgres_pgdump uses below. That backup is fully valid and
+        // restorable in OSS; only the WAL-G-specific immutable-identity proof
+        // is unavailable, so it mirrors to Cloud as a plain object set
+        // instead of being permanently excluded. Previously this whole
+        // branch required a `/walg` path and returned `Unsupported` forever
+        // for any non-WAL-G Redis/MongoDB backup, even though nothing about
+        // the dump itself makes it structurally unmirrorable.
+        "mongodb" | "mongo" | "redis" => {
+            let root = location_key
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .ok_or_else(|| {
+                    StageError::Unsupported(format!(
+                        "{service_type} dump location {location_key} has no parent directory"
+                    ))
+                })?;
+            let metadata_key = format!("{root}/metadata.json");
+            let all = resources
+                .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+                .await?;
+            let selected = all
+                .iter()
+                .filter(|object| object.key == location_key || object.key == metadata_key)
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.len() < 2 || !selected.iter().any(|object| object.key == metadata_key) {
+                return Err(StageError::Retry(format!(
+                    "{service_type} dump {location_key} is incomplete or lacks {metadata_key}"
+                )));
+            }
+            let (engine, format) = if service_type == "redis" {
+                (BackupEngine::Redis, BackupFormat::RedisRdb)
+            } else {
+                (BackupEngine::MongoDb, BackupFormat::MongoDumpArchive)
+            };
+            (
+                root,
+                selected,
+                engine,
+                format,
+                BackupCompression::Gzip,
+                NativeSnapshotIdentity::ObjectSet {
+                    snapshot_name: backup.backup_id.clone(),
+                },
+            )
         }
         "mariadb" => {
             let root = location_key.trim_end_matches('/').to_string();
@@ -3305,6 +3350,451 @@ mod tests {
                  Unsupported, never Retry): {reason}"
             ),
         }
+    }
+
+    /// Shared fixture for the redis-fallback tests below: one `redis`
+    /// service with one completed backup tagged `{"engine": "redis"}`,
+    /// whose `s3_location` is a logical-dump path (does NOT end in `/walg`,
+    /// matching what `RedisEngine`'s `redis-cli --rdb` fallback actually
+    /// uploads). `s3_endpoint` lets callers point the S3 source at either an
+    /// unreachable port (proving only that dispatch is correct, no I/O) or a
+    /// real local stub server (proving the selection/checksum logic too).
+    async fn seed_redis_fallback_backup(
+        db: &sea_orm::DatabaseConnection,
+        s3_endpoint: &str,
+    ) -> (
+        temps_core::EncryptionService,
+        temps_entities::backups::Model,
+    ) {
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+            schema.create_table_from_entity(temps_entities::external_service_backups::Entity),
+            schema.create_table_from_entity(temps_entities::external_services::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite fixture table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated foreign keys");
+
+        let encryption = temps_core::EncryptionService::new_from_password("redis-fallback-test");
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("Temps Cloud managed backups".to_owned()),
+            bucket_name: Set("managed-bucket".to_owned()),
+            region: Set("test-1".to_owned()),
+            backing_service_id: Set(None),
+            endpoint: Set(Some(s3_endpoint.to_owned())),
+            bucket_path: Set(String::new()),
+            access_key_id: Set(encryption
+                .encrypt_string("test-access-key")
+                .expect("encrypt fixture access key")),
+            secret_key: Set(encryption
+                .encrypt_string("test-secret-key")
+                .expect("encrypt fixture secret key")),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("S3 source inserts");
+        temps_entities::external_services::Model {
+            id: 1,
+            name: "redis".to_owned(),
+            service_type: "redis".to_owned(),
+            version: Some("7".to_owned()),
+            status: "running".to_owned(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_owned(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+        .into_active_model()
+        .insert(db)
+        .await
+        .expect("external service inserts");
+        let backup_uuid = Uuid::new_v4().to_string();
+        let s3_location = format!(
+            "s3://managed-bucket/external_services/redis/redis/2026/09/04/{backup_uuid}/dump.rdb.gz"
+        );
+        temps_entities::external_service_backups::Model {
+            id: 1,
+            service_id: 1,
+            backup_id: 1,
+            backup_type: "full".to_owned(),
+            state: "completed".to_owned(),
+            started_at: now,
+            finished_at: Some(now),
+            size_bytes: Some(1),
+            s3_location: s3_location.clone(),
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "gzip".to_owned(),
+            created_by: 1,
+            expires_at: None,
+            service_name_snapshot: None,
+            service_type_snapshot: None,
+        }
+        .into_active_model()
+        .insert(db)
+        .await
+        .expect("external service backup inserts");
+        let backup = temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("redis-fallback-backup".to_owned()),
+            backup_id: Set(backup_uuid),
+            schedule_id: Set(None),
+            backup_type: Set("full".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1)),
+            file_count: Set(Some(1)),
+            s3_source_id: Set(1),
+            s3_location: Set(s3_location),
+            error_message: Set(None),
+            metadata: Set(serde_json::json!({"engine": "redis"}).to_string()),
+            checksum: Set(None),
+            compression_type: Set("gzip".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("redis-fallback backup inserts");
+
+        (encryption, backup)
+    }
+
+    /// Redis/MongoDB fall back to a one-shot logical dump (`redis-cli
+    /// --rdb`/`mongodump --archive`) whenever the container has no wal-g in
+    /// it, uploading a single object under a location that does NOT end in
+    /// `/walg`. Before this fix, `mirror_native_backup`'s combined
+    /// `"redis"|"mongodb"` arm required a `/walg` root unconditionally and
+    /// returned `Unsupported` — a *permanent* rejection — for every such
+    /// backup, with no I/O at all. The fallback arm added by this fix
+    /// reaches its own repository-listing S3 call instead, which fails with
+    /// `Retry` against the closed loopback endpoint below. As in the
+    /// pg_dump test above, that distinction (`Retry` vs. synchronous
+    /// `Unsupported`) is proof of taking the right path without a working
+    /// S3 backend.
+    ///
+    /// This test proves only dispatch — it never reaches a real S3 backend,
+    /// so it says nothing about whether the fallback branch selects the
+    /// right objects or builds the right snapshot request. See
+    /// `redis_fallback_native_mirror_selects_dump_and_metadata_over_a_real_repository`
+    /// and `redis_fallback_native_mirror_retries_when_metadata_json_is_missing`
+    /// below for that.
+    #[tokio::test]
+    async fn redis_logical_fallback_backups_route_to_native_mirror_not_walg() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        // A closed loopback port: any S3 call this test reaches fails fast
+        // with connection-refused instead of hanging or reaching a real
+        // object storage endpoint, per the convention documented on
+        // `linked_link_fixture`.
+        let (encryption, backup) = seed_redis_fallback_backup(&db, "http://127.0.0.1:1").await;
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        let instance_id = link.instance_id().expect("linked instance id");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("closed loopback source can never actually mirror in this test");
+        match error {
+            StageError::Retry(_) => {}
+            StageError::Unsupported(reason) => panic!(
+                "redis logical-fallback backup (no /walg root) was permanently rejected instead \
+                 of routed to native mirroring (this is the exact bug under test — dispatch fell \
+                 through to the /walg-only guard, which runs before any I/O and can only produce \
+                 Unsupported, never Retry): {reason}"
+            ),
+        }
+    }
+
+    struct RepositoryStub {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    /// `aws-sdk-s3` percent-encodes query values (notably `/` as `%2F` in
+    /// `prefix`), so a raw `split('=')` must be decoded before comparing
+    /// against real object keys. Repository keys are plain ASCII paths, so a
+    /// minimal `%XX` decoder is sufficient — no general UTF-8 handling needed.
+    fn percent_decode(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
+                    decoded.push(byte);
+                    index += 3;
+                    continue;
+                }
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+        String::from_utf8(decoded).expect("repository stub keys are ASCII")
+    }
+
+    async fn repository_list_stub(
+        State(state): State<Arc<RepositoryStub>>,
+        Path(bucket): Path<String>,
+        uri: axum::http::Uri,
+    ) -> (StatusCode, HeaderMap, String) {
+        let params: HashMap<String, String> = uri
+            .query()
+            .map(|query| {
+                query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(k, v)| (percent_decode(k), percent_decode(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let prefix = params.get("prefix").cloned().unwrap_or_default();
+        let objects = state.objects.lock().expect("repository stub objects lock");
+        let mut contents = String::new();
+        for (key, body) in objects.iter().filter(|(key, _)| key.starts_with(&prefix)) {
+            contents.push_str(&format!(
+                "<Contents><Key>{key}</Key><Size>{}</Size></Contents>",
+                body.len()
+            ));
+        }
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>{bucket}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount>\
+             <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{contents}\
+             </ListBucketResult>",
+            objects.len(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/xml".parse().expect("content-type header"),
+        );
+        (StatusCode::OK, headers, xml)
+    }
+
+    async fn repository_get_object_stub(
+        State(state): State<Arc<RepositoryStub>>,
+        Path((_bucket, key)): Path<(String, String)>,
+    ) -> (StatusCode, HeaderMap, Body) {
+        let objects = state.objects.lock().expect("repository stub objects lock");
+        match objects.get(&key) {
+            Some(body) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_LENGTH,
+                    body.len()
+                        .to_string()
+                        .parse()
+                        .expect("content-length header"),
+                );
+                (StatusCode::OK, headers, Body::from(body.clone()))
+            }
+            None => (StatusCode::NOT_FOUND, HeaderMap::new(), Body::empty()),
+        }
+    }
+
+    /// Starts a minimal real S3-compatible stub (ListObjectsV2 + GetObject,
+    /// backed by an in-memory key/value map) that `aws-sdk-s3` can talk to
+    /// like any other endpoint. Returns `None` when the sandbox denies TCP
+    /// binding, mirroring `test_native_backup_mirror_streams_s3_source_and_resumes_at_object_boundary`'s
+    /// skip convention.
+    async fn spawn_repository_stub(
+        objects: HashMap<String, Vec<u8>>,
+    ) -> Option<(String, Arc<RepositoryStub>)> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping repository stub test");
+                return None;
+            }
+            Err(error) => panic!("bind repository stub: {error}"),
+        };
+        let address = listener.local_addr().expect("repository stub address");
+        let state = Arc::new(RepositoryStub {
+            objects: Mutex::new(objects),
+        });
+        let app = Router::new()
+            // `list_objects_v2` with `force_path_style` requests
+            // `/{bucket}/` (trailing slash) for the bucket-level listing —
+            // distinct from `GetObject`'s `/{bucket}/{key}`, which never has
+            // a trailing slash of its own before the key.
+            .route("/{bucket}/", get(repository_list_stub))
+            .route("/{bucket}/{*key}", get(repository_get_object_stub))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve repository stub");
+        });
+        Some((format!("http://{address}"), state))
+    }
+
+    /// Derives `(root, dump_key, metadata_key)` from a seeded backup's
+    /// `s3_location`, the same way `mirror_native_backup`'s fallback branch
+    /// does: strip the bucket prefix, then split the dump object's key off
+    /// its parent directory.
+    fn redis_fallback_repository_keys(backup: &temps_entities::backups::Model) -> (String, String) {
+        let bucket_relative = backup
+            .s3_location
+            .strip_prefix("s3://managed-bucket/")
+            .expect("fixture location is under managed-bucket");
+        let root = bucket_relative
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .expect("fixture dump key has a parent directory");
+        let metadata_key = format!("{root}/metadata.json");
+        (bucket_relative.to_string(), metadata_key)
+    }
+
+    /// The substantive counterpart to the dispatch-only test above: a real
+    /// repository stub proves the fallback branch selects exactly the dump
+    /// object and its `metadata.json` sidecar out of a repository that also
+    /// contains an unrelated object, and that both selected objects are
+    /// actually read and checksummed (`resources.object_inspections`) before
+    /// the flow reaches Cloud's (unreachable, in this test) declare
+    /// endpoint. Without this, a change that silently selected the wrong
+    /// objects — or none at all — would still produce the same `Retry` the
+    /// dispatch-only test checks for, and pass unnoticed.
+    #[tokio::test]
+    async fn redis_fallback_native_mirror_selects_dump_and_metadata_over_a_real_repository() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, metadata_key) = redis_fallback_repository_keys(&backup);
+        let decoy_key = {
+            let root = dump_key.rsplit_once('/').expect("dump key has a parent").0;
+            format!("{root}/unrelated-object.tmp")
+        };
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
+            objects.insert(metadata_key, b"{\"redis_version\":\"7.4\"}".to_vec());
+            objects.insert(decoy_key, b"not part of this backup".to_vec());
+        }
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        // Cloud itself stays unreachable — this test is only about what
+        // happens against the *source* repository, so `link.declare_native_snapshot`
+        // is expected to fail too, just later in the flow than the bug this
+        // fix addresses.
+        let link = linked_link_fixture(&temp);
+        let instance_id = link.instance_id().expect("linked instance id");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("Cloud link is unreachable in this test");
+        match error {
+            StageError::Retry(_) => {}
+            StageError::Unsupported(reason) => panic!(
+                "a real repository with a complete dump + metadata.json must not be Unsupported: {reason}"
+            ),
+        }
+        assert_eq!(
+            resources.object_inspections.len(),
+            2,
+            "expected exactly the dump object and metadata.json to be read and checksummed, \
+             proving the decoy object was excluded and both real objects were reached"
+        );
+    }
+
+    /// The `mirror_native_backup` fallback branch treats a dump with no
+    /// sibling `metadata.json` as incomplete and retries rather than
+    /// mirroring a snapshot that can never be restored. Prove that guard
+    /// actually fires against a real (if sparse) repository listing, not
+    /// just against an unreachable endpoint.
+    #[tokio::test]
+    async fn redis_fallback_native_mirror_retries_when_metadata_json_is_missing() {
+        let Some((origin, state)) = spawn_repository_stub(HashMap::new()).await else {
+            return;
+        };
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let (encryption, backup) = seed_redis_fallback_backup(&db, &origin).await;
+        let (dump_key, _metadata_key) = redis_fallback_repository_keys(&backup);
+        {
+            let mut objects = state.objects.lock().expect("repository stub objects lock");
+            objects.insert(dump_key, b"redis-rdb-dump-bytes".to_vec());
+            // Deliberately no metadata.json.
+        }
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        let instance_id = link.instance_id().expect("linked instance id");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("a dump with no metadata.json sidecar must not mirror");
+        match error {
+            StageError::Retry(reason) => assert!(
+                reason.contains("is incomplete or lacks"),
+                "expected the incomplete-repository retry, got a different Retry: {reason}"
+            ),
+            StageError::Unsupported(reason) => panic!(
+                "a missing metadata.json is a transient repository state (the upload may still be \
+                 in progress), not a permanent rejection: {reason}"
+            ),
+        }
+        assert_eq!(
+            resources.object_inspections.len(),
+            0,
+            "the incomplete-repository check must short-circuit before inspecting any object"
+        );
     }
 
     #[test]
