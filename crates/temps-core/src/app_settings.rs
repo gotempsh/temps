@@ -997,18 +997,20 @@ impl Default for MultiNodeSettings {
 
 /// Workspace preview gateway settings.
 ///
-/// The preview gateway is a single shared Docker container that lives on the
-/// `temps-sandbox-net` network and routes requests to workspace sandbox dev
-/// servers based on the `Host` header (`ws-<sid>-<port>.<preview_domain>`).
-/// `temps serve` reconciles this container on startup; these settings let an
-/// operator override the image, host port, and auto-upgrade behavior.
+/// The preview gateway uses a private routing container plus a hardened ingress
+/// relay bound to host loopback. The router joins each sandbox's isolated
+/// network and routes requests to workspace dev servers based on the `Host`
+/// header (`ws-<sid>-<port>.<preview_domain>`), while the relay never joins a
+/// tenant network. `temps serve` reconciles both containers on startup; these
+/// settings let an operator override the router image, host port, and
+/// auto-upgrade behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
     /// Docker image reference for the gateway. Pinned by digest per Temps release.
     /// Operators can override this to test a custom build.
     #[schema(
-        example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
+        example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
     )]
     pub image: String,
     /// Host port to publish the gateway on (always bound to 127.0.0.1).
@@ -1059,7 +1061,7 @@ fn default_preview_gateway_container() -> String {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
-            image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9".to_string(),
+            image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448".to_string(),
             host_port: 8090,
             container_name: default_preview_gateway_container(),
             auto_upgrade: true,
