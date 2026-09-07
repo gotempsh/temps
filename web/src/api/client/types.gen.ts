@@ -872,7 +872,7 @@ export type AiStatusBreakdownResponse = {
 
 /**
  * One row in the AI-agent HTTP status breakdown: the request count for a
- * status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+ * status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
  */
 export type AiStatusBreakdownRow = {
     request_count: number;

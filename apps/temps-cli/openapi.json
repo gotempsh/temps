@@ -1784,7 +1784,7 @@
         "type": "object"
       },
       "AiStatusBreakdownRow": {
-        "description": "One row in the AI-agent HTTP status breakdown: the request count for a\nstatus class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.",
+        "description": "One row in the AI-agent HTTP status breakdown: the request count for a\nstatus class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.",
         "properties": {
           "request_count": {
             "format": "int64",
