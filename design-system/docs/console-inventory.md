@@ -78,6 +78,23 @@ Ranked by how many pages need them.
 15. **Data browser**: entity tree, data grid, Monaco editor.
 16. **Role/permission matrix**, retention sliders, DNS TXT challenge block,
     insight strip (stat and AI insights with tone and headline value).
+17. **Resource monitoring**: four synchronised time series (cpu, memory, disk,
+    network) on one axis with one cursor, per-resource threshold lines with
+    words, a disk projection, `Gauge` tiles with peaks, a composition view by
+    container, and a container ledger with per-row sparklines. In web today
+    this is `NodeDetail`'s four independent recharts cards plus a table with
+    three unlabelled bars per row; there is no shared cursor, no attribution
+    from a chart to a container, no projection, and no "last known" state for
+    a node that stopped answering.
+18. **Service resources**: the same four synchronised series for one service
+    rather than one machine — replicas summed, the same shared cursor, then a
+    per-replica ledger whose row opens the node that replica runs on, because
+    "the service is fine but one replica is on the machine that is not" is what
+    the facet exists to show. It is a `Section` inside the project record's
+    `overview`, never a seventh tab. A stateless service's disk pane is a
+    `PageState` that says *which* of the four reasons it is empty ("no volume",
+    not "no data") and links the nodes where the bytes land. Web has no
+    per-service resource view at all: container stats stop at the node page.
 
 ## Interaction states that mockups must include
 

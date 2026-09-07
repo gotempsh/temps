@@ -1366,7 +1366,7 @@ function ScreenFrame({ view, dark, label, href }: { view: string; dark?: boolean
   )
 }
 
-/** The five shapes, each with the screen that is its reference. */
+/** The six shapes, each with the screen that is its reference. */
 const SHAPES: readonly { id: string; shape: string; data: string; view: string; href?: string; rule: string }[] = [
   {
     id: 'list', shape: 'Ledger', data: 'Many records of one kind',
@@ -1387,6 +1387,11 @@ const SHAPES: readonly { id: string; shape: string; data: string; view: string; 
     id: 'config', shape: 'Settings', data: 'A configuration, saved once',
     view: 'settings',
     rule: 'Sections of fields, one sticky save bar, the danger zone last and typed. Every field says when it takes effect.',
+  },
+  {
+    id: 'monitor', shape: 'Detail with charts', data: 'A machine and what it is using',
+    view: 'node:hetzner-2',
+    rule: 'A monitor is a record, not a dashboard: the verdict names the container to move, the four resources share one time axis and one cursor, every threshold is a dashed line carrying its own word, and the containers that made the pressure are a ledger under the plots.',
   },
   {
     id: 'tool', shape: 'Tool', data: 'A question, narrowed until it answers',

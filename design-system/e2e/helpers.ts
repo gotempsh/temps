@@ -106,6 +106,10 @@ export const V5_VIEWS = [
   'proxy',
   'settings',
   'settings:nodes',
+  // Both node records: hetzner-2 is the machine under pressure (four charts on
+  // one axis, the containers that made them), hetzner-3 the silent one that
+  // keeps its tiles and stamps them with the time they were last true.
+  'node:hetzner-2',
   'node:hetzner-3',
   'settings:cluster',
   'settings:builds',

@@ -69,6 +69,11 @@ import { fmtNum } from '@/components/op'
 import { DeploysTab, EnvironmentsTab, VariablesTab } from '@/sections/ConsoleV1Env'
 import { DeploymentScreen } from '@/sections/ConsoleV1Deploy'
 import { NodeScreen } from '@/sections/ConsoleV1Nodes'
+/* The project record already carries six tabs, and a page gets one row of them,
+   ever — so the service's resources fold into `overview` as a Section between
+   the request chart and the deploys, where "what is it costing" is read.
+   See docs/handoff.additions.resources.md. */
+import { ServiceResources } from '@/sections/ConsoleV1Resources'
 import { MetricsScreen, SandboxScreen, SandboxesScreen, TraceScreen, TracesScreen } from '@/sections/ConsoleV1Observe'
 import { EmailDetailScreen, EmailDomainScreen, EmailScreen } from './ConsoleV1Email'
 import { DatabaseScreen } from './ConsoleV1Database'
@@ -532,6 +537,7 @@ function ProjectScreen({ name, dense, go }: { name: string; dense: boolean; go: 
               <Metric label="p95 latency" value={184} unit="ms" delta="−9ms" baseline={prev ? `vs ${prev.id}` : 'first deploy'} />
               <Metric label="uptime · 90d" value="99.94" unit="%" baseline="2 incidents · 90d window" />
             </MetricGrid>
+            <ServiceResources project={project.name} go={go} dense={dense} />
             <Section title="Recent deploys" meta={`${deploys.length} of 41 · all deploys in the deploys tab`}>
             <div className="op-rows border">
               <div className="op-row hidden items-center md:grid md:grid-cols-[80px_80px_1fr_100px]"><span className="op-label">deploy</span><span className="op-label">when</span><span className="op-label">commit</span><span className="op-label">build</span></div>

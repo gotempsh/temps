@@ -156,6 +156,9 @@ const RECORDS: ReadonlyArray<{ label: string; path: string }> = [
   { label: 'deploy-dep_91a', path: v1('deploy:dep_91a') },
   { label: 'db-acme-pg', path: v1('db:acme-pg') },
   { label: 'issue-i_4821', path: v1('issue:i_4821') },
+  // The two halves of the monitoring screen: hetzner-2 under pressure with
+  // every plot drawn, hetzner-3 silent with every plot greyed and stamped.
+  { label: 'node-hetzner-2', path: v1('node:hetzner-2') },
   { label: 'node-hetzner-3', path: v1('node:hetzner-3') },
   { label: 'settings-hub', path: v1('settings') },
   // The logs screen, on the chrome-free console route: query bar, histogram,

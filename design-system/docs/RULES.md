@@ -278,6 +278,18 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Lay it out as conversation (main) · run (aside: model · workspace · mode · context · checkpoints) · composer (fixed bottom); below md the aside becomes the composer's picker row.
 - Write verdict first, then the blocks; sentence case, one fact once, no "I have successfully…".
 
+## Monitoring
+
+- Open a monitoring page with a verdict: the container to move, not the number it reached.
+- Put cpu, memory, disk and network on one time axis with one cursor; `←` `→` walk the buckets and every readout answers for the same one.
+- Print a percentage beside its absolute, always: `92% · 7.4 GiB of 8.0 GiB`.
+- Draw a threshold as a dashed line carrying its own word (`busy 80%`, `oom risk 95%`), and tone only the stretch that crossed it.
+- State the projection on anything that fills: the free space, the rate, and the date it runs out.
+- Attribute pressure under the chart: a ledger of containers worst first, `⏎` opening what the reader can act on.
+- Order every fleet list pressure first — unreachable, then closest to a threshold — and fold a service's resources into its overview, never into a seventh tab.
+- Keep a silent node's tiles and stamp each with the time it was last true; never a gauge with no number behind it, and never an empty page where a sick machine should be.
+- Pause a live number the moment the reader scrolls, and say `paused`.
+
 ## Content
 
 - Write everything in sentence case. Spell product names as their owners do; never re-case an identifier.

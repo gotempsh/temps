@@ -1729,12 +1729,12 @@ trust are cards above and below it.
   down, and the two ways out; memory pressure on another node is the `+1`.
 - **The record** follows the recipe. Verdict; lede word online · offline ·
   draining with heartbeat, address, reach, agent, running, up; a Callout
-  quoting the agent's last error when offline. Content: Pressure (three
-  tiles, the chart of the picked one, range), Running (first four). Aside:
-  Reach (private and public address, tunnel, latency), Agent (version, os,
-  joined, last heartbeat, and a note when it is behind), Danger (drain,
-  undrain, remove; the control plane says it cannot be). Facets: containers
-  (a ledger, each row opening its project or service), agent log.
+  quoting the agent's last error when offline. Content is the Resources
+  entry below: four charts on one axis, the containers that made them, and
+  an aside of Gauge tiles, the machine facts and the three actions (drain,
+  restart agent, add a node). Two facets and no third — resources (the
+  machine) and agent log (what it has been telling us); containers folded
+  under the charts, because the ledger is the attribution the charts owe.
 - **Cluster** is a settings page: joining (the token as a SecretValue with
   regenerate, the three commands to run on the machine), cluster dns (the
   toggle, the locked pool and prefix with why they are locked), trust (the
@@ -1742,6 +1742,131 @@ trust are cards above and below it.
   The list's hint links there and "join a node" goes there.
 - Every "hetzner-1" mentioned on a database or deployment record opens
   `node:hetzner-1`; before this the link went nowhere.
+
+### Resources (`node:<name>` · the project record's `resources` section)
+
+`src/sections/ConsoleV1Resources.tsx`. Dokploy's monitoring page is four
+gauges and four charts in a row of cards with a range picker on top: it tells
+the operator that memory is at 91% and stops there, which is the half of the
+sentence they cannot act on. Ours is a record, not a dashboard.
+
+- **The verdict is the page.** `◐ Memory is at 92% of 8.0 GiB and has been
+  climbing for two hours, since dep_31c. billing-worker-dep_31c-1 holds
+  1.4 GiB of it and has restarted 2 times. Move it to another node, or add a
+  node.` Every phrase is a link: the deploy that caused it, the container that
+  holds it, the page that adds capacity. A healthy machine still gets a
+  sentence with the fact that proves it — "Nothing to do: cpu, memory, disk and
+  network are all under their warn lines, and the busiest is disk at 78%. At
+  400 MB a day the disk is full in 44 d." A number with no verb is a
+  dashboard; a verb with no number is a slogan.
+- **The lede is the four resources plus who is running and who is talking**:
+  cpu (now · peak with its time), memory (used *of* total *and* the share),
+  disk free (with the projection), network (in · out), containers, heartbeat
+  (with the agent version). Six facts, each of which the reader would
+  otherwise have to hunt for; the meta carries `worker · fsn1 · direct` and
+  nothing else, because a fact appears once.
+- **One axis, one cursor.** The four charts are the same 48 buckets of 30
+  minutes, and hovering 19:30 on any of them reads 19:30 on all four —
+  `cpu 20% · memory 38% (3.1 GiB) · disk 22% · network 4.0 MB/s in`. That is
+  the whole point of the page: "what was cpu doing when memory climbed" is one
+  question, and four charts with four independent hovers make the reader ask
+  it four times and hold the answers in their head. A `cursor` control above
+  the strip is the keyboard's way in (`←` `→` walk the buckets, `esc` clears),
+  and the bucket is announced in a live region. The cursor itself is a dotted
+  ink rule drawn over all four plots at the same fraction of the axis.
+- **A threshold is a line with a word, and tone is only where it crossed.**
+  Each chart carries its two dashed threshold lines labelled in their own
+  words — `busy 80%` / `saturated 95%`, `tight 85%` / `oom risk 95%`,
+  `tight 80%` / `writes stop 90%`. The series stays ink for the whole window;
+  a second series carries **only** the buckets at or above the line, drawn on
+  top in the threshold's tone and kept out of the table view (it is the same
+  numbers as the line it marks). The footer states the excursion as a fact:
+  `◐ above tight for 1 bucket (30m 00s)`. Toning the whole line, as the first
+  cut did, says memory was bad all day when it was fine until 19:30.
+- **A percentage always arrives with its absolute.** The header says the unit
+  once (`memory · % of 8.0 GiB`), the readout says `92% (7.4 GiB)`, the gauge
+  says `7.4 GiB of 8.0 GiB`. Disk is drawn as a share rather than in GB for
+  one reason: the axis is then bounded 0–100 and its two threshold lines are
+  always on it, however empty the disk is. The absolutes ride the readout and
+  the footer.
+- **Disk states its projection.** The dashed second series is the fitted trend
+  at the measured growth rate, and the footer names where it lands and when:
+  `125 GB free · at 100 MB/day it hits the 90% line on Aug 28 2029 and is full
+  on Feb 4 2030`. A disk is the one resource whose future is knowable, so not
+  saying it is a choice to withhold it. The projection is drawn on the shared
+  axis, not on an axis of its own: the picture stays comparable with the other
+  three, and the date does the extrapolating.
+- **Pressure is attributed.** Under the charts is one `Ledger` of the
+  containers on the machine — kind icon, name, cpu, memory *of its own limit*
+  with the share, network, restarts, uptime, and a `Sparkline` each for cpu
+  and memory — sorted failing-first then closest to its own limit, `⏎` opening
+  the service. A chart that says 92% and does not say which container holds it
+  has told the reader nothing they can do. The memory chart's `total · by
+  container` segment swaps the line for a `StackedInk` of the three biggest
+  containers plus an honest remainder, so the layer that grew after the deploy
+  is visible as a layer.
+- **The aside is what is left**: four `Gauge` tiles (current, peak with its
+  window, thresholds as ticks carrying their words), "what is using it" as the
+  top three by memory, the machine facts the lede does not carry (arch,
+  kernel, docker, disk device), and the three actions — `drain node`
+  (`EchoDialog`, typed, because it moves containers), `restart agent`
+  (`EchoDialog`, ink not red, because it is reversible and nothing is
+  redeployed), `add a node`. The agent version is a lede fact and therefore
+  *not* in the aside.
+- **One reversible click makes the monitor.** In the memory chart's footer:
+  `alert when memory > 90% for 10m`. It creates the monitor, toasts, and turns
+  into `◐ alerting when memory > 90% for 10m · undo`. The moment a reader
+  learns a threshold matters is the moment to offer the alert; sending them to
+  a settings page loses them.
+- **Live is honest.** A `Live` control polls every 30s and **pauses itself the
+  moment the reader scrolls**, saying `paused`; the same control resumes, and
+  `space` toggles it. A number that moves under somebody reading it is worse
+  than a number that is a minute old. On an offline machine the control is not
+  drawn at all — it says `○ not live · no samples since 21:25`, because
+  nothing is arriving and a spinning "live" badge would be a lie.
+- **A node with no samples keeps its tiles.** hetzner-3 is offline: the record
+  keeps every tile, every plot and every row, greys them, and stamps each with
+  the time it was last true (`of 4 vCPU · last true 21:25`), over a `Callout`
+  quoting the agent's last error verbatim. An empty page is indistinguishable
+  from a healthy one, and this machine is neither.
+- **The range strip** is `1h · 24h · 7d · 30d` with everything past the sample
+  horizon struck through and explained on click, never hidden. Node samples
+  are kept 7d — a different shelf from the plan's 30d telemetry retention, and
+  every footer says which one it is quoting.
+- **Phone (390).** The four charts stack, each keeping its readout, footer and
+  table view; the aside collapses behind a `details` button at the *top* of
+  the column (a `Drop` opening downwards — anchored at the foot of a long page
+  it would open off-screen); the containers ledger renders its mobile row,
+  `name · memory of limit`, with the state glyph in its own slot and the row
+  itself as the action. No horizontal document scroll at 390 or 1440; the
+  ledger is the one deliberate sideways scroller.
+- **The service side.** The project record already carries six tabs and a page
+  gets one row of them, ever — so a service's resources are a `Section` inside
+  `overview`, between the request chart and the deploys, not a seventh tab.
+  The same four charts, the replicas summed, the same shared cursor; then the
+  per-replica ledger with the node each one runs on as a link, because "the
+  service is fine but one replica is on the machine that is not" is the thing
+  this view exists to show. A stateless service has no disk of its own, so the
+  fourth chart is a `PageState` that says *which* of the four reasons it is —
+  "no volume", not "no data" — and links the nodes where the bytes actually
+  land.
+- **The nodes ledger** gained four `Sparkline`s per row (cpu · memory · disk ·
+  network, the same 24h the record plots) and a pressure-first default order:
+  unreachable first, then closest to a threshold. The phone row carries the
+  one fact a phone has room for — the worst thing on that machine right now
+  (`memory 92%`, or `no heartbeat for 4m · last sample 21:25`).
+
+**The fixture.** Deterministic: a seeded PRNG (mulberry32) and a clock frozen
+at 2026-09-06 21:29 UTC. No `Math.random`, no `new Date()` for a value, so the
+same 48 buckets render on every reload and a visual baseline means something.
+The story it tells: hetzner-2 sits at 38% memory all day until `dep_31c` lands
+billing-worker at 19:30, which leaks from 420 MiB to 1.4 GiB and takes the
+machine to 92% over the next two hours; hetzner-1 is a control plane whose cpu
+spikes to 83% three times while it builds and whose disk is at 78%, growing
+400 MB a day; `dep_91a` at 20:34 bursts the network on both while the image is
+pulled; hetzner-3 has been silent for four minutes and shows the last values
+that were true at 21:25. Fictional names throughout, and addresses only from
+the documentation ranges (`10.0.3.x`, `203.0.113.x`).
 
 ### Landing system map (`/landing`, "One engine at the center")
 
@@ -2168,7 +2293,47 @@ design-system/
      ("in api-gateway, billing-worker · from the facets").
    Minor, with it: `Drop` anchors right by default, so a suggestion panel
    needs a `start-0 end-auto` override.
-10. The `op.css` blanket transition rule carries `!important`, so every class
+10. Nine gaps the Resources screens (§7b) hit and worked around locally,
+    with none of the package touched. The first two are the expensive ones:
+    - **`TimeChart` has no `cursor` / `onCursor` pair.** It owns its hover
+      state, so a group of charts cannot be made to read the same bucket.
+      Worked around with a local `ChartStack` + `AxisPane` holding one bucket
+      index and feeding every `readoutFormat`. The visible seam: the word
+      beside each readout (`hover` / `latest`) still comes from `TimeChart`'s
+      own state, so a chart the pointer is not over says `latest` while
+      showing the shared bucket. `cursor?: number | null` +
+      `onCursor?: (i: number) => void` removes the wrapper and the seam.
+    - **`TimeChart` cannot pin its y domain.** `yTicks` sets ticks and the
+      domain stays recharts' `[0, auto]`, so a threshold above the data's
+      maximum is simply not drawn. Disk had to be re-expressed as a
+      percentage, and the service memory chart needs `yTicks` reaching the
+      limit for the limit line to appear. `yDomain?: [number, number]`, or
+      extending the domain to cover `thresholds`, is the fix.
+    - **`TimeChart` has no partial-bucket hatch.** `StackedInk` takes
+      `partial`; `TimeChart` does not, so these footers say "current bucket
+      partial" without the picture saying it.
+    - **`StackedInk` cannot join a shared cursor** either — it owns its own
+      readout region, so memory's `by container` view reads independently of
+      the other three.
+    - **`RangePicker` cannot be asked for the strip alone.** It bundles the
+      custom-window popover, which a phone does not want here, so the gated
+      strike-through had to be rebuilt locally (`Ranges`). A
+      `custom={false}` variant, or exporting the strip mapping, would do.
+    - **`Gauge` has no stale rendering** between healthy and `idle`, and
+      `idle` empties the bar — wrong for a node whose last sample is four
+      minutes old and still true. Worked around with muted ink and the stamp
+      in `of`; a `stale?: ReactNode` that greys the fill would be better.
+    - **`Live` draws a `space` `Kbd` badge and binds no key.** Every caller
+      has to add the window listener, and every caller will forget. The
+      binding belongs beside the badge.
+    - **The generated legend prints `92 %` and `1,434 MiB`** through `fmtNum`
+      plus a space, where `content.md` §6 asks for `92%`. A
+      `format?: (n: number) => string` on `TimeChart` would let the legend,
+      the readout and the table spell a number the same way.
+    - **Threshold labels overprint** each other and the deploy-cluster label
+      at the right edge when two lines are close (`busy 80%` under
+      `saturated 95%`).
+11. The `op.css` blanket transition rule carries `!important`, so every class
     that must actually animate has to be lifted out of it with a `:not(…)`
     arm — now `.animate-spin`, `.animate-pulse` and `.op-pulse`. That is
     fragile (opting one class in means editing a selector three hundred lines

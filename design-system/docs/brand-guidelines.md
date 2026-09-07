@@ -432,6 +432,12 @@ the same way every time.
   missed is the bell, a blocking decision is an EchoDialog. Two surfaces for one
   event is one of them lying. `docs/notifications.md`.
 
+- **Four charts about one machine are one question.** Resources share one time
+  axis and one cursor: "what was cpu doing when memory climbed" is asked once,
+  not four times with the answers held in the reader's head. And the page opens
+  with the container to move, never with the number it reached — a number with
+  no verb is a dashboard. `design-system-handoff.md` §7b Resources.
+
 - **An agent draws with the console's own blocks.** It has no drawing kit of
   its own, every block it renders carries the call that produced it, and every
   write is a proposal a human confirms. `docs/generative-ui.md`.
