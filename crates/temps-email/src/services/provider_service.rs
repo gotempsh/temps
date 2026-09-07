@@ -4,19 +4,19 @@
 //! Provider service for managing email provider configurations
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
-use temps_entities::email_providers;
-use tracing::{debug, error};
+use temps_entities::{email_domains, email_providers};
+use tracing::{debug, error, info};
 
 use crate::errors::EmailError;
 use crate::providers::{
     verify_scaleway_credentials, verify_ses_credentials, EmailProvider, EmailProviderType,
-    ScalewayCredentials, ScalewayProvider, SesCredentials, SesProvider, SmtpCredentials,
-    SmtpProvider,
+    ProviderDomainIdentity, ScalewayCredentials, ScalewayProvider, SesCredentials, SesProvider,
+    SmtpCredentials, SmtpProvider,
 };
 
 /// Service for managing email providers
@@ -73,6 +73,42 @@ pub struct UpdateProviderRequest {
 pub struct UpdateProviderOutcome {
     pub provider: email_providers::Model,
     pub changed_fields: Vec<String>,
+}
+
+/// Result of listing a provider's registered domains for an "import
+/// existing domain" picker. See `ProviderService::list_provider_domains`
+/// for how `supported` and `error` are distinguished.
+#[derive(Debug, Clone)]
+pub struct ListProviderDomainsResult {
+    pub supported: bool,
+    pub domains: Vec<ProviderDomainIdentity>,
+    pub error: Option<String>,
+}
+
+/// Call `list_identities` and fold "this provider type can't list domains"
+/// vs. "listing is supported but this attempt failed" into the typed
+/// result. Free function over `&dyn EmailProvider` (rather than a
+/// `ProviderService` method) so it's unit-testable against
+/// `MockEmailProvider` without a live provider connection — mirroring
+/// `refresh_identity_details` in `domain_service.rs`.
+async fn collect_provider_domains(provider: &dyn EmailProvider) -> ListProviderDomainsResult {
+    match provider.list_identities().await {
+        Ok(domains) => ListProviderDomainsResult {
+            supported: true,
+            domains,
+            error: None,
+        },
+        Err(EmailError::UnsupportedOperation { .. }) => ListProviderDomainsResult {
+            supported: false,
+            domains: Vec::new(),
+            error: None,
+        },
+        Err(e) => ListProviderDomainsResult {
+            supported: true,
+            domains: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
 }
 
 /// Result of sending a test email
@@ -387,15 +423,79 @@ impl ProviderService {
             });
         }
 
-        let updated = active.update(self.db.as_ref()).await?;
+        // The credential rotation and the domain-verification reset below
+        // must land together: if the reset failed after the credentials had
+        // already been committed, domains would keep a stale `verified`
+        // status scoped to the old provider account, letting a later send
+        // skip the local verification gate and fail against the provider
+        // instead of being caught locally. A transaction makes that
+        // impossible — either both writes land or neither does.
+        let txn = self.db.begin().await?;
+        let updated = active.update(&txn).await?;
         debug!(
             "Updated email provider {} (changed fields: {:?})",
             id, changed_fields
         );
+
+        // A domain's "verified" status was earned against whatever
+        // account/project the *old* credentials pointed at — e.g. Scaleway's
+        // "checked domain" state is scoped to a `project_id`, so rotating the
+        // API key/project silently repoints every domain at a project where
+        // none of them were ever checked. Leaving the stale `verified` status
+        // in place would let `EmailService::send` skip its local verification
+        // gate and call the provider directly, which then rejects the send
+        // with a raw provider error (e.g. Scaleway's "Email must be sent from
+        // a checked domain") instead of the graceful "domain not verified"
+        // capture path. Forcing re-verification keeps the local status honest.
+        if changed_fields.contains(&"credentials".to_string()) {
+            Self::invalidate_domain_verification(&txn, id).await?;
+        }
+
+        txn.commit().await?;
+
         Ok(UpdateProviderOutcome {
             provider: updated,
             changed_fields,
         })
+    }
+
+    /// Reset every domain bound to `provider_id` back to `pending`, clearing
+    /// its last-verified timestamp so the operator must re-verify before
+    /// Temps will send through it again. Called after a provider's
+    /// credentials change, in the same transaction as that change, so the
+    /// two writes commit or roll back together; see the call site for why
+    /// that's necessary.
+    async fn invalidate_domain_verification(
+        conn: &impl ConnectionTrait,
+        provider_id: i32,
+    ) -> Result<(), EmailError> {
+        use sea_orm::sea_query::Expr;
+
+        let reset = email_domains::Entity::update_many()
+            .col_expr(email_domains::Column::Status, Expr::value("pending"))
+            .col_expr(
+                email_domains::Column::VerificationError,
+                Expr::value(Some(
+                    "Provider credentials changed; domain must be re-verified".to_string(),
+                )),
+            )
+            .col_expr(
+                email_domains::Column::LastVerifiedAt,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
+            .filter(email_domains::Column::ProviderId.eq(provider_id))
+            .filter(email_domains::Column::Status.ne("pending"))
+            .exec(conn)
+            .await?;
+
+        if reset.rows_affected > 0 {
+            info!(
+                "Reset {} domain(s) for provider {} to pending after credential change",
+                reset.rows_affected, provider_id
+            );
+        }
+
+        Ok(())
     }
 
     /// Decrypt and parse a provider's stored SES credentials. Fails for
@@ -461,6 +561,29 @@ impl ProviderService {
                 Ok(Box::new(smtp_provider))
             }
         }
+    }
+
+    /// List domain identities registered on a provider's side, for
+    /// populating an "import existing domain" picker.
+    ///
+    /// Never returns `Err` for "this provider type can't list domains" or
+    /// "the live fetch failed" -- both are folded into the typed result so
+    /// callers (the frontend) can render an honest fallback instead of a
+    /// bare error: `supported: false` means this provider type has no
+    /// listing API at all (SMTP) and manual entry is the only option;
+    /// `error: Some(_)` means listing is supported but this particular
+    /// attempt failed (network, revoked credentials), which is also a
+    /// manual-entry fallback but worth surfacing as a warning rather than
+    /// silently pretending nothing is available. Only a genuine failure to
+    /// resolve the provider itself (not found, undecryptable credentials)
+    /// still propagates as `Err`.
+    pub async fn list_provider_domains(
+        &self,
+        provider_id: i32,
+    ) -> Result<ListProviderDomainsResult, EmailError> {
+        let provider = self.get(provider_id).await?;
+        let provider_instance = self.create_provider_instance(&provider).await?;
+        Ok(collect_provider_domains(provider_instance.as_ref()).await)
     }
 
     /// Send a test email to verify provider configuration
@@ -825,6 +948,24 @@ mod tests {
         let encryption_service = create_test_encryption_service();
         let service = ProviderService::new(db.db.clone(), encryption_service);
         Some((db, service))
+    }
+
+    // Helper to create a test domain directly in the database (bypasses the
+    // provider's create_identity, which needs real credentials).
+    async fn create_test_domain(
+        db: &Arc<sea_orm::DatabaseConnection>,
+        provider_id: i32,
+        domain_name: &str,
+    ) -> email_domains::Model {
+        let domain = email_domains::ActiveModel {
+            provider_id: Set(provider_id),
+            domain: Set(domain_name.to_string()),
+            status: Set("pending".to_string()),
+            provider_identity_id: Set(Some(format!("mock-identity-{}", domain_name))),
+            ..Default::default()
+        };
+
+        domain.insert(db.as_ref()).await.unwrap()
     }
 
     // ========== Unit Tests (no database required) ==========
@@ -1652,6 +1793,93 @@ mod tests {
         );
     }
 
+    /// Reproduces the reported bug: a domain verified against a provider's old
+    /// credentials keeps showing `verified` after the credentials are rotated
+    /// to point at a different account/project, so `EmailService::send` skips
+    /// its local gate and lets a genuinely unchecked domain reach the
+    /// provider — which is exactly how a live Scaleway send ends up rejected
+    /// with "Email must be sent from a checked domain" while Temps still
+    /// displays the domain as verified. Rotating credentials must reset any
+    /// domain bound to that provider back to `pending`.
+    #[tokio::test]
+    async fn test_update_credentials_resets_verified_domains_to_pending() {
+        let Some((db, service)) = setup_test_env().await else {
+            return;
+        };
+
+        // SMTP, not Scaleway/SES: verify_provider_credentials makes a real
+        // network call for those provider types (see test_list_providers's
+        // comment above), so SMTP is used here to exercise the credential
+        // rotation path without depending on network access.
+        let created = service
+            .create(CreateProviderRequest {
+                name: "SMTP".to_string(),
+                provider_type: EmailProviderType::Smtp,
+                region: "us-east-1".to_string(),
+                credentials: ProviderCredentials::Smtp(crate::providers::SmtpCredentials {
+                    host: "smtp.old-account.example.com".to_string(),
+                    port: 587,
+                    username: None,
+                    password: None,
+                    encryption: crate::providers::SmtpEncryption::Starttls,
+                    accept_invalid_certs: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let verified_domain = create_test_domain(&db.db, created.id, "verified.example.com").await;
+        let mut active: email_domains::ActiveModel = verified_domain.clone().into();
+        active.status = Set("verified".to_string());
+        active.last_verified_at = Set(Some(chrono::Utc::now()));
+        active.update(db.db.as_ref()).await.unwrap();
+
+        // A domain that was never verified must not be reported as "reset" —
+        // only genuinely stale verified domains are the bug being fixed here.
+        let pending_domain = create_test_domain(&db.db, created.id, "pending.example.com").await;
+        assert_eq!(pending_domain.status, "pending");
+
+        let outcome = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    credentials: Some(ProviderCredentials::Smtp(
+                        crate::providers::SmtpCredentials {
+                            host: "smtp.new-account.example.com".to_string(),
+                            port: 587,
+                            username: None,
+                            password: None,
+                            encryption: crate::providers::SmtpEncryption::Starttls,
+                            accept_invalid_certs: false,
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.changed_fields, vec!["credentials".to_string()]);
+
+        let refreshed = email_domains::Entity::find_by_id(verified_domain.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refreshed.status, "pending",
+            "a previously-verified domain must be forced back to pending after credential rotation"
+        );
+        assert!(refreshed.verification_error.is_some());
+        assert!(refreshed.last_verified_at.is_none());
+
+        let refreshed_pending = email_domains::Entity::find_by_id(pending_domain.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed_pending.status, "pending");
+    }
+
     // ========== Unit Tests for TestEmailResult ==========
 
     #[test]
@@ -2074,6 +2302,105 @@ mod tests {
                 // Some LocalStack versions may not fully support SESv2
                 println!("Identity creation failed (may be expected): {}", e);
             }
+        }
+    }
+
+    // ── collect_provider_domains ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn collect_provider_domains_returns_domains_when_supported() {
+        let mock = crate::providers::MockEmailProvider::new().with_list_identities_response(vec![
+            ProviderDomainIdentity {
+                domain: "example.com".to_string(),
+                provider_identity_id: "example.com".to_string(),
+                status: crate::providers::VerificationStatus::Verified,
+            },
+        ]);
+
+        let result = collect_provider_domains(&mock).await;
+
+        assert!(result.supported);
+        assert!(result.error.is_none());
+        assert_eq!(result.domains.len(), 1);
+        assert_eq!(result.domains[0].domain, "example.com");
+    }
+
+    /// The picker's fallback path: a provider type with no listing API
+    /// (SMTP, mimicked here) must report `supported: false` with no error —
+    /// this is a permanent "not available for this provider type", not a
+    /// transient failure worth retrying or alarming the operator about.
+    #[tokio::test]
+    async fn collect_provider_domains_reports_unsupported_without_error() {
+        let mock = crate::providers::MockEmailProvider::new().with_list_identities_unsupported();
+
+        let result = collect_provider_domains(&mock).await;
+
+        assert!(!result.supported);
+        assert!(result.error.is_none());
+        assert!(result.domains.is_empty());
+    }
+
+    /// A supported provider whose live fetch still fails (network, revoked
+    /// credentials) must fall back the same way as "unsupported" — empty
+    /// domains, never an `Err` bubbling to the caller — but with `error` set
+    /// so the UI can show *why*, distinct from "this provider type can
+    /// never do this".
+    #[tokio::test]
+    async fn collect_provider_domains_falls_back_with_reason_on_failure() {
+        let result = collect_provider_domains(&FailingListProvider).await;
+
+        assert!(result.supported);
+        assert!(result.error.is_some());
+        assert!(result.domains.is_empty());
+    }
+
+    /// Minimal `EmailProvider` whose `list_identities` always fails with a
+    /// generic provider error (not `UnsupportedOperation`), to exercise the
+    /// "supported but this attempt failed" branch of `collect_provider_domains`.
+    struct FailingListProvider;
+
+    #[async_trait::async_trait]
+    impl EmailProvider for FailingListProvider {
+        async fn create_identity(
+            &self,
+            _domain: &str,
+        ) -> Result<crate::providers::DomainIdentity, EmailError> {
+            unimplemented!()
+        }
+        async fn verify_identity(
+            &self,
+            _domain: &str,
+            _provider_identity_id: Option<&str>,
+        ) -> Result<crate::providers::VerificationStatus, EmailError> {
+            unimplemented!()
+        }
+        async fn get_identity_details(
+            &self,
+            _domain: &str,
+            _provider_identity_id: Option<&str>,
+        ) -> Result<crate::providers::DomainIdentityDetails, EmailError> {
+            unimplemented!()
+        }
+        async fn delete_identity(
+            &self,
+            _domain: &str,
+            _provider_identity_id: Option<&str>,
+        ) -> Result<(), EmailError> {
+            unimplemented!()
+        }
+        async fn send(
+            &self,
+            _email: &crate::providers::SendEmailRequest,
+        ) -> Result<crate::providers::SendEmailResponse, EmailError> {
+            unimplemented!()
+        }
+        fn provider_type(&self) -> EmailProviderType {
+            EmailProviderType::Smtp
+        }
+        async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+            Err(EmailError::ProviderError(
+                "simulated network failure".to_string(),
+            ))
         }
     }
 }

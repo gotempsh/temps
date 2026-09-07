@@ -319,7 +319,7 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
 }
 
 #[tokio::test]
-async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyhow::Result<()> {
+async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> anyhow::Result<()> {
     if external_db_configured() {
         println!("Skipping managed-monitor migration test: external database configured");
         return Ok(());
@@ -444,12 +444,28 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .expect("managed monitor count row")
         .try_get::<i64>("", "count")?,
         1,
-        "simulate the ownership inferred by the previously shipped migration"
+        "simulate a row with is_managed = TRUE, indistinguishable from either a \
+         name-guessed legacy row or a legitimately created managed monitor"
     );
 
-    Migrator::up(&db, None).await?;
+    // m20260904_000001 must NOT touch this row. A name-guessed row and a
+    // legitimately-created managed monitor are indistinguishable by any
+    // durable field (both use the "{environment} Monitor" naming
+    // convention), so blanket-demoting is_managed = TRUE here would also
+    // demote real ownership and cause reconciliation to create a duplicate
+    // managed monitor on the next boot. See that migration's file comment.
+    //
+    // Apply up through m20260904_000001 specifically, not `None` (every
+    // registered migration) — later migrations added after it would
+    // otherwise become the target of the `Some(1)` down()/up() calls below.
+    let reset_target = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let reset_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == reset_target)
+        .unwrap_or_else(|| panic!("migration {reset_target} not found in Migrator"));
+    Migrator::up(&db, Some(reset_target_count as u32 + 1)).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
-    let corrected = db
+    let preserved = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
@@ -457,13 +473,12 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .await?
         .expect("default-named user monitor remains present");
     assert!(
-        !corrected.try_get::<bool>("", "is_managed")?,
-        "the forward corrective migration must demote ownership inferred by the shipped migration"
+        preserved.try_get::<bool>("", "is_managed")?,
+        "the corrective migration must not demote ownership it cannot verify is ambiguous"
     );
 
-    let steps = steps_back_to("m20260904_000001_reset_ambiguous_managed_status_monitors");
-    Migrator::down(&db, Some(steps)).await?;
-    let restored = db
+    Migrator::down(&db, Some(1)).await?;
+    let after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
@@ -471,19 +486,134 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .await?
         .expect("default-named user monitor remains present after rollback");
     assert!(
-        restored.try_get::<bool>("", "is_managed")?,
-        "rolling back the corrective migration must restore the captured ownership state"
+        after_down.try_get::<bool>("", "is_managed")?,
+        "rolling back the now-no-op corrective migration must leave ownership untouched"
     );
 
-    Migrator::up(&db, Some(steps)).await?;
-    let corrected_again = db
+    Migrator::up(&db, Some(1)).await?;
+    let after_up_again = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
         ))
         .await?
-        .expect("default-named user monitor remains present after reapplying correction");
-    assert!(!corrected_again.try_get::<bool>("", "is_managed")?);
+        .expect("default-named user monitor remains present after reapplying migration");
+    assert!(after_up_again.try_get::<bool>("", "is_managed")?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_managed_monitor_migration_down_restores_state_from_previous_up_implementation(
+) -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping managed-monitor mixed-version rollback test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping managed-monitor mixed-version rollback test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    // Apply up through m20260904_000001 specifically (its current no-op
+    // up()), not `None` (every registered migration) — otherwise a later
+    // migration becomes the target of the `down(&db, Some(1))` call below
+    // instead of the one this test means to roll back.
+    let target = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(target_count as u32 + 1)).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-rollback-test', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'monitor-rollback-test')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-rollback-test-production', 'monitor-rollback.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-rollback-test'",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', 60, true, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-rollback-test-production'",
+    )
+    .await?;
+
+    // Simulate a database that already ran the previous, destructive up()
+    // implementation of this migration before the current no-op fix
+    // shipped: it backed up the managed monitor's id and demoted it.
+    db.execute_unprepared(
+        "CREATE TABLE _temps_m20260904_managed_monitor_ownership_backup ( \
+             monitor_id INTEGER PRIMARY KEY REFERENCES status_monitors(id) ON DELETE CASCADE \
+         ); \
+         INSERT INTO _temps_m20260904_managed_monitor_ownership_backup (monitor_id) \
+         SELECT id FROM status_monitors WHERE name = 'production Monitor'; \
+         UPDATE status_monitors SET is_managed = FALSE WHERE name = 'production Monitor'",
+    )
+    .await?;
+
+    Migrator::down(&db, Some(1)).await?;
+
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("previously managed monitor remains present");
+    assert!(
+        restored.try_get::<bool>("", "is_managed")?,
+        "rolling back on the current no-op up() must still restore ownership captured by a \
+         previous, destructive up()"
+    );
+
+    let backup_table_dropped = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('_temps_m20260904_managed_monitor_ownership_backup') IS NULL AS dropped"
+                .to_string(),
+        ))
+        .await?
+        .expect("regclass lookup row")
+        .try_get::<bool>("", "dropped")?;
+    assert!(
+        backup_table_dropped,
+        "the backup table must be cleaned up after restoring"
+    );
+
     Ok(())
 }
 

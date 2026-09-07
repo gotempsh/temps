@@ -245,6 +245,7 @@ mod m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources;
 mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 mod m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources;
 mod m20260904_000003_add_continuous_archive_source_to_external_services;
+mod m20260907_000001_add_mfa_pending_origin_to_sessions;
 
 pub struct Migrator;
 
@@ -545,6 +546,7 @@ impl MigratorTrait for Migrator {
             Box::new(
                 m20260904_000003_add_continuous_archive_source_to_external_services::Migration,
             ),
+            Box::new(m20260907_000001_add_mfa_pending_origin_to_sessions::Migration),
         ]
     }
 }

@@ -121,6 +121,17 @@ pub enum EmailError {
         provider_type: String,
         reason: String,
     },
+
+    /// The provider has no API to perform this operation at all (e.g. SMTP
+    /// has no domain-management API to list registered domains against).
+    /// Distinct from `ProviderUnreachable` and other transient failures:
+    /// retrying can never succeed, so callers must fall back to a manual
+    /// path instead of surfacing this as a retryable error.
+    #[error("{provider_type} does not support {operation}")]
+    UnsupportedOperation {
+        provider_type: String,
+        operation: String,
+    },
 }
 
 impl From<serde_json::Error> for EmailError {

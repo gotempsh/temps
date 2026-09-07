@@ -23694,6 +23694,31 @@
         ],
         "type": "object"
       },
+      "ListProviderDomainsResponse": {
+        "description": "Domains discoverable on a provider's side for the \"import existing\ndomain\" picker.\n\n`supported: false` means this provider type has no domain-listing API at\nall (SMTP) — the UI must fall back to manual domain entry rather than\ntreat it as an error to retry. `error` is set when `supported` is `true`\nbut the live fetch still failed (network, revoked credentials); the same\nmanual-entry fallback applies, but it's worth surfacing as a warning.",
+        "properties": {
+          "domains": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderDomainIdentityResponse"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supported",
+          "domains"
+        ],
+        "type": "object"
+      },
       "ListRenewalAttemptsResponse": {
         "description": "Paginated renewal-attempt history for one domain, newest first.",
         "properties": {
@@ -32568,6 +32593,30 @@
         "required": [
           "key",
           "models"
+        ],
+        "type": "object"
+      },
+      "ProviderDomainIdentityResponse": {
+        "description": "A single domain identity already registered on the provider's side,\noffered for import.",
+        "properties": {
+          "domain": {
+            "example": "example.com",
+            "type": "string"
+          },
+          "provider_identity_id": {
+            "example": "12345678-1234-1234-1234-123456789012",
+            "type": "string"
+          },
+          "status": {
+            "description": "The provider's current verification status for this domain\n(\"verified\", \"pending\", \"failed\", \"not_started\", \"temporary_failure\")",
+            "example": "verified",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "provider_identity_id",
+          "status"
         ],
         "type": "object"
       },
@@ -63043,6 +63092,7 @@
     },
     "/email-domains/{id}": {
       "delete": {
+        "description": "By default this only removes the Temps-side record; the domain identity\non the provider (Scaleway/SES) is left intact, since it may be shared\nwith other tools against that provider account. Pass\n`delete_from_provider=true` to also remove it on the provider's side. In\neither case, the local record is deleted regardless of whether that\nprovider-side deletion succeeds — an unreachable provider never blocks\nremoving the domain from Temps.",
         "operationId": "delete_email_domain",
         "parameters": [
           {
@@ -63053,6 +63103,15 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Also remove the domain identity on the provider's side (Scaleway/SES),\nnot just the local Temps record. Defaults to `false`: the same domain\nmay be shared with other tools against that provider account, so\ndeleting it from Temps must not silently un-register it elsewhere\nunless explicitly requested. If the provider-side deletion fails\n(network error, revoked credentials), the local record is still\ndeleted -- an unreachable provider never blocks removing it from Temps.",
+            "in": "query",
+            "name": "delete_from_provider",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -63070,7 +63129,7 @@
             "description": "Domain not found"
           },
           "500": {
-            "description": "Internal server error"
+            "description": "Internal server error (includes provider-side cleanup failure; the local record is still deleted)"
           }
         },
         "security": [
@@ -63699,6 +63758,57 @@
           }
         ],
         "summary": "Update an email provider",
+        "tags": [
+          "Email Providers"
+        ]
+      }
+    },
+    "/email-providers/{id}/discoverable-domains": {
+      "get": {
+        "description": "Always returns `200`, even when the provider type has no domain-listing\nAPI (SMTP) or the live fetch failed — `supported: false` or a non-null\n`error` signal the caller to fall back to manual entry instead of\ntreating this as a hard failure. Only a genuine failure to resolve the\nprovider itself (not found, undecryptable credentials) returns an error\nstatus.",
+        "operationId": "list_discoverable_domains",
+        "parameters": [
+          {
+            "description": "Provider ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListProviderDomainsResponse"
+                }
+              }
+            },
+            "description": "Discoverable domains (see `supported`/`error` for fallback state)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Provider not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List domain identities already registered on a provider's side, for\npopulating an \"import existing domain\" picker instead of requiring the\noperator to type the domain name (and, for Scaleway, its internal UUID)\nby hand.",
         "tags": [
           "Email Providers"
         ]
