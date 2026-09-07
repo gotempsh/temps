@@ -2748,6 +2748,7 @@ pub async fn list_project_templates(
     let response = super::templates::ListTemplatesResponse {
         templates: templates
             .into_iter()
+            .map(resolve_template_for_host_arch)
             .map(super::templates::TemplateResponse::from)
             .collect(),
         total,
@@ -2789,7 +2790,9 @@ pub async fn get_project_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
-    Ok(Json(super::templates::TemplateResponse::from(template)))
+    Ok(Json(super::templates::TemplateResponse::from(
+        resolve_template_for_host_arch(template),
+    )))
 }
 
 /// List all available template tags
@@ -2975,6 +2978,24 @@ fn is_pinned_sha256_image_reference(image: &str) -> bool {
 /// which matches the documented single/few-node self-hosted reference
 /// deployment. A heterogeneous multi-node fleet with mixed architectures is
 /// not resolved correctly by this heuristic.
+/// Overwrite `image` with the host-architecture-appropriate variant before a
+/// template is shown to a client. The create-project form always submits
+/// whatever `image` it was shown as an explicit runtime override (even when
+/// the user never touched it), so arch selection has to happen here -- by
+/// the time a request reaches `resolve_image_template_runtime`, an unedited
+/// default already looks identical to a deliberate override.
+fn resolve_template_for_host_arch(
+    mut template: temps_core::templates::ProjectTemplate,
+) -> temps_core::templates::ProjectTemplate {
+    if let Some(default_image) = template.image.as_deref().filter(|image| !image.is_empty()) {
+        let resolved =
+            select_template_image_for_arch(&template, default_image, std::env::consts::ARCH)
+                .to_string();
+        template.image = Some(resolved);
+    }
+    template
+}
+
 fn select_template_image_for_arch<'a>(
     template: &'a temps_core::templates::ProjectTemplate,
     default_image: &'a str,
