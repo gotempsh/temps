@@ -81,9 +81,19 @@ incompatible `CSSProperties` at type level. `src/components/op/index.ts`
 is a one-line re-export so `@/components/op` imports keep working.
 
 A consumer imports `@temps-sdk/op/op.css` at the top of its stylesheet
-(imports must precede rules) and puts `operator ink` on the root element
-it wants skinned; the skin is scoped to `.operator`, nothing outside it
+(imports must precede rules) and puts `operator ink v1` on the root element
+it wants skinned — all three words, because the CSS chains them
+(`.operator.ink.v1`). The skin is scoped to `.operator`, nothing outside it
 changes. Version and changes: `web/packages/op/CHANGELOG.md`.
+
+The package is publish-ready: `bun run build` in `web/packages/op` emits
+bundler-targeted ESM plus `.d.ts` to `dist/` (git-ignored), `exports` points
+`.` at `dist` with a `"source"` condition for bundlers that prefer the TSX,
+and everything the source imports is a dependency or a peer dependency rather
+than something that only resolves through the monorepo root. An installed copy
+publishes `dist/`, not `src/`, so a consumer's Tailwind must scan the package
+itself — `@source "../node_modules/@temps-sdk/op/dist"`. `README.md` is the
+consumer setup; nothing is published from this branch.
 
 ### Tests
 
@@ -110,12 +120,48 @@ layout suites only.
 | `a11y.spec.ts`     | axe-core over the main surfaces in **light and dark**. Serious/critical fail unless the rule is in the documented `KNOWN` list at the top of the file; moderate and minor land as test annotations. |
 | `visual.spec.ts`   | One snapshot per `/op-components` block plus full-page shots of four records and the settings hub, in desktop light, desktop dark and phone light. |
 
-Updating snapshots: run `bun run e2e:update`, then **look at the diff before
-committing it** — that is the whole point of the baseline. Only regenerate from
-a quiet dev server (no HMR error overlay, `bun run lint` clean), or you bake a
-half-finished refactor into the baseline. Baselines live in
-`e2e/__screenshots__/` and are committed; `test-results/` and
+Updating snapshots: **do not run `bun run e2e:update` for one block.**
+`--update-snapshots` rewrites all ~85 baselines, including the eighty that only
+moved by a sub-pixel, and the diff you were supposed to look at drowns. Adopt
+actuals one at a time instead:
+
+```bash
+DS_PORT=5186 bunx playwright test e2e/visual.spec.ts     # writes the failures out
+ls test-results/                                          # …-actual.png per failure
+cp test-results/<run>/<name>-actual.png \
+   e2e/__screenshots__/visual.spec.ts/<name>-<project>.png
+```
+
+Then **look at what you copied before committing it** — that is the whole point
+of the baseline. Only adopt from a quiet dev server (no HMR error overlay,
+`bun run lint` clean), or you bake a half-finished refactor in. Baselines live
+in `e2e/__screenshots__/` and are committed; `test-results/` and
 `playwright-report/` are not.
+
+### Adding a primitive
+
+The mechanical half, in order. Skipping step 3 is how a block stops being
+shot without anything going red.
+
+1. **Build it in the package**: `web/packages/op/src/*.tsx`, exported from
+   `src/index.ts`.
+2. **Give it a gallery block**: a `<section id="…">` in
+   `design-system/src/sections/blocks/*.tsx` (a new rule set gets its own
+   file) or in `OpComponents.tsx` for a primitive that belongs to no document,
+   showing every state — not a happy path. Add its id + label to the page's
+   TOC (`OpComponents.tsx`, or the file's `*_TOC` export that the page
+   spreads).
+3. **Add the id to `BLOCKS` in `e2e/visual.spec.ts`**, in page order. The
+   `toEqual([...BLOCKS])` assertion compares the list against the sections the
+   page actually renders, so the run goes red until the two agree — that is
+   the check, and it only works if the id is in both places.
+4. **Shoot the baseline**: run the gallery tests, then adopt only the new
+   block's `-actual.png` files as above (desktop light, desktop dark, phone
+   light). Never a blanket `--update-snapshots`.
+5. **Write the §6 entry** in this file: what it is for, what it refuses to do,
+   and the states it has. A primitive with no entry is a primitive nobody
+   finds.
+6. **Add the `CHANGELOG.md` line** in `web/packages/op/`.
 
 `a11y.spec.ts`'s `KNOWN` map is a debt register, not a mute button: each entry
 names the rule and what causes it, a test fails if an entry stops firing (so
@@ -168,6 +214,44 @@ change is wrong, not the rule.
    The single landing accent lives on `--primary` and appears once per viewport.
 5. **Dense by default.** Whitespace is spent between sections, not inside
    tables. Density has two settings and the choice is remembered.
+
+## 3b. Plugin UI
+
+A plugin's UI is **not** part of the console document. `PluginPage.tsx` mounts
+it in a same-origin iframe at `/api/x/{plugin}/ui/`, and the plugin serves its
+own HTML, JS and CSS from there. Nothing crosses that boundary on its own: not
+the console's stylesheet, not the `operator ink v1` root, not the fonts the
+console loaded, not the Tailwind build that generated the utilities the
+primitives use. A plugin that assumes it inherits the skin renders unstyled.
+
+So a plugin sets the system up for itself, exactly as any outside app does
+(`web/packages/op/README.md` is the setup):
+
+1. **Bundle the package.** `bun add @temps-sdk/op` plus its peer dependencies.
+   A plugin UI is a plain Vite + React app (`examples/example-plugin/web/` is
+   the shape), so the Vite/Tailwind v4 setup in the README applies verbatim.
+2. **Import the skin and scan the package.** `@import '@temps-sdk/op/op.css'`
+   at the top of the entry stylesheet, and
+   `@source "../node_modules/@temps-sdk/op/dist"` so Tailwind generates the
+   utilities the primitives render.
+3. **Put `operator ink v1` on the plugin's own root**, and on any portalled
+   content it renders.
+4. **Mirror the console's theme.** There is no theme channel today —
+   `PluginPage.tsx` syncs the route (hash or `postMessage`) and nothing else.
+   Read `prefers-color-scheme` for now and toggle `.dark` from it; theme sync
+   from the parent is a follow-up (§15).
+5. **Pin the version the console ships.** Two versions of the skin side by
+   side drift in a way that reads as "this page looks slightly wrong" rather
+   than as a bug. `web/packages/op/CHANGELOG.md` is the record.
+6. **Use the same conventions as a console screen**: `CopyAction` for a copy
+   (it answers on the control, never a toast), `Button busy` for an action in
+   flight, `useUrlState` for the view — a plugin route is mirrored into the
+   console's address bar, so a plugin that keeps its facet in React state
+   produces a link that does not reopen what the reader was looking at.
+
+The iframe is same-origin, so this is a convention, not a sandbox restriction:
+a plugin can do whatever it likes. It just does not get the console's look by
+accident.
 
 ## 4. Tokens
 
@@ -855,6 +939,41 @@ for a numeric column), framed figures with counted captions, `kbd`,
 `details`, footnotes, and `mark` as an ink underline rather than a yellow
 wash. A live block dropped into a document is a component, not prose: wrap it
 in `.op-raw`. See `docs/content-pages.md`.
+
+### useUrlState
+
+`web/packages/op/src/url-state.ts`, exported from `@temps-sdk/op`. Not a
+component: the six hooks that keep the view the reader is on in the address,
+which is the requirement in `docs/requirements.md` and the thing a screen is
+most likely to get wrong.
+
+| Hook | For |
+|---|---|
+| `useUrlState(key, fallback, { values, push })` | One string key: a facet, a range, a segment. Unknown values fall back; writing the fallback deletes the key. |
+| `useUrlNumber(key, fallback)` | A page number. |
+| `useUrlPatch()` | Several keys as **one** history entry — a filter that also resets the page is one change to the view, not two. |
+| `useUrlWindow(key)` | A window brushed on a chart, written `from~to`. |
+| `useUrlSort(key)` | A ledger's sort, `?sort=key` / `?sort=-key`. |
+| `useUrlText(key, also)` | Filter text: a local draft on the keystroke, the address as the truth, and the address wins whenever it moves from outside. |
+
+`VIEW_KEYS` is the whole vocabulary a screen may write, so a screen cannot
+invent `?tabb=` and quietly stop being linkable. `forNewView(params, keep?)`
+drops the view state on a navigation to another record, keeping only the
+routing keys — `p`, `fresh`, `fail` by default (`KEPT_ON_NAVIGATION`); an app
+with other routing conventions passes its own list.
+
+They sit on `react-router`'s `useSearchParams` (bare `react-router`, v8 — the
+package the console and the sandbox are both on) and must be called under a
+router, which is why `react-router` is a peer dependency of the package.
+Every write goes through the functional form of `setParams` and reads the live
+`window.location.search`, because two keystrokes can land before React
+re-renders and a setter closed over its own render's params would drop the
+first — which is how a filter box silently loses letters.
+
+Replace on a view change, push on a navigation. Live block: `/op-components`
+→ the URL-state section (`src/sections/blocks/UrlStateBlocks.tsx`). The
+sandbox's `src/sections/console-url.ts` is now a one-line re-export of the
+package; new code imports from `@temps-sdk/op`.
 
 ---
 
@@ -2255,10 +2374,42 @@ direction will drift the way the console already has.
 - A rule changes only by editing the doc and the reference page in one PR.
 
 What exists today, in `bun run lint`: `tsc --noEmit`, `scripts/audit-records.mjs`
-(the eight record rules), and `node ../web/packages/op/scripts/tokens.mjs check`
+(the record recipe rules), and `node ../web/packages/op/scripts/tokens.mjs check`
 (`tokens.json` against `op.css`, value by value and name by name, in order).
 The token check is the first of these that guards a token rather than a
 structure, and it fails with a printed diff rather than a count.
+`audit-records.mjs` defaults to `src/sections` and takes `--dir <path>`
+(repeatable) so another folder of screens — a second sandbox, a plugin UI, the
+console once a screen has moved — can be held to the same rules.
+
+**What a green lint actually proves.** Machine-checked:
+
+| Rule | Checked by |
+|---|---|
+| Types, unused locals and params | `tsc --noEmit` |
+| The record recipe (lede facts, meta, a fact appears once, a record has a lede) | `scripts/audit-records.mjs` — literal-only, heuristic on rules 4 and 5 |
+| `tokens.json` and `op.css` agree, name by name and value by value | `scripts/tokens.mjs check` |
+| No horizontal document scroll at 390 and 1440, clean console | `e2e/overflow.spec.ts` |
+| No new serious/critical axe violation, light and dark | `e2e/a11y.spec.ts` |
+| Keyboard: `j`/`k`, `⏎`, `/`, `[`/`]`, digits, ignored inside inputs | `e2e/keyboard.spec.ts` |
+| Reload signatures: the address rebuilds the screen | `e2e/state.spec.ts` |
+| Nothing moved visually that you did not mean to move | `e2e/visual.spec.ts` |
+
+Honour system — nothing fails if you break these, so they are on the reviewer
+and on the agent:
+
+- Paper and ink only; no second hue; colour only through `Status`.
+- No cards; one `.op-raise` per screen.
+- No hex, `oklch()`, Tailwind palette literal or `ms` literal in a `.tsx`
+  (§13 bans them; no linter counts them yet — §15 item 1).
+- Whitespace between sections, not inside tables; the closed spacing scale.
+- Every drawn control is wired; a `Kbd` badge has a handler.
+- View state in the URL beyond what `state.spec.ts` samples — a `useState`
+  that decides what is on screen is invisible to the lint (§15 item 10).
+- The words: `content.md`, `localisation.md`, `icons.md`.
+
+A green `bun run lint` means the types, the record recipe and the tokens hold.
+It does not mean the screen follows the design system.
 
 ## 13. Banned
 
@@ -2352,6 +2503,13 @@ design-system/
    reviewed screen by screen.
 7. `EmptyPlaceholder` and `PageState.unconfigured` overlap. Retire the former
    once the landing stops using it.
+7b. **Theme sync into a plugin iframe.** `PluginPage.tsx` syncs the plugin's
+   route (hash or `postMessage`) and nothing else, so a plugin on
+   `@temps-sdk/op` cannot follow the console between light and dark: it reads
+   `prefers-color-scheme` and is wrong for every reader whose console theme is
+   not their OS theme (§3b). The fix is a `{ type: 'temps:theme', theme }`
+   message on mount and on every change, and a matching listener in the plugin
+   SDK's web helper so a plugin gets it without writing the handler.
 8. Accessibility pass: the ledger uses `role="listbox"` with
    `aria-activedescendant`; verify with a screen reader, and confirm the
    sampled band has a text equivalent beyond the footer.

@@ -37,6 +37,7 @@ Rendered at `/guide#tooling`. Reference implementation: `/v1`, `/op-components`.
 - Write several keys in one patch. Two `setParams` calls in one handler compute from the same snapshot, so the second drops the first.
 - Emit complete links: every row, every "open in …", and `copy link` carries the view the reader is on, not the bare record.
 - Keep only the moment local: a hover, an open menu, a two-second `copied`, an unsubmitted draft — and say so before a reload would lose the draft.
+- Do not hand-roll any of this. `useUrlState`, `useUrlNumber`, `useUrlPatch`, `useUrlWindow`, `useUrlSort` and `useUrlText` from `@temps-sdk/op` already enforce it: typed keys (`VIEW_KEYS`), defaults omitted, unknown values falling back, replace-not-push, and one patch per handler. `forNewView(params)` drops the view on a navigation. Catalogue: handoff §6 "useUrlState".
 
 ## Tokens
 

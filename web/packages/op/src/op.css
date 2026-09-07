@@ -15,7 +15,15 @@
    `@source "./"` is relative to THIS file: it tells Tailwind to scan the
    package's own TSX for utility classes, so the utilities used inside
    `@temps-sdk/op` get generated in whatever app imports this stylesheet.
-   Consumers do not need to add the package to their own `@source` list.
+   That covers a consumer that resolves the package to SOURCE (the monorepo,
+   and the sandbox through its Vite alias), where the TSX sits beside this
+   file. An installed copy publishes `dist/` and this stylesheet, not `src/`,
+   so a consumer on the tarball must scan the built package itself:
+
+       @source "../node_modules/@temps-sdk/op/dist";
+
+   The package renders Tailwind utility classes; without one of those two
+   scans the components mount with tokens applied and no layout.
 
    Docs: design-system/docs/brand-guidelines.md §6 (the op layer) and
    design-system/docs/design-system-handoff.md §6/§7.

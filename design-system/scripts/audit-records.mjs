@@ -14,8 +14,44 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-const dir = 'src/sections'
-const files = readdirSync(dir).filter((f) => f.endsWith('.tsx')).map((f) => join(dir, f))
+/**
+ * Which folders to audit. Defaults to the sandbox's screens; `--dir <path>`
+ * (repeatable) points it at any other folder of screens — a second sandbox, a
+ * plugin UI, a console directory once a screen has moved onto the templates —
+ * so the recipe is one rule set rather than one script per app.
+ *
+ *   node scripts/audit-records.mjs
+ *   node scripts/audit-records.mjs --dir ../web/src/pages --dir src/sections
+ */
+const dirs = []
+for (let i = 2; i < process.argv.length; i++) {
+  const arg = process.argv[i]
+  if (arg === '--dir' || arg === '-d') {
+    const value = process.argv[++i]
+    if (!value) {
+      console.error('audit-records: --dir needs a path')
+      process.exit(2)
+    }
+    dirs.push(value)
+  } else if (arg.startsWith('--dir=')) {
+    dirs.push(arg.slice('--dir='.length))
+  } else {
+    console.error(`audit-records: unknown argument ${arg}\nusage: audit-records.mjs [--dir <path>]...`)
+    process.exit(2)
+  }
+}
+if (!dirs.length) dirs.push('src/sections')
+
+const files = dirs.flatMap((dir) => {
+  let entries
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    console.error(`audit-records: cannot read ${dir}`)
+    process.exit(2)
+  }
+  return entries.filter((f) => f.endsWith('.tsx')).map((f) => join(dir, f))
+})
 
 // Words that carry no record identity, so repeating them says nothing.
 const COMMON = new Set([
@@ -151,4 +187,4 @@ if (problems.length) {
   console.error('record recipe audit failed:\n' + problems.map((p) => '  ' + p).join('\n') + '\n\nsee docs/design-system-handoff.md §7 "Record page checklist"')
   process.exit(1)
 }
-console.log(`record recipe audit: ${files.length} files, no problems`)
+console.log(`record recipe audit: ${files.length} files in ${dirs.join(', ')}, no problems`)

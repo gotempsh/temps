@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- **`useUrlState` and the rest of the URL-state hooks moved into the package**
+  (`src/url-state.ts`, exported from the index): `useUrlState`,
+  `useUrlNumber`, `useUrlPatch`, `useUrlWindow`, `useUrlSort`, `useUrlText`,
+  `forNewView`, `VIEW_KEYS`, `KEPT_ON_NAVIGATION` and their types. They were
+  the design-system sandbox's, which meant every other consumer had to
+  re-derive "the URL is the view" by hand. `forNewView(params, keep?)` now
+  takes the keep-list as a parameter — the `p` / `fresh` / `fail` default is a
+  routing convention, not a rule. `react-router` (bare, v8) is a new peer
+  dependency: the hooks sit on its `useSearchParams`.
+- **The package is publishable.** `bun run build` emits bundler-targeted ESM
+  plus `.d.ts` and maps to `dist/` (git-ignored) via `tsconfig.build.json`;
+  `main` / `module` / `types` / `exports` point at it, with a `"source"`
+  condition for bundlers that prefer the TSX and the sandbox's Vite alias
+  untouched. Everything the source imports is now a dependency or a peer
+  dependency instead of resolving through the monorepo root. `README.md` is
+  the consumer setup, including the `@source` line a consumer's Tailwind needs
+  in order to generate the utilities the primitives render.
+
 ## 0.1.2
 
 - `.op-prose` is the whole look of a body of long-form prose, not just "the
