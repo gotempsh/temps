@@ -6,15 +6,24 @@
 //! Orchestrates plugin lifecycle (discovery, proxy creation, event delivery)
 //! and provides a clean API consumed by the handler and plugin layers.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
 use temps_core::external_plugin::PluginManifest;
 use temps_core::JobQueue;
+use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
+use crate::catalog::{
+    validate_url, CatalogError, RegistryClient, RegistryPlugin, VerifiedRegistry,
+};
 use crate::event_listener::PluginEventListener;
+use crate::install::{
+    normalize_digest, platform_target, validate_plugin_name, validate_version, InstallError,
+    PluginInstaller,
+};
 use crate::manager::{ExternalPluginConfig, ExternalPluginManager};
 use crate::proxy;
 
@@ -31,6 +40,57 @@ pub struct ExternalPluginsService {
     /// Swappable proxy router — rebuilt on reload so new/removed plugins
     /// are reflected without restarting the server.
     proxy_router: Arc<RwLock<Router>>,
+    /// Serializes discovery, reload, and install/promotion lifecycles.
+    lifecycle: tokio::sync::Mutex<()>,
+    /// Set before shutdown waits for the lifecycle lock so queued mutations
+    /// cannot start after shutdown was requested.
+    closing: AtomicBool,
+}
+
+#[derive(Debug, Error)]
+pub enum ExternalPluginsError {
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    #[error(transparent)]
+    Install(#[from] InstallError),
+    #[error("Plugin '{name}' is not present in the authenticated registry document")]
+    NotInRegistry { name: String },
+    #[error("Authenticated registry document contains duplicate entries for plugin '{name}'")]
+    DuplicateRegistryEntry { name: String },
+    #[error("Plugin '{name}' v{version} failed protocol identity/ready verification; previous active version was preserved: {reason}")]
+    CandidateRejected {
+        name: String,
+        version: String,
+        reason: String,
+    },
+    #[error("External plugin service is shutting down and cannot accept lifecycle changes")]
+    ShuttingDown,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallOutcome {
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+    pub signer_key_id: String,
+    pub registry_source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseIdentity {
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+    pub signer_key_id: String,
+    pub registry_source: String,
+}
+
+pub struct SelectedPlugin {
+    registry: VerifiedRegistry,
+    plugin: RegistryPlugin,
+    pub identity: ReleaseIdentity,
 }
 
 impl ExternalPluginsService {
@@ -69,6 +129,8 @@ impl ExternalPluginsService {
             event_listener: RwLock::new(None),
             queue,
             proxy_router: Arc::new(RwLock::new(Router::new())),
+            lifecycle: tokio::sync::Mutex::new(()),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -77,6 +139,10 @@ impl ExternalPluginsService {
     /// freshly-constructed shell from [`new_empty`](Self::new_empty).
     pub fn start_background_discovery(self: Arc<Self>) {
         tokio::spawn(async move {
+            let _lifecycle = self.lifecycle.lock().await;
+            if self.closing.load(Ordering::Acquire) {
+                return;
+            }
             let manifests = self.manager.discover_and_start().await;
 
             if !manifests.is_empty() {
@@ -150,6 +216,8 @@ impl ExternalPluginsService {
             event_listener: RwLock::new(event_listener),
             queue,
             proxy_router: Arc::new(RwLock::new(proxy_router)),
+            lifecycle: tokio::sync::Mutex::new(()),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -183,6 +251,10 @@ impl ExternalPluginsService {
     ///
     /// Returns the manifests of all successfully started plugins.
     pub async fn reload_plugins(&self) -> Vec<PluginManifest> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return self.manifests().await;
+        }
         // Stop event listener
         {
             let mut listener = self.event_listener.write().await;
@@ -229,8 +301,156 @@ impl ExternalPluginsService {
         new_manifests
     }
 
+    /// Fetch and authenticate the complete remote catalogue.
+    pub async fn catalog(&self) -> Result<VerifiedRegistry, ExternalPluginsError> {
+        let client = RegistryClient::new(self.manager.config().registry.clone())?;
+        Ok(client.fetch().await?)
+    }
+
+    /// Resolve the exact signed release identity without downloading or
+    /// executing it. Handlers use this boundary to durably audit which bytes
+    /// are about to run before candidate execution starts.
+    pub async fn select_plugin(&self, name: &str) -> Result<SelectedPlugin, ExternalPluginsError> {
+        validate_plugin_name(name)?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        let registry = self.catalog().await?;
+        let mut matches = registry
+            .document
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.name == name);
+        let plugin = matches
+            .next()
+            .ok_or_else(|| ExternalPluginsError::NotInRegistry {
+                name: name.to_string(),
+            })?;
+        if matches.next().is_some() {
+            return Err(ExternalPluginsError::DuplicateRegistryEntry {
+                name: name.to_string(),
+            });
+        }
+        let plugin = plugin.clone();
+        validate_version(&plugin.name, &plugin.version)?;
+        let platform = platform_target()?;
+        let release = plugin
+            .platforms
+            .get(&platform)
+            .ok_or_else(|| InstallError::NoRelease {
+                plugin: plugin.name.clone(),
+                version: plugin.version.clone(),
+                platform: platform.clone(),
+            })?;
+        let sha256 = normalize_digest(&plugin.name, &plugin.version, &release.sha256)?;
+        validate_url(&release.url, &self.manager.config().registry, false).map_err(|_| {
+            InstallError::UnsafeArtifactUrl {
+                plugin: plugin.name.clone(),
+                url: release.url.clone(),
+            }
+        })?;
+        let identity = ReleaseIdentity {
+            name: plugin.name.clone(),
+            version: plugin.version.clone(),
+            platform,
+            sha256,
+            signer_key_id: registry.envelope.key_id.clone(),
+            registry_source: self.manager.config().registry.url.clone(),
+        };
+        Ok(SelectedPlugin {
+            registry,
+            plugin,
+            identity,
+        })
+    }
+
+    /// Install and activate one preselected signed release without disrupting
+    /// its healthy process until the candidate completes its handshake.
+    pub async fn install_selected(
+        &self,
+        selected: SelectedPlugin,
+    ) -> Result<InstallOutcome, ExternalPluginsError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+
+        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
+        installer
+            .accept_registry_revision(
+                &self.manager.config().plugins_dir,
+                selected.registry.document.revision,
+            )
+            .await?;
+        let candidate = installer
+            .prepare(
+                &self.manager.config().plugins_dir,
+                &selected.registry,
+                &selected.plugin,
+            )
+            .await?;
+        let pending = match self
+            .manager
+            .prepare_candidate(
+                &candidate.name,
+                &candidate.version,
+                &candidate.sha256,
+                &candidate.binary_path,
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(reason) => {
+                if let Err(cleanup_error) = installer.discard(&candidate).await {
+                    tracing::warn!(
+                        plugin = %candidate.name,
+                        error = %cleanup_error,
+                        "Failed to remove rejected plugin candidate"
+                    );
+                }
+                return Err(ExternalPluginsError::CandidateRejected {
+                    name: candidate.name.clone(),
+                    version: candidate.version.clone(),
+                    reason,
+                });
+            }
+        };
+
+        if let Err(error) = installer.activate(&candidate).await {
+            self.manager.discard_candidate(pending).await;
+            if let Err(cleanup_error) = installer.discard(&candidate).await {
+                tracing::warn!(
+                    plugin = %candidate.name,
+                    error = %cleanup_error,
+                    "Failed to remove uncommitted plugin candidate"
+                );
+            }
+            return Err(error.into());
+        }
+        self.manager.promote_candidate(pending).await;
+        self.refresh_runtime_surfaces().await;
+
+        Ok(InstallOutcome {
+            name: candidate.name,
+            version: candidate.version,
+            platform: candidate.platform,
+            sha256: candidate.sha256,
+            signer_key_id: selected.identity.signer_key_id,
+            registry_source: selected.identity.registry_source,
+        })
+    }
+
+    /// Convenience entrypoint for non-HTTP callers that do not need a
+    /// pre-execution audit hook.
+    pub async fn install_plugin(&self, name: &str) -> Result<InstallOutcome, ExternalPluginsError> {
+        let selected = self.select_plugin(name).await?;
+        self.install_selected(selected).await
+    }
+
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
+        self.closing.store(true, Ordering::Release);
+        let _lifecycle = self.lifecycle.lock().await;
         let mut listener = self.event_listener.write().await;
         if let Some(l) = listener.take() {
             l.stop().await;
@@ -270,6 +490,22 @@ impl ExternalPluginsService {
         router
     }
 
+    async fn refresh_runtime_surfaces(&self) {
+        {
+            let mut listener = self.event_listener.write().await;
+            if let Some(listener) = listener.take() {
+                listener.stop().await;
+            }
+        }
+        let manifests = self.manager.manifests().await;
+        let router = Self::build_proxy_router_from(&self.manager, &manifests).await;
+        let listener =
+            Self::start_event_listener(&self.manager, &manifests, self.queue.as_ref()).await;
+        *self.proxy_router.write().await = router;
+        *self.event_listener.write().await = listener;
+        *self.manifests.write().await = manifests;
+    }
+
     /// Start event listener if any plugins subscribe to events.
     async fn start_event_listener(
         manager: &Arc<ExternalPluginManager>,
@@ -302,5 +538,59 @@ impl ExternalPluginsService {
             );
             Some(listener)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service() -> ExternalPluginsService {
+        let database = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        ExternalPluginsService::new_empty(
+            ExternalPluginConfig::new(
+                std::env::temp_dir().join("temps-external-plugin-service-tests"),
+                "postgres://localhost/test".to_string(),
+            ),
+            None,
+            database,
+        )
+    }
+
+    #[tokio::test]
+    async fn catalog_fails_closed_without_production_trust_anchor() {
+        let error = service()
+            .catalog()
+            .await
+            .expect_err("unsigned registry access must be unavailable");
+        assert!(matches!(
+            error,
+            ExternalPluginsError::Catalog(CatalogError::TrustNotConfigured { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn install_rejects_path_traversal_before_network_access() {
+        let error = service()
+            .install_plugin("../../escape")
+            .await
+            .expect_err("path traversal must be rejected");
+        assert!(matches!(
+            error,
+            ExternalPluginsError::Install(InstallError::UnsafePluginName { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_later_installs_before_registry_access() {
+        let service = service();
+        service.shutdown_all().await;
+        let error = service
+            .install_plugin("safe")
+            .await
+            .expect_err("closed service must reject installs");
+        assert!(matches!(error, ExternalPluginsError::ShuttingDown));
     }
 }
