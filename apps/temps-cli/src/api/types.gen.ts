@@ -872,7 +872,7 @@ export type AiStatusBreakdownResponse = {
 
 /**
  * One row in the AI-agent HTTP status breakdown: the request count for a
- * status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+ * status class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
  */
 export type AiStatusBreakdownRow = {
     request_count: number;
@@ -10645,6 +10645,22 @@ export type ListPresetsResponse = {
 };
 
 /**
+ * Domains discoverable on a provider's side for the "import existing
+ * domain" picker.
+ *
+ * `supported: false` means this provider type has no domain-listing API at
+ * all (SMTP) — the UI must fall back to manual domain entry rather than
+ * treat it as an error to retry. `error` is set when `supported` is `true`
+ * but the live fetch still failed (network, revoked credentials); the same
+ * manual-entry fallback applies, but it's worth surfacing as a warning.
+ */
+export type ListProviderDomainsResponse = {
+    domains: Array<ProviderDomainIdentityResponse>;
+    error?: string | null;
+    supported: boolean;
+};
+
+/**
  * Paginated renewal-attempt history for one domain, newest first.
  */
 export type ListRenewalAttemptsResponse = {
@@ -13664,6 +13680,10 @@ export type PresetResponse = {
     slug: string;
 };
 
+export type PreviewGatewayLogsResponse = {
+    lines: Array<string>;
+};
+
 /**
  * Workspace preview gateway settings.
  *
@@ -14640,6 +14660,20 @@ export type ProviderDescriptor = {
 export type ProviderDetailResponse = {
     key: ProviderKeyResponse;
     models: Array<ProviderModelResponse>;
+};
+
+/**
+ * A single domain identity already registered on the provider's side,
+ * offered for import.
+ */
+export type ProviderDomainIdentityResponse = {
+    domain: string;
+    provider_identity_id: string;
+    /**
+     * The provider's current verification status for this domain
+     * ("verified", "pending", "failed", "not_started", "temporary_failure")
+     */
+    status: string;
 };
 
 export type ProviderKeyResponse = {
@@ -29442,17 +29476,37 @@ export type FinalizeOrderData = {
 
 export type FinalizeOrderErrors = {
     /**
+     * Bad request - account email or ACME order is invalid
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Domain or DNS provider permission denied
+     */
+    403: unknown;
     /**
      * Domain or order not found
      */
     404: unknown;
     /**
+     * Certificate issued but DNS cleanup requires operator action
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Certificate issued but DNS provider cleanup failed
+     */
+    502: unknown;
+    /**
+     * Certificate issued but DNS provider service is unavailable
+     */
+    503: unknown;
 };
 
 export type FinalizeOrderResponses = {
@@ -29493,6 +29547,10 @@ export type SetupDnsChallengeErrors = {
      * Domain or DNS provider not found
      */
     404: unknown;
+    /**
+     * Ambiguous managed DNS zone
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -29662,13 +29720,25 @@ export type ProvisionDomainData = {
 
 export type ProvisionDomainErrors = {
     /**
+     * Bad request - account email or challenge is invalid
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
     /**
+     * Domain permission denied or a user account is required
+     */
+    403: unknown;
+    /**
      * Domain not found
      */
     404: unknown;
+    /**
+     * DNS cleanup-aware order must use the finalize endpoint
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -29990,7 +30060,18 @@ export type DeleteEmailDomainData = {
          */
         id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Also remove the domain identity on the provider's side (Scaleway/SES),
+         * not just the local Temps record. Defaults to `false`: the same domain
+         * may be shared with other tools against that provider account, so
+         * deleting it from Temps must not silently un-register it elsewhere
+         * unless explicitly requested. If the provider-side deletion fails
+         * (network error, revoked credentials), the local record is still
+         * deleted -- an unreachable provider never blocks removing it from Temps.
+         */
+        delete_from_provider?: boolean;
+    };
     url: '/email-domains/{id}';
 };
 
@@ -30008,7 +30089,7 @@ export type DeleteEmailDomainErrors = {
      */
     404: unknown;
     /**
-     * Internal server error
+     * Internal server error (includes provider-side cleanup failure; the local record is still deleted)
      */
     500: unknown;
 };
@@ -30354,7 +30435,7 @@ export type CreateEmailProviderData = {
 
 export type CreateEmailProviderErrors = {
     /**
-     * Invalid request
+     * Invalid request or validation error
      */
     400: unknown;
     /**
@@ -30366,9 +30447,17 @@ export type CreateEmailProviderErrors = {
      */
     403: unknown;
     /**
+     * Provider credentials are invalid — the provider API definitively rejected them
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Could not reach the provider API to verify credentials — the credentials may still be valid
+     */
+    502: unknown;
 };
 
 export type CreateEmailProviderResponses = {
@@ -30494,9 +30583,17 @@ export type UpdateEmailProviderErrors = {
      */
     409: unknown;
     /**
+     * New credentials are invalid — the provider API definitively rejected them
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Could not reach the provider API to verify new credentials
+     */
+    502: unknown;
 };
 
 export type UpdateEmailProviderResponses = {
@@ -30507,6 +30604,46 @@ export type UpdateEmailProviderResponses = {
 };
 
 export type UpdateEmailProviderResponse = UpdateEmailProviderResponses[keyof UpdateEmailProviderResponses];
+
+export type ListDiscoverableDomainsData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}/discoverable-domains';
+};
+
+export type ListDiscoverableDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDiscoverableDomainsResponses = {
+    /**
+     * Discoverable domains (see `supported`/`error` for fallback state)
+     */
+    200: ListProviderDomainsResponse;
+};
+
+export type ListDiscoverableDomainsResponse = ListDiscoverableDomainsResponses[keyof ListDiscoverableDomainsResponses];
 
 export type TestProviderData = {
     body: TestEmailRequest;
@@ -40911,8 +41048,17 @@ export type GetPreviewGatewayLogsData = {
     url: '/preview-gateway/logs';
 };
 
+export type GetPreviewGatewayLogsErrors = {
+    /**
+     * Docker log request failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetPreviewGatewayLogsError = GetPreviewGatewayLogsErrors[keyof GetPreviewGatewayLogsErrors];
+
 export type GetPreviewGatewayLogsResponses = {
-    200: LogsResponse;
+    200: PreviewGatewayLogsResponse;
 };
 
 export type GetPreviewGatewayLogsResponse = GetPreviewGatewayLogsResponses[keyof GetPreviewGatewayLogsResponses];
@@ -40923,6 +41069,15 @@ export type RestartPreviewGatewayData = {
     query?: never;
     url: '/preview-gateway/restart';
 };
+
+export type RestartPreviewGatewayErrors = {
+    /**
+     * Gateway restart failed
+     */
+    500: ProblemDetails;
+};
+
+export type RestartPreviewGatewayError = RestartPreviewGatewayErrors[keyof RestartPreviewGatewayErrors];
 
 export type RestartPreviewGatewayResponses = {
     /**
@@ -40953,6 +41108,15 @@ export type PatchPreviewGatewaySettingsData = {
     url: '/preview-gateway/settings';
 };
 
+export type PatchPreviewGatewaySettingsErrors = {
+    /**
+     * Settings update failed
+     */
+    500: ProblemDetails;
+};
+
+export type PatchPreviewGatewaySettingsError = PatchPreviewGatewaySettingsErrors[keyof PatchPreviewGatewaySettingsErrors];
+
 export type PatchPreviewGatewaySettingsResponses = {
     200: PreviewGatewaySettingsResponse;
 };
@@ -40966,6 +41130,15 @@ export type GetPreviewGatewayStatusData = {
     url: '/preview-gateway/status';
 };
 
+export type GetPreviewGatewayStatusErrors = {
+    /**
+     * Docker status request failed
+     */
+    500: ProblemDetails;
+};
+
+export type GetPreviewGatewayStatusError = GetPreviewGatewayStatusErrors[keyof GetPreviewGatewayStatusErrors];
+
 export type GetPreviewGatewayStatusResponses = {
     200: GatewayStatus;
 };
@@ -40978,6 +41151,15 @@ export type UpgradePreviewGatewayData = {
     query?: never;
     url: '/preview-gateway/upgrade';
 };
+
+export type UpgradePreviewGatewayErrors = {
+    /**
+     * Gateway upgrade failed
+     */
+    500: ProblemDetails;
+};
+
+export type UpgradePreviewGatewayError = UpgradePreviewGatewayErrors[keyof UpgradePreviewGatewayErrors];
 
 export type UpgradePreviewGatewayResponses = {
     /**

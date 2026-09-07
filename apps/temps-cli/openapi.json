@@ -1784,7 +1784,7 @@
         "type": "object"
       },
       "AiStatusBreakdownRow": {
-        "description": "One row in the AI-agent HTTP status breakdown: the request count for a\nstatus class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.",
+        "description": "One row in the AI-agent HTTP status breakdown: the request count for a\nstatus class (`1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.",
         "properties": {
           "request_count": {
             "format": "int64",
@@ -22574,6 +22574,31 @@
         ],
         "type": "object"
       },
+      "ListProviderDomainsResponse": {
+        "description": "Domains discoverable on a provider's side for the \"import existing\ndomain\" picker.\n\n`supported: false` means this provider type has no domain-listing API at\nall (SMTP) — the UI must fall back to manual domain entry rather than\ntreat it as an error to retry. `error` is set when `supported` is `true`\nbut the live fetch still failed (network, revoked credentials); the same\nmanual-entry fallback applies, but it's worth surfacing as a warning.",
+        "properties": {
+          "domains": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderDomainIdentityResponse"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supported",
+          "domains"
+        ],
+        "type": "object"
+      },
       "ListRenewalAttemptsResponse": {
         "description": "Paginated renewal-attempt history for one domain, newest first.",
         "properties": {
@@ -29437,6 +29462,20 @@
         ],
         "type": "object"
       },
+      "PreviewGatewayLogsResponse": {
+        "properties": {
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lines"
+        ],
+        "type": "object"
+      },
       "PreviewGatewaySettings": {
         "description": "Workspace preview gateway settings.\n\nThe preview gateway is a single shared Docker container that lives on the\n`temps-sandbox-net` network and routes requests to workspace sandbox dev\nservers based on the `Host` header (`ws-<sid>-<port>.<preview_domain>`).\n`temps serve` reconciles this container on startup; these settings let an\noperator override the image, host port, and auto-upgrade behavior.",
         "properties": {
@@ -31244,6 +31283,30 @@
         "required": [
           "key",
           "models"
+        ],
+        "type": "object"
+      },
+      "ProviderDomainIdentityResponse": {
+        "description": "A single domain identity already registered on the provider's side,\noffered for import.",
+        "properties": {
+          "domain": {
+            "example": "example.com",
+            "type": "string"
+          },
+          "provider_identity_id": {
+            "example": "12345678-1234-1234-1234-123456789012",
+            "type": "string"
+          },
+          "status": {
+            "description": "The provider's current verification status for this domain\n(\"verified\", \"pending\", \"failed\", \"not_started\", \"temporary_failure\")",
+            "example": "verified",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "provider_identity_id",
+          "status"
         ],
         "type": "object"
       },
@@ -60500,14 +60563,29 @@
             },
             "description": "Order finalized successfully"
           },
+          "400": {
+            "description": "Bad request - account email or ACME order is invalid"
+          },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Domain or DNS provider permission denied"
           },
           "404": {
             "description": "Domain or order not found"
           },
+          "409": {
+            "description": "Certificate issued but DNS cleanup requires operator action"
+          },
           "500": {
             "description": "Internal server error"
+          },
+          "502": {
+            "description": "Certificate issued but DNS provider cleanup failed"
+          },
+          "503": {
+            "description": "Certificate issued but DNS provider service is unavailable"
           }
         },
         "security": [
@@ -60569,6 +60647,9 @@
           },
           "404": {
             "description": "Domain or DNS provider not found"
+          },
+          "409": {
+            "description": "Ambiguous managed DNS zone"
           },
           "500": {
             "description": "Internal server error"
@@ -60785,11 +60866,20 @@
             },
             "description": "Certificate provisioning initiated"
           },
+          "400": {
+            "description": "Bad request - account email or challenge is invalid"
+          },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Domain permission denied or a user account is required"
+          },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "description": "DNS cleanup-aware order must use the finalize endpoint"
           },
           "500": {
             "description": "Internal server error"
@@ -61231,6 +61321,7 @@
     },
     "/email-domains/{id}": {
       "delete": {
+        "description": "By default this only removes the Temps-side record; the domain identity\non the provider (Scaleway/SES) is left intact, since it may be shared\nwith other tools against that provider account. Pass\n`delete_from_provider=true` to also remove it on the provider's side. In\neither case, the local record is deleted regardless of whether that\nprovider-side deletion succeeds — an unreachable provider never blocks\nremoving the domain from Temps.",
         "operationId": "delete_email_domain",
         "parameters": [
           {
@@ -61241,6 +61332,15 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Also remove the domain identity on the provider's side (Scaleway/SES),\nnot just the local Temps record. Defaults to `false`: the same domain\nmay be shared with other tools against that provider account, so\ndeleting it from Temps must not silently un-register it elsewhere\nunless explicitly requested. If the provider-side deletion fails\n(network error, revoked credentials), the local record is still\ndeleted -- an unreachable provider never blocks removing it from Temps.",
+            "in": "query",
+            "name": "delete_from_provider",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -61258,7 +61358,7 @@
             "description": "Domain not found"
           },
           "500": {
-            "description": "Internal server error"
+            "description": "Internal server error (includes provider-side cleanup failure; the local record is still deleted)"
           }
         },
         "security": [
@@ -61701,7 +61801,7 @@
             "description": "Provider created successfully"
           },
           "400": {
-            "description": "Invalid request"
+            "description": "Invalid request or validation error"
           },
           "401": {
             "description": "Unauthorized"
@@ -61709,8 +61809,14 @@
           "403": {
             "description": "Insufficient permissions"
           },
+          "422": {
+            "description": "Provider credentials are invalid — the provider API definitively rejected them"
+          },
           "500": {
             "description": "Internal server error"
+          },
+          "502": {
+            "description": "Could not reach the provider API to verify credentials — the credentials may still be valid"
           }
         },
         "security": [
@@ -61865,6 +61971,63 @@
           "409": {
             "description": "Provider type mismatch"
           },
+          "422": {
+            "description": "New credentials are invalid — the provider API definitively rejected them"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "Could not reach the provider API to verify new credentials"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update an email provider",
+        "tags": [
+          "Email Providers"
+        ]
+      }
+    },
+    "/email-providers/{id}/discoverable-domains": {
+      "get": {
+        "description": "Always returns `200`, even when the provider type has no domain-listing\nAPI (SMTP) or the live fetch failed — `supported: false` or a non-null\n`error` signal the caller to fall back to manual entry instead of\ntreating this as a hard failure. Only a genuine failure to resolve the\nprovider itself (not found, undecryptable credentials) returns an error\nstatus.",
+        "operationId": "list_discoverable_domains",
+        "parameters": [
+          {
+            "description": "Provider ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListProviderDomainsResponse"
+                }
+              }
+            },
+            "description": "Discoverable domains (see `supported`/`error` for fallback state)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Provider not found"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -61874,7 +62037,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Update an email provider",
+        "summary": "List domain identities already registered on a provider's side, for\npopulating an \"import existing domain\" picker instead of requiring the\noperator to type the domain name (and, for Scaleway, its internal UUID)\nby hand.",
         "tags": [
           "Email Providers"
         ]
@@ -78360,11 +78523,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LogsResponse"
+                  "$ref": "#/components/schemas/PreviewGatewayLogsResponse"
                 }
               }
             },
             "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Docker log request failed"
           }
         },
         "security": [
@@ -78383,6 +78556,16 @@
         "responses": {
           "204": {
             "description": "Gateway restarted"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Gateway restart failed"
           }
         },
         "security": [
@@ -78441,6 +78624,16 @@
               }
             },
             "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Settings update failed"
           }
         },
         "security": [
@@ -78466,6 +78659,16 @@
               }
             },
             "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Docker status request failed"
           }
         },
         "security": [
@@ -78494,6 +78697,16 @@
         "responses": {
           "204": {
             "description": "Gateway upgraded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Gateway upgrade failed"
           }
         },
         "security": [

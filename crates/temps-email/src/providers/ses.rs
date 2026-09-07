@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_sesv2::{
     config::{Credentials, Region},
-    types::{Body, Content, Destination, EmailContent, Message},
+    types::{Body, Content, Destination, EmailContent, IdentityType, Message},
     Client,
 };
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,8 @@ use tracing::{debug, error};
 
 use super::traits::{
     DnsRecord, DnsRecordStatus, DomainIdentity, DomainIdentityDetails, EmailProvider,
-    EmailProviderType, SendEmailRequest, SendEmailResponse, VerificationStatus,
-    DEFAULT_MAIL_FROM_SUBDOMAIN,
+    EmailProviderType, ProviderDomainIdentity, SendEmailRequest, SendEmailResponse,
+    VerificationStatus, DEFAULT_MAIL_FROM_SUBDOMAIN,
 };
 use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
@@ -643,6 +643,60 @@ impl EmailProvider for SesProvider {
     fn provider_type(&self) -> EmailProviderType {
         EmailProviderType::Ses
     }
+
+    async fn list_identities(&self) -> Result<Vec<ProviderDomainIdentity>, EmailError> {
+        debug!("Listing SES domain identities");
+
+        // A single page is enough for an interactive "pick a domain to
+        // import" picker — see the equivalent comment on Scaleway's
+        // `list_identities` for the same reasoning.
+        let result = self
+            .client
+            .list_email_identities()
+            .page_size(100)
+            .send()
+            .await
+            .map_err(|e| EmailError::AwsSes(format!("Failed to list email identities: {}", e)))?;
+
+        Ok(result
+            .email_identities()
+            .iter()
+            // SES also returns individual verified sender *addresses*
+            // (IdentityType::EmailAddress) alongside domains -- only domains
+            // are relevant to a "pick a domain to import" picker.
+            .filter(|identity| identity.identity_type() == Some(&IdentityType::Domain))
+            .filter_map(|identity| {
+                identity.identity_name().map(|name| ProviderDomainIdentity {
+                    domain: name.to_string(),
+                    provider_identity_id: name.to_string(),
+                    status: ses_verification_status_to_status(identity.verification_status()),
+                })
+            })
+            .collect())
+    }
+}
+
+/// Maps AWS's per-identity verification status to the provider-agnostic
+/// type. Pure and free of I/O so it's unit-testable without live AWS
+/// credentials.
+fn ses_verification_status_to_status(
+    status: Option<&aws_sdk_sesv2::types::VerificationStatus>,
+) -> VerificationStatus {
+    match status {
+        Some(aws_sdk_sesv2::types::VerificationStatus::Success) => VerificationStatus::Verified,
+        Some(aws_sdk_sesv2::types::VerificationStatus::Pending) => VerificationStatus::Pending,
+        Some(aws_sdk_sesv2::types::VerificationStatus::Failed) => {
+            VerificationStatus::Failed("SES identity verification failed".to_string())
+        }
+        Some(aws_sdk_sesv2::types::VerificationStatus::TemporaryFailure) => {
+            VerificationStatus::TemporaryFailure
+        }
+        Some(aws_sdk_sesv2::types::VerificationStatus::NotStarted) | None => {
+            VerificationStatus::NotStarted
+        }
+        // Forward-compat: a status SES added after this SDK was generated.
+        Some(_) => VerificationStatus::NotStarted,
+    }
 }
 
 #[cfg(test)]
@@ -733,5 +787,35 @@ mod tests {
             deserialized.endpoint_url,
             Some("http://localhost:4566".to_string())
         );
+    }
+
+    // ── ses_verification_status_to_status ────────────────────────────────────
+
+    #[test]
+    fn ses_verification_status_to_status_maps_success_to_verified() {
+        assert!(matches!(
+            ses_verification_status_to_status(Some(
+                &aws_sdk_sesv2::types::VerificationStatus::Success
+            )),
+            VerificationStatus::Verified
+        ));
+    }
+
+    #[test]
+    fn ses_verification_status_to_status_maps_failed_with_reason() {
+        match ses_verification_status_to_status(Some(
+            &aws_sdk_sesv2::types::VerificationStatus::Failed,
+        )) {
+            VerificationStatus::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ses_verification_status_to_status_defaults_missing_to_not_started() {
+        assert!(matches!(
+            ses_verification_status_to_status(None),
+            VerificationStatus::NotStarted
+        ));
     }
 }
