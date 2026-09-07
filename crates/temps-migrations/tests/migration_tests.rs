@@ -295,7 +295,7 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
 }
 
 #[tokio::test]
-async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyhow::Result<()> {
+async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> anyhow::Result<()> {
     if external_db_configured() {
         println!("Skipping managed-monitor migration test: external database configured");
         return Ok(());
@@ -420,12 +420,19 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .expect("managed monitor count row")
         .try_get::<i64>("", "count")?,
         1,
-        "simulate the ownership inferred by the previously shipped migration"
+        "simulate a row with is_managed = TRUE, indistinguishable from either a \
+         name-guessed legacy row or a legitimately created managed monitor"
     );
 
+    // m20260904_000001 must NOT touch this row. A name-guessed row and a
+    // legitimately-created managed monitor are indistinguishable by any
+    // durable field (both use the "{environment} Monitor" naming
+    // convention), so blanket-demoting is_managed = TRUE here would also
+    // demote real ownership and cause reconciliation to create a duplicate
+    // managed monitor on the next boot. See that migration's file comment.
     Migrator::up(&db, None).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
-    let corrected = db
+    let preserved = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
@@ -433,12 +440,12 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .await?
         .expect("default-named user monitor remains present");
     assert!(
-        !corrected.try_get::<bool>("", "is_managed")?,
-        "the forward corrective migration must demote ownership inferred by the shipped migration"
+        preserved.try_get::<bool>("", "is_managed")?,
+        "the corrective migration must not demote ownership it cannot verify is ambiguous"
     );
 
     Migrator::down(&db, Some(1)).await?;
-    let restored = db
+    let after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
@@ -446,19 +453,19 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .await?
         .expect("default-named user monitor remains present after rollback");
     assert!(
-        restored.try_get::<bool>("", "is_managed")?,
-        "rolling back the corrective migration must restore the captured ownership state"
+        after_down.try_get::<bool>("", "is_managed")?,
+        "rolling back the now-no-op corrective migration must leave ownership untouched"
     );
 
     Migrator::up(&db, Some(1)).await?;
-    let corrected_again = db
+    let after_up_again = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
         ))
         .await?
-        .expect("default-named user monitor remains present after reapplying correction");
-    assert!(!corrected_again.try_get::<bool>("", "is_managed")?);
+        .expect("default-named user monitor remains present after reapplying migration");
+    assert!(after_up_again.try_get::<bool>("", "is_managed")?);
     Ok(())
 }
 
