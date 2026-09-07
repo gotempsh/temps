@@ -333,13 +333,19 @@ itself (rrweb) is not ours; this is the contract around it.
 
 **What it must state.** The events on a time axis with the player's position,
 and the same events as a synchronised list. The list is the primary view and
-carries the keyboard: arrows step, Enter seeks. The scrubber is a native range
-input. Only an event that is a state (a failed request, a thrown error) takes a
-tone; a click is not a state. Offsets are from the start of the recording, and
-zero is `0s`.
+carries the keyboard: arrows step, Enter seeks. The axis draws ticks, not
+glyphs: a page view is a full-height rule (a page boundary), any other event a
+short tick, an error a red rule; the kind glyph lives in the list, where there
+is room for it. The track is inset from the frame so `0s` and the end sit
+inside it, and the scrubber, a native range input, spans exactly the track so
+the thumb sits under the cursor line. Only an event that is a state (a failed
+request, a thrown error) takes a tone; a click is not a state. Offsets are
+from the start of the recording, and zero is `0s`.
 
-**Banned.** Marks on the axis with a hover-only tooltip and no list. A custom
-scrubber a keyboard cannot drive. Colour-coding every event kind.
+**Banned.** Glyphs on the axis: at a session's density they collide, and the
+one at `0s` sits on the border. Marks on the axis with a hover-only tooltip
+and no list. A custom scrubber a keyboard cannot drive. Colour-coding every
+event kind.
 
 ## 17. UsageBar — usage against an allowance
 

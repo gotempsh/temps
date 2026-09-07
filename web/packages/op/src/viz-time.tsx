@@ -695,21 +695,34 @@ export function SessionTimeline({ duration_ms, events, position_ms = 0, onSeek, 
         <span className="tabular-nums">{readText || `${offset(position_ms)} of ${fmtDuration(duration_ms)}`}</span>
         <span className="text-muted-foreground">{sel ? 'event' : 'position'}</span>
       </div>
+      {/* The axis draws ticks, not glyphs: at a session's density glyphs collide and
+          the one at 0s sits on the border. A page view is a full-height rule (a page
+          boundary), any other event a short tick, an error a red rule. The kind is
+          in the list, where there is room for it. The track is inset so 0s and the
+          end are inside the frame. */}
       <div role="img" aria-label={label} className="relative h-8 border bg-background">
-        {events.map((e, n) => (
-          <span key={n} aria-hidden onMouseEnter={() => setI(n)} onMouseLeave={() => setI(null)}
-            className={cn('absolute top-1/2 -translate-x-1/2 -translate-y-1/2 font-mono text-[10px] leading-none', e.state === 'error' ? 'text-destructive' : e.state === 'warn' ? 'text-warning' : 'text-muted-foreground', i === n && 'text-foreground')}
-            style={{ left: `${pos(e.at_ms)}%` }}>{KIND_GLYPH[e.kind]}</span>
-        ))}
-        <span aria-hidden className="absolute inset-y-0 w-px bg-foreground" style={{ left: `${pos(position_ms)}%` }} />
+        <div className="absolute inset-y-0 inset-x-2">
+          {events.map((e, n) => {
+            const boundary = e.kind === 'pageview'
+            const tone = e.state === 'error' ? 'bg-destructive' : e.state === 'warn' ? 'bg-warning' : boundary ? 'bg-foreground/50' : 'bg-muted-foreground'
+            return (
+              <span key={n} aria-hidden onMouseEnter={() => setI(n)} onMouseLeave={() => setI(null)}
+                className="absolute inset-y-0 flex w-2 -translate-x-1/2 items-center justify-center" style={{ left: `${pos(e.at_ms)}%` }}>
+                <span className={cn('w-px', boundary || e.state ? 'h-full' : 'h-2/5', tone, (e.state || i === n) && 'w-0.5', i === n && !e.state && 'bg-foreground')} />
+              </span>
+            )
+          })}
+          <span aria-hidden className="absolute inset-y-0 w-0.5 -translate-x-1/2 bg-foreground" style={{ left: `${pos(position_ms)}%` }}>
+            <span className="absolute -top-px left-1/2 h-0 w-0 -translate-x-1/2 border-x-4 border-t-4 border-x-transparent border-t-foreground" />
+          </span>
+        </div>
       </div>
-      {/* The scrubber is a native range: a keyboard already knows how to drive it. */}
-      <label className="flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
-        <span className="op-label text-[9px]">position</span>
+      {/* The scrubber is a native range: a keyboard already knows how to drive it. It
+          spans the track exactly, so the thumb sits under the cursor line. */}
+      <div className="px-2">
         <input type="range" min={0} max={duration_ms} step={100} value={position_ms} disabled={!onSeek} aria-label={`position in the session, ${offset(position_ms)} of ${fmtDuration(duration_ms)}`}
-          onChange={(e) => onSeek?.(Number(e.target.value))} className="h-1 min-w-0 flex-1 accent-[var(--foreground)]" />
-        <span className="tabular-nums text-foreground">{offset(position_ms)}</span>
-      </label>
+          onChange={(e) => onSeek?.(Number(e.target.value))} className="block h-1 w-full accent-[var(--foreground)]" />
+      </div>
       <ul className="flex flex-wrap items-center gap-x-3 font-mono text-[10px] text-muted-foreground">
         {kinds.map((k) => <li key={k} className="flex items-center gap-1"><span aria-hidden>{KIND_GLYPH[k]}</span>{k}</li>)}
       </ul>

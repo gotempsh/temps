@@ -689,7 +689,8 @@ zone printed; it goes directly above the point-in-time field.
 `SessionTimeline({ duration_ms, events, position_ms, onSeek, title, verdict,
 footer })` is one session: the axis, and beside it the `SessionEvent` list
 (`at_ms`, `kind`, `label`, `state`, `note`) that carries the keyboard. The
-scrubber is a native range input.
+axis is ticks (page view a full rule, other events short, errors red), never
+glyphs; the scrubber is a native range input spanning exactly the track.
 
 ### PercentileLadder, CohortGrid, DeltaTable
 

@@ -333,6 +333,8 @@ export function DataVizBlocks2() {
           <p>The timeline half of session replay: the events on a time axis with the player's position, and the same events as a synchronised list. The player itself (rrweb) is not ours — this is the contract around it.</p>
           <Rule state="ok">The list is the primary view: it carries the keyboard, Enter seeks.</Rule>
           <Rule state="ok">The scrubber is a native range input, so a keyboard already knows how to drive it.</Rule>
+          <Rule state="ok">The axis is ticks: a page view a full rule, other events short, an error red. The kind glyph is in the list, where there is room for it.</Rule>
+          <Rule state="error">Glyphs on the axis: at a session's density they collide, and the one at 0s sits on the border.</Rule>
           <Rule state="error">Marks on the axis with a hover-only tooltip and no list.</Rule>
         </>}
         api={`<SessionTimeline duration_ms={92_000} events={events}

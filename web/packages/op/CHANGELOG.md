@@ -2,6 +2,10 @@
 
 ## 0.1.2
 
+- `SessionTimeline` axis draws ticks instead of glyphs (page view a full rule,
+  other events short, errors red), on a track inset from the frame so `0s` is
+  inside it; the range scrubber spans exactly the track so the thumb sits
+  under the cursor line. Glyphs stay in the list.
 - `CopyAction` and `useCopy`: a copy answers on the control that was pressed
   (`✓ copied` for two seconds, `× couldn't copy` in red with the reason), never
   in a toast. The idle label holds the width under the answer. `Inspector` takes
