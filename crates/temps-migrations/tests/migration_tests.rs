@@ -859,7 +859,31 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
 
     db.execute_unprepared(&format!(
         "UPDATE status_monitors \
-         SET check_path = '/post-migration-deploy', updated_at = now() \
+         SET check_path = '/from-temps-yaml', \
+             check_path_revision = check_path_revision + 1, \
+             updated_at = now() \
+         WHERE id = {canonical_id}"
+    ))
+    .await?;
+    Migrator::down(&db, Some(1)).await?;
+    let equal_path_write_after_rollback = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT check_path FROM status_monitors WHERE id = {canonical_id}"),
+        ))
+        .await?
+        .expect("canonical monitor after equal-valued path write and rollback");
+    assert_eq!(
+        equal_path_write_after_rollback.try_get::<String>("", "check_path")?,
+        "/from-temps-yaml"
+    );
+    Migrator::up(&db, Some(1)).await?;
+
+    db.execute_unprepared(&format!(
+        "UPDATE status_monitors \
+         SET check_path = '/post-migration-deploy', \
+             check_path_revision = check_path_revision + 1, \
+             updated_at = now() \
          WHERE id = {canonical_id}"
     ))
     .await?;
@@ -956,7 +980,9 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
 
     db.execute_unprepared(&format!(
         "UPDATE status_monitors \
-         SET check_path = NULL, updated_at = now() + interval '1 second' \
+         SET check_path = NULL, \
+             check_path_revision = check_path_revision + 1, \
+             updated_at = now() + interval '1 second' \
          WHERE id = {canonical_id}"
     ))
     .await?;

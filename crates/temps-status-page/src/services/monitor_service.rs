@@ -3,6 +3,7 @@
 
 use chrono::Utc;
 use futures::future::BoxFuture;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
     QueryFilter, QueryOrder, QuerySelect, Set,
@@ -616,7 +617,7 @@ impl MonitorService {
     }
 
     /// Set or clear the deployment-discovered path on Temps' managed monitor.
-    /// User-created monitors retain their independently configured endpoints.
+    /// Custom-named monitors retain their independently configured endpoints.
     pub async fn update_managed_check_path_for_environment(
         &self,
         project_id: i32,
@@ -627,18 +628,21 @@ impl MonitorService {
             validate_check_path(check_path)?;
         }
 
-        let monitors = status_monitors::Entity::find()
+        status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::CheckPath,
+                Expr::value(check_path.map(str::to_string)),
+            )
+            .col_expr(
+                status_monitors::Column::CheckPathRevision,
+                Expr::col(status_monitors::Column::CheckPathRevision).add(1_i64),
+            )
+            .col_expr(status_monitors::Column::UpdatedAt, Expr::value(Utc::now()))
             .filter(status_monitors::Column::ProjectId.eq(project_id))
             .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
             .filter(status_monitors::Column::IsManaged.eq(true))
-            .all(self.db.as_ref())
+            .exec(self.db.as_ref())
             .await?;
-
-        for monitor in monitors {
-            let mut active: status_monitors::ActiveModel = monitor.into();
-            active.check_path = Set(check_path.map(str::to_string));
-            active.update(self.db.as_ref()).await?;
-        }
 
         Ok(())
     }
@@ -1340,6 +1344,18 @@ mod tests {
             .update_managed_check_path_for_environment(project.id, environment.id, Some("/docs"))
             .await
             .unwrap();
+        let changed_managed = status_monitors::Entity::find_by_id(managed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let unchanged_custom = status_monitors::Entity::find_by_id(custom.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed_managed.check_path_revision, 1);
+        assert_eq!(unchanged_custom.check_path_revision, 0);
         assert_eq!(
             service
                 .get_monitor(managed.id)
@@ -1360,9 +1376,34 @@ mod tests {
         );
 
         service
+            .update_managed_check_path_for_environment(project.id, environment.id, Some("/docs"))
+            .await
+            .unwrap();
+        let equal_value_write = status_monitors::Entity::find_by_id(managed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(equal_value_write.check_path.as_deref(), Some("/docs"));
+        assert_eq!(equal_value_write.check_path_revision, 2);
+
+        service
             .update_managed_check_path_for_environment(project.id, environment.id, None)
             .await
             .unwrap();
+        let cleared_managed = status_monitors::Entity::find_by_id(managed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let still_unchanged_custom = status_monitors::Entity::find_by_id(custom.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared_managed.check_path, None);
+        assert_eq!(cleared_managed.check_path_revision, 3);
+        assert_eq!(still_unchanged_custom.check_path_revision, 0);
         assert_eq!(
             service.get_monitor(managed.id).await.unwrap().check_path,
             None

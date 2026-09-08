@@ -20,7 +20,9 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
-                "LOCK TABLE status_monitors, status_checks, status_incidents \
+                "ALTER TABLE status_monitors \
+                     ADD COLUMN check_path_revision BIGINT NOT NULL DEFAULT 0; \
+                 LOCK TABLE status_monitors, status_checks, status_incidents \
                      IN SHARE ROW EXCLUSIVE MODE; \
                  CREATE TEMP TABLE _temps_monitor_canonical ON COMMIT DROP AS \
                  SELECT DISTINCT ON (monitor.environment_id) \
@@ -46,7 +48,9 @@ impl MigrationTrait for Migration {
                         OR monitor.name = environment.name || ' Monitor'); \
                  CREATE TABLE _temps_m20260908_monitor_canonical_backup AS \
                  SELECT monitor.id, monitor.is_managed, monitor.check_path, \
-                        monitor.check_path AS reconciled_check_path \
+                        monitor.check_path_revision, \
+                        monitor.check_path AS reconciled_check_path, \
+                        monitor.check_path_revision AS reconciled_check_path_revision \
                  FROM status_monitors AS monitor \
                  JOIN _temps_monitor_canonical AS canonical \
                    ON canonical.canonical_id = monitor.id; \
@@ -97,11 +101,22 @@ impl MigrationTrait for Migration {
                              LIMIT 1 \
                          ) \
                          ELSE canonical.check_path \
-                     END \
+                     END, \
+                     check_path_revision = GREATEST( \
+                         canonical.check_path_revision, \
+                         COALESCE(( \
+                             SELECT MAX(duplicate.check_path_revision) \
+                             FROM _temps_monitor_duplicates AS mapping \
+                             JOIN status_monitors AS duplicate \
+                               ON duplicate.id = mapping.duplicate_id \
+                             WHERE mapping.canonical_id = canonical.id \
+                         ), canonical.check_path_revision) \
+                     ) + 1 \
                  FROM _temps_monitor_canonical AS selected \
                  WHERE canonical.id = selected.canonical_id; \
                  UPDATE _temps_m20260908_monitor_canonical_backup AS backup \
-                 SET reconciled_check_path = canonical.check_path \
+                 SET reconciled_check_path = canonical.check_path, \
+                     reconciled_check_path_revision = canonical.check_path_revision \
                  FROM status_monitors AS canonical \
                  WHERE canonical.id = backup.id; \
                  UPDATE status_checks AS status_check \
@@ -138,20 +153,24 @@ impl MigrationTrait for Migration {
                  WHERE canonical.id = backup.id; \
                  INSERT INTO status_monitors \
                      (id, project_id, environment_id, name, monitor_type, check_path, \
-                      check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+                      check_path_revision, check_interval_seconds, is_active, is_managed, \
+                      created_at, updated_at) \
                  SELECT id, project_id, environment_id, name, monitor_type, check_path, \
-                        check_interval_seconds, is_active, is_managed, created_at, updated_at \
+                        check_path_revision, check_interval_seconds, is_active, is_managed, \
+                        created_at, updated_at \
                  FROM _temps_m20260908_monitor_duplicate_backup; \
                  WITH changed_canonical AS ( \
-                     SELECT canonical.id, canonical.check_path, canonical.updated_at \
+                     SELECT canonical.id, canonical.check_path, \
+                            canonical.check_path_revision, canonical.updated_at \
                      FROM status_monitors AS canonical \
                      JOIN _temps_m20260908_monitor_canonical_backup AS backup \
                        ON backup.id = canonical.id \
-                     WHERE canonical.check_path IS DISTINCT FROM \
-                           backup.reconciled_check_path \
+                     WHERE canonical.check_path_revision <> \
+                           backup.reconciled_check_path_revision \
                  ), handoff AS ( \
                      SELECT DISTINCT ON (duplicate.canonical_id) \
-                            duplicate.id, changed.check_path, changed.updated_at \
+                            duplicate.id, changed.check_path, \
+                            changed.check_path_revision, changed.updated_at \
                      FROM _temps_m20260908_monitor_duplicate_backup AS duplicate \
                      JOIN changed_canonical AS changed \
                        ON changed.id = duplicate.canonical_id \
@@ -159,7 +178,9 @@ impl MigrationTrait for Migration {
                               duplicate.updated_at DESC, duplicate.id DESC \
                  ) \
                  UPDATE status_monitors AS restored \
-                 SET check_path = handoff.check_path, updated_at = handoff.updated_at \
+                 SET check_path = handoff.check_path, \
+                     check_path_revision = handoff.check_path_revision, \
+                     updated_at = handoff.updated_at \
                  FROM handoff \
                  WHERE restored.id = handoff.id; \
                  UPDATE status_checks AS status_check \
@@ -174,17 +195,24 @@ impl MigrationTrait for Migration {
                  UPDATE status_monitors AS canonical \
                  SET is_managed = backup.is_managed, \
                      check_path = CASE \
-                         WHEN canonical.check_path IS NOT DISTINCT FROM \
-                                  backup.reconciled_check_path \
+                         WHEN canonical.check_path_revision = \
+                              backup.reconciled_check_path_revision \
                          THEN backup.check_path \
                          ELSE canonical.check_path \
+                     END, \
+                     check_path_revision = CASE \
+                         WHEN canonical.check_path_revision = \
+                              backup.reconciled_check_path_revision \
+                         THEN backup.check_path_revision \
+                         ELSE canonical.check_path_revision \
                      END \
                  FROM _temps_m20260908_monitor_canonical_backup AS backup \
                  WHERE canonical.id = backup.id; \
                  DROP TABLE _temps_m20260908_status_incident_backup; \
                  DROP TABLE _temps_m20260908_status_check_backup; \
                  DROP TABLE _temps_m20260908_monitor_duplicate_backup; \
-                 DROP TABLE _temps_m20260908_monitor_canonical_backup",
+                 DROP TABLE _temps_m20260908_monitor_canonical_backup; \
+                 ALTER TABLE status_monitors DROP COLUMN check_path_revision",
             )
             .await?;
 
