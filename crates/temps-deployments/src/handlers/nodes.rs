@@ -642,7 +642,21 @@ impl std::fmt::Display for NodeAddressError {
 /// Workers that use public IPs with a WireGuard underlay are intentionally
 /// allowed — the goal is to block dangerous special-purpose ranges, not enforce
 /// private-only addressing.
-fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
+///
+/// `pub`: also called from `temps-cli`'s `temps agent --private-address`/
+/// `TEMPS_AGENT_PRIVATE_ADDRESS` override resolution, so a manually supplied
+/// address gets the identical rejection of dangerous ranges (in particular
+/// `0.0.0.0`, which would otherwise silently reproduce the all-interface
+/// container-port exposure this whole registration check exists to prevent)
+/// that a `temps join`-registered address already gets server-side.
+///
+/// Returns the bare `IpAddr` with any port suffix stripped (registration
+/// tolerates `host:port`/`[ipv6]:port`, matching `node_address_host`'s
+/// scheme+port stripping below, but a caller that binds Docker container
+/// ports to this address — see `temps-agent` — needs the bare host: passing
+/// a `host:port` string straight to Docker's `PortBinding.host_ip` is not a
+/// valid IP and fails every container creation).
+pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, NodeAddressError> {
     use std::net::IpAddr;
 
     // Strip an optional port suffix (handles both "10.0.5.20" and "10.0.5.20:8443").
@@ -652,15 +666,19 @@ fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
         // Bracketed IPv6 — either "[::1]" or "[::1]:port"
         stripped.split(']').next().unwrap_or(addr)
     } else {
-        // Plain IPv4 or bare IPv6: split on last ':' to strip port, but only
-        // if what remains before the ':' parses as an IP (so we don't strip
-        // the last group of a bare IPv6 address like "fc00::1").
-        if let Some((before, _after)) = addr.rsplit_once(':') {
-            if before.parse::<IpAddr>().is_ok() {
-                before
-            } else {
-                addr
-            }
+        // Disambiguate by colon count, not by "does the prefix also happen
+        // to parse as an IP" -- that heuristic is unsound for unbracketed
+        // IPv6: plenty of valid bare addresses (e.g. "2001:db8::1:2") have a
+        // last hextet that looks like a "port" AND a prefix that is itself
+        // an independently valid IPv6 address, so it would silently
+        // truncate them to the wrong host. RFC 3986 requires brackets for
+        // an IPv6 host:port, so an unbracketed address is unambiguous by
+        // colon count alone: any bare IPv6 address needs at least two
+        // colons (minimum form "::"), so exactly one colon can only mean
+        // IPv4:port.
+        if addr.matches(':').count() == 1 {
+            addr.rsplit_once(':')
+                .map_or(addr, |(before, _after)| before)
         } else {
             addr
         }
@@ -744,7 +762,7 @@ fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
         }
     }
 
-    Ok(())
+    Ok(ip)
 }
 
 /// Extract the host from a validated node agent URL or private address for use
@@ -1029,17 +1047,24 @@ async fn register_node(
 
     // ── Address validation (SSRF guard) ──────────────────────────────────────
     // Reject private_address values in reserved/dangerous ranges before they
-    // can be persisted and later used to build health-check URLs.
-    validate_node_private_address(request.private_address.trim()).map_err(|e| {
-        warn!(
-            "Node registration rejected: invalid private_address '{}': {}",
-            request.private_address.trim(),
-            e
-        );
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Node Address")
-            .with_detail(e.to_string())
-    })?;
+    // can be persisted and later used to build health-check URLs. Store the
+    // normalized bare IP, not the raw request value: route_table.rs's
+    // build_container_backend_addr appends its own port to whatever is
+    // stored here (`format!("{private_addr}:{port}")`), so a port-suffixed
+    // value persisted verbatim would corrupt every proxy backend address
+    // built for this node.
+    let private_address = validate_node_private_address(request.private_address.trim())
+        .map_err(|e| {
+            warn!(
+                "Node registration rejected: invalid private_address '{}': {}",
+                request.private_address.trim(),
+                e
+            );
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Node Address")
+                .with_detail(e.to_string())
+        })?
+        .to_string();
 
     // The `address` field is also user-supplied (used as the deployer agent URL).
     // Extract the host portion and apply the same check.
@@ -1108,7 +1133,7 @@ async fn register_node(
         // CSR SANs are discarded by sign_node_csr so one worker cannot mint a
         // certificate valid for another cluster identity.
         let mut allowed_sans = vec![request.name.trim().to_string()];
-        for address in [&registered_address, request.private_address.trim()] {
+        for address in [&registered_address, &private_address] {
             let host = node_address_host(address);
             if !host.is_empty() && !allowed_sans.contains(&host) {
                 allowed_sans.push(host);
@@ -1131,7 +1156,7 @@ async fn register_node(
         token_hash,
         token_encrypted: Some(token_encrypted),
         address: registered_address,
-        private_address: request.private_address.trim().to_string(),
+        private_address,
         public_endpoint: request.public_endpoint,
         wg_public_key: request.wg_public_key,
         role: request.role.unwrap_or_else(|| "worker".to_string()),
@@ -3874,6 +3899,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_node_private_address_strips_port_from_returned_ip() {
+        // Regression guard: a caller that binds Docker container ports to
+        // this address (temps-agent) needs the bare host, since Docker's
+        // PortBinding.host_ip is not a valid IP with a port suffix attached
+        // -- every container creation would fail if the raw "host:port"
+        // input were forwarded unchanged instead of the parsed IpAddr.
+        let ip = validate_node_private_address("10.0.5.20:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "10.0.5.20");
+
+        let ip = validate_node_private_address("[fc00::1]:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "fc00::1");
+    }
+
+    #[test]
     fn test_validate_node_private_address_accepts_rfc1918_bare() {
         assert!(
             validate_node_private_address("192.168.1.50").is_ok(),
@@ -3955,6 +3994,21 @@ mod tests {
             validate_node_private_address("fc00::1").is_ok(),
             "fc00::1 must be accepted (unique-local IPv6)"
         );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_never_truncates_bare_ipv6_with_ambiguous_prefix() {
+        // Regression guard: "2001:db8::1:2"'s prefix before the last colon
+        // ("2001:db8::1") is itself a valid, DIFFERENT IPv6 address, so a
+        // naive "does the prefix parse as an IP" port-stripping heuristic
+        // would wrongly truncate this bare address down to that prefix,
+        // silently changing which host gets used. Any multi-colon
+        // unbracketed address must be preserved whole.
+        let ip = validate_node_private_address("2001:db8::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "2001:db8::1:2");
+
+        let ip = validate_node_private_address("fc00::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "fc00::1:2");
     }
 
     #[test]

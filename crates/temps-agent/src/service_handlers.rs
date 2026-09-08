@@ -208,6 +208,17 @@ fn ok_response<T: serde::Serialize>(data: T) -> Json<AgentResponse<T>> {
     })
 }
 
+/// Build a Docker port binding for a service container, always bound to
+/// this agent's resolved private/overlay address — never `"0.0.0.0"`, which
+/// would make the service reachable on the node's public interface too.
+/// `host_port: None` means auto-assign: let Docker pick a free host port.
+fn service_port_binding(host_ip: &str, host_port: Option<u16>) -> bollard::models::PortBinding {
+    bollard::models::PortBinding {
+        host_ip: Some(host_ip.to_string()),
+        host_port: host_port.map(|port| port.to_string()),
+    }
+}
+
 fn mounted_volume_names(
     container_name: &str,
     mounts: Vec<bollard::models::MountPoint>,
@@ -288,18 +299,15 @@ pub async fn create_service(
             has_auto_assign = true;
             port_bindings.insert(
                 container_port_key,
-                Some(vec![bollard::models::PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: None,
-                }]),
+                Some(vec![service_port_binding(&state.host_bind_address, None)]),
             );
         } else {
             port_bindings.insert(
                 container_port_key,
-                Some(vec![bollard::models::PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(pm.host_port.to_string()),
-                }]),
+                Some(vec![service_port_binding(
+                    &state.host_bind_address,
+                    Some(pm.host_port),
+                )]),
             );
             if first_host_port == 0 {
                 first_host_port = pm.host_port;
@@ -2286,5 +2294,27 @@ mod overlay_ip_tests {
         assert!(command[4].contains("pg_dumpall"));
         assert!(command[4].contains("| gzip"));
         assert!(command[4].contains("&& echo 'dump_complete'"));
+    }
+}
+
+#[cfg(test)]
+mod service_port_binding_tests {
+    use super::service_port_binding;
+
+    // Regression guard for the exact bug this replaced: both port mappings
+    // used a hardcoded "0.0.0.0" PortBinding, exposing service containers
+    // (managed databases, Redis, etc.) on every interface of the worker
+    // node instead of only the private/overlay one.
+    #[test]
+    fn never_binds_to_all_interfaces() {
+        let fixed = service_port_binding("10.100.0.2", Some(5432));
+        assert_eq!(fixed.host_ip.as_deref(), Some("10.100.0.2"));
+        assert_ne!(fixed.host_ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(fixed.host_port.as_deref(), Some("5432"));
+
+        let auto_assign = service_port_binding("10.100.0.2", None);
+        assert_eq!(auto_assign.host_ip.as_deref(), Some("10.100.0.2"));
+        assert_ne!(auto_assign.host_ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(auto_assign.host_port, None);
     }
 }

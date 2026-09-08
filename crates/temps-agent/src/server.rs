@@ -51,6 +51,14 @@ pub fn build_router(
     overlay_peers: crate::network_sync::SharedPeers,
     platform: SharedPlatform,
 ) -> Router {
+    // Same address app-container deploys bind to (never "0.0.0.0" — see
+    // AgentConfig::private_address). Falls back to loopback only for the
+    // legacy-config test-fixture case; `temps agent`'s CLI entrypoint
+    // already hard-errors before reaching here if this is genuinely unset.
+    let host_bind_address = config
+        .private_address
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
@@ -58,6 +66,7 @@ pub fn build_router(
         overlay_bridge_address,
         overlay_peers,
         platform,
+        host_bind_address,
     });
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
@@ -781,6 +790,7 @@ mod tests {
             require_mtls,
             underlay_dev: None,
             underlay_mtu: None,
+            private_address: None,
         }
     }
 
