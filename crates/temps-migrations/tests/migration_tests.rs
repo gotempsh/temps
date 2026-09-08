@@ -319,7 +319,7 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
 }
 
 #[tokio::test]
-async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyhow::Result<()> {
+async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> anyhow::Result<()> {
     if external_db_configured() {
         println!("Skipping managed-monitor migration test: external database configured");
         return Ok(());
@@ -352,10 +352,19 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
     ))
     .await?;
     let target = "m20260831_000002_add_managed_status_monitors";
-    let pre_target_count = Migrator::migrations()
+    let correction = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let migrations = Migrator::migrations();
+    let pre_target_count = migrations
         .iter()
         .position(|migration| migration.name() == target)
         .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    let correction_position = migrations
+        .iter()
+        .position(|migration| migration.name() == correction)
+        .unwrap_or_else(|| panic!("migration {correction} not found in Migrator"));
+    let post_target_to_correction_count = correction_position
+        .checked_sub(pre_target_count)
+        .unwrap_or_else(|| panic!("migration {correction} must follow {target}"));
     Migrator::up(&db, Some(pre_target_count as u32)).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
 
@@ -444,12 +453,24 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .expect("managed monitor count row")
         .try_get::<i64>("", "count")?,
         1,
-        "simulate the ownership inferred by the previously shipped migration"
+        "simulate a row with is_managed = TRUE, indistinguishable from either a \
+         name-guessed legacy row or a legitimately created managed monitor"
     );
 
-    Migrator::up(&db, None).await?;
+    // m20260904_000001 must NOT touch this row. A name-guessed row and a
+    // legitimately-created managed monitor are indistinguishable by any
+    // durable field (both use the "{environment} Monitor" naming
+    // convention), so blanket-demoting is_managed = TRUE here would also
+    // demote real ownership and cause reconciliation to create a duplicate
+    // managed monitor on the next boot. See that migration's file comment.
+    //
+    // Apply through m20260904_000001 specifically, not `None` (every
+    // registered migration). This database is already migrated through the
+    // target, so the step count is relative to that applied position; later
+    // migrations would otherwise become the target of the one-step rollback.
+    Migrator::up(&db, Some(post_target_to_correction_count as u32)).await?;
     assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
-    let corrected = db
+    let preserved = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
@@ -457,13 +478,12 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .await?
         .expect("default-named user monitor remains present");
     assert!(
-        !corrected.try_get::<bool>("", "is_managed")?,
-        "the forward corrective migration must demote ownership inferred by the shipped migration"
+        preserved.try_get::<bool>("", "is_managed")?,
+        "the corrective migration must not demote ownership it cannot verify is ambiguous"
     );
 
-    let steps = steps_back_to("m20260904_000001_reset_ambiguous_managed_status_monitors");
-    Migrator::down(&db, Some(steps)).await?;
-    let restored = db
+    Migrator::down(&db, Some(1)).await?;
+    let after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
@@ -471,19 +491,134 @@ async fn test_managed_monitor_migrations_preserve_and_repair_ownership() -> anyh
         .await?
         .expect("default-named user monitor remains present after rollback");
     assert!(
-        restored.try_get::<bool>("", "is_managed")?,
-        "rolling back the corrective migration must restore the captured ownership state"
+        after_down.try_get::<bool>("", "is_managed")?,
+        "rolling back the now-no-op corrective migration must leave ownership untouched"
     );
 
-    Migrator::up(&db, Some(steps)).await?;
-    let corrected_again = db
+    Migrator::up(&db, Some(1)).await?;
+    let after_up_again = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
         ))
         .await?
-        .expect("default-named user monitor remains present after reapplying correction");
-    assert!(!corrected_again.try_get::<bool>("", "is_managed")?);
+        .expect("default-named user monitor remains present after reapplying migration");
+    assert!(after_up_again.try_get::<bool>("", "is_managed")?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_managed_monitor_migration_down_restores_state_from_previous_up_implementation(
+) -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping managed-monitor mixed-version rollback test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping managed-monitor mixed-version rollback test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    // Apply up through m20260904_000001 specifically (its current no-op
+    // up()), not `None` (every registered migration) — otherwise a later
+    // migration becomes the target of the `down(&db, Some(1))` call below
+    // instead of the one this test means to roll back.
+    let target = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(target_count as u32 + 1)).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-rollback-test', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'monitor-rollback-test')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-rollback-test-production', 'monitor-rollback.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-rollback-test'",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', 60, true, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-rollback-test-production'",
+    )
+    .await?;
+
+    // Simulate a database that already ran the previous, destructive up()
+    // implementation of this migration before the current no-op fix
+    // shipped: it backed up the managed monitor's id and demoted it.
+    db.execute_unprepared(
+        "CREATE TABLE _temps_m20260904_managed_monitor_ownership_backup ( \
+             monitor_id INTEGER PRIMARY KEY REFERENCES status_monitors(id) ON DELETE CASCADE \
+         ); \
+         INSERT INTO _temps_m20260904_managed_monitor_ownership_backup (monitor_id) \
+         SELECT id FROM status_monitors WHERE name = 'production Monitor'; \
+         UPDATE status_monitors SET is_managed = FALSE WHERE name = 'production Monitor'",
+    )
+    .await?;
+
+    Migrator::down(&db, Some(1)).await?;
+
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_managed FROM status_monitors WHERE name = 'production Monitor'".to_string(),
+        ))
+        .await?
+        .expect("previously managed monitor remains present");
+    assert!(
+        restored.try_get::<bool>("", "is_managed")?,
+        "rolling back on the current no-op up() must still restore ownership captured by a \
+         previous, destructive up()"
+    );
+
+    let backup_table_dropped = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('_temps_m20260904_managed_monitor_ownership_backup') IS NULL AS dropped"
+                .to_string(),
+        ))
+        .await?
+        .expect("regclass lookup row")
+        .try_get::<bool>("", "dropped")?;
+    assert!(
+        backup_table_dropped,
+        "the backup table must be cleaned up after restoring"
+    );
+
     Ok(())
 }
 
@@ -3350,6 +3485,252 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
         .await?
         .expect("creator column reapply query");
     assert!(creator_column_after_reapply.try_get::<bool>("", "present")?);
+
+    Ok(())
+}
+
+/// The AI workspace feature is a seven-migration chain whose later steps
+/// depend on columns, constraints, and indexes installed by earlier steps.
+/// Exercise the chain as PostgreSQL actually sees it, including rollback and
+/// re-application, instead of relying only on MockDatabase SQL-shape tests.
+#[tokio::test]
+async fn test_ai_workspace_migration_chain_up_down_and_reapply() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping AI workspace migration-chain test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping AI workspace migration-chain test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let chain = [
+        "m20260831_000001_ai_first_applications",
+        "m20260901_000001_persist_ai_turn_state",
+        "m20260901_000002_user_owned_ai_conversations",
+        "m20260903_000001_application_workspace_topology",
+        "m20260903_000002_harden_application_workspaces",
+        "m20260903_000003_application_workspace_quarantine",
+        "m20260903_000004_repair_application_primary_projects",
+    ];
+    let migrations = Migrator::migrations();
+    let first = migrations
+        .iter()
+        .position(|migration| migration.name() == chain[0])
+        .expect("first AI workspace migration is registered");
+    let registered = migrations[first..first + chain.len()]
+        .iter()
+        .map(|migration| migration.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        registered,
+        chain
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+
+    Migrator::up(&db, Some(first as u32)).await?;
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO users (name, email, created_at, updated_at) \
+             VALUES ('AI migration user', 'ai-workspace-migration@example.test', now(), now()) \
+             RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted AI migration user");
+    let user_id: i32 = user.try_get("", "id")?;
+    let project = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO projects \
+             (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug) \
+             VALUES ('AI migration project', '', '', '.', 'main', 'nodejs', now(), now(), \
+                     'ai-workspace-migration') RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted AI migration project");
+    let project_id: i32 = project.try_get("", "id")?;
+
+    // Seed rows between the first migration and the topology migrations so
+    // the real database exercises the legacy data backfills, not only the
+    // final empty-schema shape.
+    Migrator::up(&db, Some(1)).await?;
+    let application = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO ai_applications (public_id, name, created_by) \
+                 VALUES ('app_migration', 'Migration app', {user_id}) RETURNING id"
+            ),
+        ))
+        .await?
+        .expect("inserted legacy application");
+    let application_id: i64 = application.try_get("", "id")?;
+    db.execute_unprepared(&format!(
+        "INSERT INTO ai_application_projects (application_id, project_id) \
+         VALUES ({application_id}, {project_id}); \
+         INSERT INTO ai_conversations \
+           (public_id, project_id, application_id, context_type, context_id, created_by) \
+         VALUES ('conversation_migration', {project_id}, {application_id}, \
+                 'application', 'app_migration', {user_id});"
+    ))
+    .await?;
+    // Advance through the topology migration, then prove the hardening step
+    // refuses incompatible production data transactionally. This sequence is
+    // intentionally separate from the later migrations: applying the whole
+    // remainder at once only exercises safe topology defaults.
+    Migrator::up(&db, Some(3)).await?;
+    db.execute_unprepared(&format!(
+        "UPDATE ai_application_workspaces \
+         SET runtime = 'custom', image = 'registry.example/custom:latest', \
+             cpu_limit = 12 \
+         WHERE application_id = {application_id}"
+    ))
+    .await?;
+    let hardening_refusal = Migrator::up(&db, Some(1))
+        .await
+        .expect_err("hardening must refuse incompatible workspace settings");
+    assert!(
+        hardening_refusal
+            .to_string()
+            .contains("cannot harden application workspaces"),
+        "hardening refusal must tell the operator what to repair: {hardening_refusal}"
+    );
+    let refused_state = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT runtime, image, cpu_limit, \
+                   NOT EXISTS (SELECT 1 FROM seaql_migrations \
+                     WHERE version = '{}') AS migration_unapplied \
+                 FROM ai_application_workspaces WHERE application_id = {application_id}",
+                chain[4]
+            ),
+        ))
+        .await?
+        .expect("workspace survives refused hardening");
+    assert_eq!(refused_state.try_get::<String>("", "runtime")?, "custom");
+    assert_eq!(
+        refused_state.try_get::<Option<String>>("", "image")?,
+        Some("registry.example/custom:latest".to_string())
+    );
+    assert_eq!(refused_state.try_get::<f64>("", "cpu_limit")?, 12.0);
+    assert!(refused_state.try_get::<bool>("", "migration_unapplied")?);
+
+    db.execute_unprepared(&format!(
+        "UPDATE ai_application_workspaces \
+         SET runtime = 'node', image = NULL, cpu_limit = 2 \
+         WHERE application_id = {application_id}"
+    ))
+    .await?;
+    Migrator::up(&db, Some(3)).await?;
+
+    async fn schema_ready(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT \
+                   to_regclass('ai_applications') IS NOT NULL \
+                   AND to_regclass('ai_application_workspaces') IS NOT NULL \
+                   AND to_regclass('uq_sandboxes_active_application_workspace') IS NOT NULL \
+                   AND EXISTS (SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = 'ai_conversations' AND column_name = 'turn_status') \
+                   AND EXISTS (SELECT 1 FROM pg_constraint \
+                     WHERE conname = 'ai_application_workspaces_image_check') \
+                   AND EXISTS (SELECT 1 FROM pg_constraint \
+                     WHERE conname = 'chk_ai_conversations_single_context') AS ready"
+                    .to_string(),
+            ))
+            .await?
+            .expect("AI workspace schema state");
+        Ok(row.try_get("", "ready")?)
+    }
+
+    assert!(schema_ready(&db).await?);
+    let backfill = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT \
+                   (SELECT project_id IS NULL FROM ai_conversations \
+                     WHERE public_id = 'conversation_migration') AS conversation_unscoped, \
+                   (SELECT count(*)::int = 1 FROM ai_application_projects \
+                     WHERE application_id = {application_id} AND is_primary) AS one_primary, \
+                   EXISTS (SELECT 1 FROM ai_application_workspaces \
+                     WHERE application_id = {application_id}) AS workspace_created"
+            ),
+        ))
+        .await?
+        .expect("AI workspace backfill state");
+    assert!(backfill.try_get::<bool>("", "conversation_unscoped")?);
+    assert!(backfill.try_get::<bool>("", "one_primary")?);
+    assert!(backfill.try_get::<bool>("", "workspace_created")?);
+
+    let unsafe_limit = db
+        .execute_unprepared(&format!(
+            "UPDATE ai_application_workspaces SET disk_limit_mb = 65537 \
+             WHERE application_id = {application_id}"
+        ))
+        .await;
+    assert!(
+        unsafe_limit.is_err(),
+        "the hardened resource ceiling must be enforced by PostgreSQL"
+    );
+
+    // Remove the application fixture (and its cascading conversation), then
+    // prove the user-owned migration refuses a destructive rollback while a
+    // global conversation still exists. Earlier reverse migrations may
+    // complete before that refusal, so finish the remaining three only after
+    // the protected row is removed.
+    db.execute_unprepared(&format!(
+        "DELETE FROM ai_applications WHERE id = {application_id}; \
+         INSERT INTO ai_conversations \
+           (public_id, project_id, application_id, context_type, context_id, created_by) \
+         VALUES ('global_migration', NULL, NULL, 'global', 'global', {user_id});"
+    ))
+    .await?;
+    let refusal = Migrator::down(&db, Some(chain.len() as u32))
+        .await
+        .expect_err("rollback must preserve global conversation history");
+    assert!(
+        refusal
+            .to_string()
+            .contains("cannot roll back user-owned AI conversations"),
+        "rollback should explain how to preserve or reassign history: {refusal}"
+    );
+    db.execute_unprepared("DELETE FROM ai_conversations WHERE public_id = 'global_migration'")
+        .await?;
+    Migrator::down(&db, Some(3)).await?;
+    assert!(!schema_ready(&db).await?);
+    Migrator::up(&db, Some(chain.len() as u32)).await?;
+    assert!(schema_ready(&db).await?);
 
     Ok(())
 }

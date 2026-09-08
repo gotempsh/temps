@@ -153,11 +153,7 @@ async fn apply_summary_preference(
     else {
         return Ok(());
     };
-    let route = preference.summary_provider_id.as_deref().or_else(|| {
-        (preference.provider_type == "agent_cli")
-            .then_some(preference.agent_cli_provider_id.as_deref())
-            .flatten()
-    });
+    let route = preference.summary_provider_id.as_deref();
     if let Some(route) = route {
         if let Some(key_id) = route.strip_prefix("gateway_key:") {
             request.provider_key_id = Some(key_id.parse::<i32>().map_err(|_| {

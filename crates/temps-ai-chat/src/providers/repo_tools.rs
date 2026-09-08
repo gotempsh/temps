@@ -371,14 +371,14 @@ impl ConversationContextProvider for RepoToolsProvider {
         "__repo_tools__"
     }
 
-    async fn seed(&self, _project_id: i32, _context_id: &str) -> Option<ConversationSeed> {
+    async fn seed(&self, _project_id: Option<i32>, _context_id: &str) -> Option<ConversationSeed> {
         // Sentinel providers have no seed.
         None
     }
 
     async fn tools_with_auth(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         _context_id: &str,
         auth: &AuthContext,
     ) -> Vec<ChatTool> {
@@ -386,6 +386,9 @@ impl ConversationContextProvider for RepoToolsProvider {
             return Vec::new();
         }
 
+        let Some(project_id) = project_id else {
+            return Vec::new();
+        };
         // No git manager → no tools.
         if self.git.is_none() {
             return Vec::new();
@@ -445,7 +448,7 @@ impl ConversationContextProvider for RepoToolsProvider {
 
     async fn execute_tool_with_auth(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         _context_id: &str,
         name: &str,
         arguments: &str,
@@ -454,6 +457,9 @@ impl ConversationContextProvider for RepoToolsProvider {
         if !auth.has_permission(&Permission::GitRepositoriesRead) {
             return "Repository tools require the git_repositories:read permission.".to_string();
         }
+        let Some(project_id) = project_id else {
+            return "Repository tools require a project-scoped conversation.".to_string();
+        };
 
         // Parse the JSON args. On failure return a readable message so the
         // model can self-correct rather than receiving a raw Rust error.
@@ -525,7 +531,9 @@ mod tests {
     async fn tools_empty_when_git_absent() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
-        let tools = provider.tools_with_auth(1, "", &auth_with_git_read()).await;
+        let tools = provider
+            .tools_with_auth(Some(1), "", &auth_with_git_read())
+            .await;
         assert!(
             tools.is_empty(),
             "expected no tools when git manager is absent"
@@ -549,7 +557,7 @@ mod tests {
         // git = None → early return before DB query; result is still empty.
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         let tools = provider
-            .tools_with_auth(42, "", &auth_with_git_read())
+            .tools_with_auth(Some(42), "", &auth_with_git_read())
             .await;
         assert!(tools.is_empty());
     }
@@ -645,7 +653,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         let result = provider
-            .execute_tool_with_auth(1, "", "nonexistent_tool", "{}", &auth_with_git_read())
+            .execute_tool_with_auth(Some(1), "", "nonexistent_tool", "{}", &auth_with_git_read())
             .await;
         assert!(
             result.contains("Unknown repo tool"),
@@ -660,7 +668,7 @@ mod tests {
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         let result = provider
             .execute_tool_with_auth(
-                1,
+                Some(1),
                 "",
                 "read_repo_file",
                 "not json {{{",
@@ -680,7 +688,7 @@ mod tests {
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         // Arguments have no "path" key at all.
         let result = provider
-            .execute_tool_with_auth(1, "", "read_repo_file", "{}", &auth_with_git_read())
+            .execute_tool_with_auth(Some(1), "", "read_repo_file", "{}", &auth_with_git_read())
             .await;
         // The missing-path guard fires before any git access.
         assert!(
@@ -695,9 +703,18 @@ mod tests {
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         let auth = auth_without_git_read();
 
-        assert!(provider.tools_with_auth(1, "", &auth).await.is_empty());
+        assert!(provider
+            .tools_with_auth(Some(1), "", &auth)
+            .await
+            .is_empty());
         let result = provider
-            .execute_tool_with_auth(1, "", "read_repo_file", r#"{"path":"README.md"}"#, &auth)
+            .execute_tool_with_auth(
+                Some(1),
+                "",
+                "read_repo_file",
+                r#"{"path":"README.md"}"#,
+                &auth,
+            )
             .await;
         assert!(result.contains("git_repositories:read"), "{result}");
     }

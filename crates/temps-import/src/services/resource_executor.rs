@@ -1034,6 +1034,8 @@ mod tests {
                 members: vec![],
                 error_message: None,
                 metrics_enabled: false,
+                continuous_archive_s3_source_id: None,
+                continuous_archive_pinned_at: None,
             },
             local_url: Some(local.to_string()),
             source_url: Some(source.to_string()),

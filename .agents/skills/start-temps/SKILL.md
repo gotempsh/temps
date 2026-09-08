@@ -280,7 +280,10 @@ done
 times than `--release` (see Notes). `TEMPS_ADMIN_EMAIL` +
 `TEMPS_ADMIN_PASSWORD_FILE` make the first-run admin bootstrap
 non-interactive — without them a fresh database wedges a detached process in
-an infinite email/password re-prompt loop.
+an infinite email/password re-prompt loop. Docker Desktop on macOS does not
+expose the Linux forwarding plane where Temps installs sandbox egress rules,
+so this trusted local-development launcher explicitly opts into unfiltered
+sandbox networking. Never copy that override into a production deployment.
 
 ```bash
 source "$HOME/.temps-dev/slot-<N>.env"
@@ -293,6 +296,7 @@ cd "$TEMPS_ROOT/crates/temps-cli" && \
   TEMPS_ADMIN_PASSWORD_FILE="$TEMPS_ADMIN_PASSWORD_FILE" \
   TEMPS_DISABLE_HTTPS_REDIRECT=true \
   TEMPS_TELEMETRY=0 \
+  TEMPS_ALLOW_INSECURE_SANDBOX_NETWORKING=1 \
   nohup cargo run --profile fast --bin temps --package temps-cli -- \
     serve \
     --disable-https-redirect \

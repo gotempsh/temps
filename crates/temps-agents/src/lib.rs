@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod ai_cli;
+mod docker_network_isolation;
 pub mod error;
 pub mod handlers;
 pub mod plugin;

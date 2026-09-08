@@ -262,6 +262,7 @@ export function buildPlatformSettingsUpdateBody(
     ai_config: updated.ai_config,
     build_limits: updated.build_limits,
     ai_chat_limits: updated.ai_chat_limits,
+    ai_workspace_file_limits: updated.ai_workspace_file_limits,
     request_timeouts: updated.request_timeouts,
     // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
     // omitting these would silently reset the operator's connection cap and

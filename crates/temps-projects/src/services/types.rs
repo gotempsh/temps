@@ -89,8 +89,6 @@ pub struct Project {
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
     pub ai_alert_summaries_enabled: Option<bool>,
-    pub ai_debug_chat_enabled: Option<bool>,
-    pub ai_write_actions_enabled: bool,
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in for native error-tracking source context.
     pub error_source_context_enabled: bool,
@@ -150,8 +148,6 @@ pub struct UpdateProjectSettingsParams {
     pub preview_envs_wake_timeout_seconds: Option<i32>,
     pub preset_config: Option<serde_json::Value>,
     pub ai_alert_summaries_enabled: Option<bool>,
-    pub ai_debug_chat_enabled: Option<bool>,
-    pub ai_write_actions_enabled: Option<bool>,
     pub cross_project_trace_sharing: Option<bool>,
     pub error_source_context_enabled: Option<bool>,
     pub vulnerability_scanning_enabled: Option<bool>,

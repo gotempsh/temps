@@ -25,15 +25,20 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use temps_agents::error::AgentError;
-use temps_agents::sandbox::{SandboxCreateConfig, SandboxHandle, SandboxProvider};
+use temps_agents::sandbox::{
+    user::SANDBOX_CHOWN, SandboxCreateConfig, SandboxHandle, SandboxProvider,
+};
 
 pub struct StandaloneSandboxRegistry {
     provider: Arc<dyn SandboxProvider>,
     handles: RwLock<HashMap<i32, SandboxHandle>>,
 }
+
+const STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl StandaloneSandboxRegistry {
     pub fn new(provider: Arc<dyn SandboxProvider>) -> Self {
@@ -71,6 +76,88 @@ impl StandaloneSandboxRegistry {
         let handle = self.provider.create_from_snapshot(artifact, config).await?;
         self.handles.write().await.insert(id, handle.clone());
         Ok(handle)
+    }
+
+    /// Reconcile the isolated data-plane network for an application workspace.
+    pub async fn configure_application_network(
+        &self,
+        id: i32,
+        public_id: &str,
+        network_name: &str,
+        service_containers: &[String],
+    ) -> Result<(), AgentError> {
+        let handle = self.get_or_recover(id, public_id).await?;
+        self.provider
+            .configure_application_network(&handle, network_name, service_containers)
+            .await
+    }
+
+    /// Replace compute while retaining provider-managed persistent volumes.
+    /// The caller owns the durable host workspace and database state.
+    pub async fn rebuild(
+        &self,
+        id: i32,
+        public_id: &str,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        if let Ok(handle) = self.get_or_recover(id, public_id).await {
+            self.provider.destroy(&handle, false).await?;
+        }
+        self.handles.write().await.remove(&id);
+        let handle = self.provider.create(config).await?;
+        self.handles.write().await.insert(id, handle.clone());
+        Ok(handle)
+    }
+
+    pub async fn restore(
+        &self,
+        id: i32,
+        public_id: &str,
+        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        if let Ok(handle) = self.get_or_recover(id, public_id).await {
+            self.provider.destroy(&handle, false).await?;
+        }
+        self.handles.write().await.remove(&id);
+        let handle = self.provider.create_from_snapshot(artifact, config).await?;
+        self.handles.write().await.insert(id, handle.clone());
+        Ok(handle)
+    }
+
+    pub async fn normalize_workspace_path(
+        &self,
+        id: i32,
+        public_id: &str,
+        container_path: &str,
+    ) -> Result<(), AgentError> {
+        let handle = self.get(id, public_id).await?;
+        let result = self
+            .provider
+            .exec_as_root(
+                &handle,
+                vec![
+                    "chown".to_string(),
+                    "-R".to_string(),
+                    SANDBOX_CHOWN.to_string(),
+                    container_path.to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await?;
+        if result.exit_code != 0 {
+            return Err(AgentError::SandboxExecFailed {
+                run_id: id,
+                sandbox_id: public_id.to_string(),
+                reason: format!(
+                    "normalize workspace path ownership failed with exit {}: {}",
+                    result.exit_code,
+                    result.stderr.trim()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Strip the `sbx_` prefix from a public ID to get the container
@@ -204,20 +291,38 @@ impl StandaloneSandboxRegistry {
     /// container label (hex suffix of `public_id`). The provider looks
     /// up by label; the registry keys by numeric id for in-memory lookup.
     pub async fn recover_active(&self, entries: &[(i32, String)]) -> usize {
+        self.recover_active_with_timeout(entries, STARTUP_RECOVERY_TIMEOUT)
+            .await
+    }
+
+    async fn recover_active_with_timeout(
+        &self,
+        entries: &[(i32, String)],
+        timeout: Duration,
+    ) -> usize {
         let mut recovered = 0;
         for (id, label) in entries {
-            match self.provider.recover_by_name(label).await {
-                Ok(Some(handle)) => {
+            match tokio::time::timeout(timeout, self.provider.recover_by_name(label)).await {
+                Ok(Ok(Some(handle))) => {
                     self.handles.write().await.insert(*id, handle);
                     recovered += 1;
                 }
-                Ok(None) => {}
-                Err(e) => {
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
                     tracing::warn!(
                         "Failed to recover standalone sandbox for id {} ({}): {}",
                         id,
                         label,
                         e
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Timed out after {:?} recovering standalone sandbox for id {} ({}) — \
+                         startup will continue and lifecycle operations will retry recovery lazily",
+                        timeout,
+                        id,
+                        label
                     );
                 }
             }
@@ -261,6 +366,7 @@ mod tests {
         stops: AtomicUsize,
         restarts: AtomicUsize,
         destroys: AtomicUsize,
+        recovery_delay: Duration,
     }
 
     impl FakeProvider {
@@ -271,12 +377,18 @@ mod tests {
                 stops: AtomicUsize::new(0),
                 restarts: AtomicUsize::new(0),
                 destroys: AtomicUsize::new(0),
+                recovery_delay: Duration::ZERO,
             }
         }
 
         fn with_known(mut self, label: &str) -> Self {
             self.known
                 .insert(label.to_string(), format!("docker-id-{}", label));
+            self
+        }
+
+        fn with_recovery_delay(mut self, delay: Duration) -> Self {
+            self.recovery_delay = delay;
             self
         }
     }
@@ -379,6 +491,9 @@ mod tests {
             &self,
             container_name: &str,
         ) -> Result<Option<SandboxHandle>, AgentError> {
+            if !self.recovery_delay.is_zero() {
+                tokio::time::sleep(self.recovery_delay).await;
+            }
             Ok(self.known.get(container_name).map(|id| SandboxHandle {
                 sandbox_id: id.clone(),
                 sandbox_name: format!("temps-sandbox-{}", container_name),
@@ -527,6 +642,27 @@ mod tests {
         reg.start(42, "sbx_abc123").await.expect("start succeeds");
 
         assert_eq!(provider.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_timeout_does_not_block_the_control_plane() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("slow")
+                .with_recovery_delay(Duration::from_secs(1)),
+        );
+        let reg = StandaloneSandboxRegistry::new(provider);
+        let started = tokio::time::Instant::now();
+
+        let recovered = reg
+            .recover_active_with_timeout(&[(42, "slow".to_string())], Duration::from_millis(20))
+            .await;
+
+        assert_eq!(recovered, 0);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "sandbox recovery must not hold control-plane startup indefinitely"
+        );
     }
 
     #[test]

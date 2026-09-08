@@ -29,6 +29,13 @@ pub async fn run(service: Arc<CloudService>, queue: Arc<dyn JobQueue>) {
                 let Some(stage_job) = to_lifecycle_job(&job) else {
                     continue;
                 };
+                // Independent of whether the lifecycle push below succeeds,
+                // is skipped for lack of a link, or Cloud is unreachable: the
+                // sweep does its own linked/candidate checks and this is
+                // strictly an early nudge, never the sweep's only trigger.
+                if stage_job.stage == BackupLifecycleStage::Completed {
+                    service.wake_backup_mirror();
+                }
                 if !service.link().is_linked() {
                     debug!("Cloud is not linked; skipping backup lifecycle push");
                     continue;

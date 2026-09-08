@@ -3,6 +3,7 @@
 
 import type { Command } from 'commander'
 import { registerRestoreCommands } from './restore.js'
+import { registerWalHealthCommands } from './wal-health.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -535,6 +536,9 @@ export function registerServicesCommands(program: Command): void {
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
   registerRestoreCommands(services)
+
+  // Live WAL / archive_command diagnostics for PostgreSQL services.
+  registerWalHealthCommands(services)
 }
 
 async function listServicesAction(options: { json?: boolean }): Promise<void> {
@@ -767,6 +771,13 @@ async function showService(options: ShowOptions): Promise<void> {
   }
   keyValue('Created', new Date(service.created_at).toLocaleString())
   keyValue('Updated', new Date(service.updated_at).toLocaleString())
+  if (service.continuous_archive_s3_source_id != null) {
+    keyValue('Continuous archive S3 source', String(service.continuous_archive_s3_source_id))
+    if (service.continuous_archive_pinned_at) {
+      keyValue('  pinned at', new Date(service.continuous_archive_pinned_at).toLocaleString())
+    }
+    info('Change with: temps services repoint-continuous-archive-source --id <id> --s3-source <id>')
+  }
 
   if (details.current_parameters && Object.keys(details.current_parameters).length > 0) {
     newline()

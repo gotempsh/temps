@@ -1745,8 +1745,11 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
     );
     // This is the exact predicate `credential_propagation_gates` keys off to
     // decide (false, false) for MariaDB — assert it on the REAL produced key.
+    // It must be the layout-agnostic one: the gate has to answer "physical"
+    // for a WAL-G repository as well as for a legacy mbstream base, so only a
+    // logical dump may fall through to (false, false).
     assert!(
-        !MariaDbService::is_physical_base_location(&dump_location),
+        !MariaDbService::is_physical_base_backup_location(&dump_location),
         "a logical dump must not classify as a physical base ({dump_location}); \
          if it did, the restore would merge the ORIGIN's credentials"
     );

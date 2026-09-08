@@ -73,15 +73,46 @@ start_dockerd() {
   # We let dockerd create its default docker0 bridge — BuildKit needs
   # *some* network for image-build RUN steps, and refuses to run with
   # `--bridge=none` (every RUN dies with "network bridge not found").
-  # Docker's default docker0 lives on 172.17.0.0/16, which doesn't
-  # collide with our compute pool (172.20.0.0/16). The temps-network
-  # crate creates `br-temps0` as a separate bridge anyway, so coexisting
-  # with docker0 is fine.
+  #
+  # Pin BOTH the default bridge and the pool user-defined bridges are
+  # carved from, so nothing Docker auto-allocates can ever land on the
+  # cluster compute pool (172.20.0.0/16, the `network_config` default).
+  #
+  # It is not enough to note that docker0 defaults to 172.17.0.0/16.
+  # Docker's *default* address pool is 172.17.0.0/12 with size 16, so
+  # every user-defined bridge walks up 172.18, 172.19, 172.20, … — and
+  # this node creates several at boot (the preview-gateway control and
+  # ingress networks, then `temps-app-network`). Whichever one lands
+  # fourth gets 172.20.0.0/16 and collides head-on with the compute
+  # pool, which makes `temps network setup-multi-node` refuse to enable
+  # the overlay:
+  #   "compute pool 172.20.0.0/16 overlaps host route 172.20.0.0/16
+  #    on device 'br-<hash>'"
+  # Because those boot-time reconcilers race, which network gets which
+  # /16 varies run to run — so the multinode e2e scenario failed only
+  # intermittently until this was pinned.
+  #
+  # The replacement pool must avoid 172.16.0.0/12 entirely, not just
+  # 172.20.0.0/16: this container's OWN eth0 is frequently on a
+  # 172.x bridge belonging to the outer daemon, and Docker refuses to
+  # subnet a pool that overlaps an existing route — pinning the pool to
+  # 172.17.0.0/16 makes every `docker network create` fail outright with
+  # "all predefined address pools have been fully subnetted".
+  #
+  # 10.98/10.99 is clear of the compute pool (172.20.0.0/16), of both
+  # cluster underlays (dev-cluster 10.42.0.0/24, e2e-multinode
+  # 10.52.0.0/24), and of the outer daemon's 172.16.0.0/12 defaults.
+  # 256 /24s is far more networks than any scenario creates. Overlay
+  # bridges (`br-temps0`) are created by the temps-network crate with an
+  # EXPLICIT subnet out of the compute pool, so they are unaffected by
+  # this pool and still land where the allocator expects.
   # --pidfile pinned so we know exactly which file to clean on restart.
   dockerd \
     --host=unix:///var/run/docker.sock \
     --pidfile=/var/run/docker.pid \
     --iptables=true \
+    --bip=10.98.0.1/24 \
+    --default-address-pool base=10.99.0.0/16,size=24 \
     --log-level=warn \
     >/var/log/docker.log 2>&1 &
 

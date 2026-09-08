@@ -120,14 +120,15 @@ pub enum ApiToolError {
         operation_id: String,
     },
 
-    /// The operation cannot be safely constrained to the caller's project scope.
+    /// A project-specific operation was attempted without selecting a project
+    /// permitted by the surrounding application/conversation context.
     #[error(
-        "Operation '{operation_id}' is not available from a project-scoped AI chat \
-         because it does not expose a project selector."
+        "Operation '{operation_id}' requires a project selected from the current context \
+         (allowed: {allowed})."
     )]
-    UnscopedOperation {
-        /// The operation that was called.
+    ProjectSelectionRequired {
         operation_id: String,
+        allowed: String,
     },
 
     /// The requested `operation_id` does not exist in the read-only index.

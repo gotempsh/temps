@@ -45,7 +45,7 @@ mod integration_tests;
 
 pub use caller::{
     ApiCallScope, ApiToolResponse, BuiltRequest, InternalApiCaller, PreparedWrite,
-    WritePrepareOutcome,
+    ProjectSelectorScope, WritePrepareOutcome,
 };
 pub use error::ApiToolError;
 pub use handle::{ApiToolsHandle, WriteApiToolsHandle};

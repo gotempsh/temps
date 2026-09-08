@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Periodic sweeper that stops sandboxes whose `expires_at` has passed.
+//! Periodic sweeper that suspends sandbox compute whose `expires_at` has passed.
 //!
 //! Sandboxes are created with a bounded `timeout_secs` window (default 1h,
 //! max 24h). Without this sweeper, a sandbox whose owner never calls
@@ -13,15 +13,15 @@
 //! to `"stopped"`. Volumes, the bind-mounted `/workspace`, and home-dir
 //! state all survive so the owner can call `/resume` later. Destroying
 //! would be irreversible — that's reserved for explicit `/destroy` calls.
+//! Durable standalone workspaces participate in idle suspension too:
+//! "persistent" means their files survive, not that their compute consumes
+//! resources forever.
 //!
-//! Workspace-class sandboxes (ADR-036) are swept exactly like ephemeral
-//! ones — deliberately. "Permanent" means the *state* is permanent, not
-//! that the container pins RAM forever; a handful of idle workspaces
-//! holding memory would evict real deployments on the 3 vCPU / 4 GB
-//! reference host. The difference lives on the access path instead:
-//! `SandboxService::resolve_id` wakes a suspended workspace transparently,
-//! so from the user's side suspension is invisible apart from a slower
-//! first call.
+//! Temps-managed application workspaces (identified by the
+//! `ai-application:` name prefix) are deliberately excluded. Their compute is
+//! part of the application runtime and must remain available until an explicit
+//! application pause or stop request changes its lifecycle state. Other
+//! workspace-class sandboxes continue to use the normal idle deadline.
 //!
 //! `expires_at` is an *idle* deadline: `SandboxService::touch` pushes it
 //! forward on every exec and filesystem operation, so a sandbox in active
@@ -42,6 +42,7 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Select,
 };
 use temps_entities::sandboxes;
 
@@ -51,6 +52,24 @@ use crate::services::registry::StandaloneSandboxRegistry;
 /// one sweep period of overrun past `expires_at` — at 60s that's a
 /// negligible blast radius relative to the minimum 60s `timeout_secs`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Application workspace compute is lifecycle-managed through the application
+/// API. The generic idle sweeper must not override that desired state.
+const APPLICATION_WORKSPACE_NAME_PATTERN: &str = "ai-application:%";
+
+fn expired_sandboxes(now: chrono::DateTime<Utc>) -> Select<sandboxes::Entity> {
+    sandboxes::Entity::find()
+        .filter(sandboxes::Column::Status.eq("running"))
+        .filter(sandboxes::Column::ExpiresAt.lt(now))
+        // Agent-run sandboxes are lifecycle-owned by the run itself
+        // (analysis → fix → PR can legitimately outlive any timeout
+        // while the user reviews between phases) — never sweep them.
+        .filter(sandboxes::Column::AgentRunId.is_null())
+        // Application workspaces are an always-on application resource.
+        // Explicit application pause/stop controls remain responsible for
+        // changing their state.
+        .filter(sandboxes::Column::Name.not_like(APPLICATION_WORKSPACE_NAME_PATTERN))
+}
 
 pub struct SandboxExpirationSweeper {
     db: Arc<DatabaseConnection>,
@@ -83,15 +102,7 @@ impl SandboxExpirationSweeper {
     /// tests + tracing visibility).
     pub async fn tick(&self) -> Result<usize, sea_orm::DbErr> {
         let now = Utc::now();
-        let expired = sandboxes::Entity::find()
-            .filter(sandboxes::Column::Status.eq("running"))
-            .filter(sandboxes::Column::ExpiresAt.lt(now))
-            // Agent-run sandboxes are lifecycle-owned by the run itself
-            // (analysis → fix → PR can legitimately outlive any timeout
-            // while the user reviews between phases) — never sweep them.
-            .filter(sandboxes::Column::AgentRunId.is_null())
-            .all(self.db.as_ref())
-            .await?;
+        let expired = expired_sandboxes(now).all(self.db.as_ref()).await?;
 
         if expired.is_empty() {
             return Ok(0);
@@ -205,12 +216,7 @@ mod tests {
         // We can't construct a real registry here without a provider.
         // The no-op path never touches the registry, so we can short-circuit
         // tick()'s body at the DB layer: confirm the query returns empty.
-        let rows = sandboxes::Entity::find()
-            .filter(sandboxes::Column::Status.eq("running"))
-            .filter(sandboxes::Column::ExpiresAt.lt(Utc::now()))
-            .all(&db)
-            .await
-            .expect("query");
+        let rows = expired_sandboxes(Utc::now()).all(&db).await.expect("query");
         assert!(rows.is_empty());
     }
 
@@ -234,12 +240,7 @@ mod tests {
             }]])
             .into_connection();
 
-        let rows = sandboxes::Entity::find()
-            .filter(sandboxes::Column::Status.eq("running"))
-            .filter(sandboxes::Column::ExpiresAt.lt(Utc::now()))
-            .all(&db)
-            .await
-            .expect("query");
+        let rows = expired_sandboxes(Utc::now()).all(&db).await.expect("query");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, 1_000_042);
 
@@ -260,5 +261,37 @@ mod tests {
         let r = make_row(42, "running", -10);
         assert_eq!(r.status, "running");
         assert!(r.expires_at < Utc::now());
+    }
+
+    #[tokio::test]
+    async fn expiry_query_excludes_managed_application_workspaces() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
+            .into_connection();
+
+        let rows = expired_sandboxes(Utc::now())
+            .all(&db)
+            .await
+            .expect("expiration query");
+        assert!(rows.is_empty());
+
+        let sql = format!("{:?}", db.into_transaction_log());
+        assert!(
+            sql.contains("ai-application:%") && sql.contains("NOT LIKE"),
+            "expiration query must exclude Temps-managed application workspaces: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_query_still_includes_ordinary_durable_workspaces() {
+        let mut workspace = make_row(1_000_043, "running", -60);
+        workspace.lifecycle = "workspace".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![workspace]])
+            .into_connection();
+
+        let rows = expired_sandboxes(Utc::now()).all(&db).await.expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].lifecycle, "workspace");
     }
 }

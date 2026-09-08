@@ -52,6 +52,7 @@ impl GatewayService {
         providers.insert("anthropic", Box::new(AnthropicProvider::new()));
         providers.insert("xai", Box::new(OpenAiCompatProvider::xai()));
         providers.insert("gemini", Box::new(GeminiProvider::new()));
+        providers.insert("openrouter", Box::new(OpenAiCompatProvider::openrouter()));
         Self {
             provider_key_service,
             providers,
@@ -115,7 +116,7 @@ impl GatewayService {
         let client = external_http_client(std::time::Duration::from_secs(30));
 
         let response = match key.provider.as_str() {
-            "openai" | "xai" => {
+            "openai" | "xai" | "openrouter" => {
                 client
                     .get(format!("{base}/models"))
                     .bearer_auth(&api_key)
@@ -484,6 +485,7 @@ impl GatewayService {
             "anthropic" => "claude-haiku-4-5",
             "xai" => "grok-4.5",
             "gemini" => "gemini-3.5-flash-lite",
+            "openrouter" => "openai/gpt-4o-mini",
             _ => {
                 return Err(AiGatewayError::ProviderNotConfigured {
                     provider: provider_id.to_string(),
@@ -865,7 +867,7 @@ mod tests {
     fn test_gateway_service_has_all_providers() {
         // We can't create a full GatewayService without a ProviderKeyService,
         // but we can verify the provider registry logic
-        let providers: Vec<&str> = vec!["openai", "anthropic", "xai", "gemini"];
+        let providers: Vec<&str> = vec!["openai", "anthropic", "xai", "gemini", "openrouter"];
 
         for provider_id in &providers {
             assert!(
@@ -874,6 +876,7 @@ mod tests {
                     "anthropic" => "claude-sonnet-4-6",
                     "xai" => "grok-3",
                     "gemini" => "gemini-3.1-pro",
+                    "openrouter" => "openai/gpt-4o",
                     _ => unreachable!(),
                 })
                 .is_some(),

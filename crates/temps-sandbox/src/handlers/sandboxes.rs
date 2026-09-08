@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -142,6 +142,21 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Subsystem Unavailable")
                     .with_detail(error.to_string())
             }
+            SandboxError::RuntimeEnvironmentNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Sandbox Runtime Environment Not Found")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::RuntimeCredentialsFailed { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Sandbox Runtime Credentials Failed")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::RuntimeVariableConflict { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Ambiguous Sandbox Runtime Variables")
+                    .with_detail(error.to_string())
+            }
             SandboxError::PasswordHashFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Password Hashing Failed")
@@ -192,6 +207,12 @@ pub enum SourceBody {
         password: Option<String>,
         #[serde(default)]
         git_connection_id: Option<i32>,
+        /// Optional path relative to the sandbox work directory.
+        #[serde(default)]
+        destination: Option<String>,
+        /// Remove `<destination>/.git` after cloning. Requires destination.
+        #[serde(default)]
+        strip_git_metadata: bool,
     },
     Tarball {
         url: String,
@@ -267,6 +288,16 @@ async fn validate_seed_url_async(url: &str, kind: &str) -> Result<(), SandboxErr
 }
 
 impl SourceBody {
+    fn uses_stored_git_connection(&self) -> bool {
+        matches!(
+            self,
+            SourceBody::Git {
+                git_connection_id: Some(_),
+                ..
+            }
+        )
+    }
+
     /// Validate the body before converting it into the service-layer
     /// `SandboxSource`. Called by handlers that accept a SourceBody.
     ///
@@ -278,9 +309,12 @@ impl SourceBody {
         match self {
             SourceBody::Git {
                 url,
+                depth,
                 username,
                 password,
                 git_connection_id,
+                destination,
+                strip_git_metadata,
                 ..
             } => {
                 if url.trim().is_empty() {
@@ -294,6 +328,11 @@ impl SourceBody {
                     });
                 }
                 validate_seed_url(url, "git")?;
+                if depth.is_some_and(|value| value == 0 || value > 1_000) {
+                    return Err(SandboxError::Validation {
+                        message: "git source: depth must be between 1 and 1000".into(),
+                    });
+                }
                 let inline = username.is_some() || password.is_some();
                 if inline && git_connection_id.is_some() {
                     return Err(SandboxError::Validation {
@@ -304,6 +343,14 @@ impl SourceBody {
                     return Err(SandboxError::Validation {
                         message: "git source: username and password must be provided together"
                             .into(),
+                    });
+                }
+                crate::services::sandbox_service::validate_source_destination(
+                    destination.as_deref(),
+                )?;
+                if *strip_git_metadata && destination.is_none() {
+                    return Err(SandboxError::Validation {
+                        message: "git source: strip_git_metadata requires destination".into(),
                     });
                 }
                 Ok(())
@@ -343,6 +390,8 @@ impl From<SourceBody> for SandboxSource {
                 username,
                 password,
                 git_connection_id,
+                destination,
+                strip_git_metadata,
             } => SandboxSource::Git {
                 url,
                 revision,
@@ -350,6 +399,8 @@ impl From<SourceBody> for SandboxSource {
                 username,
                 password,
                 git_connection_id,
+                destination,
+                strip_git_metadata,
             },
             SourceBody::Tarball { url } => SandboxSource::Tarball { url },
         }
@@ -437,7 +488,8 @@ pub struct CreateSandboxBody {
     /// no explicit `source` is given, and the sandbox is attributed to the
     /// project so it can be listed alongside it.
     ///
-    /// Requires access to the project — the same team/scope rules that
+    /// Requires access to the project and `git_repositories:read` when Temps
+    /// derives the source from the project. The same team/scope rules that
     /// gate every other project-scoped endpoint apply.
     #[serde(default)]
     pub project_id: Option<i32>,
@@ -485,6 +537,7 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             // Snapshot artifact is resolved and injected by the handler;
             // the `From` impl starts with None and the handler sets it.
             from_snapshot_artifact: None,
+            host_work_dir_override: None,
         }
     }
 }
@@ -923,6 +976,17 @@ pub async fn create_sandbox(
     Json(body): Json<CreateSandboxBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    // An implicit project source may resolve a stored provider connection in
+    // the service. Require repository-read permission before that lookup so a
+    // revoked Git grant cannot be bypassed through sandbox creation.
+    if (body.project_id.is_some() && body.source.is_none())
+        || body
+            .source
+            .as_ref()
+            .is_some_and(SourceBody::uses_stored_git_connection)
+    {
+        temps_auth::permission_guard!(auth, GitRepositoriesRead);
+    }
     // Creating a sandbox *from* a project reads that project's repo URL and
     // git credential, so it needs the same access gate as any other
     // project-scoped endpoint — an API key scoped to project A must not be
@@ -965,7 +1029,7 @@ pub async fn create_sandbox(
         })?;
         artifact_lifecycle_guard = Some(snapshot_svc.acquire_artifact_lifecycle().await);
         let artifact = snapshot_svc
-            .resolve_for_restore(user_id, &snap_id, req.backend.as_deref())
+            .resolve_standalone_for_restore(user_id, &snap_id, req.backend.as_deref())
             .await
             .map_err(|e| {
                 use temps_core::problemdetails::Problem;
@@ -1362,6 +1426,9 @@ pub async fn source_sandbox(
     Json(body): Json<SourceBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    if body.uses_stored_git_connection() {
+        temps_auth::permission_guard!(auth, GitRepositoriesRead);
+    }
     body.validate_async().await?;
     let source: SandboxSource = body.into();
     let row = state
@@ -2452,6 +2519,77 @@ pub struct PreviewShareLinkResponse {
     pub expires_at: u64,
 }
 
+/// Live project runtime variables issued to a sandbox. Values are deliberately
+/// absent from Debug output and must not be cached or persisted by Temps.
+#[derive(Serialize, ToSchema)]
+pub struct SandboxRuntimeEnvironmentResponse {
+    pub variables: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for SandboxRuntimeEnvironmentResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut variable_names = self.variables.keys().collect::<Vec<_>>();
+        variable_names.sort();
+        formatter
+            .debug_struct("SandboxRuntimeEnvironmentResponse")
+            .field("variable_names", &variable_names)
+            .finish()
+    }
+}
+
+/// Issue the same scoped service variables used by a deployment runtime for
+/// the project attached to this sandbox.
+#[utoipa::path(
+    tag = "Sandboxes",
+    operation_id = "sandbox_issue_runtime_environment",
+    post,
+    path = "/v1/sandboxes/{id}/runtime-environment",
+    responses(
+        (status = 200, description = "Runtime variables issued", body = SandboxRuntimeEnvironmentResponse),
+        (status = 400, description = "Sandbox has no attached project"),
+        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 404, description = "Sandbox or project environment not found"),
+        (status = 409, description = "Linked services expose ambiguous variables"),
+        (status = 503, description = "Runtime credential provider unavailable")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn issue_runtime_environment(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    sandbox_permission_guard(&auth, Permission::SandboxesExec, Permission::ProjectsWrite)?;
+    if !auth.has_permission(&Permission::SecretsRead) {
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/insufficient-permissions")
+                .title("Insufficient Permissions")
+                .detail("Issuing sandbox runtime variables requires the secrets:read permission")
+                .value("required_permission", Permission::SecretsRead.to_string())
+                .value("user_role", auth.effective_role.to_string())
+                .build(),
+        );
+    }
+    let sandbox = state
+        .sandbox_service
+        .find_by_public_id(&id, auth.user_id())
+        .await?;
+    if let Some(project_id) = sandbox.project_id {
+        project_scope_guard!(auth, project_id);
+        project_access_guard!(auth, project_id, state.project_access_checker);
+    }
+    let variables = state
+        .sandbox_service
+        .runtime_environment(auth.user_id(), &id)
+        .await?;
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SandboxRuntimeEnvironmentResponse { variables }),
+    ))
+}
+
 /// Mint a shareable link to a sandbox preview.
 ///
 /// `GET /domain` returns the bare preview URL, which is useless to anyone who
@@ -2529,6 +2667,10 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         .route("/v1/sandboxes/{id}/source", post(source_sandbox))
         .route("/v1/sandboxes/{id}/extend-timeout", post(extend_timeout))
         .route("/v1/sandboxes/{id}/exec", post(exec))
+        .route(
+            "/v1/sandboxes/{id}/runtime-environment",
+            post(issue_runtime_environment),
+        )
         .route("/v1/sandboxes/{id}/exec-detached", post(exec_detached))
         .route("/v1/sandboxes/{id}/jobs", get(list_jobs))
         .route("/v1/sandboxes/{id}/jobs/{job_id}", get(job_status))
@@ -2899,6 +3041,8 @@ mod tests {
             username: None,
             password: None,
             git_connection_id: None,
+            destination: None,
+            strip_git_metadata: false,
         };
         assert!(body.validate().is_ok());
     }
@@ -2912,6 +3056,8 @@ mod tests {
             username: None,
             password: None,
             git_connection_id: None,
+            destination: None,
+            strip_git_metadata: false,
         };
         let err = body.validate().expect_err("expected validation failure");
         assert!(
@@ -2930,6 +3076,8 @@ mod tests {
             username: Some("x-access-token".into()),
             password: None,
             git_connection_id: None,
+            destination: None,
+            strip_git_metadata: false,
         };
         assert!(body.validate().is_err());
     }
@@ -2943,6 +3091,8 @@ mod tests {
             username: Some("x-access-token".into()),
             password: Some("ghp_xxx".into()),
             git_connection_id: Some(7),
+            destination: None,
+            strip_git_metadata: false,
         };
         assert!(body.validate().is_err());
     }
@@ -2956,8 +3106,31 @@ mod tests {
             username: None,
             password: None,
             git_connection_id: Some(7),
+            destination: Some("projects/foo".into()),
+            strip_git_metadata: true,
         };
         assert!(body.validate().is_ok());
+        assert!(body.uses_stored_git_connection());
+    }
+
+    #[test]
+    fn source_permission_classification_ignores_anonymous_and_tarball_sources() {
+        let anonymous = SourceBody::Git {
+            url: "https://github.com/foo/bar".into(),
+            revision: None,
+            depth: None,
+            username: None,
+            password: None,
+            git_connection_id: None,
+            destination: None,
+            strip_git_metadata: false,
+        };
+        let tarball = SourceBody::Tarball {
+            url: "https://downloads.example/source.tar.gz".into(),
+        };
+
+        assert!(!anonymous.uses_stored_git_connection());
+        assert!(!tarball.uses_stored_git_connection());
     }
 
     #[test]
@@ -2969,8 +3142,42 @@ mod tests {
             username: Some("x-access-token".into()),
             password: Some("ghp_xxx".into()),
             git_connection_id: None,
+            destination: None,
+            strip_git_metadata: false,
         };
         assert!(body.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_git_destinations() {
+        for destination in ["", "/workspace/project", "../project", "projects/../escape"] {
+            let body = SourceBody::Git {
+                url: "https://github.com/foo/bar".into(),
+                revision: None,
+                depth: None,
+                username: None,
+                password: None,
+                git_connection_id: None,
+                destination: Some(destination.into()),
+                strip_git_metadata: false,
+            };
+            assert!(body.validate().is_err(), "accepted {destination:?}");
+        }
+    }
+
+    #[test]
+    fn validate_requires_a_destination_before_stripping_git_metadata() {
+        let body = SourceBody::Git {
+            url: "https://github.com/foo/bar".into(),
+            revision: None,
+            depth: None,
+            username: None,
+            password: None,
+            git_connection_id: None,
+            destination: None,
+            strip_git_metadata: true,
+        };
+        assert!(body.validate().is_err());
     }
 
     // ── Security: Fix #19 + #27 for sandbox extract_tar_gz ───────────────────

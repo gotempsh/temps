@@ -1091,7 +1091,11 @@ pub async fn login(
             // Check if user has MFA enabled
             if user.mfa_enabled {
                 // Create temporary MFA session
-                match state.auth_service.create_mfa_session(user.id).await {
+                match state
+                    .auth_service
+                    .create_mfa_session(user.id, "password")
+                    .await
+                {
                     Ok(mfa_token) => {
                         // Encrypt the MFA token
                         let encrypted_token = match state.cookie_crypto.encrypt(&mfa_token) {

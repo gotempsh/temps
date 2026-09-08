@@ -95,6 +95,8 @@ impl TempsPlugin for SandboxPlugin {
             let platform_config = context.require_service::<ConfigService>();
             let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
             let git_provider_manager = context.require_service::<GitProviderManager>();
+            let runtime_credentials =
+                context.require_service::<dyn temps_core::SandboxRuntimeCredentialsProvider>();
 
             let registry = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
             context.register_service(registry.clone());
@@ -129,8 +131,12 @@ impl TempsPlugin for SandboxPlugin {
                     git_provider_manager,
                     root,
                 )
+                .with_runtime_credentials(runtime_credentials)
                 .with_snapshot_service(snapshot_service),
             );
+            let network_reconciler: Arc<dyn temps_core::ApplicationDataNetworkReconciler> =
+                service.clone();
+            context.register_service(network_reconciler);
             context.register_service(service);
 
             debug!("Sandbox plugin services registered");
@@ -287,7 +293,12 @@ impl TempsPlugin for SandboxPlugin {
             project_access_checker,
             audit_service,
         });
-        let router = configure_routes().with_state(app_state);
+        let router = configure_routes()
+            .route_layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                crate::handlers::hide_managed_application_workspaces,
+            ))
+            .with_state(app_state);
         Some(PluginRoutes::new(router))
     }
 

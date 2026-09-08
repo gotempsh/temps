@@ -43,6 +43,8 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use temps_auth::Permission;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
@@ -1629,6 +1631,66 @@ async fn session_caller_may_access_linked_projects(
     }
 }
 
+/// Require a project-scoped permission on at least one project linked to the
+/// service. Installations without scoped project roles retain the existing
+/// membership behavior, while configured roles cannot use an instance-level
+/// permission to mutate a service outside their effective project grants.
+#[cfg(test)]
+async fn session_caller_has_permission_on_linked_projects(
+    auth: &temps_auth::AuthContext,
+    project_ids: &[i32],
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+    required: &Permission,
+) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(());
+    }
+
+    let Some(checker) = checker else {
+        return Ok(());
+    };
+    let required = required.to_string();
+    for &project_id in project_ids {
+        let effective = checker
+            .effective_project_permissions(auth.user_id(), project_id)
+            .await
+            .map_err(|error| {
+                internal_server_error()
+                    .detail(format!(
+                        "Could not verify project permissions for external service access: {error}"
+                    ))
+                    .build()
+            })?;
+        match effective {
+            Some(permissions) if permissions.iter().any(|permission| permission == &required) => {
+                return Ok(());
+            }
+            Some(_) => {}
+            None => {
+                let is_member = checker
+                    .user_can_access_project(auth.user_id(), project_id)
+                    .await
+                    .map_err(|error| {
+                        internal_server_error()
+                            .detail(format!(
+                                "Could not verify project access for external service: {error}"
+                            ))
+                            .build()
+                    })?;
+                if is_member {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(forbidden()
+        .detail(format!(
+            "The external service is not linked to a project where you have the {required} permission"
+        ))
+        .build())
+}
+
 /// Allow iff `user_id` can access at least one of `project_ids`, per the
 /// registered [`temps_core::ProjectAccessChecker`]. Fails closed (denies) on
 /// any infrastructure error from the checker — a checker that can't verify
@@ -2014,6 +2076,30 @@ mod tests {
         }
     }
 
+    struct EffectiveServicePermissionChecker {
+        permissions: Option<Vec<String>>,
+        member: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for EffectiveServicePermissionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.member)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.permissions.clone())
+        }
+    }
+
     fn test_session_auth(role: temps_auth::Role) -> temps_auth::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
@@ -2085,6 +2171,42 @@ mod tests {
         .await
         .expect_err("no linked project is accessible — must deny");
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_mutation_is_denied_when_project_role_removes_write_permission() {
+        let checker = EffectiveServicePermissionChecker {
+            permissions: Some(vec![Permission::ExternalServicesRead.to_string()]),
+            member: true,
+        };
+
+        let problem = session_caller_has_permission_on_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[99],
+            Some(&checker),
+            &Permission::ExternalServicesWrite,
+        )
+        .await
+        .expect_err("coarse membership must not authorize a service mutation");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_mutation_falls_back_to_membership_without_scoped_permissions() {
+        let checker = EffectiveServicePermissionChecker {
+            permissions: None,
+            member: true,
+        };
+
+        session_caller_has_permission_on_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[99],
+            Some(&checker),
+            &Permission::ExternalServicesWrite,
+        )
+        .await
+        .expect("unconfigured project roles preserve coarse membership semantics");
     }
 
     #[tokio::test]

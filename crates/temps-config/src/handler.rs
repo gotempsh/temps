@@ -17,10 +17,10 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
-    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
-    AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings, ClusterDnsSettings,
-    ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings,
-    MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
+    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
+    AppSettings, AuditContext, AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings,
+    ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings,
+    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
     MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
@@ -330,6 +330,8 @@ pub struct AppSettingsResponse {
 
     /// Per-turn limits for the AI chat. No sensitive content.
     pub ai_chat_limits: AiChatLimitsSettings,
+    /// Persistent AI workspace file transfer and preview limits.
+    pub ai_workspace_file_limits: AiWorkspaceFileLimitsSettings,
     /// Upstream request/connection timeouts (hard ceiling + defaults) applied
     /// by the proxy to customer app traffic. No sensitive content.
     pub request_timeouts: RequestTimeoutSettings,
@@ -590,6 +592,7 @@ impl From<AppSettings> for AppSettingsResponse {
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
             ai_chat_limits: settings.ai_chat_limits,
+            ai_workspace_file_limits: settings.ai_workspace_file_limits,
             request_timeouts: settings.request_timeouts,
             connection_limits: settings.connection_limits,
             tenant_resource_ceilings: settings.tenant_resource_ceilings,
@@ -1996,6 +1999,87 @@ fn validate_ai_chat_limits(limits: &AiChatLimitsSettings) -> Result<(), Problem>
     Ok(())
 }
 
+fn validate_ai_workspace_file_limits(
+    limits: &AiWorkspaceFileLimitsSettings,
+) -> Result<(), Problem> {
+    let invalid = [
+        (
+            "max_files_per_upload",
+            u64::from(limits.max_files_per_upload),
+            1,
+            100,
+        ),
+        (
+            "max_file_size_mb",
+            u64::from(limits.max_file_size_mb),
+            1,
+            32,
+        ),
+        (
+            "max_upload_size_mb",
+            u64::from(limits.max_upload_size_mb),
+            1,
+            32,
+        ),
+        (
+            "max_workspace_size_mb",
+            u64::from(limits.max_workspace_size_mb),
+            1,
+            2_048,
+        ),
+        (
+            "max_workspace_entries",
+            u64::from(limits.max_workspace_entries),
+            1,
+            50_000,
+        ),
+        (
+            "max_text_preview_kb",
+            u64::from(limits.max_text_preview_kb),
+            1,
+            1_024,
+        ),
+        (
+            "max_image_preview_size_mb",
+            u64::from(limits.max_image_preview_size_mb),
+            1,
+            16,
+        ),
+        (
+            "max_download_size_mb",
+            u64::from(limits.max_download_size_mb),
+            1,
+            32,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, value, min, max)| !(*min..=*max).contains(value));
+
+    if let Some((name, value, min, max)) = invalid {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "ai_workspace_file_limits.{name} must be between {min} and {max} (got {value})"
+            ))
+            .build());
+    }
+    if limits.max_file_size_mb > limits.max_upload_size_mb {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail("ai_workspace_file_limits.max_file_size_mb cannot exceed max_upload_size_mb")
+            .build());
+    }
+    if limits.max_image_preview_size_mb > limits.max_download_size_mb {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(
+                "ai_workspace_file_limits.max_image_preview_size_mb cannot exceed max_download_size_mb",
+            )
+            .build());
+    }
+    Ok(())
+}
+
 /// Reject a request-timeout ceiling outside the supported range, or a
 /// nonzero default timeout outside `1..=max`. `0` is accepted as the
 /// explicit "no timeout" state — see the loop below.
@@ -2465,6 +2549,7 @@ async fn update_settings(
 
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
+    validate_ai_workspace_file_limits(&settings.ai_workspace_file_limits)?;
     validate_request_timeouts(&settings.request_timeouts)?;
 
     validate_observability_compression(&settings.observability_compression)?;
@@ -2874,7 +2959,10 @@ async fn refresh_route_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::{AgentSandboxSettings, AiChatLimitsSettings, AppSettings, ProviderConfig};
+    use temps_core::{
+        AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
+        ProviderConfig,
+    };
 
     fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
         let now = chrono::Utc::now();
@@ -3444,6 +3532,42 @@ mod tests {
                 "{ok}s should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn ai_workspace_file_limits_reject_unsafe_or_inconsistent_values() {
+        let oversized = AiWorkspaceFileLimitsSettings {
+            max_image_preview_size_mb: 17,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&oversized).is_err());
+
+        let oversized_download = AiWorkspaceFileLimitsSettings {
+            max_download_size_mb: 33,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&oversized_download).is_err());
+
+        let inconsistent = AiWorkspaceFileLimitsSettings {
+            max_file_size_mb: 16,
+            max_upload_size_mb: 8,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&inconsistent).is_err());
+
+        let preview_exceeds_download = AiWorkspaceFileLimitsSettings {
+            max_image_preview_size_mb: 8,
+            max_download_size_mb: 4,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&preview_exceeds_download).is_err());
+    }
+
+    #[test]
+    fn default_ai_workspace_file_limits_are_accepted() {
+        assert!(
+            validate_ai_workspace_file_limits(&AiWorkspaceFileLimitsSettings::default()).is_ok()
+        );
     }
 
     #[test]

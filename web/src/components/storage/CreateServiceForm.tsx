@@ -32,9 +32,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
+import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
-import { customAlphabet } from 'nanoid'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -62,9 +62,6 @@ const ADVANCED_PARAM_NAMES = new Set([
 
 /** Service types that support WAL-G streaming backups */
 const WALG_SERVICE_TYPES = ['postgres', 'redis', 'mongodb']
-
-// Create a custom nanoid with lowercase alphanumeric characters
-const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 
 /**
  * Shows a warning when the user selects a Docker image without WAL-G support
@@ -196,10 +193,6 @@ export function CreateServiceForm({
   onSuccess,
   successMessage,
 }: CreateServiceFormProps) {
-  const defaultName = useMemo(
-    () => `${serviceType}-${generateId()}`,
-    [serviceType]
-  )
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
 
   // Fetch parameters for the selected service type
@@ -326,7 +319,7 @@ export function CreateServiceForm({
     mode: 'onChange', // Validate on change for immediate feedback
     reValidateMode: 'onChange', // Revalidate on every change
     defaultValues: {
-      name: defaultName,
+      name: '',
       service_type: serviceType,
       parameters: {},
     },
@@ -350,7 +343,11 @@ export function CreateServiceForm({
       )
       form.setValue('parameters', defaultParameters)
     }
-  }, [parameters, form])
+    const defaults = serviceCreationDefaults(parametersResponse)
+    if (defaults?.name && !form.getFieldState('name').isDirty) {
+      form.setValue('name', defaults.name, { shouldValidate: true })
+    }
+  }, [parameters, parametersResponse, form])
 
   const createServiceMut = useMutation({
     ...createServiceMutation(),

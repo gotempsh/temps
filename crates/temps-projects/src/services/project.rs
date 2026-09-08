@@ -1746,8 +1746,6 @@ impl ProjectService {
             preview_envs_wake_timeout_seconds,
             preset_config,
             ai_alert_summaries_enabled,
-            ai_debug_chat_enabled,
-            ai_write_actions_enabled,
             cross_project_trace_sharing,
             error_source_context_enabled,
             vulnerability_scanning_enabled,
@@ -1991,12 +1989,9 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update AI feature toggles if provided (ADR-021 / ADR-023). Both are
+        // Update AI feature toggles if provided (ADR-021 / ADR-023). These are
         // tri-state opt-ins (Some(true) = on), stored as nullable columns.
-        // ai_write_actions_enabled is a non-null bool column (default false).
         if ai_alert_summaries_enabled.is_some()
-            || ai_debug_chat_enabled.is_some()
-            || ai_write_actions_enabled.is_some()
             || error_source_context_enabled.is_some()
             || vulnerability_scanning_enabled.is_some()
             || error_source_root.is_some()
@@ -2012,12 +2007,6 @@ impl ProjectService {
             let mut active_project: projects::ActiveModel = project.into();
             if let Some(v) = ai_alert_summaries_enabled {
                 active_project.ai_alert_summaries_enabled = Set(Some(v));
-            }
-            if let Some(v) = ai_debug_chat_enabled {
-                active_project.ai_debug_chat_enabled = Set(Some(v));
-            }
-            if let Some(v) = ai_write_actions_enabled {
-                active_project.ai_write_actions_enabled = Set(v);
             }
             if let Some(v) = ai_api_traffic_summary_enabled {
                 active_project.ai_api_traffic_summary_enabled = Set(Some(v));
@@ -4630,8 +4619,6 @@ impl ProjectService {
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
             ai_alert_summaries_enabled: db_project.ai_alert_summaries_enabled,
-            ai_debug_chat_enabled: db_project.ai_debug_chat_enabled,
-            ai_write_actions_enabled: db_project.ai_write_actions_enabled,
             ai_api_traffic_summary_enabled: db_project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: db_project.error_source_context_enabled,
             vulnerability_scanning_enabled: db_project.vulnerability_scanning_enabled,

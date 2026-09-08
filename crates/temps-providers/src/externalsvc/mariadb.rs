@@ -2393,8 +2393,15 @@ impl MariaDbService {
     // bind mounts (which `volumes_from` cannot express) and avoids feeding the
     // stream over an exec stdin pipe (which the log-mux would corrupt).
 
-    /// True when this backup location is a physical (`mariadb-backup` mbstream)
-    /// base — the only kind PITR can replay onto.
+    /// True when this backup location is a LEGACY single-object physical
+    /// (`mariadb-backup` mbstream) base.
+    ///
+    /// This is the pre-WAL-G layout only. Callers asking the broader question
+    /// "can PITR replay onto this base?" must use
+    /// [`Self::is_physical_base_backup_location`] instead — today's
+    /// `MariadbPhysicalEngine` writes a WAL-G repository, never a
+    /// `base.mbstream.gz` object, so this predicate alone is false for every
+    /// backup the current engine produces.
     ///
     /// `pub` because the generic restore orchestrator (`temps-backup`) has to
     /// classify a MariaDB backup location the *same* way this engine does when
@@ -2407,8 +2414,29 @@ impl MariaDbService {
 
     /// True when the backup location points at a WAL-G repository rather than
     /// a single legacy mbstream object.
-    pub(crate) fn is_walg_repository_location(location: &str) -> bool {
+    ///
+    /// `pub` for the same reason as [`Self::is_physical_base_location`]: the
+    /// orchestrator classifies locations this engine produced.
+    pub fn is_walg_repository_location(location: &str) -> bool {
         location.trim_end_matches('/').ends_with("/walg")
+    }
+
+    /// True when `location` is a physical (`mariadb-backup`) base in EITHER
+    /// on-disk layout — the WAL-G repository written by today's
+    /// `MariadbPhysicalEngine`, or the legacy single `base.mbstream.gz`
+    /// object still present in older buckets.
+    ///
+    /// This is the predicate that answers "can this back a PITR forward-roll,
+    /// and does restoring it replace the whole datadir (including the `mysql`
+    /// system schema)?" — the two questions the orchestrator actually asks.
+    /// It deliberately mirrors the dispatch inside [`Self::restore_pitr`] and
+    /// [`super::ExternalServiceProvider::restore_in_place`] so the guard, the
+    /// plan preview, and the executor cannot disagree: classifying only the
+    /// legacy layout made the orchestrator reject every backup the current
+    /// engine writes, so MariaDB PITR was unreachable through the API even
+    /// though the engine implemented it.
+    pub fn is_physical_base_backup_location(location: &str) -> bool {
+        Self::is_walg_repository_location(location) || Self::is_physical_base_location(location)
     }
 
     /// Derive the `metadata.json` companion key from a base backup key by
@@ -5235,6 +5263,37 @@ mod tests {
         assert!(!MariaDbService::is_walg_repository_location(
             "backups/mariadb/orders.sql.gz"
         ));
+    }
+
+    /// The orchestrator-facing predicate must accept BOTH physical layouts.
+    ///
+    /// `MariadbPhysicalEngine` only ever writes a WAL-G repository, so a
+    /// layout-agnostic answer here is what keeps `temps-backup`'s PITR guard,
+    /// plan preview, and credential-propagation gates from rejecting every
+    /// backup the engine actually produces.
+    #[test]
+    fn physical_base_predicate_accepts_both_layouts() {
+        // What MariadbPhysicalEngine writes today.
+        assert!(MariaDbService::is_physical_base_backup_location(
+            "s3://temps-backups/prod/external_services/mariadb/orders/walg"
+        ));
+        assert!(MariaDbService::is_physical_base_backup_location(
+            "prod/external_services/mariadb/orders/walg/"
+        ));
+        // Legacy single-object bases still in older buckets.
+        assert!(MariaDbService::is_physical_base_backup_location(
+            "backups/prod/external_services/mariadb/orders/2026/06/23/abc/base.mbstream.gz"
+        ));
+        // Logical dumps anchor nothing and must stay rejected.
+        assert!(!MariaDbService::is_physical_base_backup_location(
+            "backups/prod/mariadb_backup_20260623_010101.sql.gz"
+        ));
+        assert!(!MariaDbService::is_physical_base_backup_location(
+            "dump.sql.gz"
+        ));
+        // A legacy row whose location was never backfilled must not be
+        // mistaken for a physical base.
+        assert!(!MariaDbService::is_physical_base_backup_location(""));
     }
 
     #[test]
