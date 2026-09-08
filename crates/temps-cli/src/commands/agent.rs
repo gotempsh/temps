@@ -412,12 +412,18 @@ impl AgentCommand {
                      nodes.private_address."
                 )
             })?;
-        private_address.parse::<std::net::IpAddr>().map_err(|_| {
-            anyhow::anyhow!(
-                "private_address '{}' is not a valid IP address",
-                private_address
-            )
-        })?;
+        // Reuse the same reserved-range rejection `temps join` registration
+        // already enforces server-side (loopback, link-local, unspecified,
+        // multicast, broadcast, documentation ranges) — a manually supplied
+        // --private-address/TEMPS_AGENT_PRIVATE_ADDRESS override must not be
+        // able to bypass it. In particular this rejects "0.0.0.0", which
+        // parses as a syntactically valid IP but would silently reproduce
+        // the exact all-interface exposure this whole mechanism exists to
+        // close.
+        temps_deployments::handlers::nodes::validate_node_private_address(&private_address)
+            .map_err(|error| {
+                anyhow::anyhow!("private_address '{private_address}' is invalid: {error}")
+            })?;
 
         Ok(temps_agent::AgentConfig {
             listen_address,

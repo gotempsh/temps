@@ -642,7 +642,14 @@ impl std::fmt::Display for NodeAddressError {
 /// Workers that use public IPs with a WireGuard underlay are intentionally
 /// allowed — the goal is to block dangerous special-purpose ranges, not enforce
 /// private-only addressing.
-fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
+///
+/// `pub`: also called from `temps-cli`'s `temps agent --private-address`/
+/// `TEMPS_AGENT_PRIVATE_ADDRESS` override resolution, so a manually supplied
+/// address gets the identical rejection of dangerous ranges (in particular
+/// `0.0.0.0`, which would otherwise silently reproduce the all-interface
+/// container-port exposure this whole registration check exists to prevent)
+/// that a `temps join`-registered address already gets server-side.
+pub fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
     use std::net::IpAddr;
 
     // Strip an optional port suffix (handles both "10.0.5.20" and "10.0.5.20:8443").
