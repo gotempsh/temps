@@ -218,9 +218,19 @@ fn build_container_backend_addr(
     runtime_context: &RuntimeContext,
 ) -> String {
     if let Some(private_addr) = node_private_address {
-        // Remote node: use the node's private/WireGuard IP with host_port
+        // Remote node: use the node's private/WireGuard IP with host_port.
+        // `SocketAddr`'s own Display brackets IPv6 automatically
+        // ("[fc00::1]:5432") -- a bare `format!("{ip}:{port}")` produces an
+        // unparsable authority for any IPv6 private address, since nothing
+        // marks where the address ends and the port begins.
         let port = host_port.unwrap_or(container_port);
-        format!("{}:{}", private_addr, port)
+        match private_addr.parse::<std::net::IpAddr>() {
+            Ok(ip) => std::net::SocketAddr::new(ip, port as u16).to_string(),
+            // nodes.private_address is validated as a bare IP at
+            // registration; this only defends a pre-existing row from
+            // before that validation existed.
+            Err(_) => format!("{}:{}", private_addr, port),
+        }
     } else {
         let endpoint = runtime_context.resolve_service_endpoint(
             container_name,
@@ -2941,6 +2951,22 @@ mod tests {
             &RuntimeContext::host(),
         );
         assert_eq!(addr, "10.100.0.5:3000");
+    }
+
+    #[test]
+    fn test_build_container_backend_addr_remote_brackets_ipv6() {
+        // Regression guard: a bare "{ip}:{port}" is unparsable for an IPv6
+        // node's private address -- nothing marks where the address ends
+        // and the port begins. The proxy must dial "[fc00::1]:8080", not
+        // "fc00::1:8080" (which parses as a different, wrong IPv6 address).
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("fc00::1"),
+            &RuntimeContext::host(),
+        );
+        assert_eq!(addr, "[fc00::1]:8080");
     }
 
     #[test]

@@ -347,6 +347,27 @@ impl JoinCommand {
         let prior_token =
             prior_token_for_reenrollment(saved_config.as_ref(), node_name, self.target.as_str());
 
+        // SocketAddr's own Display brackets IPv6 automatically
+        // ("[fc00::1]:3100") -- a bare "{ip}:{port}" is unparsable as a URL
+        // authority for an IPv6 private address, since nothing marks where
+        // the address ends and the port begins. `private_address` is
+        // already a validated bare IP at this point (see above), so this
+        // only falls back to the unbracketed form if the configured
+        // `--agent-address` port isn't itself numeric.
+        let agent_port = self
+            .agent_address
+            .split(':')
+            .next_back()
+            .unwrap_or("3100")
+            .trim();
+        let agent_url_host = match (
+            private_address.parse::<std::net::IpAddr>(),
+            agent_port.parse::<u16>(),
+        ) {
+            (Ok(ip), Ok(port)) => std::net::SocketAddr::new(ip, port).to_string(),
+            _ => format!("{}:{}", private_address, agent_port),
+        };
+
         let register_body = serde_json::json!({
             "name": node_name,
             "token": agent_token,
@@ -355,7 +376,7 @@ impl JoinCommand {
             // The control plane may still accept an old CSR-less HTTP worker
             // during migration, but a newly enrolled worker must never be
             // persisted as plaintext.
-            "address": format!("https://{}:{}", private_address.trim(), self.agent_address.split(':').next_back().unwrap_or("3100").trim()),
+            "address": format!("https://{}", agent_url_host),
             "private_address": private_address,
             "labels": labels,
             "architecture": platform,
