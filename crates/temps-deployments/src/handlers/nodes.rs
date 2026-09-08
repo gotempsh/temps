@@ -649,7 +649,14 @@ impl std::fmt::Display for NodeAddressError {
 /// `0.0.0.0`, which would otherwise silently reproduce the all-interface
 /// container-port exposure this whole registration check exists to prevent)
 /// that a `temps join`-registered address already gets server-side.
-pub fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
+///
+/// Returns the bare `IpAddr` with any port suffix stripped (registration
+/// tolerates `host:port`/`[ipv6]:port`, matching `node_address_host`'s
+/// scheme+port stripping below, but a caller that binds Docker container
+/// ports to this address — see `temps-agent` — needs the bare host: passing
+/// a `host:port` string straight to Docker's `PortBinding.host_ip` is not a
+/// valid IP and fails every container creation).
+pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, NodeAddressError> {
     use std::net::IpAddr;
 
     // Strip an optional port suffix (handles both "10.0.5.20" and "10.0.5.20:8443").
@@ -751,7 +758,7 @@ pub fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError>
         }
     }
 
-    Ok(())
+    Ok(ip)
 }
 
 /// Extract the host from a validated node agent URL or private address for use
@@ -3878,6 +3885,20 @@ mod tests {
             validate_node_private_address("10.0.5.20:8443").is_ok(),
             "10.0.5.20:8443 must be accepted (RFC-1918 with port)"
         );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_strips_port_from_returned_ip() {
+        // Regression guard: a caller that binds Docker container ports to
+        // this address (temps-agent) needs the bare host, since Docker's
+        // PortBinding.host_ip is not a valid IP with a port suffix attached
+        // -- every container creation would fail if the raw "host:port"
+        // input were forwarded unchanged instead of the parsed IpAddr.
+        let ip = validate_node_private_address("10.0.5.20:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "10.0.5.20");
+
+        let ip = validate_node_private_address("[fc00::1]:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "fc00::1");
     }
 
     #[test]

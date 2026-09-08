@@ -420,10 +420,18 @@ impl AgentCommand {
         // parses as a syntactically valid IP but would silently reproduce
         // the exact all-interface exposure this whole mechanism exists to
         // close.
-        temps_deployments::handlers::nodes::validate_node_private_address(&private_address)
-            .map_err(|error| {
-                anyhow::anyhow!("private_address '{private_address}' is invalid: {error}")
-            })?;
+        //
+        // Also normalizes to a bare IP: registration tolerates a "host:port"
+        // shape for `nodes.private_address` (e.g. a scheme+port agent URL),
+        // but Docker's `PortBinding.host_ip` needs a bare address — passing
+        // a port-suffixed string straight through would fail every
+        // subsequent container creation on this node.
+        let private_address =
+            temps_deployments::handlers::nodes::validate_node_private_address(&private_address)
+                .map_err(|error| {
+                    anyhow::anyhow!("private_address '{private_address}' is invalid: {error}")
+                })?
+                .to_string();
 
         Ok(temps_agent::AgentConfig {
             listen_address,
