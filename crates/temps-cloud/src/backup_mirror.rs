@@ -26,7 +26,10 @@ use temps_entities::{
     backups, cloud_backup_mirror_cursors, cloud_backup_mirror_states, external_service_backups,
     external_services, s3_sources,
 };
-use tokio::{io::AsyncReadExt, sync::watch};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{watch, Notify},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -120,6 +123,7 @@ pub async fn run(
     db: Arc<DatabaseConnection>,
     encryption: Arc<EncryptionService>,
     mut cancel: watch::Receiver<bool>,
+    wake: Arc<Notify>,
 ) {
     info!("Cloud backup mirror started");
     // The first discovery pass is immediate. Subsequent failures back off,
@@ -146,28 +150,59 @@ pub async fn run(
                     slept_secs = retry_in.as_secs(),
                     "Cloud backup mirror sweep tick starting"
                 );
-                let outcome = match sweep(&link, &db, &encryption).await {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        warn!(error = %error, "Cloud backup mirror sweep failed; local backups remain authoritative");
-                        SweepOutcome::Retry
-                    }
-                };
-                retry_in = next_sweep_interval(retry_in, outcome);
-                tracing::debug!(
-                    outcome = ?outcome,
-                    next_tick_secs = retry_in.as_secs(),
-                    "Cloud backup mirror sweep tick finished"
-                );
-                if outcome == SweepOutcome::Retry {
-                    warn!(
-                        retry_in_secs = retry_in.as_secs(),
-                        "Cloud backup mirror retained local backup; retrying with exponential backoff"
-                    );
-                }
+                retry_in = run_sweep_tick(&link, &db, &encryption, retry_in).await;
+            }
+            // A backup that just finished locally shouldn't sit behind
+            // `retry_in`'s current backoff -- that backoff describes how hard
+            // Cloud or this instance's own S3 access has been failing, not how
+            // fresh the newest local backup is. `lifecycle_notify` fires this
+            // the moment a `Job::BackupCompleted` crosses the queue, so the
+            // common case (nothing was failing, the sweep was just idling at
+            // `BASE_SWEEP_INTERVAL`) reports to Cloud within the same second
+            // the local backup finished instead of up to `BASE_SWEEP_INTERVAL`
+            // later -- and, more importantly, instead of up to
+            // `MAX_SWEEP_INTERVAL` later if an unrelated backup on this same
+            // instance was mid-backoff from an earlier, now-resolved failure.
+            // A spurious or redundant wake costs one `sweep()` call against
+            // `DUE_BACKUPS_SQL`, which is a no-op query when nothing is due --
+            // cheap enough to not need debouncing.
+            _ = wake.notified() => {
+                tracing::debug!("Cloud backup mirror woken by a completed local backup");
+                retry_in = run_sweep_tick(&link, &db, &encryption, retry_in).await;
             }
         }
     }
+}
+
+/// Run one sweep and compute the next tick's delay. Shared by the timer and
+/// the early-wake paths in [`run`] so both go through identical outcome
+/// handling and logging.
+async fn run_sweep_tick(
+    link: &Arc<CloudLink>,
+    db: &Arc<DatabaseConnection>,
+    encryption: &Arc<EncryptionService>,
+    retry_in: Duration,
+) -> Duration {
+    let outcome = match sweep(link, db, encryption).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            warn!(error = %error, "Cloud backup mirror sweep failed; local backups remain authoritative");
+            SweepOutcome::Retry
+        }
+    };
+    let next = next_sweep_interval(retry_in, outcome);
+    tracing::debug!(
+        outcome = ?outcome,
+        next_tick_secs = next.as_secs(),
+        "Cloud backup mirror sweep tick finished"
+    );
+    if outcome == SweepOutcome::Retry {
+        warn!(
+            retry_in_secs = next.as_secs(),
+            "Cloud backup mirror retained local backup; retrying with exponential backoff"
+        );
+    }
+    next
 }
 
 async fn sweep(
@@ -3124,11 +3159,17 @@ mod tests {
             "mirror-loop-test",
         ));
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let wake = Arc::new(tokio::sync::Notify::new());
 
         // `run` starts with a zero-length first sleep, so its first sweep is
         // immediate and needs no clock manipulation to observe.
-        let loop_handle =
-            tokio::spawn(run(link.clone(), db.clone(), encryption.clone(), cancel_rx));
+        let loop_handle = tokio::spawn(run(
+            link.clone(),
+            db.clone(),
+            encryption.clone(),
+            cancel_rx,
+            wake,
+        ));
 
         let registered = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
