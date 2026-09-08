@@ -666,15 +666,19 @@ pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, Nod
         // Bracketed IPv6 — either "[::1]" or "[::1]:port"
         stripped.split(']').next().unwrap_or(addr)
     } else {
-        // Plain IPv4 or bare IPv6: split on last ':' to strip port, but only
-        // if what remains before the ':' parses as an IP (so we don't strip
-        // the last group of a bare IPv6 address like "fc00::1").
-        if let Some((before, _after)) = addr.rsplit_once(':') {
-            if before.parse::<IpAddr>().is_ok() {
-                before
-            } else {
-                addr
-            }
+        // Disambiguate by colon count, not by "does the prefix also happen
+        // to parse as an IP" -- that heuristic is unsound for unbracketed
+        // IPv6: plenty of valid bare addresses (e.g. "2001:db8::1:2") have a
+        // last hextet that looks like a "port" AND a prefix that is itself
+        // an independently valid IPv6 address, so it would silently
+        // truncate them to the wrong host. RFC 3986 requires brackets for
+        // an IPv6 host:port, so an unbracketed address is unambiguous by
+        // colon count alone: any bare IPv6 address needs at least two
+        // colons (minimum form "::"), so exactly one colon can only mean
+        // IPv4:port.
+        if addr.matches(':').count() == 1 {
+            addr.rsplit_once(':')
+                .map_or(addr, |(before, _after)| before)
         } else {
             addr
         }
@@ -3983,6 +3987,21 @@ mod tests {
             validate_node_private_address("fc00::1").is_ok(),
             "fc00::1 must be accepted (unique-local IPv6)"
         );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_never_truncates_bare_ipv6_with_ambiguous_prefix() {
+        // Regression guard: "2001:db8::1:2"'s prefix before the last colon
+        // ("2001:db8::1") is itself a valid, DIFFERENT IPv6 address, so a
+        // naive "does the prefix parse as an IP" port-stripping heuristic
+        // would wrongly truncate this bare address down to that prefix,
+        // silently changing which host gets used. Any multi-colon
+        // unbracketed address must be preserved whole.
+        let ip = validate_node_private_address("2001:db8::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "2001:db8::1:2");
+
+        let ip = validate_node_private_address("fc00::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "fc00::1:2");
     }
 
     #[test]
