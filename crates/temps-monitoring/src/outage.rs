@@ -1350,6 +1350,7 @@ mod tests {
             name: "API Health".to_string(),
             monitor_type: "web".to_string(),
             check_path: None,
+            check_path_revision: 0,
             check_interval_seconds: 60,
             is_active: true,
             is_managed: false,
