@@ -106,6 +106,33 @@ fn prior_token_for_reenrollment(
     (saved.node_name == node_name && same_control_plane).then(|| saved.token.clone())
 }
 
+/// Extract the port `temps agent` will listen on from `--agent-address`.
+/// Uses `SocketAddr::from_str` rather than a manual `.split(':').next_back()`
+/// so a bracketed IPv6 address with no port (e.g. "[::1]") doesn't glue the
+/// closing bracket onto the extracted "port" -- falls back to the default
+/// agent port only when `agent_address` isn't a parsable socket address at
+/// all.
+fn agent_listen_port(agent_address: &str) -> u16 {
+    agent_address
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(3100)
+}
+
+/// Build a "host:port" URL authority, bracketing IPv6 the way
+/// `SocketAddr`'s `Display` does ("[fc00::1]:3100") -- a bare
+/// "{ip}:{port}" is unparsable for IPv6 since nothing marks where the
+/// address ends and the port begins. Falls back to the unbracketed form
+/// only if `ip` isn't itself a parsable IP address (shouldn't happen for a
+/// validated `private_address`, but this must never produce a *worse*
+/// address than the naive concatenation it replaces).
+fn socket_authority(ip: &str, port: u16) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{ip}:{port}"),
+    }
+}
+
 /// Generate a per-node keypair + CSR. The private key never leaves this host.
 /// `ip` is the address the control plane will connect to (the node's
 /// private/WG IP) and MUST be a SAN, or the CP's server-cert hostname check
@@ -347,26 +374,8 @@ impl JoinCommand {
         let prior_token =
             prior_token_for_reenrollment(saved_config.as_ref(), node_name, self.target.as_str());
 
-        // SocketAddr's own Display brackets IPv6 automatically
-        // ("[fc00::1]:3100") -- a bare "{ip}:{port}" is unparsable as a URL
-        // authority for an IPv6 private address, since nothing marks where
-        // the address ends and the port begins. `private_address` is
-        // already a validated bare IP at this point (see above), so this
-        // only falls back to the unbracketed form if the configured
-        // `--agent-address` port isn't itself numeric.
-        let agent_port = self
-            .agent_address
-            .split(':')
-            .next_back()
-            .unwrap_or("3100")
-            .trim();
-        let agent_url_host = match (
-            private_address.parse::<std::net::IpAddr>(),
-            agent_port.parse::<u16>(),
-        ) {
-            (Ok(ip), Ok(port)) => std::net::SocketAddr::new(ip, port).to_string(),
-            _ => format!("{}:{}", private_address, agent_port),
-        };
+        let agent_port = agent_listen_port(&self.agent_address);
+        let agent_url_host = socket_authority(private_address, agent_port);
 
         let register_body = serde_json::json!({
             "name": node_name,
@@ -713,7 +722,35 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::prior_token_for_reenrollment;
+    use super::{agent_listen_port, prior_token_for_reenrollment, socket_authority};
+
+    #[test]
+    fn agent_listen_port_reads_ipv4_socket_addr() {
+        assert_eq!(agent_listen_port("127.0.0.1:3100"), 3100);
+    }
+
+    #[test]
+    fn agent_listen_port_reads_bracketed_ipv6_socket_addr() {
+        assert_eq!(agent_listen_port("[::1]:8080"), 8080);
+    }
+
+    #[test]
+    fn agent_listen_port_falls_back_when_bracketed_ipv6_has_no_port() {
+        // Regression guard: a naive `.split(':').next_back()` on "[::1]"
+        // (no port) would glue the closing bracket onto the extracted
+        // "port" instead of recognizing there isn't one.
+        assert_eq!(agent_listen_port("[::1]"), 3100);
+    }
+
+    #[test]
+    fn socket_authority_brackets_ipv6() {
+        assert_eq!(socket_authority("fc00::1", 3100), "[fc00::1]:3100");
+    }
+
+    #[test]
+    fn socket_authority_leaves_ipv4_unbracketed() {
+        assert_eq!(socket_authority("10.0.5.20", 3100), "10.0.5.20:3100");
+    }
 
     fn saved_config() -> temps_agent::AgentConfig {
         temps_agent::AgentConfig {
