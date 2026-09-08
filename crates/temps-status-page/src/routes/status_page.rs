@@ -1174,6 +1174,7 @@ fn map_error(error: StatusPageError) -> Problem {
             ))
             .build(),
         error @ (StatusPageError::EnvironmentOwnershipLookup { .. }
+        | StatusPageError::ManagedMonitorReconciliation { .. }
         | StatusPageError::MonitorOwnershipLookup { .. }) => {
             tracing::error!(error = %error, "status-page association ownership lookup failed");
             internal_server_error()

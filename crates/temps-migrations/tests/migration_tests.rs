@@ -623,6 +623,289 @@ async fn test_managed_monitor_migration_down_restores_state_from_previous_up_imp
 }
 
 #[tokio::test]
+async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_history(
+) -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping legacy-monitor reconciliation test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping legacy-monitor reconciliation test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260908_000001_reconcile_legacy_status_monitors";
+    let target_position = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(target_position as u32)).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-reconcile-test', 'repo', 'owner', '.', 'main', 'nodejs', \
+                 now(), now(), 'monitor-reconcile-test'); \
+         INSERT INTO environments \
+         (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-reconcile-production', \
+                'monitor-reconcile.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-reconcile-test'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', '/legacy-health', \
+                60, true, false, now() - interval '30 days', now() - interval '30 days' \
+         FROM environments WHERE subdomain = 'monitor-reconcile-production'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'Custom API check', 'web', '/custom', \
+                120, true, false, now() - interval '20 days', now() - interval '20 days' \
+         FROM environments WHERE subdomain = 'monitor-reconcile-production'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', NULL, \
+                60, true, false, now() - interval '2 days', now() - interval '2 days' \
+         FROM environments WHERE subdomain = 'monitor-reconcile-production'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', '/from-temps-yaml', \
+                60, true, true, now() - interval '1 day', now() - interval '1 day' \
+         FROM environments WHERE subdomain = 'monitor-reconcile-production'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', '/user-health', \
+                90, true, false, now() - interval '12 hours', now() - interval '12 hours' \
+         FROM environments WHERE subdomain = 'monitor-reconcile-production'",
+    )
+    .await?;
+
+    let monitor_rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, name FROM status_monitors ORDER BY id".to_string(),
+        ))
+        .await?;
+    let canonical_id = monitor_rows[0].try_get::<i32>("", "id")?;
+    let repeated_duplicate_id = monitor_rows[2].try_get::<i32>("", "id")?;
+    let managed_duplicate_id = monitor_rows[3].try_get::<i32>("", "id")?;
+    let explicit_user_monitor_id = monitor_rows[4].try_get::<i32>("", "id")?;
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO status_checks (monitor_id, status, checked_at, created_at) VALUES \
+             ({canonical_id}, 'operational', now() - interval '3 days', now() - interval '3 days'), \
+             ({repeated_duplicate_id}, 'operational', now() - interval '2 days', now() - interval '2 days'), \
+             ({managed_duplicate_id}, 'degraded', now() - interval '1 day', now() - interval '1 day'), \
+             ({explicit_user_monitor_id}, 'unknown', now() - interval '12 hours', now() - interval '12 hours'); \
+         UPDATE status_checks \
+         SET error_message = 'Monitor created - awaiting first health check' \
+         WHERE monitor_id = {explicit_user_monitor_id}; \
+         INSERT INTO status_incidents \
+             (project_id, environment_id, monitor_id, title, severity, status, \
+              started_at, created_at, updated_at) \
+         SELECT project_id, id, {managed_duplicate_id}, 'Deployment health failed', \
+                'minor', 'resolved', now() - interval '1 day', \
+                now() - interval '1 day', now() - interval '1 day' \
+         FROM environments WHERE subdomain = 'monitor-reconcile-production'; \
+         CREATE TABLE _temps_m20260904_managed_monitor_ownership_backup ( \
+             monitor_id INTEGER PRIMARY KEY REFERENCES status_monitors(id) ON DELETE CASCADE \
+         ); \
+         INSERT INTO _temps_m20260904_managed_monitor_ownership_backup (monitor_id) \
+         VALUES ({canonical_id})"
+    ))
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+
+    let reconciled = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, name, check_path, is_managed \
+             FROM status_monitors ORDER BY id"
+                .to_string(),
+        ))
+        .await?;
+    assert_eq!(
+        reconciled.len(),
+        2,
+        "the reserved environment-monitor rows are integrated while the custom monitor remains"
+    );
+    assert_eq!(reconciled[0].try_get::<i32>("", "id")?, canonical_id);
+    assert_eq!(
+        reconciled[0].try_get::<String>("", "name")?,
+        "production Monitor"
+    );
+    assert_eq!(
+        reconciled[0].try_get::<String>("", "check_path")?,
+        "/from-temps-yaml"
+    );
+    assert!(reconciled[0].try_get::<bool>("", "is_managed")?);
+    assert_eq!(
+        reconciled[1].try_get::<String>("", "name")?,
+        "Custom API check"
+    );
+    assert!(!reconciled[1].try_get::<bool>("", "is_managed")?);
+
+    let check_count = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT COUNT(*) AS count FROM status_checks WHERE monitor_id = {canonical_id}"
+            ),
+        ))
+        .await?
+        .expect("canonical status-check count");
+    assert_eq!(check_count.try_get::<i64>("", "count")?, 4);
+
+    let incident_monitor_id = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT monitor_id FROM status_incidents WHERE title = 'Deployment health failed'"
+                .to_string(),
+        ))
+        .await?
+        .expect("migrated incident");
+    assert_eq!(
+        incident_monitor_id.try_get::<i32>("", "monitor_id")?,
+        canonical_id
+    );
+
+    let reconciliation_backup_exists = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('_temps_m20260908_monitor_duplicate_backup') IS NOT NULL AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("reconciliation backup-table lookup");
+    assert!(reconciliation_backup_exists.try_get::<bool>("", "present")?);
+    let stale_ownership_backup_retired = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('_temps_m20260904_managed_monitor_ownership_backup') IS NULL AS gone"
+                .to_string(),
+        ))
+        .await?
+        .expect("legacy ownership backup lookup");
+    assert!(stale_ownership_backup_retired.try_get::<bool>("", "gone")?);
+
+    Migrator::down(&db, Some(1)).await?;
+    let restored = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, name, check_path, is_managed FROM status_monitors ORDER BY id".to_string(),
+        ))
+        .await?;
+    assert_eq!(restored.len(), 5);
+    assert_eq!(restored[0].try_get::<i32>("", "id")?, canonical_id);
+    assert_eq!(
+        restored[0].try_get::<String>("", "check_path")?,
+        "/legacy-health"
+    );
+    assert!(!restored[0].try_get::<bool>("", "is_managed")?);
+    assert_eq!(restored[2].try_get::<i32>("", "id")?, repeated_duplicate_id);
+    assert_eq!(restored[3].try_get::<i32>("", "id")?, managed_duplicate_id);
+    assert!(restored[3].try_get::<bool>("", "is_managed")?);
+
+    let restored_check_owners = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT monitor_id FROM status_checks ORDER BY checked_at".to_string(),
+        ))
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<i32>("", "monitor_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        restored_check_owners,
+        vec![
+            canonical_id,
+            repeated_duplicate_id,
+            managed_duplicate_id,
+            explicit_user_monitor_id,
+        ]
+    );
+    let restored_incident_owner = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT monitor_id FROM status_incidents WHERE title = 'Deployment health failed'"
+                .to_string(),
+        ))
+        .await?
+        .expect("restored incident")
+        .try_get::<i32>("", "monitor_id")?;
+    assert_eq!(restored_incident_owner, managed_duplicate_id);
+
+    let reconciliation_backup_gone = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('_temps_m20260908_monitor_duplicate_backup') IS NULL AS gone"
+                .to_string(),
+        ))
+        .await?
+        .expect("reconciliation backup-table lookup after down");
+    assert!(reconciliation_backup_gone.try_get::<bool>("", "gone")?);
+
+    Migrator::down(&db, Some(1)).await?;
+    let after_legacy_rollback = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, is_managed FROM status_monitors ORDER BY id".to_string(),
+        ))
+        .await?;
+    assert_eq!(after_legacy_rollback.len(), 5);
+    assert!(!after_legacy_rollback[0].try_get::<bool>("", "is_managed")?);
+    assert!(after_legacy_rollback[3].try_get::<bool>("", "is_managed")?);
+
+    Migrator::up(&db, Some(2)).await?;
+    let reconciled_after_reapply = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, name, check_path, is_managed FROM status_monitors ORDER BY id".to_string(),
+        ))
+        .await?;
+    assert_eq!(reconciled_after_reapply.len(), 2);
+    assert_eq!(
+        reconciled_after_reapply[0].try_get::<i32>("", "id")?,
+        canonical_id
+    );
+    assert_eq!(
+        reconciled_after_reapply[0].try_get::<String>("", "check_path")?,
+        "/from-temps-yaml"
+    );
+    assert!(reconciled_after_reapply[0].try_get::<bool>("", "is_managed")?);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Result<()> {
     if external_db_configured() {
         println!(

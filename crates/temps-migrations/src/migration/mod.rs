@@ -254,6 +254,7 @@ mod m20260904_000001_reset_ambiguous_managed_status_monitors;
 mod m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources;
 mod m20260904_000003_add_continuous_archive_source_to_external_services;
 mod m20260907_000001_add_mfa_pending_origin_to_sessions;
+mod m20260908_000001_reconcile_legacy_status_monitors;
 
 pub struct Migrator;
 
@@ -564,6 +565,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260903_000002_harden_application_workspaces::Migration),
             Box::new(m20260903_000003_application_workspace_quarantine::Migration),
             Box::new(m20260903_000004_repair_application_primary_projects::Migration),
+            Box::new(m20260908_000001_reconcile_legacy_status_monitors::Migration),
         ]
     }
 }
@@ -614,6 +616,10 @@ mod registry_tests {
             (
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",
                 "m20260831_000001_ai_first_applications",
+            ),
+            (
+                "m20260903_000004_repair_application_primary_projects",
+                "m20260908_000001_reconcile_legacy_status_monitors",
             ),
         ] {
             let shipped_position = names

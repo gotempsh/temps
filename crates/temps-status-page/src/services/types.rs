@@ -41,6 +41,16 @@ pub enum StatusPageError {
         source: sea_orm::DbErr,
     },
     #[error(
+        "failed to {operation} the managed monitor for environment {environment_id} in project {project_id}: {source}"
+    )]
+    ManagedMonitorReconciliation {
+        operation: &'static str,
+        environment_id: i32,
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
         "failed to validate monitor {monitor_id} ownership for project {project_id}: {source}"
     )]
     MonitorOwnershipLookup {
