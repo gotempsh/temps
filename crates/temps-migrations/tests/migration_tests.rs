@@ -826,6 +826,39 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
 
     db.execute_unprepared(&format!(
         "UPDATE status_monitors \
+         SET is_active = FALSE, updated_at = now() \
+         WHERE id = {canonical_id}"
+    ))
+    .await?;
+    Migrator::down(&db, Some(1)).await?;
+    let after_unrelated_update = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT check_path, is_active FROM status_monitors WHERE id = {canonical_id}"),
+        ))
+        .await?
+        .expect("canonical monitor after unrelated-update rollback");
+    assert_eq!(
+        after_unrelated_update.try_get::<String>("", "check_path")?,
+        "/legacy-health"
+    );
+    assert!(!after_unrelated_update.try_get::<bool>("", "is_active")?);
+
+    Migrator::up(&db, Some(1)).await?;
+    let after_unrelated_update_reapply = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT check_path FROM status_monitors WHERE id = {canonical_id}"),
+        ))
+        .await?
+        .expect("canonical monitor after unrelated-update reapply");
+    assert_eq!(
+        after_unrelated_update_reapply.try_get::<String>("", "check_path")?,
+        "/from-temps-yaml"
+    );
+
+    db.execute_unprepared(&format!(
+        "UPDATE status_monitors \
          SET check_path = '/post-migration-deploy', updated_at = now() \
          WHERE id = {canonical_id}"
     ))
