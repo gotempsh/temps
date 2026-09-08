@@ -46,7 +46,9 @@ impl MigrationTrait for Migration {
                         OR monitor.name = environment.name || ' Monitor'); \
                  CREATE TABLE _temps_m20260908_monitor_canonical_backup AS \
                  SELECT monitor.id, monitor.is_managed, monitor.check_path, \
-                        monitor.updated_at \
+                        monitor.updated_at, \
+                        monitor.check_path AS reconciled_check_path, \
+                        monitor.updated_at AS reconciled_updated_at \
                  FROM status_monitors AS monitor \
                  JOIN _temps_monitor_canonical AS canonical \
                    ON canonical.canonical_id = monitor.id; \
@@ -80,19 +82,27 @@ impl MigrationTrait for Migration {
                  WHERE duplicate.id = mapping.duplicate_id; \
                  UPDATE status_monitors AS canonical \
                  SET is_managed = TRUE, \
-                     check_path = COALESCE(( \
-                         SELECT duplicate.check_path \
-                         FROM _temps_monitor_duplicates AS mapping \
-                         JOIN status_monitors AS duplicate \
-                           ON duplicate.id = mapping.duplicate_id \
-                         WHERE mapping.canonical_id = canonical.id \
-                           AND duplicate.check_path IS NOT NULL \
-                         ORDER BY mapping.was_managed DESC, \
-                                  duplicate.updated_at DESC, duplicate.id DESC \
+                     check_path = ( \
+                         SELECT candidate.check_path \
+                         FROM status_monitors AS candidate \
+                         LEFT JOIN _temps_monitor_duplicates AS mapping \
+                           ON mapping.duplicate_id = candidate.id \
+                          AND mapping.canonical_id = canonical.id \
+                         WHERE (candidate.id = canonical.id \
+                                OR mapping.duplicate_id IS NOT NULL) \
+                         ORDER BY candidate.updated_at DESC, \
+                                  COALESCE(mapping.was_managed, \
+                                           candidate.is_managed) DESC, \
+                                  candidate.id DESC \
                          LIMIT 1 \
-                     ), canonical.check_path) \
+                     ) \
                  FROM _temps_monitor_canonical AS selected \
                  WHERE canonical.id = selected.canonical_id; \
+                 UPDATE _temps_m20260908_monitor_canonical_backup AS backup \
+                 SET reconciled_check_path = canonical.check_path, \
+                     reconciled_updated_at = canonical.updated_at \
+                 FROM status_monitors AS canonical \
+                 WHERE canonical.id = backup.id; \
                  UPDATE status_checks AS status_check \
                  SET monitor_id = mapping.canonical_id \
                  FROM _temps_monitor_duplicates AS mapping \
@@ -142,8 +152,20 @@ impl MigrationTrait for Migration {
                  WHERE incident.id = backup.id; \
                  UPDATE status_monitors AS canonical \
                  SET is_managed = backup.is_managed, \
-                     check_path = backup.check_path, \
-                     updated_at = backup.updated_at \
+                     check_path = CASE \
+                         WHEN canonical.check_path IS NOT DISTINCT FROM \
+                                  backup.reconciled_check_path \
+                          AND canonical.updated_at = backup.reconciled_updated_at \
+                         THEN backup.check_path \
+                         ELSE canonical.check_path \
+                     END, \
+                     updated_at = CASE \
+                         WHEN canonical.check_path IS NOT DISTINCT FROM \
+                                  backup.reconciled_check_path \
+                          AND canonical.updated_at = backup.reconciled_updated_at \
+                         THEN backup.updated_at \
+                         ELSE canonical.updated_at \
+                     END \
                  FROM _temps_m20260908_monitor_canonical_backup AS backup \
                  WHERE canonical.id = backup.id; \
                  DROP TABLE _temps_m20260908_status_incident_backup; \

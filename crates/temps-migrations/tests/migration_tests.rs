@@ -662,6 +662,14 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
         .iter()
         .position(|migration| migration.name() == target)
         .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    let legacy_ownership_target = "m20260904_000001_reset_ambiguous_managed_status_monitors";
+    let legacy_ownership_position = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == legacy_ownership_target)
+        .unwrap_or_else(|| panic!("migration {legacy_ownership_target} not found in Migrator"));
+    assert!(legacy_ownership_position < target_position);
+    let rollback_through_legacy = (target_position - legacy_ownership_position) as u32;
+    let reapply_through_target = rollback_through_legacy + 1;
     Migrator::up(&db, Some(target_position as u32)).await?;
 
     db.execute_unprepared(
@@ -702,7 +710,7 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
          (project_id, environment_id, name, monitor_type, check_path, \
           check_interval_seconds, is_active, is_managed, created_at, updated_at) \
          SELECT project_id, id, 'production Monitor', 'web', '/user-health', \
-                90, true, false, now() - interval '12 hours', now() - interval '12 hours' \
+                90, true, false, now() - interval '10 days', now() - interval '10 days' \
          FROM environments WHERE subdomain = 'monitor-reconcile-production'",
     )
     .await?;
@@ -816,6 +824,13 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
         .expect("legacy ownership backup lookup");
     assert!(stale_ownership_backup_retired.try_get::<bool>("", "gone")?);
 
+    db.execute_unprepared(&format!(
+        "UPDATE status_monitors \
+         SET check_path = '/post-migration-deploy', updated_at = now() \
+         WHERE id = {canonical_id}"
+    ))
+    .await?;
+
     Migrator::down(&db, Some(1)).await?;
     let restored = db
         .query_all(sea_orm::Statement::from_string(
@@ -827,7 +842,7 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
     assert_eq!(restored[0].try_get::<i32>("", "id")?, canonical_id);
     assert_eq!(
         restored[0].try_get::<String>("", "check_path")?,
-        "/legacy-health"
+        "/post-migration-deploy"
     );
     assert!(!restored[0].try_get::<bool>("", "is_managed")?);
     assert_eq!(restored[2].try_get::<i32>("", "id")?, repeated_duplicate_id);
@@ -873,18 +888,22 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
         .expect("reconciliation backup-table lookup after down");
     assert!(reconciliation_backup_gone.try_get::<bool>("", "gone")?);
 
-    Migrator::down(&db, Some(1)).await?;
+    Migrator::down(&db, Some(rollback_through_legacy)).await?;
     let after_legacy_rollback = db
         .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, is_managed FROM status_monitors ORDER BY id".to_string(),
+            "SELECT id, check_path, is_managed FROM status_monitors ORDER BY id".to_string(),
         ))
         .await?;
     assert_eq!(after_legacy_rollback.len(), 5);
     assert!(!after_legacy_rollback[0].try_get::<bool>("", "is_managed")?);
+    assert_eq!(
+        after_legacy_rollback[0].try_get::<String>("", "check_path")?,
+        "/post-migration-deploy"
+    );
     assert!(after_legacy_rollback[3].try_get::<bool>("", "is_managed")?);
 
-    Migrator::up(&db, Some(2)).await?;
+    Migrator::up(&db, Some(reapply_through_target)).await?;
     let reconciled_after_reapply = db
         .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -898,9 +917,55 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
     );
     assert_eq!(
         reconciled_after_reapply[0].try_get::<String>("", "check_path")?,
-        "/from-temps-yaml"
+        "/post-migration-deploy"
     );
     assert!(reconciled_after_reapply[0].try_get::<bool>("", "is_managed")?);
+
+    db.execute_unprepared(&format!(
+        "UPDATE status_monitors \
+         SET check_path = NULL, updated_at = now() + interval '1 second' \
+         WHERE id = {canonical_id}"
+    ))
+    .await?;
+    Migrator::down(&db, Some(1)).await?;
+    let cleared_after_target_rollback = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT check_path FROM status_monitors WHERE id = {canonical_id}"),
+        ))
+        .await?
+        .expect("canonical monitor after rolling back reconciliation");
+    assert_eq!(
+        cleared_after_target_rollback.try_get::<Option<String>>("", "check_path")?,
+        None
+    );
+
+    Migrator::down(&db, Some(rollback_through_legacy)).await?;
+    let cleared_after_legacy_rollback = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT check_path FROM status_monitors WHERE id = {canonical_id}"),
+        ))
+        .await?
+        .expect("canonical monitor after rolling back legacy ownership migration");
+    assert_eq!(
+        cleared_after_legacy_rollback.try_get::<Option<String>>("", "check_path")?,
+        None
+    );
+
+    Migrator::up(&db, Some(reapply_through_target)).await?;
+    let cleared_after_reapply = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT check_path, is_managed FROM status_monitors WHERE id = {canonical_id}"),
+        ))
+        .await?
+        .expect("canonical monitor after reapplying reconciliation");
+    assert_eq!(
+        cleared_after_reapply.try_get::<Option<String>>("", "check_path")?,
+        None
+    );
+    assert!(cleared_after_reapply.try_get::<bool>("", "is_managed")?);
 
     Ok(())
 }
