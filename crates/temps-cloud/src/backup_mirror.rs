@@ -606,6 +606,16 @@ async fn mirror_backup(
 ) -> Result<(), StageError> {
     let external = resources.external(backup.id);
     let Some(external) = external else {
+        // Control-plane backups never have an `external_services` row: the
+        // control plane is not a customer service and is never registered in
+        // that table. Routing them into `mirror_walg_backup` permanently
+        // rejects them because `walg_root_key` requires a `/walg` suffix,
+        // which flat `backup.sql.gz` paths never satisfy. Non-control-plane
+        // backups that somehow lack an external row keep the WAL-G fallback
+        // for safety, though in practice no such row should exist.
+        if backup_engine_key(&backup.metadata).as_deref() == Some("control_plane") {
+            return mirror_control_plane_backup(link, resources, backup, instance_id).await;
+        }
         return mirror_walg_backup(link, resources, backup, None, instance_id).await;
     };
     let service = resources.service(external.service_id)?;
@@ -905,8 +915,47 @@ async fn mirror_native_backup(
         }
     };
 
+    declare_and_complete_native_snapshot(
+        link,
+        resources,
+        backup,
+        instance_id,
+        &source_config,
+        &client,
+        format!("{}/{}", service.service_type, service.name),
+        engine,
+        format,
+        compression,
+        identity,
+        &root,
+        &selected,
+    )
+    .await
+}
+
+/// Declare, upload (if required), and complete a native snapshot against
+/// Cloud. Factored out of `mirror_native_backup` so [`mirror_control_plane_backup`]
+/// can reuse the same declare/upload/complete sequence without duplicating
+/// it -- `source` is the only thing that differs (a `service_type/name` label
+/// for customer services, `control_plane/{name}` for the control plane).
+#[allow(clippy::too_many_arguments)]
+async fn declare_and_complete_native_snapshot(
+    link: &CloudLink,
+    resources: &mut SweepResources<'_>,
+    backup: &backups::Model,
+    instance_id: Uuid,
+    source_config: &s3_sources::Model,
+    client: &S3Client,
+    source: String,
+    engine: BackupEngine,
+    format: BackupFormat,
+    compression: BackupCompression,
+    identity: NativeSnapshotIdentity,
+    root: &str,
+    selected: &[SourceObject],
+) -> Result<(), StageError> {
     let mut declarations = Vec::with_capacity(selected.len());
-    for object in &selected {
+    for object in selected {
         let (bytes, checksum_sha256) = resources
             .inspect_object(backup.s3_source_id, &source_config.bucket_name, &object.key)
             .await?;
@@ -948,7 +997,7 @@ async fn mirror_native_backup(
     let request = NativeSnapshotRequest {
         backup_id: cloud_backup_id,
         instance_id,
-        source: format!("{}/{}", service.service_type, service.name),
+        source,
         engine,
         format,
         compression,
@@ -963,9 +1012,9 @@ async fn mirror_native_backup(
         for declaration in declarations {
             upload_native_object(
                 link,
-                &client,
+                client,
                 &source_config.bucket_name,
-                &root,
+                root,
                 instance_id,
                 cloud_backup_id,
                 declaration,
@@ -978,6 +1027,66 @@ async fn mirror_native_backup(
     })
     .await
     .map_err(|error| StageError::Retry(error.to_string()))
+}
+
+/// Mirror Temps' own control-plane database backup to Cloud.
+///
+/// Control-plane backups (`ControlPlaneEngine`, engine key `"control_plane"`)
+/// are plain `pg_dumpall --globals-only` + `pg_dump | gzip` artifacts stored
+/// as `backup.sql.gz` + `metadata.json` in a flat S3 directory -- the same
+/// object shape `mirror_native_backup`'s `postgres_pgdump` arm already
+/// mirrors above. They never have an `external_services` row, so
+/// `mirror_backup`'s normal dispatch (which requires one to resolve
+/// `service.service_type`) cannot route them; this is their dedicated path.
+async fn mirror_control_plane_backup(
+    link: &CloudLink,
+    resources: &mut SweepResources<'_>,
+    backup: &backups::Model,
+    instance_id: Uuid,
+) -> Result<(), StageError> {
+    let source_config = resources.source(backup.s3_source_id)?;
+    let client = resources.client(backup.s3_source_id)?;
+    let location_key = s3_key(&source_config.bucket_name, &backup.s3_location)?;
+    let root = location_key
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .ok_or_else(|| {
+            StageError::Unsupported(format!(
+                "control_plane backup location {location_key} has no parent directory"
+            ))
+        })?;
+    let metadata_key = format!("{root}/metadata.json");
+    let all = resources
+        .list_repository(backup.s3_source_id, &source_config.bucket_name, &root)
+        .await?;
+    let selected = all
+        .iter()
+        .filter(|object| object.key == location_key || object.key == metadata_key)
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.len() < 2 || !selected.iter().any(|object| object.key == metadata_key) {
+        return Err(StageError::Retry(format!(
+            "control_plane backup {location_key} is incomplete or lacks {metadata_key}"
+        )));
+    }
+    declare_and_complete_native_snapshot(
+        link,
+        resources,
+        backup,
+        instance_id,
+        &source_config,
+        &client,
+        format!("control_plane/{}", backup.name),
+        BackupEngine::Postgres,
+        BackupFormat::PgDumpPlain,
+        BackupCompression::Gzip,
+        NativeSnapshotIdentity::ObjectSet {
+            snapshot_name: backup.backup_id.clone(),
+        },
+        &root,
+        &selected,
+    )
+    .await
 }
 
 async fn mirror_walg_backup(
@@ -3303,6 +3412,126 @@ mod tests {
                  (this is the exact bug under test — dispatch fell through to WAL-G's synchronous \
                  \"not a WAL-G repository\" check, which runs before any I/O and can only produce \
                  Unsupported, never Retry): {reason}"
+            ),
+        }
+    }
+
+    /// Control-plane backups (`ControlPlaneEngine`, `{"engine": "control_plane"}`)
+    /// are flat `backup.sql.gz` + `metadata.json` artifacts and never have an
+    /// `external_services` row. Before this fix, `mirror_backup` routed any
+    /// backup without an external row into `mirror_walg_backup`, which
+    /// synchronously rejects paths that don't end in `/walg` with
+    /// `Unsupported` — a permanent rejection, no I/O attempted. The fix routes
+    /// control-plane backups to `mirror_control_plane_backup` instead, which
+    /// reaches an S3 listing call and fails with `Retry` against the closed
+    /// loopback below. `Retry` vs. synchronous `Unsupported` is the observable
+    /// distinction proving correct dispatch without a working S3 backend.
+    #[tokio::test]
+    async fn control_plane_backups_route_to_native_mirror_not_walg() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite connects");
+        let backend = db.get_database_backend();
+        let schema = Schema::new(backend);
+        for statement in [
+            schema.create_table_from_entity(temps_entities::backups::Entity),
+            schema.create_table_from_entity(temps_entities::s3_sources::Entity),
+            schema.create_table_from_entity(temps_entities::external_service_backups::Entity),
+            schema.create_table_from_entity(temps_entities::external_services::Entity),
+        ] {
+            db.execute(backend.build(&statement))
+                .await
+                .expect("SQLite fixture table creates");
+        }
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("SQLite fixture disables unrelated foreign keys");
+
+        let encryption =
+            temps_core::EncryptionService::new_from_password("control-plane-dispatch-test");
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::ActiveModel {
+            id: Set(1),
+            name: Set("Temps Cloud managed backups".to_owned()),
+            bucket_name: Set("managed-bucket".to_owned()),
+            region: Set("test-1".to_owned()),
+            backing_service_id: Set(None),
+            // A closed loopback port: any S3 call this test reaches fails
+            // fast with connection-refused instead of hanging or reaching
+            // real AWS, per the convention documented on `linked_link_fixture`.
+            endpoint: Set(Some("http://127.0.0.1:1".to_owned())),
+            bucket_path: Set(String::new()),
+            access_key_id: Set(encryption
+                .encrypt_string("test-access-key")
+                .expect("encrypt fixture access key")),
+            secret_key: Set(encryption
+                .encrypt_string("test-secret-key")
+                .expect("encrypt fixture secret key")),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            managed_by_cloud: Set(true),
+            lifecycle_reconcile_failed_at: Set(None),
+            lifecycle_reconcile_generation: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("S3 source inserts");
+        // No `external_services` or `external_service_backups` rows: this is
+        // the defining characteristic of a control-plane backup. The tables
+        // must still exist (SweepResources::load queries them), but they stay
+        // empty for this test.
+        let backup_uuid = Uuid::new_v4().to_string();
+        let s3_location = format!(
+            "s3://managed-bucket/managed-backups/backups/2026/09/08/{backup_uuid}/backup.sql.gz"
+        );
+        let backup = temps_entities::backups::ActiveModel {
+            id: Set(1),
+            name: Set("control plane".to_owned()),
+            backup_id: Set(backup_uuid),
+            schedule_id: Set(None),
+            backup_type: Set("full".to_owned()),
+            state: Set("completed".to_owned()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1)),
+            file_count: Set(Some(1)),
+            s3_source_id: Set(1),
+            s3_location: Set(s3_location),
+            error_message: Set(None),
+            metadata: Set(serde_json::json!({"engine": "control_plane"}).to_string()),
+            checksum: Set(None),
+            compression_type: Set("gzip".to_owned()),
+            created_by: Set(1),
+            expires_at: Set(None),
+            tags: Set("[]".to_owned()),
+            schedule_run_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("control-plane backup inserts");
+
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = linked_link_fixture(&temp);
+        let instance_id = link.instance_id().expect("linked instance id");
+        let mut resources =
+            super::SweepResources::load(&db, &encryption, std::slice::from_ref(&backup))
+                .await
+                .expect("resources load");
+
+        let error = mirror_backup(&link, &mut resources, &backup, instance_id)
+            .await
+            .expect_err("closed loopback source can never actually mirror in this test");
+        match error {
+            StageError::Retry(_) => {}
+            StageError::Unsupported(reason) => panic!(
+                "control-plane backup was rejected instead of routed to native mirroring \
+                 (this is the exact bug under test — a backup with no external_services row \
+                 fell through to WAL-G's synchronous \"not a WAL-G repository\" check, which \
+                 runs before any I/O and can only produce Unsupported, never Retry): {reason}"
             ),
         }
     }
