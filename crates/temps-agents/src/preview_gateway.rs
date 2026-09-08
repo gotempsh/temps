@@ -45,6 +45,14 @@ use std::sync::Arc;
 use temps_core::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
 
+use crate::docker_network_isolation::{
+    create_host_isolated_network, has_host_isolation, with_host_isolation,
+};
+#[cfg(test)]
+use crate::docker_network_isolation::{
+    BRIDGE_GATEWAY_MODE_IPV4_OPTION, BRIDGE_INHIBIT_IPV4_OPTION,
+};
+
 /// Immutable multi-platform manifest reference. Bumped per release.
 pub const PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
 
@@ -139,7 +147,6 @@ const PREVIEW_GATEWAY_SECURITY_PROTOCOL_LABEL: &str = "sh.temps.preview-gateway-
 const PREVIEW_GATEWAY_SECURITY_PROTOCOL_VERSION: &str = "strip-token-v1";
 const BRIDGE_ENABLE_ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
 const BRIDGE_ENABLE_MASQUERADE_OPTION: &str = "com.docker.network.bridge.enable_ip_masquerade";
-const BRIDGE_GATEWAY_MODE_IPV4_OPTION: &str = "com.docker.network.bridge.gateway_mode_ipv4";
 const SANDBOX_NETWORK_OWNER_LABEL: &str = "sh.temps.sandbox-network-for";
 const PREVIEW_GATEWAY_INGRESS_SCRIPT: &str = r#"
 const net = require("net");
@@ -404,45 +411,58 @@ async fn connect_sandbox_networks(docker: &Docker, container_name: &str) -> Resu
 }
 
 async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
-    let networks = docker
-        .list_networks(None::<ListNetworksOptions>)
+    let (network, created) = match docker
+        .inspect_network(
+            name,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
         .await
-        .context("failed to list docker networks")?;
-    if let Some(network) = networks.iter().find(|n| n.name.as_deref() == Some(name)) {
-        let policy_label = network
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(PREVIEW_GATEWAY_NETWORK_LABEL));
-        let options = network.options.as_ref();
-        if network.driver.as_deref() != Some("bridge")
-            || network.internal != Some(true)
-            || network.enable_ipv6 != Some(false)
-            || policy_label.map(String::as_str) != Some(PREVIEW_GATEWAY_NETWORK_POLICY_VERSION)
-            || options
-                .and_then(|value| value.get(BRIDGE_ENABLE_MASQUERADE_OPTION))
-                .map(String::as_str)
-                != Some("false")
-            || options
-                .and_then(|value| value.get(BRIDGE_GATEWAY_MODE_IPV4_OPTION))
-                .map(String::as_str)
-                != Some("isolated")
-        {
-            return Err(anyhow!(
-                "existing preview network {name} does not match the managed internal control policy"
+    {
+        Ok(network) => (network, false),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            info!(network = %name, "creating internal preview gateway control network");
+            create_host_isolated_network(docker, preview_gateway_network_request(name))
+                .await
+                .map_err(|error| {
+                    docker_operation_error(
+                        format!("failed to create preview gateway control network {name}"),
+                        error,
+                    )
+                })?;
+            let network = docker
+                .inspect_network(
+                    name,
+                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                )
+                .await
+                .map_err(|error| {
+                    docker_operation_error(
+                        format!("failed to verify preview gateway control network {name}"),
+                        error,
+                    )
+                })?;
+            (network, true)
+        }
+        Err(error) => {
+            return Err(docker_operation_error(
+                format!("failed to inspect preview gateway control network {name}"),
+                error,
             ));
         }
-        return Ok(());
+    };
+    if !preview_gateway_network_matches_policy(&network) {
+        let state = if created { "newly created" } else { "existing" };
+        return Err(anyhow!(
+            "{state} preview network {name} does not match the managed internal control policy"
+        ));
     }
-    info!(network = %name, "creating internal preview gateway control network");
-    docker
-        .create_network(preview_gateway_network_request(name))
-        .await
-        .with_context(|| format!("failed to create network {}", name))?;
     Ok(())
 }
 
 fn preview_gateway_network_request(name: &str) -> NetworkCreateRequest {
-    NetworkCreateRequest {
+    with_host_isolation(NetworkCreateRequest {
         name: name.to_string(),
         driver: Some("bridge".to_string()),
         internal: Some(true),
@@ -452,21 +472,31 @@ fn preview_gateway_network_request(name: &str) -> NetworkCreateRequest {
             PREVIEW_GATEWAY_NETWORK_POLICY_VERSION.to_string(),
         )])),
         // The relay and router must be able to communicate on this private
-        // network, so ICC remains enabled. Isolated gateway mode removes the
-        // host-side bridge address as well as external routing; disabled
-        // masquerading is retained as an explicit defense-in-depth policy.
-        options: Some(HashMap::from([
-            (
-                BRIDGE_ENABLE_MASQUERADE_OPTION.to_string(),
-                "false".to_string(),
-            ),
-            (
-                BRIDGE_GATEWAY_MODE_IPV4_OPTION.to_string(),
-                "isolated".to_string(),
-            ),
-        ])),
+        // network, so ICC remains enabled. Host isolation removes the bridge
+        // address as well as external routing; disabled masquerading remains
+        // an explicit defense-in-depth policy.
+        options: Some(HashMap::from([(
+            BRIDGE_ENABLE_MASQUERADE_OPTION.to_string(),
+            "false".to_string(),
+        )])),
         ..Default::default()
-    }
+    })
+}
+
+fn preview_gateway_network_matches_policy(network: &bollard::models::NetworkInspect) -> bool {
+    let options = network.options.as_ref();
+    network.driver.as_deref() == Some("bridge")
+        && network.internal == Some(true)
+        && network.enable_ipv6 == Some(false)
+        && network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(PREVIEW_GATEWAY_NETWORK_LABEL))
+            .is_some_and(|value| value == PREVIEW_GATEWAY_NETWORK_POLICY_VERSION)
+        && options
+            .and_then(|options| options.get(BRIDGE_ENABLE_MASQUERADE_OPTION))
+            .is_some_and(|value| value == "false")
+        && has_host_isolation(options)
 }
 
 async fn ensure_ingress_network(docker: &Docker) -> Result<()> {
@@ -1600,14 +1630,49 @@ mod tests {
                 .map(String::as_str),
             Some("false")
         );
-        assert_eq!(
-            request
-                .options
-                .as_ref()
-                .and_then(|options| options.get(BRIDGE_GATEWAY_MODE_IPV4_OPTION))
-                .map(String::as_str),
-            Some("isolated")
-        );
+        assert!(has_host_isolation(request.options.as_ref()));
+    }
+
+    #[test]
+    fn existing_gateway_control_network_accepts_only_complete_host_isolation_policy() {
+        let request = preview_gateway_network_request("preview-test");
+        let modern = bollard::models::NetworkInspect {
+            name: Some(request.name),
+            driver: request.driver,
+            internal: request.internal,
+            enable_ipv6: request.enable_ipv6,
+            labels: request.labels,
+            options: request.options,
+            ..Default::default()
+        };
+        assert!(preview_gateway_network_matches_policy(&modern));
+
+        let mut legacy = modern.clone();
+        let legacy_options = legacy.options.get_or_insert_with(HashMap::new);
+        legacy_options.remove(BRIDGE_GATEWAY_MODE_IPV4_OPTION);
+        legacy_options.insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "true".to_string());
+        assert!(preview_gateway_network_matches_policy(&legacy));
+
+        let mut masquerading = legacy.clone();
+        masquerading
+            .options
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                BRIDGE_ENABLE_MASQUERADE_OPTION.to_string(),
+                "true".to_string(),
+            );
+        assert!(!preview_gateway_network_matches_policy(&masquerading));
+
+        let mut externally_routed = legacy.clone();
+        externally_routed.internal = Some(false);
+        assert!(!preview_gateway_network_matches_policy(&externally_routed));
+
+        let mut disabled_isolation = legacy;
+        disabled_isolation
+            .options
+            .get_or_insert_with(HashMap::new)
+            .insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "false".to_string());
+        assert!(!preview_gateway_network_matches_policy(&disabled_isolation));
     }
 
     #[test]
