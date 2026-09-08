@@ -29,8 +29,8 @@ pub mod streaming;
 pub mod typed;
 
 pub use provider::{
-    ModelCapability, ProviderAuthSource, ProviderCapabilities, RealtimeCapabilities, RefreshPolicy,
-    SelectOption,
+    ModelCapability, ModelCatalogSource, ProviderAuthSource, ProviderCapabilities,
+    ProviderCapabilitiesSnapshot, RealtimeCapabilities, RefreshPolicy, SelectOption,
 };
 pub use service::{AiError, AiRequest, AiResponse, AiService};
 pub use streaming::{

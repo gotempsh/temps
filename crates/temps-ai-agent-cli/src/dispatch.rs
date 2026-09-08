@@ -181,6 +181,51 @@ impl AiService for AiProviderRegistry {
         service.capabilities_for(provider, refresh).await
     }
 
+    async fn capabilities_snapshot_for_principal(
+        &self,
+        provider: Option<&str>,
+        principal_id: i32,
+        refresh: RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        let service = self
+            .routed(provider)
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    provider.unwrap_or("unknown")
+                ),
+            })?;
+        service
+            .capabilities_snapshot_for_principal(provider, principal_id, refresh)
+            .await
+    }
+
+    async fn capabilities_snapshot_for(
+        &self,
+        provider: Option<&str>,
+        refresh: RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        let service = self
+            .routed(provider)
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    provider.unwrap_or("unknown")
+                ),
+            })?;
+        service.capabilities_snapshot_for(provider, refresh).await
+    }
+
+    async fn invalidate_capabilities_for(&self, provider: Option<&str>) {
+        if let Some(service) = self.routed(provider).await {
+            service.invalidate_capabilities_for(provider).await;
+        }
+    }
+
     async fn complete(&self, mut request: AiRequest) -> Result<AiResponse, AiError> {
         self.apply_summary_defaults(&mut request).await?;
         let service = self

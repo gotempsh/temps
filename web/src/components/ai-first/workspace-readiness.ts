@@ -39,6 +39,29 @@ export function workspaceStatusClickTarget(
   return hasApplication || workspace ? 'workspace' : null
 }
 
+export function workspaceNeedsAutomaticWake(
+  workspace: ApplicationWorkspaceResponse | null
+): boolean {
+  return (
+    workspace?.desired_state === 'running' &&
+    (workspace.state === 'sleeping' || workspace.state === 'failed')
+  )
+}
+
+export function workspaceShouldAttemptAutomaticWake(
+  workspace: ApplicationWorkspaceResponse | null,
+  applicationId: string | null,
+  attemptedApplicationId: string | null,
+  inFlightApplicationId: string | null
+): applicationId is string {
+  return (
+    applicationId !== null &&
+    workspaceNeedsAutomaticWake(workspace) &&
+    attemptedApplicationId !== applicationId &&
+    inFlightApplicationId !== applicationId
+  )
+}
+
 export function workspaceStatusPresentation(
   workspace: ApplicationWorkspaceResponse | null,
   loading: boolean,

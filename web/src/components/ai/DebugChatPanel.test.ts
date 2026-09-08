@@ -17,6 +17,7 @@ import {
   chatApiPaths,
   chatFailureFromProblem,
   chatTurnActivityLabel,
+  claimAutomaticModelRefresh,
   clearResolvedPermissionParts,
   conversationSnapshotPollInterval,
   conversationHistoryErrorMessage,
@@ -28,7 +29,10 @@ import {
   permissionModeIsAuto,
   permissionModeOptionDisabled,
   permissionPollIsTerminal,
+  providerRefreshCopy,
+  providerRefreshMatchesSelection,
   serverElapsedDeciseconds,
+  shouldPreserveRuntimeSelectionAfterProviderLoad,
   shouldShowAssistantActivityAfterContent,
   shouldShowLiveTurn,
   shouldSuppressPermissionPollEvent,
@@ -75,6 +79,83 @@ describe('assistantParts', () => {
 })
 
 describe('conversation-local client state', () => {
+  test('preserves a selected provider during explicit catalog refreshes', () => {
+    expect(shouldPreserveRuntimeSelectionAfterProviderLoad(false, true)).toBe(
+      true
+    )
+    expect(shouldPreserveRuntimeSelectionAfterProviderLoad(false, false)).toBe(
+      false
+    )
+    expect(shouldPreserveRuntimeSelectionAfterProviderLoad(true, false)).toBe(
+      true
+    )
+  })
+
+  test('claims exactly one automatic model refresh per context and provider', () => {
+    const attempts = new Set<string>()
+    const unresolvedClaude = {
+      id: 'claude_cli',
+      name: 'Claude Code',
+      auth_source: 'host_environment' as const,
+      models: [],
+      model_source: 'bootstrap' as const,
+      model_discovery_status: 'unavailable' as const,
+      permission_modes: [],
+    }
+
+    expect(
+      claimAutomaticModelRefresh(attempts, 'global', unresolvedClaude)
+    ).toBe(true)
+    expect(
+      claimAutomaticModelRefresh(attempts, 'global', unresolvedClaude)
+    ).toBe(false)
+    expect(attempts).toEqual(new Set(['global:claude_cli']))
+  })
+
+  test('never attributes an in-flight model refresh to another provider', () => {
+    const refresh = {
+      providerId: 'claude_cli',
+      operation: 'workspace_models' as const,
+    }
+
+    expect(providerRefreshMatchesSelection(refresh, 'claude_cli')).toBe(true)
+    expect(providerRefreshMatchesSelection(refresh, 'codex_cli')).toBe(false)
+    expect(providerRefreshMatchesSelection(null, 'claude_cli')).toBe(false)
+  })
+
+  test('describes workspace model discovery as a workspace start', () => {
+    expect(
+      providerRefreshCopy(
+        { providerId: 'claude_cli', operation: 'workspace_models' },
+        'claude_cli',
+        'Claude Code'
+      )
+    ).toEqual({
+      status: 'Starting your workspace and resolving models for Claude Code…',
+      button: 'Starting…',
+    })
+  })
+
+  test('describes provider-only refresh without claiming to start a workspace', () => {
+    expect(
+      providerRefreshCopy(
+        { providerId: 'claude_cli', operation: 'provider_status' },
+        'claude_cli',
+        'Claude Code'
+      )
+    ).toEqual({
+      status: 'Refreshing authentication and models for Claude Code…',
+      button: 'Refreshing…',
+    })
+    expect(
+      providerRefreshCopy(
+        { providerId: 'codex_cli', operation: 'provider_status' },
+        'claude_cli',
+        'Claude Code'
+      )
+    ).toBeNull()
+  })
+
   test('polls conversation snapshots only when live updates are unavailable', () => {
     expect(conversationSnapshotPollInterval('connected', true)).toBe(false)
     expect(conversationSnapshotPollInterval('connecting', true)).toBe(false)

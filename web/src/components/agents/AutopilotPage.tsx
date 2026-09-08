@@ -51,6 +51,7 @@ import {
   updateAgentMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AgentRunResponse } from '@/api/client/types.gen'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 
 type AgentRun = AgentRunResponse
@@ -386,19 +387,7 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
   // Fetch the provider catalog to determine the platform's configured default
   // and whether credentials are saved (which is what actually matters for sandbox mode)
   const { data: providerCatalog } = useQuery({
-    queryKey: ['ai-provider-catalog'],
-    queryFn: async () => {
-      const res = await fetch('/api/settings/ai-providers')
-      if (!res.ok) return null
-      return res.json() as Promise<{
-        default_provider: string
-        providers: Array<{
-          id: string
-          name: string
-          credential_saved: boolean
-        }>
-      }>
-    },
+    ...aiProviderCatalogQueryOptions,
     staleTime: 60_000,
   })
 

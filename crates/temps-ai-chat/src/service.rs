@@ -2213,6 +2213,7 @@ impl ConversationService {
         let now = Utc::now();
         let runtime = self
             .resolve_conversation_runtime(
+                user_id,
                 requested_provider,
                 requested_model,
                 requested_thinking_level,
@@ -2282,6 +2283,7 @@ impl ConversationService {
             });
         }
         self.resolve_conversation_runtime(
+            user_id,
             requested_provider,
             requested_model,
             requested_thinking_level,
@@ -2292,6 +2294,7 @@ impl ConversationService {
 
     async fn resolve_conversation_runtime(
         &self,
+        principal_id: i32,
         requested: Option<&str>,
         requested_model: Option<&str>,
         requested_thinking_level: Option<&str>,
@@ -2302,65 +2305,87 @@ impl ConversationService {
             Some(value) => value.to_string(),
             None => self.resolve_default_provider().await?,
         };
-        let capabilities = self
+        let snapshot = self
             .ai
-            .capabilities_for(Some(&provider), temps_ai::RefreshPolicy::Cached)
+            .capabilities_snapshot_for_principal(
+                Some(&provider),
+                principal_id,
+                temps_ai::RefreshPolicy::Cached,
+            )
             .await
             .map_err(|error| {
                 ChatError::Ai(format!(
                     "provider '{provider}' is not ready for a new conversation: {error}"
                 ))
             })?;
+        let capabilities = snapshot.capabilities;
         let model = requested_model
             .map(str::to_string)
             .or_else(|| capabilities.default_model_id.clone())
             .or_else(|| capabilities.models.first().map(|model| model.id.clone()))
             .unwrap_or_else(|| "default".to_string());
         let discovered_model = capabilities.model(&model);
-        if discovered_model.is_none() && !(capabilities.models.is_empty() && model == "default") {
+        if snapshot.model_source.is_authoritative()
+            && discovered_model.is_none()
+            && !(capabilities.models.is_empty() && model == "default")
+        {
             return Err(ChatError::Ai(format!(
                 "model '{model}' is not available for provider '{provider}'"
             )));
         }
-        let thinking_level = match discovered_model {
-            Some(discovered) => {
-                // Project chat always attaches function tools. Providers may
-                // advertise a narrower set of reasoning modes for tool turns.
-                let valid_modes = discovered
-                    .tool_thinking_modes
-                    .as_ref()
-                    .unwrap_or(&discovered.thinking_modes);
-                let desired = requested_thinking_level
-                    .map(str::to_string)
-                    .or_else(|| discovered.default_thinking_mode_id.clone());
-                match desired {
-                    Some(value) if valid_modes.iter().any(|option| option.id == value) => {
+        let thinking_level = if !snapshot.model_source.is_authoritative() {
+            // Bootstrap and expired inventories do not describe the current
+            // account's reasoning controls. Preserve the persisted/requested
+            // value, including an intentional provider-default `None`, even
+            // when the model id happens to appear in the fallback.
+            requested_thinking_level.map(str::to_string)
+        } else {
+            match discovered_model {
+                Some(discovered) => {
+                    // Project chat always attaches function tools. Providers may
+                    // advertise a narrower set of reasoning modes for tool turns.
+                    let valid_modes = discovered
+                        .tool_thinking_modes
+                        .as_ref()
+                        .unwrap_or(&discovered.thinking_modes);
+                    let desired = requested_thinking_level
+                        .map(str::to_string)
+                        .or_else(|| discovered.default_thinking_mode_id.clone());
+                    match desired {
+                        Some(value) if valid_modes.iter().any(|option| option.id == value) => {
+                            Some(value)
+                        }
                         Some(value)
+                            if discovered.tool_thinking_modes.is_some()
+                                && discovered
+                                    .thinking_modes
+                                    .iter()
+                                    .any(|option| option.id == value) =>
+                        {
+                            valid_modes.first().map(|option| option.id.clone())
+                        }
+                        Some(value) => {
+                            return Err(ChatError::Ai(format!(
+                                "thinking option '{value}' is not available for model '{model}'"
+                            )));
+                        }
+                        None => valid_modes.first().map(|option| option.id.clone()),
                     }
-                    Some(value)
-                        if discovered.tool_thinking_modes.is_some()
-                            && discovered
-                                .thinking_modes
-                                .iter()
-                                .any(|option| option.id == value) =>
-                    {
-                        valid_modes.first().map(|option| option.id.clone())
-                    }
-                    Some(value) => {
-                        return Err(ChatError::Ai(format!(
-                            "thinking option '{value}' is not available for model '{model}'"
-                        )));
-                    }
-                    None => valid_modes.first().map(|option| option.id.clone()),
                 }
+                None if snapshot.model_source.is_authoritative()
+                    && requested_thinking_level.is_some() =>
+                {
+                    return Err(ChatError::Ai(format!(
+                        "thinking option '{}' is not available for model '{model}'",
+                        requested_thinking_level.unwrap_or_default()
+                    )));
+                }
+                // A bootstrap or expired model list is a convenience list, not an
+                // account allowlist. Preserve the requested/saved reasoning value
+                // and let the provider decide until an explicit refresh produces
+                // an authoritative inventory.
+                None => requested_thinking_level.map(str::to_string),
             }
-            None if requested_thinking_level.is_some() => {
-                return Err(ChatError::Ai(format!(
-                    "thinking option '{}' is not available for model '{model}'",
-                    requested_thinking_level.unwrap_or_default()
-                )));
-            }
-            None => None,
         };
         let permission_mode = requested_permission_mode
             .map(str::to_string)
@@ -2434,15 +2459,10 @@ impl ConversationService {
         let desired_thinking = normalize_thinking_level(thinking_level)
             .or_else(|| (!model_changed).then_some(current_thinking).flatten());
         let desired_permission = permission_mode.unwrap_or(&conv.ai_permission_mode);
-        if desired_model == conv.ai_model
-            && desired_thinking == conv.ai_thinking_level.as_deref()
-            && desired_permission == conv.ai_permission_mode
-        {
-            return Ok(conv.clone());
-        }
 
         let runtime = self
             .resolve_conversation_runtime(
+                conv.created_by,
                 Some(&conv.ai_provider),
                 Some(desired_model),
                 desired_thinking,
@@ -2453,6 +2473,18 @@ impl ConversationService {
             return Err(ChatError::Ai(
                 "conversation provider cannot be changed after creation".to_string(),
             ));
+        }
+        // A provider's model inventory can change after the conversation was
+        // created (account policy, entitlement, CLI upgrade, or model
+        // retirement). Even when the browser sends no option changes, validate
+        // the persisted selection against the current cached capabilities
+        // before allowing another turn. The former early return let a stale
+        // model bypass this guard and fail much later inside the provider CLI.
+        let resolved_options_unchanged = runtime.model == conv.ai_model
+            && runtime.thinking_level == conv.ai_thinking_level
+            && runtime.permission_mode == conv.ai_permission_mode;
+        if resolved_options_unchanged {
+            return Ok(conv.clone());
         }
         ai_conversations::ActiveModel {
             id: Set(conv.id),
@@ -6328,6 +6360,82 @@ mod tests {
     /// while an authenticated host harness is ready for chat.
     struct HostHarnessOnlyAi;
 
+    struct NonAuthoritativeCapabilitiesAi(temps_ai::ModelCatalogSource);
+
+    struct ToolRestrictedCapabilitiesAi;
+
+    #[async_trait]
+    impl AiService for NonAuthoritativeCapabilitiesAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn capabilities_snapshot_for_principal(
+            &self,
+            provider: Option<&str>,
+            _principal_id: i32,
+            _refresh: temps_ai::RefreshPolicy,
+        ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+            let capabilities = ScriptedAi::new(vec![])
+                .capabilities_for(provider, temps_ai::RefreshPolicy::Cached)
+                .await?;
+            Ok(temps_ai::ProviderCapabilitiesSnapshot {
+                capabilities,
+                model_source: self.0,
+                models_refreshed_at: None,
+            })
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+    }
+
+    #[async_trait]
+    impl AiService for ToolRestrictedCapabilitiesAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn capabilities_snapshot_for_principal(
+            &self,
+            provider: Option<&str>,
+            _principal_id: i32,
+            _refresh: temps_ai::RefreshPolicy,
+        ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+            let mut capabilities = ScriptedAi::new(vec![])
+                .capabilities_for(provider, temps_ai::RefreshPolicy::Cached)
+                .await?;
+            let model = capabilities
+                .models
+                .iter_mut()
+                .find(|model| model.id == "gpt-4o-mini")
+                .expect("test model");
+            model.tool_thinking_modes = Some(vec![temps_ai::SelectOption {
+                id: "medium".to_string(),
+                name: "Medium".to_string(),
+                description: None,
+            }]);
+            Ok(temps_ai::ProviderCapabilitiesSnapshot {
+                capabilities,
+                model_source: temps_ai::ModelCatalogSource::Live,
+                models_refreshed_at: None,
+            })
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+    }
+
     #[async_trait]
     impl AiService for HostHarnessOnlyAi {
         async fn is_available(&self) -> bool {
@@ -8313,6 +8421,7 @@ mod tests {
 
         let runtime = service
             .resolve_conversation_runtime(
+                1,
                 Some("gateway_key:1"),
                 Some("gpt-5.6-luna"),
                 Some("medium"),
@@ -8400,6 +8509,67 @@ mod tests {
 
         assert!(matches!(error, ChatError::Ai(message) if
             message.contains("claude-opus") && message.contains("codex_cli")));
+    }
+
+    #[tokio::test]
+    async fn update_runtime_options_revalidates_an_unchanged_persisted_model() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_model = "claude-model-no-longer-available".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        let error = db_service(db)
+            .update_runtime_options(&conversation, None, None, None)
+            .await
+            .expect_err("a stale persisted model must not bypass capability validation");
+
+        assert!(matches!(error, ChatError::Ai(message) if
+            message.contains("claude-model-no-longer-available")
+                && message.contains("claude_cli")));
+    }
+
+    #[tokio::test]
+    async fn update_runtime_options_persists_reconciled_tool_thinking_mode() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_thinking_level = Some("high".to_string());
+        let mut updated = conversation.clone();
+        updated.ai_thinking_level = Some("medium".to_string());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[updated]])
+            .into_connection();
+
+        let result = db_service_with_ai(db, Arc::new(ToolRestrictedCapabilitiesAi))
+            .update_runtime_options(&conversation, None, None, None)
+            .await
+            .expect("the reconciled tool-safe thinking mode should persist");
+
+        assert_eq!(result.ai_thinking_level.as_deref(), Some("medium"));
+    }
+
+    #[tokio::test]
+    async fn update_runtime_options_does_not_reject_from_non_authoritative_catalogs() {
+        for source in [
+            temps_ai::ModelCatalogSource::Bootstrap,
+            temps_ai::ModelCatalogSource::StaleCache,
+        ] {
+            for model in ["workspace-entitled-model", "gpt-4o-mini"] {
+                for thinking_level in [Some("medium".to_string()), None] {
+                    let mut conversation = test_conversation();
+                    conversation.ai_provider = "claude_cli".to_string();
+                    conversation.ai_model = model.to_string();
+                    conversation.ai_thinking_level = thinking_level;
+                    let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+                    let result =
+                        db_service_with_ai(db, Arc::new(NonAuthoritativeCapabilitiesAi(source)))
+                            .update_runtime_options(&conversation, None, None, None)
+                            .await
+                            .expect("fallback catalogs are not account allowlists");
+
+                    assert_eq!(result, conversation);
+                }
+            }
+        }
     }
 
     #[tokio::test]

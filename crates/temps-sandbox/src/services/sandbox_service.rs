@@ -199,6 +199,10 @@ pub struct CreateSandboxRequest {
 #[derive(Debug, Clone)]
 pub struct ApplicationWorkspaceSandbox {
     pub public_id: String,
+    /// Authoritative provider handle adopted through SandboxService. Internal
+    /// harness callers use this instead of recovering the same live sandbox a
+    /// second time and mistaking a cold local cache for an orphan.
+    pub handle: Option<temps_agents::sandbox::SandboxHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -1689,7 +1693,7 @@ impl SandboxService {
                 self.destroy_sandbox(&untrusted.public_id, user_id).await?;
             }
         }
-        let sandbox = if let Some(mut existing) = existing {
+        let sandbox_public_id = if let Some(mut existing) = existing {
             // `project_id` is the generic sandbox credential scope. Keep it
             // aligned when an application changes its primary project.
             if existing.project_id != project_id {
@@ -1715,9 +1719,7 @@ impl SandboxService {
                 )
                 .await?;
             }
-            ApplicationWorkspaceSandbox {
-                public_id: existing.public_id,
-            }
+            existing.public_id
         } else {
             // A per-workspace password makes the bare opaque hostname useless on
             // its own. The chat API returns only short-lived preview grants; this
@@ -1744,16 +1746,18 @@ impl SandboxService {
                     },
                 )
                 .await?;
-            ApplicationWorkspaceSandbox {
-                public_id: row.public_id,
-            }
+            row.public_id
         };
 
         // Reconcile the complete authorized data plane while stopped compute
         // cannot use stale memberships. Only after this succeeds may an idle
         // workspace be resumed. New/rebuilt compute starts with no application
         // data network; if reconciliation fails, stop it before returning.
-        let row = self.find_by_public_id(&sandbox.public_id, user_id).await?;
+        let row = self.find_by_public_id(&sandbox_public_id, user_id).await?;
+        self.registry
+            .fence_recovered_harness_processes(row.id, &sandbox_public_id)
+            .await
+            .map_err(|error| from_agent_error(&sandbox_public_id, error))?;
         let configure_result = self
             .configure_application_data_network_locked(&row, authorized_project_ids)
             .await;
@@ -1770,13 +1774,26 @@ impl SandboxService {
             return Err(error);
         }
         if row.status == "stopped" && config.desired_state == "running" {
-            self.resume_sandbox(&sandbox.public_id, user_id).await?;
+            self.resume_sandbox(&sandbox_public_id, user_id).await?;
         }
         if config.desired_state == "running" {
-            self.prepare_application_git_workspace(&sandbox.public_id, user_id)
+            self.prepare_application_git_workspace(&sandbox_public_id, user_id)
                 .await?;
         }
-        Ok(sandbox)
+        let handle = if config.desired_state == "running" {
+            Some(
+                self.registry
+                    .get(row.id, &sandbox_public_id)
+                    .await
+                    .map_err(|error| from_agent_error(&sandbox_public_id, error))?,
+            )
+        } else {
+            None
+        };
+        Ok(ApplicationWorkspaceSandbox {
+            public_id: sandbox_public_id,
+            handle,
+        })
     }
 
     pub async fn rebuild_application_workspace(
@@ -4648,6 +4665,16 @@ mod storage_cleanup_tests {
             Ok(())
         }
 
+        async fn fence_process_trees(
+            &self,
+            _handle: &SandboxHandle,
+            _patterns: &[&str],
+        ) -> Result<(), AgentError> {
+            // Restart-recovery fencing is orthogonal to the individual
+            // lifecycle failure knobs exercised by this service fake.
+            Ok(())
+        }
+
         async fn destroy(
             &self,
             handle: &SandboxHandle,
@@ -5048,6 +5075,14 @@ mod storage_cleanup_tests {
             .expect("application preparation must wake its stopped provider runtime");
 
         assert_eq!(sandbox.public_id, PUBLIC_ID);
+        assert_eq!(
+            sandbox
+                .handle
+                .as_ref()
+                .expect("running application workspace handle")
+                .sandbox_name,
+            "temps-sandbox-deadbeef01234567"
+        );
         assert_eq!(
             creates.load(Ordering::SeqCst),
             1,

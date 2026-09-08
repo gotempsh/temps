@@ -133,6 +133,99 @@ impl TempsPlugin for AiChatPlugin {
                 config_service.data_dir(),
             ));
             context.register_service(application_workspaces.clone());
+            let application_sandboxes = context.get_service::<temps_sandbox::SandboxService>();
+            if let (Some(sandboxes), Some(resolver_slot)) = (
+                application_sandboxes.as_ref(),
+                context.get_service::<temps_ai_agent_cli::SandboxWorkspaceResolverSlot>(),
+            ) {
+                let sandboxes = sandboxes.clone();
+                let workspaces = application_workspaces.clone();
+                let applications_for_resolver = applications.clone();
+                let resolver: temps_ai_agent_cli::SandboxWorkspaceResolver = Arc::new(
+                    move |principal_id| {
+                        let sandboxes = sandboxes.clone();
+                        let workspaces = workspaces.clone();
+                        let applications = applications_for_resolver.clone();
+                        Box::pin(async move {
+                            let _workspace_quota_reservation = applications
+                                .reserve_global_workspace_quota(principal_id)
+                                .await
+                                .map_err(|error| temps_ai::AiError::Provider {
+                                    purpose: "provider.capabilities.workspace".to_string(),
+                                    reason: format!(
+                                        "could not reserve the global workspace: {error}"
+                                    ),
+                                })?;
+                            let workspace_id = format!("global-user-{principal_id}");
+                            let mut workspace = workspaces
+                                .ensure(&workspace_id, &[])
+                                .await
+                                .map_err(|error| temps_ai::AiError::Provider {
+                                    purpose: "provider.capabilities.workspace".to_string(),
+                                    reason: format!(
+                                        "could not prepare the persistent global workspace: {error}"
+                                    ),
+                                })?;
+                            let sandbox = sandboxes
+                                .get_or_create_application_workspace(
+                                    principal_id,
+                                    &workspace_id,
+                                    None,
+                                    workspace.host_work_dir.clone(),
+                                )
+                                .await
+                                .map_err(|error| temps_ai::AiError::Provider {
+                                    purpose: "provider.capabilities.workspace".to_string(),
+                                    reason: format!(
+                                        "could not start the persistent global workspace sandbox: {error}"
+                                    ),
+                                })?;
+                            workspace.sandbox_label = sandbox
+                                .public_id
+                                .strip_prefix("sbx_")
+                                .unwrap_or(&sandbox.public_id)
+                                .to_string();
+                            let handle = sandbox.handle.ok_or_else(|| temps_ai::AiError::Provider {
+                                purpose: "provider.capabilities.workspace".to_string(),
+                                reason: "the persistent global workspace did not return a running sandbox handle"
+                                    .to_string(),
+                            })?;
+                            let sandbox_public_id = sandbox.public_id;
+                            let sandboxes_for_stop = sandboxes.clone();
+                            let stop: temps_ai_agent_cli::SandboxWorkspaceStopper = Arc::new(
+                                move || {
+                                    let sandboxes = sandboxes_for_stop.clone();
+                                    let sandbox_public_id = sandbox_public_id.clone();
+                                    Box::pin(async move {
+                                        sandboxes
+                                            .pause_sandbox(&sandbox_public_id, principal_id)
+                                            .await
+                                            .map(|_| ())
+                                            .map_err(|error| temps_ai::AiError::Provider {
+                                                purpose: "provider.capabilities.workspace.stop"
+                                                    .to_string(),
+                                                reason: format!(
+                                                    "could not stop the persistent global workspace after model discovery was interrupted: {error}"
+                                                ),
+                                            })
+                                    })
+                                },
+                            );
+                            Ok(temps_ai_agent_cli::ResolvedSandboxWorkspace {
+                                workspace,
+                                handle,
+                                stop,
+                            })
+                        })
+                    },
+                );
+                if !resolver_slot.set(resolver) {
+                    return Err(PluginError::InitializationFailed(
+                        "persistent sandbox workspace resolver was registered more than once"
+                            .to_string(),
+                    ));
+                }
+            }
             // Optional: operator-tuned chat limits (turn timeout). Absent in
             // minimal wirings, where the compiled defaults apply.
             let config_service = context.get_service::<temps_config::ConfigService>();
@@ -140,8 +233,8 @@ impl TempsPlugin for AiChatPlugin {
                 .with_write_support(write_handle, pending_actions.clone(), audit_service.clone())
                 .with_application_workspaces(application_workspaces.clone())
                 .with_application_service(applications.clone());
-            if let Some(sandboxes) = context.get_service::<temps_sandbox::SandboxService>() {
-                service = service.with_application_sandboxes(sandboxes);
+            if let Some(sandboxes) = &application_sandboxes {
+                service = service.with_application_sandboxes(sandboxes.clone());
             } else {
                 tracing::warn!(
                     "SandboxService is unavailable; application harness turns will fail closed"
@@ -178,7 +271,7 @@ impl TempsPlugin for AiChatPlugin {
                 project_service,
                 application_workspaces,
                 config_service,
-                application_sandboxes: context.get_service::<temps_sandbox::SandboxService>(),
+                application_sandboxes,
                 sandbox_snapshots: context
                     .get_service::<temps_sandbox::services::SnapshotService>(),
                 source_drop_deployer: context.get_service::<dyn temps_core::SourceDropDeployer>(),
