@@ -1047,17 +1047,24 @@ async fn register_node(
 
     // ── Address validation (SSRF guard) ──────────────────────────────────────
     // Reject private_address values in reserved/dangerous ranges before they
-    // can be persisted and later used to build health-check URLs.
-    validate_node_private_address(request.private_address.trim()).map_err(|e| {
-        warn!(
-            "Node registration rejected: invalid private_address '{}': {}",
-            request.private_address.trim(),
-            e
-        );
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Node Address")
-            .with_detail(e.to_string())
-    })?;
+    // can be persisted and later used to build health-check URLs. Store the
+    // normalized bare IP, not the raw request value: route_table.rs's
+    // build_container_backend_addr appends its own port to whatever is
+    // stored here (`format!("{private_addr}:{port}")`), so a port-suffixed
+    // value persisted verbatim would corrupt every proxy backend address
+    // built for this node.
+    let private_address = validate_node_private_address(request.private_address.trim())
+        .map_err(|e| {
+            warn!(
+                "Node registration rejected: invalid private_address '{}': {}",
+                request.private_address.trim(),
+                e
+            );
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Node Address")
+                .with_detail(e.to_string())
+        })?
+        .to_string();
 
     // The `address` field is also user-supplied (used as the deployer agent URL).
     // Extract the host portion and apply the same check.
@@ -1126,7 +1133,7 @@ async fn register_node(
         // CSR SANs are discarded by sign_node_csr so one worker cannot mint a
         // certificate valid for another cluster identity.
         let mut allowed_sans = vec![request.name.trim().to_string()];
-        for address in [&registered_address, request.private_address.trim()] {
+        for address in [&registered_address, &private_address] {
             let host = node_address_host(address);
             if !host.is_empty() && !allowed_sans.contains(&host) {
                 allowed_sans.push(host);
@@ -1149,7 +1156,7 @@ async fn register_node(
         token_hash,
         token_encrypted: Some(token_encrypted),
         address: registered_address,
-        private_address: request.private_address.trim().to_string(),
+        private_address,
         public_endpoint: request.public_endpoint,
         wg_public_key: request.wg_public_key,
         role: request.role.unwrap_or_else(|| "worker".to_string()),

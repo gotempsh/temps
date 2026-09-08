@@ -305,6 +305,21 @@ impl JoinCommand {
         labels: &serde_json::Value,
         platform: Option<&str>,
     ) -> anyhow::Result<()> {
+        // Reject dangerous ranges up front, and normalize to a bare IP: the
+        // "address" field built below appends its own port
+        // (`https://{private_address}:{agent_port}`), and the control plane
+        // does the same when constructing proxy backend addresses from the
+        // stored `nodes.private_address` -- a port-suffixed value here would
+        // corrupt both, independent of the server's own validation.
+        let private_address = temps_deployments::handlers::nodes::validate_node_private_address(
+            private_address.trim(),
+        )
+        .map(|ip| ip.to_string())
+        .map_err(|error| {
+            anyhow::anyhow!("--private-address '{private_address}' is invalid: {error}")
+        })?;
+        let private_address = private_address.as_str();
+
         println!(
             "Using direct mode with private address: {}",
             private_address
