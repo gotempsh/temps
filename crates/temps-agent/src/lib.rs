@@ -136,6 +136,28 @@ pub struct AgentConfig {
     /// it can never raise the overlay beyond what the link supports.
     #[serde(default)]
     pub underlay_mtu: Option<u32>,
+    /// This node's private/underlay address as registered with the control
+    /// plane (`nodes.private_address`) — the WireGuard tunnel IP assigned by
+    /// the relay, or the user-supplied address in direct mode. Always an IP
+    /// already bound to a local interface by the time `temps agent` starts,
+    /// since relay mode configures the WireGuard interface and direct mode
+    /// requires the operator's networking to already own it.
+    ///
+    /// Used to bind published Docker container ports to this address
+    /// instead of `0.0.0.0`, so deployed app containers are reachable only
+    /// over the private/overlay network (where the control-plane proxy
+    /// connects from) and never on the node's public interface.
+    /// `#[serde(default)]` so `agent.json` files saved before this field
+    /// existed still parse as `None` rather than failing deserialization —
+    /// but `temps agent`'s config resolution then hard-errors at startup
+    /// when it's missing (see `resolve_config` in `temps-cli`), directing
+    /// the operator to re-run `temps join`. There is no insecure fallback:
+    /// `build_router`'s own defensive fallback for a `None` config
+    /// substitutes loopback (`127.0.0.1`), never `0.0.0.0` — and is
+    /// unreachable in the real `temps agent` binary, since `resolve_config`
+    /// always rejects a `None` config before `build_router` is called.
+    #[serde(default)]
+    pub private_address: Option<String>,
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -425,6 +447,7 @@ mod tests {
             require_mtls: false,
             underlay_dev: None,
             underlay_mtu: None,
+            private_address: Some("10.100.0.2".to_string()),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -432,6 +455,21 @@ mod tests {
         assert_eq!(parsed.node_name, "worker-1");
         assert_eq!(parsed.node_id, 1);
         assert!(!parsed.require_mtls);
+        assert_eq!(parsed.private_address.as_deref(), Some("10.100.0.2"));
+    }
+
+    #[test]
+    fn test_agent_config_without_private_address_remains_compatible() {
+        let json = r#"{
+            "listen_address": "0.0.0.0:3100",
+            "token": "test-token",
+            "node_name": "worker-1",
+            "control_plane_url": "https://control:3000",
+            "node_id": 1
+        }"#;
+
+        let parsed: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.private_address, None);
     }
 
     #[test]

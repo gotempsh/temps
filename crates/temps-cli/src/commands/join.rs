@@ -392,6 +392,7 @@ impl JoinCommand {
             require_mtls: register_response.mtls_required,
             underlay_dev: self.underlay_dev.clone(),
             underlay_mtu: self.underlay_mtu,
+            private_address: Some(private_address.trim().to_string()),
         };
         self.save_agent_config(&config)?;
 
@@ -574,6 +575,7 @@ impl JoinCommand {
             require_mtls: register_response.mtls_required,
             underlay_dev: self.underlay_dev.clone(),
             underlay_mtu: self.underlay_mtu,
+            private_address: Some(relay_response.assigned_ip.clone()),
         };
         self.save_agent_config(&config)?;
 
@@ -692,6 +694,7 @@ mod tests {
             require_mtls: false,
             underlay_dev: None,
             underlay_mtu: None,
+            private_address: Some("10.100.0.7".to_string()),
         }
     }
 
