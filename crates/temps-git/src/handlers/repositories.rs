@@ -150,7 +150,7 @@ pub async fn get_repository_branches(
     permission_check!(auth, Permission::GitRepositoriesRead);
 
     // Find the repository with the specific connection ID
-    state
+    let repository = state
         .git_provider_manager
         .get_repository_by_owner_and_name_in_connection(&owner, &repo, params.connection_id)
         .await?;
@@ -180,13 +180,17 @@ pub async fn get_repository_branches(
         .get_connection_token(connection_id)
         .await?;
 
-    // Fetch the repository's default branch live from the provider rather
-    // than trusting our DB-synced copy, which can go stale if the provider
-    // side changes it between syncs.
-    let default_branch = provider_service
+    // Prefer the provider's live default branch (it can change between
+    // syncs), but never let that lookup block branch listing: fall back to
+    // our DB-synced copy so a provider outage still serves cached branches
+    // instead of failing the whole request.
+    let default_branch = match provider_service
         .get_repository(&access_token, &owner, &repo)
-        .await?
-        .default_branch;
+        .await
+    {
+        Ok(info) => info.default_branch,
+        Err(_) => repository.default_branch,
+    };
 
     // Create cache key
     let cache_key =
@@ -437,14 +441,17 @@ pub async fn get_branches_by_repository_id(
                 .build()
         })?;
 
-    // Fetch the repository's default branch live from the provider rather
-    // than trusting our DB-synced copy, which can go stale if the provider
-    // side changes it between syncs.
-    let default_branch = provider_service
+    // Prefer the provider's live default branch (it can change between
+    // syncs), but never let that lookup block branch listing: fall back to
+    // our DB-synced copy so a provider outage still serves cached branches
+    // instead of failing the whole request.
+    let default_branch = match provider_service
         .get_repository(&access_token, &repository.owner, &repository.name)
         .await
-        .map_err(Problem::from)?
-        .default_branch;
+    {
+        Ok(info) => info.default_branch,
+        Err(_) => repository.default_branch.clone(),
+    };
 
     // Create cache key
     let cache_key = crate::services::cache::BranchCacheKey::new(

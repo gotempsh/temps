@@ -5178,6 +5178,10 @@
           "commit_sha": {
             "type": "string"
           },
+          "is_default": {
+            "description": "Whether this is the repository's default branch, as reported by the\ngit provider (e.g. `main` or `master`). Clients should use this\ninstead of guessing from the branch name.",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -5188,7 +5192,8 @@
         "required": [
           "name",
           "commit_sha",
-          "protected"
+          "protected",
+          "is_default"
         ],
         "type": "object"
       },
