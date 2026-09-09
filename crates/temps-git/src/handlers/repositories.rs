@@ -184,11 +184,24 @@ pub async fn get_repository_branches(
     // syncs), but never let that lookup block branch listing: fall back to
     // our DB-synced copy so a provider outage still serves cached branches
     // instead of failing the whole request.
+    let repository_id = repository.id;
     let default_branch = match provider_service
         .get_repository(&access_token, &owner, &repo)
         .await
     {
-        Ok(info) => info.default_branch,
+        Ok(info) => {
+            if let Err(e) = state
+                .repository_service
+                .update_default_branch(repository_id, &info.default_branch)
+                .await
+            {
+                warn!(
+                    "Failed to persist refreshed default branch for repository {}: {}",
+                    repository_id, e
+                );
+            }
+            info.default_branch
+        }
         Err(_) => repository.default_branch,
     };
 
@@ -449,7 +462,19 @@ pub async fn get_branches_by_repository_id(
         .get_repository(&access_token, &repository.owner, &repository.name)
         .await
     {
-        Ok(info) => info.default_branch,
+        Ok(info) => {
+            if let Err(e) = state
+                .repository_service
+                .update_default_branch(repository_id, &info.default_branch)
+                .await
+            {
+                warn!(
+                    "Failed to persist refreshed default branch for repository {}: {}",
+                    repository_id, e
+                );
+            }
+            info.default_branch
+        }
         Err(_) => repository.default_branch.clone(),
     };
 

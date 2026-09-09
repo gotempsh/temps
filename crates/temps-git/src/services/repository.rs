@@ -315,6 +315,34 @@ impl RepositoryService {
             })
             .collect())
     }
+
+    /// Opportunistically persist a freshly-observed default branch so that a
+    /// later provider outage falls back to a recently-seen value instead of
+    /// whatever was last recorded at the repository's initial sync. No-op
+    /// when the value hasn't changed, so this doesn't churn `updated_at` on
+    /// every branch listing request.
+    pub async fn update_default_branch(
+        &self,
+        repository_id: i32,
+        default_branch: &str,
+    ) -> Result<(), RepositoryServiceError> {
+        let Some(repo) = repositories::Entity::find_by_id(repository_id)
+            .one(self.db.as_ref())
+            .await?
+        else {
+            return Ok(());
+        };
+
+        if repo.default_branch == default_branch {
+            return Ok(());
+        }
+
+        let mut active: repositories::ActiveModel = repo.into();
+        active.default_branch = sea_orm::Set(default_branch.to_string());
+        active.update(self.db.as_ref()).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -454,5 +482,123 @@ mod tests {
             .unwrap();
         assert_eq!(repos_for_b.len(), 1);
         assert_eq!(repos_for_b[0].name, "user-b-private-repo");
+    }
+
+    async fn insert_repo_with_default_branch(
+        db: &Arc<sea_orm::DatabaseConnection>,
+        default_branch: &str,
+    ) -> repositories::Model {
+        let now = Utc::now();
+
+        let user = users::ActiveModel {
+            email: Set("owner@example.com".to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            name: Set("Test User".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let provider = git_providers::ActiveModel {
+            name: Set("provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("oauth".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(Some(user.id)),
+            account_name: Set("account".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        repositories::ActiveModel {
+            git_provider_connection_id: Set(connection.id),
+            owner: Set("owner".to_string()),
+            name: Set("repo".to_string()),
+            full_name: Set("owner/repo".to_string()),
+            description: Set(None),
+            private: Set(true),
+            fork: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            pushed_at: Set(now),
+            size: Set(0),
+            stargazers_count: Set(0),
+            watchers_count: Set(0),
+            language: Set(None),
+            default_branch: Set(default_branch.to_string()),
+            open_issues_count: Set(0),
+            topics: Set("[]".to_string()),
+            repo_object: Set("{}".to_string()),
+            installation_id: Set(None),
+            clone_url: Set(None),
+            ssh_url: Set(Some("git@example.com:owner/repo.git".to_string())),
+            preset: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_default_branch_persists_changed_value() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let repo = insert_repo_with_default_branch(&db, "master").await;
+
+        let service = RepositoryService::new(db.clone());
+        service
+            .update_default_branch(repo.id, "main")
+            .await
+            .unwrap();
+
+        let refreshed = service
+            .find_by_owner_and_name("owner", "repo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.default_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn update_default_branch_is_noop_for_unknown_repository() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+
+        let service = RepositoryService::new(db.clone());
+        // No repository with this ID exists — must not error.
+        service
+            .update_default_branch(999_999, "main")
+            .await
+            .unwrap();
     }
 }

@@ -65,7 +65,12 @@ interface BranchSelectorProps {
   onBranchDetailsLoaded?: (branches: ResolvedBranch[]) => void
   disabled?: boolean
   /** Pre-loaded branches (for public repos or when already fetched) */
-  branches?: Array<{ name: string; is_default?: boolean }>
+  branches?: Array<{
+    name: string
+    is_default?: boolean
+    commit_sha?: string
+    protected?: boolean
+  }>
   /** Git URL for public repos without a provider connection */
   gitUrl?: string | null
 }
