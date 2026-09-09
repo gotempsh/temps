@@ -36,6 +36,25 @@ fn cancellation_safe_command(program: &str) -> Command {
     command
 }
 
+fn model_discovery_command() -> Command {
+    let mut command = cancellation_safe_command("claude");
+    command.args([
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--tools",
+        "",
+        // Capability discovery must not execute the operator's user,
+        // project, or local SessionStart hooks. Managed account policy and
+        // the authenticated model list remain available.
+        "--setting-sources=",
+    ]);
+    command
+}
+
 async fn configure_chat_mcp(cmd: &mut Command, config: &AiRunConfig) -> Result<(), AgentError> {
     // A non-interactive turn must never inherit Claude Code's host
     // shell/filesystem tools. Interactive turns intentionally keep Claude's
@@ -93,104 +112,117 @@ pub struct ClaudeModelInfo {
     pub supports_auto_mode: bool,
 }
 
-/// Turn Claude's resolved model identifier into the versioned label users see
-/// in Claude Code. The selectable `value` is intentionally often a moving
-/// alias (`sonnet`, `haiku`, `default`), while `resolvedModel` carries the
-/// concrete version selected for the authenticated account.
-fn resolved_model_display_name(resolved_model: &str) -> Option<String> {
-    let resolved_model = resolved_model.strip_prefix("claude-")?;
-    let (model_slug, context) = resolved_model
-        .strip_suffix(']')
-        .and_then(|without_bracket| without_bracket.rsplit_once('['))
-        .map_or((resolved_model, None), |(model, context)| {
-            (model, Some(context))
-        });
-    let parts = model_slug.split('-').collect::<Vec<_>>();
-    let (family, version_parts) = if parts.first()?.chars().all(|c| c.is_ascii_digit()) {
-        let family_index = parts
-            .iter()
-            .position(|part| !part.chars().all(|c| c.is_ascii_digit()))?;
-        (parts[family_index], &parts[..family_index])
-    } else {
-        let version_end = parts[1..]
-            .iter()
-            .position(|part| part.len() == 8 && part.chars().all(|c| c.is_ascii_digit()))
-            .map(|index| index + 1)
-            .unwrap_or(parts.len());
-        (parts[0], &parts[1..version_end])
-    };
-    let version = version_parts
-        .iter()
-        .take_while(|part| part.chars().all(|c| c.is_ascii_digit()))
-        .copied()
-        .collect::<Vec<_>>()
-        .join(".");
-    if version.is_empty() {
-        return None;
-    }
-    let mut family_chars = family.chars();
-    let family = family_chars
-        .next()
-        .map(|first| first.to_uppercase().collect::<String>() + family_chars.as_str())?;
-    let mut label = format!("{family} {version}");
-    if let Some(context) = context {
-        label.push_str(&format!(" ({} context)", context.to_ascii_uppercase()));
-    }
-    Some(label)
-}
-
 fn model_display_name(model: &serde_json::Value, id: &str) -> String {
-    let fallback = model
+    model
         .get("displayName")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or(id);
-    let resolved = model
-        .get("resolvedModel")
-        .and_then(serde_json::Value::as_str)
-        .and_then(resolved_model_display_name);
-    match (id, resolved) {
-        // The CLI needs the moving `default` alias as its value, but that is an
-        // implementation detail rather than a useful model label. Show the
-        // concrete account-resolved model in the composer.
-        ("default", Some(resolved)) => resolved,
-        (_, Some(resolved)) => resolved,
-        (_, None) => fallback.to_string(),
-    }
+        .unwrap_or(id)
+        .to_string()
 }
 
 fn parse_model_initialize_response(value: &serde_json::Value) -> Vec<ClaudeModelInfo> {
-    value
+    let models = value
         .pointer("/response/response/models")
         .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let default_resolved = models
+        .iter()
+        .find(|model| model.get("value").and_then(serde_json::Value::as_str) == Some("default"))
+        .and_then(|model| model.get("resolvedModel"))
+        .and_then(serde_json::Value::as_str);
+    let mut parsed = models
+        .iter()
+        // `default` is an internal sentinel. The UI already has an explicit
+        // provider-default choice, so exposing it as a second model is both
+        // redundant and different from temps-agent-runtime's catalog.
+        .filter(|model| model.get("value").and_then(serde_json::Value::as_str) != Some("default"))
         .filter_map(|model| {
             let id = model.get("value")?.as_str()?.to_string();
-            Some(ClaudeModelInfo {
-                name: model_display_name(model, &id),
-                description: model
-                    .get("description")
+            let is_default = default_resolved.is_some()
+                && model
+                    .get("resolvedModel")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                effort_levels: model
-                    .get("supportedEffortLevels")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .collect(),
-                supports_adaptive_thinking: model
-                    .get("supportsAdaptiveThinking")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                supports_auto_mode: model
-                    .get("supportsAutoMode")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                id,
-            })
+                    == default_resolved;
+            Some((
+                is_default,
+                ClaudeModelInfo {
+                    name: model_display_name(model, &id),
+                    description: model
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    effort_levels: model
+                        .get("supportedEffortLevels")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    supports_adaptive_thinking: model
+                        .get("supportsAdaptiveThinking")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    supports_auto_mode: model
+                        .get("supportsAutoMode")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    id,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    parsed.sort_by_key(|(is_default, _)| !*is_default);
+    parsed.into_iter().map(|(_, model)| model).collect()
+}
+
+/// Parse the SDK initialization response emitted by Claude Code into the
+/// provider-neutral model contract. Sandbox-backed discovery uses the same
+/// parser as host discovery so selectors and turn validation cannot drift.
+pub fn parse_model_capabilities_from_initialize_output(
+    output: &str,
+) -> Vec<super::AiCliModelCapability> {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| {
+            value
+                .pointer("/response/request_id")
+                .and_then(serde_json::Value::as_str)
+                == Some("temps-models")
+        })
+        .map(|value| model_capabilities(parse_model_initialize_response(&value)))
+        .unwrap_or_default()
+}
+
+fn model_capabilities(models: Vec<ClaudeModelInfo>) -> Vec<super::AiCliModelCapability> {
+    models
+        .into_iter()
+        .map(|model| {
+            let has_reasoning = !model.effort_levels.is_empty() || model.supports_adaptive_thinking;
+            let mut reasoning_options = if has_reasoning {
+                vec!["off".to_string()]
+            } else {
+                Vec::new()
+            };
+            reasoning_options.extend(model.effort_levels.iter().cloned());
+            if model.supports_adaptive_thinking {
+                reasoning_options.push("auto".to_string());
+            }
+            let default_reasoning_option = model
+                .effort_levels
+                .iter()
+                .find(|effort| effort.as_str() == "medium")
+                .or_else(|| model.effort_levels.first())
+                .cloned();
+            super::AiCliModelCapability {
+                id: model.id,
+                name: model.name,
+                reasoning_options,
+                default_reasoning_option,
+            }
         })
         .collect()
 }
@@ -202,20 +234,8 @@ pub async fn discover_models() -> Vec<ClaudeModelInfo> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let probe = async {
-        let mut command = cancellation_safe_command("claude");
+        let mut command = model_discovery_command();
         command
-            .args([
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--input-format",
-                "stream-json",
-                // Capability discovery must not execute the operator's user,
-                // project, or local SessionStart hooks. Managed account policy
-                // and the authenticated model list remain available.
-                "--setting-sources",
-                "",
-            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -385,35 +405,7 @@ impl AiCliProvider for ClaudeCliProvider {
     }
 
     async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {
-        discover_models()
-            .await
-            .into_iter()
-            .map(|model| {
-                let has_reasoning =
-                    !model.effort_levels.is_empty() || model.supports_adaptive_thinking;
-                let mut reasoning_options = if has_reasoning {
-                    vec!["off".to_string()]
-                } else {
-                    Vec::new()
-                };
-                reasoning_options.extend(model.effort_levels.iter().cloned());
-                if model.supports_adaptive_thinking {
-                    reasoning_options.push("auto".to_string());
-                }
-                let default_reasoning_option = model
-                    .effort_levels
-                    .iter()
-                    .find(|effort| effort.as_str() == "medium")
-                    .or_else(|| model.effort_levels.first())
-                    .cloned();
-                super::AiCliModelCapability {
-                    id: model.id,
-                    name: model.name,
-                    reasoning_options,
-                    default_reasoning_option,
-                }
-            })
-            .collect()
+        model_capabilities(discover_models().await)
     }
 
     fn extract_assistant_text(&self, line: &str) -> Option<String> {
@@ -1493,6 +1485,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_discovery_uses_claudes_metadata_only_initialization_mode() {
+        let command = model_discovery_command();
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.iter().any(|argument| argument == "--print"));
+        assert!(arguments.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--setting-sources="));
+    }
+
+    #[test]
     fn parses_account_aware_models_and_effort_capabilities() {
         let response = serde_json::json!({
             "type": "control_response",
@@ -1529,31 +1537,18 @@ mod tests {
         });
 
         let models = parse_model_initialize_response(&response);
-        assert_eq!(models.len(), 3);
-        assert_eq!(models[0].id, "default");
-        assert_eq!(models[0].name, "Opus 5 (1M context)");
-        assert_eq!(models[1].id, "opus[1m]");
-        assert_eq!(models[1].name, "Opus 5 (1M context)");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "opus[1m]");
+        assert_eq!(models[0].name, "Opus (1M context)");
         assert_eq!(
-            models[1].effort_levels,
+            models[0].effort_levels,
             ["low", "medium", "high", "xhigh", "max"]
         );
-        assert!(models[1].supports_adaptive_thinking);
-        assert!(models[1].supports_auto_mode);
-        assert_eq!(models[2].name, "Haiku 4.5");
-        assert!(models[2].effort_levels.is_empty());
-    }
-
-    #[test]
-    fn formats_both_current_and_legacy_resolved_claude_model_ids() {
-        assert_eq!(
-            resolved_model_display_name("claude-sonnet-5").as_deref(),
-            Some("Sonnet 5")
-        );
-        assert_eq!(
-            resolved_model_display_name("claude-3-7-sonnet-20250219").as_deref(),
-            Some("Sonnet 3.7")
-        );
+        assert!(models[0].supports_adaptive_thinking);
+        assert!(models[0].supports_auto_mode);
+        assert_eq!(models[1].id, "haiku");
+        assert_eq!(models[1].name, "Haiku");
+        assert!(models[1].effort_levels.is_empty());
     }
 
     fn thinking_args(level: &str) -> Vec<String> {

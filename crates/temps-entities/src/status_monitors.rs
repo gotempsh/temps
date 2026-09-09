@@ -17,6 +17,7 @@ pub struct Model {
     pub name: String,
     pub monitor_type: String, // web, api, desktop
     pub check_path: Option<String>,
+    pub check_path_revision: i64,
     pub check_interval_seconds: i32,
     pub is_active: bool,
     pub is_managed: bool,

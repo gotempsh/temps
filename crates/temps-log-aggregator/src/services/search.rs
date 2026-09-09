@@ -55,8 +55,8 @@ const MAX_CONCURRENT_FETCHES: usize = 20;
 
 /// Search service that routes log queries to the appropriate execution path.
 pub struct LogSearchService {
-    storage: Arc<dyn LogStorage>,
-    metadata_service: Arc<LogMetadataService>,
+    pub(crate) storage: Arc<dyn LogStorage>,
+    pub(crate) metadata_service: Arc<LogMetadataService>,
 }
 
 impl LogSearchService {

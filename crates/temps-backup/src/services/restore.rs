@@ -485,14 +485,15 @@ impl RestoreService {
         // logical dump object is named `dump.sql.gz`, so the generic
         // `.sql.gz` arm below would label it `pg_dump_restore` and the plan
         // would describe a `pg_restore` that never runs. Its physical base is
-        // `base.mbstream.gz`, which matches no generic arm at all and would
-        // land in `unsupported` even though it is the engine's PITR format.
+        // a WAL-G repository (or, in older buckets, a `base.mbstream.gz`
+        // object), neither of which matches a generic arm — both would land
+        // in `unsupported` even though they are the engine's PITR format.
         let target_is_mariadb = target.service_type.eq_ignore_ascii_case("mariadb");
         let engine_lower = target.service_type.to_ascii_lowercase();
         let strategy = if target_is_mariadb {
             // Same predicate the MariaDB engine itself dispatches on, so the
             // preview cannot promise a restore shape the executor won't take.
-            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_location(
+            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
                 &resolved_location,
             ) {
                 "mariadb_physical_restore"
@@ -1221,21 +1222,25 @@ fn validate_pitr_recovery_target(
 /// their base backups differently:
 ///
 ///   Postgres — WAL-G bases are stored as `s3://…` URLs.
-///   MariaDB  — physical (`mariadb-backup`) bases are stored as a BARE S3 key
-///              ending in `base.mbstream.gz` (see engines/mariadb_physical.rs),
-///              never with a scheme prefix.
+///   MariaDB  — physical (`mariadb-backup`) bases are stored either as a WAL-G
+///              repository ending in `/walg` (what `MariadbPhysicalEngine`
+///              writes today) or, in older buckets, as a bare S3 key ending in
+///              `base.mbstream.gz`.
 ///
 /// Applying the Postgres shape to MariaDB rejected every MariaDB PITR before
 /// it could start — with a "requires WAL-G" message that made no sense for the
 /// engine — even though `MariaDbService::restore_capabilities` advertises
 /// `pitr: true`. MariaDB is classified with the engine's own predicate so this
 /// guard, the plan preview, and the engine all agree on what a physical base is.
+/// That predicate must be the layout-agnostic one: testing only the legacy
+/// `base.mbstream.gz` object reintroduces the same class of bug, because a
+/// MariaDB WAL-G repository is a physical base the engine can and does replay.
 fn validate_pitr_backup_location(
     target_service_type: &str,
     backup_location: &str,
 ) -> Result<(), RestoreError> {
     if target_service_type.eq_ignore_ascii_case("mariadb") {
-        if !temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_location(
+        if !temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
             backup_location,
         ) {
             return Err(RestoreError::Validation {
@@ -1271,8 +1276,9 @@ fn validate_pitr_backup_location(
 ///   MongoDB  — patch only. `mongorestore` streams into a LIVE mongod that
 ///              still wants the TARGET's password until the restore lands.
 ///   MariaDB  — depends on the backup FORMAT, which the location encodes:
-///              a physical base replaces the whole datadir including the
-///              `mysql` system schema (so both, like Postgres), while a
+///              a physical base — WAL-G repository or legacy mbstream object
+///              alike — replaces the whole datadir including the `mysql`
+///              system schema (so both, like Postgres), while a
 ///              logical `mariadb_dump` explicitly EXCLUDES the `mysql` schema
 ///              (see engines/mariadb_dump.rs) and therefore carries no
 ///              credentials at all — merging there would authenticate the dump
@@ -1291,7 +1297,7 @@ fn credential_propagation_gates(target_service_type: &str, backup_location: &str
         "mongodb" => (true, false),
         "mariadb" => {
             let physical =
-                temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_location(
+                temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
                     backup_location,
                 );
             (physical, physical)
@@ -2950,6 +2956,41 @@ mod tests {
             matches!(&err, RestoreError::Validation { message } if message.contains("WAL-G")),
             "got {:?}",
             err
+        );
+    }
+
+    /// Regression: `MariadbPhysicalEngine` writes a WAL-G repository, not a
+    /// `base.mbstream.gz` object. Testing only the legacy layout rejected
+    /// every PITR restore of every backup the current engine produces, with
+    /// HTTP 400 at `startRestore` — before the engine (which handles the
+    /// repository layout fine) was ever reached.
+    #[test]
+    fn pitr_location_guard_accepts_a_walg_repository_base() {
+        let repository =
+            "s3://temps-backups/prod/external_services/mariadb/orders-mariadb-pitr/walg";
+
+        validate_pitr_backup_location("mariadb", repository)
+            .expect("a MariaDB WAL-G repository base must be accepted for PITR");
+        validate_pitr_backup_location("MariaDB", &format!("{repository}/"))
+            .expect("a trailing slash must not change the classification");
+    }
+
+    /// A WAL-G repository restore streams the whole datadir back — including
+    /// the `mysql` system schema — exactly like the legacy mbstream base, so
+    /// it must take the same credential-propagation path. Leaving it on the
+    /// logical-dump path would skip patching the target's stored password
+    /// after a cross-service restore and lock the operator out via UI/CLI.
+    #[test]
+    fn credential_gates_treat_a_walg_repository_as_physical() {
+        let repository =
+            "s3://temps-backups/prod/external_services/mariadb/orders-mariadb-pitr/walg";
+        assert_eq!(
+            credential_propagation_gates("mariadb", repository),
+            (true, true)
+        );
+        assert_eq!(
+            credential_propagation_gates("mariadb", &format!("{repository}/")),
+            (true, true)
         );
     }
 

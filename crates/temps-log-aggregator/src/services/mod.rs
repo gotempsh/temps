@@ -5,6 +5,7 @@
 
 mod chunk_writer;
 mod collector;
+pub(crate) mod global_search;
 mod metadata;
 mod remote_collector;
 mod retention;

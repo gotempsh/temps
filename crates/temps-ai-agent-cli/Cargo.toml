@@ -27,6 +27,7 @@ subtle = "2.6"
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

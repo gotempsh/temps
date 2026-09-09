@@ -666,7 +666,9 @@ pub struct DockerRuntime {
     docker: Arc<Docker>,
     use_buildkit: bool,
     network_name: String,
-    /// Address to bind host ports to (e.g. "127.0.0.1" for local, "0.0.0.0" for remote agents)
+    /// Address to bind host ports to: "127.0.0.1" for the control plane's
+    /// own local containers, or a worker agent's private/overlay address
+    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]).
     host_bind_address: String,
     /// Optional secondary network for multi-host overlay (e.g. "temps-overlay").
     /// When set, every container is additionally connected to this network
@@ -1187,7 +1189,11 @@ impl DockerRuntime {
     }
 
     /// Set the host bind address for container port mappings.
-    /// Use "0.0.0.0" on agent nodes so containers are reachable from the private network.
+    /// On agent (worker) nodes, pass the node's private/overlay address
+    /// (`AgentConfig::private_address`) so published container ports are
+    /// reachable from the control-plane proxy over the private network but
+    /// never on the node's public interface. Never pass "0.0.0.0" — Docker
+    /// treats it as "bind every interface", including any public one.
     pub fn with_host_bind_address(mut self, address: String) -> Self {
         self.host_bind_address = address;
         self

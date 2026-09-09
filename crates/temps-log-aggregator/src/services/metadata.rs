@@ -29,6 +29,12 @@ pub struct LogEventsQuery {
     pub limit: u64,
 }
 
+/// Ownership used to authorize access to external-service logs.
+pub struct ExternalServiceLogScope {
+    pub created_by_user_id: Option<i32>,
+    pub project_ids: Vec<i32>,
+}
+
 /// Service for managing log metadata in the database.
 ///
 /// Handles:
@@ -36,7 +42,7 @@ pub struct LogEventsQuery {
 /// - Inserting ERROR/WARN log events for fast indexed search
 /// - Querying chunk metadata for search and retention
 pub struct LogMetadataService {
-    db: Arc<DatabaseConnection>,
+    pub(crate) db: Arc<DatabaseConnection>,
 }
 
 impl LogMetadataService {
@@ -325,26 +331,26 @@ impl LogMetadataService {
         Ok(events)
     }
 
-    /// Return all project IDs that have linked this external service via `project_services`.
-    ///
-    /// Used by the access guard in log handlers: when `external_service_id` is
-    /// supplied the normal project-based `project_access_guard!` cannot be used,
-    /// so the handler looks up the owning project(s) and checks team membership
-    /// against those instead.
-    ///
-    /// An empty `Vec` means the external service has no project association
-    /// (orphaned). Callers **must** treat that as a denial — there is no
-    /// legitimate use case for reading logs of an unlinked external service, and
-    /// defaulting to fail-open on an anomalous state would be an IDOR.
-    pub async fn find_owning_project_ids(
+    /// Resolve an existing service's creator and linked projects for log access.
+    /// Standalone services are valid resources; no row means the service is missing.
+    pub async fn find_external_service_scope(
         &self,
         external_service_id: i32,
-    ) -> Result<Vec<i32>, LogAggregatorError> {
+    ) -> Result<Option<ExternalServiceLogScope>, LogAggregatorError> {
+        let service = temps_entities::external_services::Entity::find_by_id(external_service_id)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(service) = service else {
+            return Ok(None);
+        };
         let rows = temps_entities::project_services::Entity::find()
             .filter(temps_entities::project_services::Column::ServiceId.eq(external_service_id))
             .all(self.db.as_ref())
             .await?;
-        Ok(rows.into_iter().map(|ps| ps.project_id).collect())
+        Ok(Some(ExternalServiceLogScope {
+            created_by_user_id: service.created_by_user_id,
+            project_ids: rows.into_iter().map(|ps| ps.project_id).collect(),
+        }))
     }
 
     /// Find chunks older than a given timestamp for retention cleanup.

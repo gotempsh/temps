@@ -551,6 +551,134 @@ pub trait SandboxProvider: Send + Sync {
         signal: KillSignal,
     ) -> Result<(), AgentError>;
 
+    /// Strictly fence matching process trees before adopting compute from a
+    /// previous control-plane generation.
+    ///
+    /// Unlike [`SandboxProvider::kill_processes`], this operation is not
+    /// best-effort. It freezes matching roots, discovers and freezes their
+    /// descendants, sends SIGTERM, escalates survivors to SIGKILL, and only
+    /// succeeds after every recorded PID is absent. Provider exec failures,
+    /// timeouts, and surviving processes are errors so callers can fail
+    /// closed instead of running a second harness in the same workspace.
+    async fn fence_process_trees(
+        &self,
+        handle: &SandboxHandle,
+        patterns: &[&str],
+    ) -> Result<(), AgentError> {
+        const FENCE_SCRIPT: &str = r#"
+set -eu
+
+roots=""
+self_pid=$$
+for pattern in "$@"; do
+  set +e
+  matches=$(pgrep -f "$pattern" 2>/dev/null)
+  match_status=$?
+  set -e
+  [ "$match_status" -le 1 ] || exit 71
+  for pid in $matches; do
+    [ "$pid" = "$self_pid" ] && continue
+    case " $roots " in
+      *" $pid "*) ;;
+      *) roots="$roots $pid" ;;
+    esac
+  done
+done
+
+[ -n "$roots" ] || exit 0
+
+# Freeze roots before walking the tree so a stale harness cannot keep
+# spawning children while the fence is being established.
+kill -STOP $roots 2>/dev/null || true
+targets="$roots"
+frontier="$roots"
+while [ -n "$frontier" ]; do
+  next=""
+  process_table=$(ps -eo pid=,ppid=)
+  for parent in $frontier; do
+    for child in $(printf '%s\n' "$process_table" | awk -v parent="$parent" '$2 == parent { print $1 }'); do
+      case " $targets " in
+        *" $child "*) ;;
+        *)
+          kill -STOP "$child" 2>/dev/null || true
+          targets="$targets $child"
+          next="$next $child"
+          ;;
+      esac
+    done
+  done
+  frontier="$next"
+done
+
+# SIGTERM is queued while the processes are stopped. SIGCONT lets graceful
+# handlers run; processes that ignore TERM are killed after the deadline.
+kill -TERM $targets 2>/dev/null || true
+kill -CONT $targets 2>/dev/null || true
+
+is_running() {
+  state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+  case "$state" in
+    ""|Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+attempt=0
+remaining="$targets"
+while [ "$attempt" -lt 30 ]; do
+  remaining=""
+  for pid in $targets; do
+    if is_running "$pid"; then
+      remaining="$remaining $pid"
+    fi
+  done
+  [ -n "$remaining" ] || exit 0
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+
+kill -KILL $remaining 2>/dev/null || true
+sleep 0.1
+for pid in $remaining; do
+  if is_running "$pid"; then
+    exit 70
+  fi
+done
+"#;
+
+        let mut command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            FENCE_SCRIPT.to_string(),
+            "temps-process-fence".to_string(),
+        ];
+        command.extend(patterns.iter().map(|pattern| (*pattern).to_string()));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.exec(handle, command, HashMap::new(), None),
+        )
+        .await
+        .map_err(|_| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: "verified process fencing timed out".to_string(),
+        })??;
+
+        if result.exit_code != 0 {
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "verified process fencing failed with exit code {}",
+                    result.exit_code
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Destroy sandbox and clean up its container.
     ///
     /// When `purge_volumes` is true, the provider also removes any per-run
@@ -816,6 +944,8 @@ pub trait SandboxProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     #[test]
     fn kill_signal_term_is_15() {
@@ -858,6 +988,96 @@ mod tests {
         assert_eq!(
             direct_model_relay_base_url("http://control-plane.test:8080/"),
             "http://control-plane.test:8080/api/ai/sandbox-models"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_fence_kills_a_term_resistant_process_tree() {
+        let marker = format!("temps-fence-test-{}", std::process::id());
+        let child_marker = format!("{marker}-child");
+        let root_marker = format!("{marker}-root");
+        let script = format!(
+            "trap '' TERM; sh -c 'trap \"\" TERM; while :; do sleep 1; done' {child_marker} & echo $!; while :; do sleep 1; done"
+        );
+        let mut root = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&root_marker)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-resistant process tree");
+        let root_pid = root.id().expect("root process id");
+        let child_pid: u32 = BufReader::new(root.stdout.take().expect("child pid pipe"))
+            .lines()
+            .next_line()
+            .await
+            .expect("read child pid")
+            .expect("child pid line")
+            .parse()
+            .expect("numeric child pid");
+
+        let probe = Command::new("pgrep")
+            .args(["-f", &format!("{root_marker}$")])
+            .output()
+            .await
+            .expect("run process discovery probe");
+        if !probe.status.success() {
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+            let _ = root.wait().await;
+            eprintln!("skipping strict fence process-tree test: process discovery unavailable");
+            return;
+        }
+
+        let handle = SandboxHandle {
+            sandbox_id: marker.clone(),
+            sandbox_name: marker.clone(),
+            work_dir: std::env::current_dir().expect("current directory"),
+            backend: SandboxBackend::Local,
+            image: String::new(),
+        };
+        let provider = local::LocalSandboxProvider::new();
+        let fence_result = provider
+            .fence_process_trees(&handle, &[&format!("{root_marker}$")])
+            .await;
+
+        if fence_result.is_err() {
+            // Test cleanup must not leave an intentionally TERM-resistant
+            // process behind when an assertion fails.
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+        }
+
+        let root_wait = tokio::time::timeout(Duration::from_secs(1), root.wait()).await;
+        if root_wait.is_err() {
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+        }
+        let root_status = match root_wait {
+            Ok(status) => status.expect("wait for root process"),
+            Err(error) => {
+                let _ = root.wait().await;
+                panic!("root process must exit: {error}")
+            }
+        };
+        fence_result.expect("verified fence must escalate TERM-resistant processes");
+        assert!(!root_status.success());
+        let child_state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &child_pid.to_string()])
+            .output()
+            .await
+            .expect("inspect child state");
+        let state = String::from_utf8_lossy(&child_state.stdout);
+        assert!(
+            state.trim().is_empty() || state.trim_start().starts_with('Z'),
+            "child process remained active with state {state:?}"
         );
     }
 }

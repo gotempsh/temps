@@ -3,9 +3,10 @@
 
 use chrono::Utc;
 use futures::future::BoxFuture;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,15 @@ use super::types::{
     validate_check_path, CreateMonitorRequest, MonitorResponse, MonitorStatus, StatusCheckResponse,
     StatusPageError, UptimeDataPoint, UptimeHistoryResponse,
 };
+
+const USER_CREATED_MONITOR_BOOTSTRAP_MESSAGE: &str =
+    "Monitor created - awaiting first health check";
+
+fn is_managed_monitor_unique_violation(error: &DbErr) -> bool {
+    let rendered = error.to_string();
+    rendered.contains("idx_status_monitors_managed_environment")
+        && (rendered.contains("23505") || rendered.contains("duplicate key"))
+}
 
 /// Service for managing status monitors and their health checks
 pub struct MonitorService {
@@ -201,16 +211,114 @@ impl MonitorService {
         environment_id: i32,
         environment_name: &str,
     ) -> Result<MonitorResponse, StatusPageError> {
-        // Check if a monitor already exists for this environment
+        let environment_project_id = environments::Entity::find_by_id(environment_id)
+            .select_only()
+            .column(environments::Column::ProjectId)
+            .into_tuple::<i32>()
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| StatusPageError::EnvironmentOwnershipLookup {
+                environment_id,
+                project_id,
+                source,
+            })?;
+        if environment_project_id != Some(project_id) {
+            return Err(StatusPageError::EnvironmentNotInProject {
+                environment_id,
+                project_id,
+            });
+        }
+
+        // Prefer the canonical managed monitor when one already exists.
         let existing = status_monitors::Entity::find()
             .filter(status_monitors::Column::ProjectId.eq(project_id))
             .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
             .filter(status_monitors::Column::IsManaged.eq(true))
             .one(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(|source| StatusPageError::ManagedMonitorReconciliation {
+                operation: "find",
+                environment_id,
+                project_id,
+                source,
+            })?;
 
         if let Some(monitor) = existing {
             let response: MonitorResponse = monitor.into();
+            return Ok(self.populate_monitor_url(response).await);
+        }
+
+        // This deterministic name is the reserved environment-monitor slot.
+        // Adopt an existing row instead of creating a second monitor: its ID
+        // owns the environment's existing uptime history, and successful
+        // deployments (including `.temps.yaml` health paths) must continue
+        // updating that same monitor.
+        let legacy_name = format!("{} Monitor", environment_name);
+        if let Some(legacy) = status_monitors::Entity::find()
+            .filter(status_monitors::Column::ProjectId.eq(project_id))
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+            .filter(status_monitors::Column::Name.eq(&legacy_name))
+            .order_by_asc(status_monitors::Column::Id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| StatusPageError::ManagedMonitorReconciliation {
+                operation: "find the existing environment monitor for",
+                environment_id,
+                project_id,
+                source,
+            })?
+        {
+            let mut adopted: status_monitors::ActiveModel = legacy.into();
+            adopted.is_managed = Set(true);
+
+            let adopted = match adopted.update(self.db.as_ref()).await {
+                Ok(monitor) => monitor,
+                Err(update_error) if is_managed_monitor_unique_violation(&update_error) => {
+                    // Environment-created jobs are at-least-once and may race
+                    // startup reconciliation. The partial unique index decides
+                    // the winner; if another worker established ownership,
+                    // return that canonical monitor.
+                    if let Some(existing) = status_monitors::Entity::find()
+                        .filter(status_monitors::Column::ProjectId.eq(project_id))
+                        .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+                        .filter(status_monitors::Column::IsManaged.eq(true))
+                        .one(self.db.as_ref())
+                        .await
+                        .map_err(|source| StatusPageError::ManagedMonitorReconciliation {
+                            operation: "resolve a concurrent adoption of",
+                            environment_id,
+                            project_id,
+                            source,
+                        })?
+                    {
+                        existing
+                    } else {
+                        return Err(StatusPageError::ManagedMonitorReconciliation {
+                            operation: "adopt",
+                            environment_id,
+                            project_id,
+                            source: update_error,
+                        });
+                    }
+                }
+                Err(source) => {
+                    return Err(StatusPageError::ManagedMonitorReconciliation {
+                        operation: "adopt",
+                        environment_id,
+                        project_id,
+                        source,
+                    });
+                }
+            };
+
+            tracing::info!(
+                monitor_id = adopted.id,
+                environment_id,
+                project_id,
+                "Adopted existing environment monitor"
+            );
+
+            let response: MonitorResponse = adopted.into();
             return Ok(self.populate_monitor_url(response).await);
         }
 
@@ -218,7 +326,7 @@ impl MonitorService {
         let monitor = status_monitors::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(Some(environment_id)),
-            name: Set(format!("{} Monitor", environment_name)),
+            name: Set(legacy_name),
             monitor_type: Set("web".to_string()),
             check_interval_seconds: Set(60), // Check every minute
             is_active: Set(true),
@@ -230,7 +338,7 @@ impl MonitorService {
 
         let result = match monitor.insert(self.db.as_ref()).await {
             Ok(monitor) => monitor,
-            Err(insert_error) => {
+            Err(insert_error) if is_managed_monitor_unique_violation(&insert_error) => {
                 // Environment creation events are at-least-once and can race.
                 // The partial unique index is authoritative; if another worker
                 // won, return that managed monitor instead of surfacing a false
@@ -240,12 +348,31 @@ impl MonitorService {
                     .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
                     .filter(status_monitors::Column::IsManaged.eq(true))
                     .one(self.db.as_ref())
-                    .await?
+                    .await
+                    .map_err(|source| StatusPageError::ManagedMonitorReconciliation {
+                        operation: "resolve a concurrent creation of",
+                        environment_id,
+                        project_id,
+                        source,
+                    })?
                 {
                     existing
                 } else {
-                    return Err(StatusPageError::Database(insert_error));
+                    return Err(StatusPageError::ManagedMonitorReconciliation {
+                        operation: "create",
+                        environment_id,
+                        project_id,
+                        source: insert_error,
+                    });
                 }
+            }
+            Err(source) => {
+                return Err(StatusPageError::ManagedMonitorReconciliation {
+                    operation: "create",
+                    environment_id,
+                    project_id,
+                    source,
+                });
             }
         };
 
@@ -311,7 +438,7 @@ impl MonitorService {
                 result.id,
                 "unknown".to_string(),
                 None,
-                Some("Monitor created - awaiting first health check".to_string()),
+                Some(USER_CREATED_MONITOR_BOOTSTRAP_MESSAGE.to_string()),
             )
             .await?;
 
@@ -490,7 +617,7 @@ impl MonitorService {
     }
 
     /// Set or clear the deployment-discovered path on Temps' managed monitor.
-    /// User-created monitors retain their independently configured endpoints.
+    /// Custom-named monitors retain their independently configured endpoints.
     pub async fn update_managed_check_path_for_environment(
         &self,
         project_id: i32,
@@ -501,18 +628,21 @@ impl MonitorService {
             validate_check_path(check_path)?;
         }
 
-        let monitors = status_monitors::Entity::find()
+        status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::CheckPath,
+                Expr::value(check_path.map(str::to_string)),
+            )
+            .col_expr(
+                status_monitors::Column::CheckPathRevision,
+                Expr::col(status_monitors::Column::CheckPathRevision).add(1_i64),
+            )
+            .col_expr(status_monitors::Column::UpdatedAt, Expr::value(Utc::now()))
             .filter(status_monitors::Column::ProjectId.eq(project_id))
             .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
             .filter(status_monitors::Column::IsManaged.eq(true))
-            .all(self.db.as_ref())
+            .exec(self.db.as_ref())
             .await?;
-
-        for monitor in monitors {
-            let mut active: status_monitors::ActiveModel = monitor.into();
-            active.check_path = Set(check_path.map(str::to_string));
-            active.update(self.db.as_ref()).await?;
-        }
 
         Ok(())
     }
@@ -1214,6 +1344,18 @@ mod tests {
             .update_managed_check_path_for_environment(project.id, environment.id, Some("/docs"))
             .await
             .unwrap();
+        let changed_managed = status_monitors::Entity::find_by_id(managed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let unchanged_custom = status_monitors::Entity::find_by_id(custom.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed_managed.check_path_revision, 1);
+        assert_eq!(unchanged_custom.check_path_revision, 0);
         assert_eq!(
             service
                 .get_monitor(managed.id)
@@ -1234,9 +1376,34 @@ mod tests {
         );
 
         service
+            .update_managed_check_path_for_environment(project.id, environment.id, Some("/docs"))
+            .await
+            .unwrap();
+        let equal_value_write = status_monitors::Entity::find_by_id(managed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(equal_value_write.check_path.as_deref(), Some("/docs"));
+        assert_eq!(equal_value_write.check_path_revision, 2);
+
+        service
             .update_managed_check_path_for_environment(project.id, environment.id, None)
             .await
             .unwrap();
+        let cleared_managed = status_monitors::Entity::find_by_id(managed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let still_unchanged_custom = status_monitors::Entity::find_by_id(custom.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared_managed.check_path, None);
+        assert_eq!(cleared_managed.check_path_revision, 3);
+        assert_eq!(still_unchanged_custom.check_path_revision, 0);
         assert_eq!(
             service.get_monitor(managed.id).await.unwrap().check_path,
             None
@@ -1253,7 +1420,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_monitor_does_not_claim_a_user_monitor_with_the_default_name() {
+    async fn managed_monitor_adopts_a_legacy_monitor_with_the_default_name() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+        let legacy_monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set(format!("{} Monitor", environment.name)),
+            monitor_type: Set("web".to_string()),
+            check_path: Set(Some("/legacy-health".to_string())),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            is_managed: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let managed_monitor = service
+            .ensure_monitor_for_environment(project.id, environment.id, &environment.name)
+            .await
+            .unwrap();
+
+        assert_eq!(managed_monitor.id, legacy_monitor.id);
+        let restarted_service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let after_restart = restarted_service
+            .ensure_monitor_for_environment(project.id, environment.id, &environment.name)
+            .await
+            .unwrap();
+        assert_eq!(after_restart.id, legacy_monitor.id);
+        service
+            .update_managed_check_path_for_environment(
+                project.id,
+                environment.id,
+                Some("/deployed-health"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_monitor(legacy_monitor.id)
+                .await
+                .unwrap()
+                .check_path
+                .as_deref(),
+            Some("/deployed-health")
+        );
+
+        let monitors = status_monitors::Entity::find()
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment.id)))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(monitors.len(), 1);
+        assert!(monitors[0].is_managed);
+    }
+
+    #[tokio::test]
+    async fn ensure_monitor_for_environment_adopts_an_existing_default_name() {
         let Ok(test_db) = TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
@@ -1269,7 +1500,7 @@ mod tests {
                     name: format!("{} Monitor", environment.name),
                     monitor_type: "web".to_string(),
                     environment_id: environment.id,
-                    check_interval_seconds: Some(60),
+                    check_interval_seconds: Some(90),
                     check_path: Some("/user-health".to_string()),
                 },
             )
@@ -1281,33 +1512,82 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(managed_monitor.id, user_monitor.id);
+        assert_eq!(managed_monitor.id, user_monitor.id);
+        assert_eq!(managed_monitor.check_path.as_deref(), Some("/user-health"));
+        assert_eq!(managed_monitor.check_interval_seconds, 90);
+        let managed_row = status_monitors::Entity::find_by_id(managed_monitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(managed_row.is_managed);
         service
             .update_managed_check_path_for_environment(
                 project.id,
                 environment.id,
-                Some("/deployed-health"),
+                Some("/from-temps-yaml"),
             )
             .await
             .unwrap();
-        assert_eq!(
-            service
-                .get_monitor(user_monitor.id)
-                .await
-                .unwrap()
-                .check_path
-                .as_deref(),
-            Some("/user-health")
+        let updated = service.get_monitor(user_monitor.id).await.unwrap();
+        assert_eq!(updated.check_path.as_deref(), Some("/from-temps-yaml"));
+
+        let monitor_count = status_monitors::Entity::find()
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment.id)))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(monitor_count, 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_monitor_for_environment_rejects_an_environment_from_another_project() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let owning_project = create_test_project(&db).await;
+        let other_project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, owning_project.id).await;
+
+        let result = service
+            .ensure_monitor_for_environment(other_project.id, environment.id, &environment.name)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(StatusPageError::EnvironmentNotInProject {
+                environment_id,
+                project_id,
+            }) if environment_id == environment.id && project_id == other_project.id
+        ));
+        let monitor_count = status_monitors::Entity::find()
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment.id)))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(monitor_count, 0);
+    }
+
+    #[test]
+    fn managed_monitor_unique_violation_requires_the_expected_constraint() {
+        let expected = DbErr::Custom(
+            "database error 23505: duplicate key violates constraint \
+             idx_status_monitors_managed_environment"
+                .to_string(),
         );
-        assert_eq!(
-            service
-                .get_monitor(managed_monitor.id)
-                .await
-                .unwrap()
-                .check_path
-                .as_deref(),
-            Some("/deployed-health")
+        let unrelated = DbErr::Custom(
+            "database error 23505: duplicate key violates constraint other_index".to_string(),
         );
+        let connection = DbErr::Custom(
+            "connection failed while reading idx_status_monitors_managed_environment".to_string(),
+        );
+
+        assert!(is_managed_monitor_unique_violation(&expected));
+        assert!(!is_managed_monitor_unique_violation(&unrelated));
+        assert!(!is_managed_monitor_unique_violation(&connection));
     }
 
     #[tokio::test]

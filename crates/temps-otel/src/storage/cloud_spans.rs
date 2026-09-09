@@ -272,6 +272,17 @@ fn bounded_limit(limit: Option<u64>) -> u64 {
 
 #[async_trait]
 impl CloudSpanSource for CloudTelemetrySpanSource {
+    async fn global_trace_stream(
+        &self,
+        query: super::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<super::global_traces::GlobalTraceStream> {
+        let refs = query
+            .scopes
+            .iter()
+            .map(|s| Ok((s.project_id, self.project_ref(s.project_id)?)))
+            .collect::<StorageResult<BTreeMap<_, _>>>()?;
+        super::global_traces::clickhouse(&self.client()?, &query, Some(&refs)).await
+    }
     async fn query_spans(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>> {
         let project_ref = self.project_ref(query.project_id)?;
         let client = self.client()?;
@@ -292,18 +303,33 @@ impl CloudSpanSource for CloudTelemetrySpanSource {
     }
 
     async fn query_trace_summaries(&self, query: TraceQuery) -> StorageResult<Vec<TraceSummary>> {
-        // Summaries are an aggregate over the same rows. Fetching the spans and
-        // folding them here keeps one SQL surface against a schema this repo
-        // does not own, at the cost of a wider read — bounded by `MAX_ROWS`.
-        let spans = self
-            .query_spans(TraceQuery {
-                limit: Some(bounded_limit(query.limit).saturating_mul(20).min(MAX_ROWS)),
-                offset: None,
-                root_only: false,
-                ..query.clone()
-            })
-            .await?;
-        Ok(summarize(spans, bounded_limit(query.limit) as usize))
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let scope = super::global_traces::TraceReadScope {
+                project_id: query.project_id,
+                from: query.start_time.unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+                to: query.end_time.unwrap_or_else(Utc::now),
+                cloud: true,
+                window_clamped_at: None,
+            };
+            let q = super::global_traces::GlobalTraceQuery {
+                source_offset: query.offset.unwrap_or(0),
+                filter: query,
+                scopes: vec![scope],
+                summaries: true,
+            };
+            let stream = self.global_trace_stream(q.clone()).await?;
+            super::global_traces::merge(vec![stream], &q)
+                .await?
+                .data
+                .into_iter()
+                .map(|r| r.summary(String::new(), String::new()).map(|s| s.trace))
+                .collect()
+        })
+        .await
+        .map_err(|_| OtelError::Storage {
+            message: "Temps Cloud trace summary query exceeded its time budget".into(),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        })?
     }
 
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
@@ -366,131 +392,9 @@ impl CloudSpanSource for CloudTelemetrySpanSource {
     }
 }
 
-/// Fold spans into one summary per trace.
-///
-/// Pure, so the aggregation the console renders is testable without Cloud.
-fn summarize(spans: Vec<SpanRecord>, limit: usize) -> Vec<TraceSummary> {
-    let mut by_trace: BTreeMap<String, Vec<SpanRecord>> = BTreeMap::new();
-    for span in spans {
-        by_trace
-            .entry(span.trace_id.clone())
-            .or_default()
-            .push(span);
-    }
-
-    let mut summaries: Vec<TraceSummary> = by_trace
-        .into_iter()
-        .filter_map(|(trace_id, spans)| {
-            let root = spans
-                .iter()
-                .find(|span| span.parent_span_id.is_none())
-                .or_else(|| spans.first())?;
-            let start_time = spans
-                .iter()
-                .map(|span| span.start_time)
-                .min()
-                .unwrap_or(root.start_time);
-            let duration_ms = spans
-                .iter()
-                .map(|span| span.duration_ms)
-                .fold(0.0_f64, f64::max);
-            let error_count = spans
-                .iter()
-                .filter(|span| span.status_code == SpanStatusCode::Error)
-                .count() as i64;
-            Some(TraceSummary {
-                trace_id,
-                root_span_name: root.name.clone(),
-                service_name: root.resource.service_name.clone(),
-                deployment_environment: root.resource.deployment_environment.clone(),
-                kind: root.kind,
-                status_code: root.status_code,
-                start_time,
-                duration_ms,
-                span_count: spans.len() as i64,
-                error_count,
-            })
-        })
-        .collect();
-
-    // Newest trace first, matching every local backend's default ordering.
-    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.start_time));
-    summaries.truncate(limit);
-    summaries
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn span(trace: &str, id: &str, parent: Option<&str>, status: SpanStatusCode) -> SpanRecord {
-        let now = Utc::now();
-        SpanRecord {
-            project_id: 7,
-            deployment_id: None,
-            resource: ResourceInfo::default(),
-            trace_id: trace.into(),
-            span_id: id.into(),
-            parent_span_id: parent.map(str::to_string),
-            name: format!("op-{id}"),
-            kind: SpanKind::Server,
-            start_time: now,
-            end_time: now,
-            duration_ms: 10.0,
-            status_code: status,
-            status_message: String::new(),
-            attributes: BTreeMap::new(),
-            events: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn a_trace_summary_counts_its_spans_and_its_errors() {
-        let spans = vec![
-            span("t1", "a", None, SpanStatusCode::Ok),
-            span("t1", "b", Some("a"), SpanStatusCode::Error),
-            span("t1", "c", Some("a"), SpanStatusCode::Ok),
-        ];
-        let summaries = summarize(spans, 10);
-
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].span_count, 3);
-        assert_eq!(summaries[0].error_count, 1);
-        assert_eq!(
-            summaries[0].root_span_name, "op-a",
-            "the parentless span is the root"
-        );
-    }
-
-    #[test]
-    fn a_trace_whose_root_did_not_ship_still_produces_a_summary() {
-        // A partial trace is a real thing to render — refusing to summarise it
-        // would make the whole trace disappear rather than showing what exists.
-        let spans = vec![span("t1", "b", Some("missing"), SpanStatusCode::Ok)];
-        let summaries = summarize(spans, 10);
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].span_count, 1);
-    }
-
-    #[test]
-    fn summaries_are_newest_first_and_bounded_by_the_limit() {
-        let mut spans = Vec::new();
-        for i in 0..10 {
-            let mut s = span(&format!("t{i}"), "a", None, SpanStatusCode::Ok);
-            s.start_time = Utc::now() - chrono::Duration::minutes(i);
-            spans.push(s);
-        }
-        let summaries = summarize(spans, 3);
-
-        assert_eq!(summaries.len(), 3);
-        assert!(summaries[0].start_time >= summaries[1].start_time);
-        assert!(summaries[1].start_time >= summaries[2].start_time);
-    }
-
-    #[test]
-    fn an_empty_result_summarises_to_nothing_rather_than_panicking() {
-        assert!(summarize(Vec::new(), 10).is_empty());
-    }
 
     #[test]
     fn the_row_limit_is_bounded_however_the_caller_asks() {

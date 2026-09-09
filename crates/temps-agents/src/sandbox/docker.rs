@@ -19,6 +19,13 @@ use super::{
     SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
 };
 use crate::ai_cli::OnEventCallback;
+use crate::docker_network_isolation::{
+    create_host_isolated_network, has_host_isolation, with_host_isolation,
+};
+#[cfg(test)]
+use crate::docker_network_isolation::{
+    BRIDGE_GATEWAY_MODE_IPV4_OPTION, BRIDGE_INHIBIT_IPV4_OPTION,
+};
 use crate::error::AgentError;
 
 /// Container naming prefix — used for recovery after server restarts.
@@ -566,8 +573,6 @@ pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
 /// Keep in sync with `preview_gateway::PREVIEW_GATEWAY_NETWORK`.
 const SANDBOX_NETWORK_PREFIX: &str = "temps-sandbox-net-v3-";
 const SANDBOX_NETWORK_OWNER_LABEL: &str = "sh.temps.sandbox-network-for";
-const SANDBOX_ISOLATED_GATEWAY_OPTION: &str = "com.docker.network.bridge.gateway_mode_ipv4";
-const SANDBOX_ISOLATED_GATEWAY_VALUE: &str = "isolated";
 
 /// The egress proxy is the only container with a NIC on both the internal
 /// sandbox network and this ordinary outbound bridge.
@@ -584,6 +589,41 @@ pub const SANDBOX_MODEL_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/model-relay";
 const SANDBOX_EGRESS_POLICY_LABEL: &str = "sh.temps.sandbox-egress-policy";
 const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
+
+fn isolated_sandbox_network_request(
+    name: &str,
+    container_name: &str,
+) -> bollard::models::NetworkCreateRequest {
+    with_host_isolation(bollard::models::NetworkCreateRequest {
+        name: name.to_string(),
+        labels: Some(HashMap::from([
+            (
+                SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+            ),
+            (
+                SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                container_name.to_string(),
+            ),
+        ])),
+        ..Default::default()
+    })
+}
+
+fn sandbox_network_matches_isolation_policy(
+    network: &bollard::models::NetworkInspect,
+    container_name: &str,
+) -> bool {
+    let labels = network.labels.as_ref();
+    docker_network_matches_policy(network, true, false)
+        && labels
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+            .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION)
+        && labels
+            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+            .is_some_and(|value| value == container_name)
+        && has_host_isolation(network.options.as_ref())
+}
 const SANDBOX_MCP_RELAY_BASE_URL: &str = "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
 
 /// Small CONNECT/HTTP forward proxy used as the sandbox's only internet
@@ -2003,35 +2043,17 @@ impl DockerSandboxProvider {
         let network = match inspected {
             Ok(network) => network,
             Err(error) if docker_error_is_not_found(&error) => {
-                self.docker
-                    .create_network(bollard::models::NetworkCreateRequest {
-                        name: name.to_string(),
-                        driver: Some("bridge".to_string()),
-                        internal: Some(true),
-                        enable_ipv6: Some(false),
-                        labels: Some(HashMap::from([
-                            (
-                                SANDBOX_EGRESS_POLICY_LABEL.to_string(),
-                                SANDBOX_EGRESS_POLICY_VERSION.to_string(),
-                            ),
-                            (
-                                SANDBOX_NETWORK_OWNER_LABEL.to_string(),
-                                container_name.to_string(),
-                            ),
-                        ])),
-                        options: Some(HashMap::from([(
-                            SANDBOX_ISOLATED_GATEWAY_OPTION.to_string(),
-                            SANDBOX_ISOLATED_GATEWAY_VALUE.to_string(),
-                        )])),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(|source| AgentError::SandboxProviderUnavailable {
-                        provider: "docker".to_string(),
-                        reason: format!(
-                            "create isolated network for sandbox '{container_name}': {source}"
-                        ),
-                    })?;
+                create_host_isolated_network(
+                    &self.docker,
+                    isolated_sandbox_network_request(name, container_name),
+                )
+                .await
+                .map_err(|source| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "create isolated network for sandbox '{container_name}': {source}"
+                    ),
+                })?;
                 self.docker
                     .inspect_network(
                         name,
@@ -2055,27 +2077,11 @@ impl DockerSandboxProvider {
             }
         };
 
-        let labels = network.labels.as_ref();
-        let policy_matches = labels
-            .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
-            .is_some_and(|value| value == SANDBOX_EGRESS_POLICY_VERSION);
-        let owner_matches = labels
-            .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
-            .is_some_and(|value| value == container_name);
-        let isolated_gateway = network
-            .options
-            .as_ref()
-            .and_then(|options| options.get(SANDBOX_ISOLATED_GATEWAY_OPTION))
-            .is_some_and(|value| value == SANDBOX_ISOLATED_GATEWAY_VALUE);
-        if !docker_network_matches_policy(&network, true, false)
-            || !policy_matches
-            || !owner_matches
-            || !isolated_gateway
-        {
+        if !sandbox_network_matches_isolation_policy(&network, container_name) {
             return Err(AgentError::SandboxProviderUnavailable {
                 provider: "docker".to_string(),
                 reason: format!(
-                    "sandbox isolation is unavailable because Docker did not preserve the required isolated-gateway policy for '{name}'"
+                    "sandbox isolation is unavailable because Docker did not preserve the required host-isolation policy for '{name}'"
                 ),
             });
         }
@@ -5487,6 +5493,87 @@ mod tests {
             ..Default::default()
         };
         assert!(docker_network_matches_policy(&shared, false, false));
+    }
+
+    #[test]
+    fn per_sandbox_network_request_requires_host_isolation() {
+        let request = isolated_sandbox_network_request("sandbox-network", "sandbox-container");
+
+        assert_eq!(request.name, "sandbox-network");
+        assert_eq!(request.driver.as_deref(), Some("bridge"));
+        assert_eq!(request.internal, Some(true));
+        assert_eq!(request.enable_ipv6, Some(false));
+        assert!(has_host_isolation(request.options.as_ref()));
+        assert_eq!(
+            request
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(SANDBOX_EGRESS_POLICY_LABEL))
+                .map(String::as_str),
+            Some(SANDBOX_EGRESS_POLICY_VERSION)
+        );
+        assert_eq!(
+            request
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))
+                .map(String::as_str),
+            Some("sandbox-container")
+        );
+    }
+
+    #[test]
+    fn existing_per_sandbox_network_accepts_only_complete_host_isolation_policy() {
+        let request = isolated_sandbox_network_request("sandbox-network", "sandbox-container");
+        let modern = bollard::models::NetworkInspect {
+            name: Some(request.name),
+            driver: request.driver,
+            internal: request.internal,
+            enable_ipv6: request.enable_ipv6,
+            labels: request.labels,
+            options: request.options,
+            ..Default::default()
+        };
+        assert!(sandbox_network_matches_isolation_policy(
+            &modern,
+            "sandbox-container"
+        ));
+
+        let mut legacy = modern.clone();
+        let legacy_options = legacy.options.get_or_insert_with(HashMap::new);
+        legacy_options.remove(BRIDGE_GATEWAY_MODE_IPV4_OPTION);
+        legacy_options.insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "true".to_string());
+        assert!(sandbox_network_matches_isolation_policy(
+            &legacy,
+            "sandbox-container"
+        ));
+
+        let mut wrong_owner = legacy.clone();
+        wrong_owner.labels.get_or_insert_with(HashMap::new).insert(
+            SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+            "another-container".to_string(),
+        );
+        assert!(!sandbox_network_matches_isolation_policy(
+            &wrong_owner,
+            "sandbox-container"
+        ));
+
+        let mut externally_routed = legacy.clone();
+        externally_routed.internal = Some(false);
+        assert!(!sandbox_network_matches_isolation_policy(
+            &externally_routed,
+            "sandbox-container"
+        ));
+
+        let mut disabled_isolation = legacy;
+        disabled_isolation
+            .options
+            .get_or_insert_with(HashMap::new)
+            .insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "false".to_string());
+        assert!(!sandbox_network_matches_isolation_policy(
+            &disabled_isolation,
+            "sandbox-container"
+        ));
     }
 
     #[test]

@@ -719,24 +719,6 @@ export type AiChatLimitsSettings = {
 };
 
 /**
- * Mirrors `temps_agents::ai_cli::AiCliStatus` with utoipa `ToSchema` added.
- * `AiCliStatus` itself does not derive `ToSchema`, so this local projection is
- * used for OpenAPI generation only — the fields are identical.
- */
-export type AiCliStatusDto = {
-    auth_method?: string | null;
-    authenticated: boolean;
-    installed: boolean;
-    provider: string;
-    /**
-     * Instructions for the operator when not installed or not authenticated.
-     */
-    setup_hint?: string | null;
-    subscription_type?: string | null;
-    version?: string | null;
-};
-
-/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -801,7 +783,7 @@ export type AiPageBreakdownRow = {
 };
 
 /**
- * Current AI provider routing preference and availability for this instance.
+ * Current API-gateway availability for this instance.
  *
  * The `configured` field drives the UI onboarding state: when `false` the UI
  * must show _exactly what is missing_ (`reason`) and _where to fix it_
@@ -809,18 +791,8 @@ export type AiPageBreakdownRow = {
  */
 export type AiProviderStatusResponse = {
     /**
-     * Active preference: `"gateway"` (BYOK) or `"agent_cli"` (subscription).
-     */
-    active_provider_type: string;
-    /**
-     * Catalog id of the active agent CLI provider, or `null` when
-     * `active_provider_type` is `"gateway"`.
-     */
-    agent_cli_provider_id?: string | null;
-    agent_cli_status?: null | AiCliStatusDto;
-    /**
-     * Providers a chat user may choose for a new conversation. Authentication
-     * source is descriptive metadata only and never contains credentials.
+     * Gateway providers available to API-backed chat and summaries. Credential
+     * source is descriptive metadata only and never contains secret values.
      */
     available_providers: Array<AvailableAiProviderDto>;
     /**
@@ -888,8 +860,8 @@ export type AiSummaryPreferenceDto = {
      */
     model?: string | null;
     /**
-     * Normalized provider route (`gateway_key:{id}`, `claude_cli`, etc.).
-     * `null` inherits the active instance provider.
+     * Normalized gateway route (`gateway_key:{id}`). `null` inherits the
+     * active gateway key.
      */
     provider_id?: string | null;
     /**
@@ -2128,8 +2100,7 @@ export type AutofixerRunWithLogsResponse = {
 
 export type AvailableAiProviderDto = {
     /**
-     * `configured_key` for the gateway or `host_environment` for an ambient
-     * CLI login discovered in the Temps process environment.
+     * `configured_key` for an encrypted gateway key.
      */
     auth_source: string;
     default_model_id?: string | null;
@@ -2419,6 +2390,12 @@ export type BlobStatusResponse = {
 
 export type BranchInfo = {
     commit_sha: string;
+    /**
+     * Whether this is the repository's default branch, as reported by the
+     * git provider (e.g. `main` or `master`). Clients should use this
+     * instead of guessing from the branch name.
+     */
+    is_default: boolean;
     name: string;
     protected: boolean;
 };
@@ -4821,9 +4798,22 @@ export type CreateExternalServiceRequest = {
      * Target node ID for the service. Omit or null to run on the control plane.
      */
     node_id?: number | null;
+    /**
+     * Service-type-specific configuration. Read
+     * `GET /external-services/types/{service_type}/parameters` before creating
+     * a service and provide every field its schema marks as required. Secret
+     * values that the schema describes as auto-generated may be omitted.
+     */
     parameters: {
         [key: string]: unknown;
     };
+    /**
+     * Optionally link the new service to this project as part of the same
+     * request. The caller must have write access to the target project. If
+     * linking fails, Temps removes the newly created service so callers do
+     * not have to recover an ambiguous half-created resource.
+     */
+    project_id?: number | null;
     service_type: CreatableServiceTypeRoute;
     /**
      * Service topology: "standalone" (default) or "cluster" (HA multi-member).
@@ -5521,7 +5511,8 @@ export type CreateSandboxBody = {
      * no explicit `source` is given, and the sandbox is attributed to the
      * project so it can be listed alongside it.
      *
-     * Requires access to the project — the same team/scope rules that
+     * Requires access to the project and `git_repositories:read` when Temps
+     * derives the source from the project. The same team/scope rules that
      * gate every other project-scoped endpoint apply.
      */
     project_id?: number | null;
@@ -10605,6 +10596,14 @@ export type ImportExternalServiceRequest = {
     version?: string | null;
 };
 
+export type ImportLocalCredentialResponse = {
+    auth_type: string;
+    provider_id: string;
+    saved: boolean;
+    source: string;
+    workspace_ready: boolean;
+};
+
 export type ImportOutcomeResponse = {
     errors: Array<ImportRowErrorResponse>;
     inserted: number;
@@ -11698,6 +11697,19 @@ export type LiveVisitorsListResponse = {
     window_minutes: number;
 };
 
+/**
+ * Metadata about a credential that Temps can import from the server process
+ * user's existing CLI login. This never includes a path or credential value.
+ */
+export type LocalCredentialDto = {
+    auth_type: string;
+    label: string;
+    /**
+     * Stable machine-readable source: `environment` or `host_auth_store`.
+     */
+    source: string;
+};
+
 export type LocationCount = {
     count: number;
     location: string;
@@ -12320,6 +12332,14 @@ export type ModelCapability = {
      */
     tool_thinking_modes?: Array<SelectOption> | null;
 };
+
+/**
+ * Provenance of a provider model inventory. Only live and unexpired cached
+ * inventories are authoritative enough to reject a saved model. Bootstrap
+ * and stale inventories remain useful for selectors, but must not block a
+ * turn because account entitlements may legitimately differ.
+ */
+export type ModelCatalogSource = 'live' | 'cache' | 'stale_cache' | 'bootstrap';
 
 export type ModelInfo = {
     id: string;
@@ -14623,11 +14643,13 @@ export type PreviewGatewayLogsResponse = {
 /**
  * Workspace preview gateway settings.
  *
- * The preview gateway is a single shared Docker container that lives on the
- * `temps-sandbox-net` network and routes requests to workspace sandbox dev
- * servers based on the `Host` header (`ws-<sid>-<port>.<preview_domain>`).
- * `temps serve` reconciles this container on startup; these settings let an
- * operator override the image, host port, and auto-upgrade behavior.
+ * The preview gateway uses a private routing container plus a hardened ingress
+ * relay bound to host loopback. The router joins each sandbox's isolated
+ * network and routes requests to workspace dev servers based on the `Host`
+ * header (`ws-<sid>-<port>.<preview_domain>`), while the relay never joins a
+ * tenant network. `temps serve` reconciles both containers on startup; these
+ * settings let an operator override the router image, host port, and
+ * auto-upgrade behavior.
  */
 export type PreviewGatewaySettings = {
     /**
@@ -15043,14 +15065,6 @@ export type ProjectResponse = {
      * Opt-in to AI summarization of API traffic analytics (NULL/false = off).
      */
     ai_api_traffic_summary_enabled?: boolean | null;
-    /**
-     * Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
-     */
-    ai_debug_chat_enabled?: boolean | null;
-    /**
-     * Opt-in to AI propose-then-confirm write capability (false = off).
-     */
-    ai_write_actions_enabled: boolean;
     /**
      * Whether this project also accepts deployments from a source other than
      * `source_type` — chiefly, whether a Git-backed project will take an
@@ -15578,6 +15592,7 @@ export type ProviderCatalogDto = {
     host_version?: string | null;
     id: string;
     install_command: string;
+    local_credential?: null | LocalCredentialDto;
     /**
      * Default max turns for the autofixer analysis phase. `None` = built-in
      * default (10). Only enforced for CLIs with a turn flag (Claude Code).
@@ -15594,9 +15609,9 @@ export type ProviderCatalogDto = {
      */
     max_turns_fix?: number | null;
     /**
-     * `live`, `cache`, `stale_cache`, or `bootstrap`.
+     * Whether the catalog is live, cached, stale, or a bootstrap fallback.
      */
-    model_source: string;
+    model_source: ModelCatalogSource;
     /**
      * Model ids this provider accepts, in display order. The first entry is
      * the recommended default. Empty when the provider doesn't expose model
@@ -16331,6 +16346,14 @@ export type ReferrersAnalyticsQuery = {
     environment_id?: number | null;
     project_id: number;
     start_date: string;
+};
+
+export type RefreshProviderModelsResponse = {
+    default_runtime_model_id?: string | null;
+    model_source: ModelCatalogSource;
+    models_refreshed_at?: string | null;
+    provider_id: string;
+    runtime_models: Array<ModelCapability>;
 };
 
 export type RegenerateDsnRequest = {
@@ -17486,6 +17509,16 @@ export type SandboxRoute = {
     port: number;
     subdomain: string;
     url: string;
+};
+
+/**
+ * Live project runtime variables issued to a sandbox. Values are deliberately
+ * absent from Debug output and must not be cached or persisted by Temps.
+ */
+export type SandboxRuntimeEnvironmentResponse = {
+    variables: {
+        [key: string]: string;
+    };
 };
 
 export type SandboxStatusResponse = {
@@ -19526,9 +19559,17 @@ export type SourceBackupIndexResponse = {
  */
 export type SourceBody = {
     depth?: number | null;
+    /**
+     * Optional path relative to the sandbox work directory.
+     */
+    destination?: string | null;
     git_connection_id?: number | null;
     password?: string | null;
     revision?: string | null;
+    /**
+     * Remove `<destination>/.git` after cloning. Requires destination.
+     */
+    strip_git_metadata?: boolean;
     type: 'git';
     url: string;
     username?: string | null;
@@ -20622,7 +20663,7 @@ export type TestProviderKeyRequest = {
      */
     base_url?: string | null;
     /**
-     * Provider ID: "openai", "anthropic", "xai", "gemini"
+     * Provider ID: "openai", "anthropic", "xai", "gemini", "openrouter"
      */
     provider: string;
 };
@@ -22331,14 +22372,6 @@ export type UpdateProjectSettingsRequest = {
      */
     ai_api_traffic_summary_enabled?: boolean | null;
     /**
-     * Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).
-     */
-    ai_debug_chat_enabled?: boolean | null;
-    /**
-     * Opt in to AI propose-then-confirm write capability.
-     */
-    ai_write_actions_enabled?: boolean | null;
-    /**
      * Enable/disable attack mode (CAPTCHA protection) for all project environments
      */
     attack_mode?: boolean | null;
@@ -22465,25 +22498,6 @@ export type UpdateProviderKeyRequest = {
 
 export type UpdateProviderModelRequest = {
     is_enabled: boolean;
-};
-
-/**
- * Request body for `PUT /api/ai/provider-preference`.
- */
-export type UpdateProviderPreferenceRequest = {
-    /**
-     * Required when `provider_type` is `"agent_cli"`.
-     */
-    agent_cli_provider_id?: string | null;
-    /**
-     * Deprecated compatibility field. Adapter realtime behavior is derived
-     * from its capability contract and cannot be toggled independently.
-     */
-    interactive_bridge_enabled?: boolean | null;
-    /**
-     * `"gateway"` or `"agent_cli"`.
-     */
-    provider_type: string;
 };
 
 export type UpdateProviderRequest = {
@@ -25542,43 +25556,6 @@ export type GetPricingResponses = {
 
 export type GetPricingResponse = GetPricingResponses[keyof GetPricingResponses];
 
-export type UpdateAiProviderPreferenceData = {
-    body: UpdateProviderPreferenceRequest;
-    path?: never;
-    query?: never;
-    url: '/ai/provider-preference';
-};
-
-export type UpdateAiProviderPreferenceErrors = {
-    /**
-     * Validation error
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type UpdateAiProviderPreferenceError = UpdateAiProviderPreferenceErrors[keyof UpdateAiProviderPreferenceErrors];
-
-export type UpdateAiProviderPreferenceResponses = {
-    /**
-     * Updated provider preference and availability
-     */
-    200: AiProviderStatusResponse;
-};
-
-export type UpdateAiProviderPreferenceResponse = UpdateAiProviderPreferenceResponses[keyof UpdateAiProviderPreferenceResponses];
-
 export type GetAiProviderStatusData = {
     body?: never;
     path?: never;
@@ -25884,7 +25861,7 @@ export type RefreshProviderModelsResponses = {
     200: Array<ProviderModelResponse>;
 };
 
-export type RefreshProviderModelsResponse = RefreshProviderModelsResponses[keyof RefreshProviderModelsResponses];
+export type RefreshProviderModelsResponse2 = RefreshProviderModelsResponses[keyof RefreshProviderModelsResponses];
 
 export type DeleteProviderModelData = {
     body?: never;
@@ -33721,13 +33698,13 @@ export type ListServicesData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/external-services';
 };
@@ -33909,13 +33886,13 @@ export type ListProjectServicesData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/external-services/projects/{project_id}';
 };
@@ -35022,13 +34999,13 @@ export type ListServiceProjectsData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/external-services/{id}/projects';
 };
@@ -40389,13 +40366,13 @@ export type ListNotificationProvidersData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/notification-providers';
 };
@@ -40878,13 +40855,13 @@ export type ListNotificationRoutesData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/notification-routes';
 };
@@ -41047,13 +41024,13 @@ export type ListOrdersData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/orders';
 };
@@ -54144,13 +54121,13 @@ export type ListWebhooksData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (max 100)
          */
-        page_size?: number | null;
-        sort_by?: string | null;
-        sort_order?: string | null;
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
     };
     url: '/projects/{project_id}/webhooks';
 };
@@ -56509,12 +56486,6 @@ export type ListAiProvidersData = {
          * first paint; an authenticated refresh follows in the background.
          */
         catalog_only?: boolean;
-        /**
-         * Run account-aware model discovery before returning. Normal catalog
-         * reads intentionally use cached/bootstrap models so chat first paint is
-         * not held hostage by provider CLIs that can take 10-15 seconds.
-         */
-        refresh_models?: boolean;
     };
     url: '/settings/ai-providers';
 };
@@ -56618,6 +56589,80 @@ export type SaveAiProviderCredentialResponses = {
 };
 
 export type SaveAiProviderCredentialResponse = SaveAiProviderCredentialResponses[keyof SaveAiProviderCredentialResponses];
+
+export type ImportLocalAiProviderCredentialData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/credential/import-local';
+};
+
+export type ImportLocalAiProviderCredentialErrors = {
+    /**
+     * Unknown provider or invalid local credential
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * System administrator permission required
+     */
+    403: unknown;
+    /**
+     * No importable local credential found
+     */
+    404: unknown;
+};
+
+export type ImportLocalAiProviderCredentialResponses = {
+    200: ImportLocalCredentialResponse;
+};
+
+export type ImportLocalAiProviderCredentialResponse = ImportLocalAiProviderCredentialResponses[keyof ImportLocalAiProviderCredentialResponses];
+
+export type RefreshAiProviderModelsData = {
+    body?: never;
+    path: {
+        /**
+         * AI provider ID
+         */
+        provider_id: string;
+    };
+    query?: never;
+    url: '/settings/ai-providers/{provider_id}/models/refresh';
+};
+
+export type RefreshAiProviderModelsErrors = {
+    /**
+     * Unknown provider
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Provider execution permission required
+     */
+    403: unknown;
+    /**
+     * Provider model discovery unavailable
+     */
+    503: unknown;
+};
+
+export type RefreshAiProviderModelsResponses = {
+    200: RefreshProviderModelsResponse;
+};
+
+export type RefreshAiProviderModelsResponse = RefreshAiProviderModelsResponses[keyof RefreshAiProviderModelsResponses];
 
 export type RotateClusterCaData = {
     body: RotateClusterCaRequest;
@@ -59870,6 +59915,47 @@ export type ResumeSandboxResponses = {
 };
 
 export type ResumeSandboxResponse = ResumeSandboxResponses[keyof ResumeSandboxResponses];
+
+export type SandboxIssueRuntimeEnvironmentData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/runtime-environment';
+};
+
+export type SandboxIssueRuntimeEnvironmentErrors = {
+    /**
+     * Sandbox has no attached project
+     */
+    400: unknown;
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
+     * Sandbox or project environment not found
+     */
+    404: unknown;
+    /**
+     * Linked services expose ambiguous variables
+     */
+    409: unknown;
+    /**
+     * Runtime credential provider unavailable
+     */
+    503: unknown;
+};
+
+export type SandboxIssueRuntimeEnvironmentResponses = {
+    /**
+     * Runtime variables issued
+     */
+    200: SandboxRuntimeEnvironmentResponse;
+};
+
+export type SandboxIssueRuntimeEnvironmentResponse = SandboxIssueRuntimeEnvironmentResponses[keyof SandboxIssueRuntimeEnvironmentResponses];
 
 export type CreateSnapshotData = {
     body: CreateSnapshotBody;

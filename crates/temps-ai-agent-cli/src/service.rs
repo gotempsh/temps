@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -15,9 +15,10 @@ use futures::future::BoxFuture;
 use tokio::sync::Semaphore;
 
 use temps_agents::ai_cli::{
-    cached_model_capabilities, discover_model_capabilities_cached, extract_session_metadata,
-    get_status_cached, provider_capabilities_from_models, scrub_and_bound, scrub_secrets,
-    AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge, ProviderSessionMetadata,
+    cached_model_capabilities, cached_status, discover_model_capabilities_cached,
+    extract_session_metadata, get_status_cached, provider_capabilities_from_models,
+    scrub_and_bound, scrub_secrets, AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge,
+    ProviderSessionMetadata,
 };
 use temps_agents::error::AgentError;
 use temps_agents::sandbox::{SandboxCreateConfig, SandboxProvider};
@@ -62,6 +63,39 @@ fn build_bridge_router(path: &str, state: McpBridgeState) -> axum::Router {
 }
 
 const PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKSPACE_MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const WORKSPACE_MODEL_REFRESH_COOLDOWN: Duration = Duration::from_secs(15);
+const WORKSPACE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const WORKSPACE_MODEL_REFRESH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+#[derive(Clone)]
+struct WorkspaceModelSnapshot {
+    capabilities: temps_ai::ProviderCapabilities,
+    refreshed_at: chrono::DateTime<chrono::Utc>,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct WorkspaceModelState {
+    snapshot: Option<WorkspaceModelSnapshot>,
+    last_completed_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct HostModelRefreshState {
+    last_completed_at: Option<Instant>,
+}
+
+fn should_reuse_completed_refresh(
+    last_completed_at: Option<Instant>,
+    requested_at: Instant,
+    now: Instant,
+) -> bool {
+    last_completed_at.is_some_and(|completed| {
+        completed >= requested_at
+            || now.saturating_duration_since(completed) < WORKSPACE_MODEL_REFRESH_COOLDOWN
+    })
+}
 
 type NativeToolCalls = Arc<Mutex<HashMap<String, ToolCall>>>;
 
@@ -609,6 +643,11 @@ pub struct AgentCliAiService {
     /// Host-side provider relay. The sandbox receives only its short-lived
     /// capability; real provider credentials never cross the boundary.
     sandbox_model_relay: Option<Arc<SandboxModelRelayService>>,
+    /// Resolves and wakes the authenticated principal's durable global
+    /// workspace. Model discovery must use the same sandbox users see and use
+    /// for chat; a hidden disposable sandbox can consume quota while leaving
+    /// the real workspace unavailable.
+    sandbox_workspace_resolver: Option<SandboxWorkspaceResolverSlot>,
     /// Handles recovered by this runtime. Recovering a Docker sandbox also
     /// performs recursive ownership repair for legacy/root-owned workspaces;
     /// repeating that on every chat message can walk a large node_modules tree
@@ -622,6 +661,67 @@ pub struct AgentCliAiService {
     /// service's configurable turn deadline, so they must not inherit the
     /// short host-CLI completion timeout used for gateway-adjacent jobs.
     sandbox_timeout: Option<Duration>,
+    /// Account-aware model inventories discovered through the same saved
+    /// credential relay used by persistent workspace turns. Entries are keyed
+    /// by principal so a future principal-specific credential resolver cannot
+    /// accidentally reuse another principal's authoritative catalog. This
+    /// cache is intentionally separate from ambient host-CLI discovery.
+    workspace_models: Arc<tokio::sync::Mutex<HashMap<i32, WorkspaceModelState>>>,
+    /// Principal-scoped single-flight gates kept separate from
+    /// `workspace_models` so one slow workspace never blocks another user's
+    /// model refresh.
+    workspace_model_refreshes: Arc<tokio::sync::Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Credential replacement takes the write side; discoveries hold the read
+    /// side. This keeps invalidation a hard freshness boundary while allowing
+    /// different principals to refresh concurrently.
+    workspace_model_refresh_barrier: Arc<tokio::sync::RwLock<()>>,
+    /// Serializes explicit host-CLI model refreshes and applies the same
+    /// cooldown as workspace discovery. Status/model caches alone do not stop
+    /// queued force-refresh callers from spawning the CLI one after another.
+    host_model_refresh: Arc<tokio::sync::Mutex<HostModelRefreshState>>,
+}
+
+pub type SandboxWorkspaceResolver =
+    Arc<dyn Fn(i32) -> BoxFuture<'static, Result<ResolvedSandboxWorkspace, AiError>> + Send + Sync>;
+pub type SandboxWorkspaceStopper =
+    Arc<dyn Fn() -> BoxFuture<'static, Result<(), AiError>> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct ResolvedSandboxWorkspace {
+    pub workspace: temps_ai::HarnessWorkspace,
+    pub handle: temps_agents::sandbox::SandboxHandle,
+    pub stop: SandboxWorkspaceStopper,
+}
+
+/// Late-bound seam between the provider registry and AI chat's durable
+/// workspace services. The gateway constructs provider services before the
+/// chat plugin registers its workspace service, so every service holds this
+/// shared slot and the chat plugin fills it exactly once during registration.
+#[derive(Clone, Default)]
+pub struct SandboxWorkspaceResolverSlot {
+    resolver: Arc<OnceLock<SandboxWorkspaceResolver>>,
+}
+
+impl SandboxWorkspaceResolverSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, resolver: SandboxWorkspaceResolver) -> bool {
+        self.resolver.set(resolver).is_ok()
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.resolver.get().is_some()
+    }
+
+    async fn resolve(&self, principal_id: i32) -> Result<ResolvedSandboxWorkspace, AiError> {
+        let resolver = self.resolver.get().ok_or_else(|| AiError::Provider {
+            purpose: "provider.capabilities.workspace".to_string(),
+            reason: "the persistent global workspace service is not configured".to_string(),
+        })?;
+        resolver(principal_id).await
+    }
 }
 
 /// If a server-owned turn is aborted while Docker exec is still active, stop
@@ -637,6 +737,7 @@ struct StopSandboxOnDrop {
     sandbox_slot: Arc<Semaphore>,
     global_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     sandbox_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    managed_stop: Option<SandboxWorkspaceStopper>,
 }
 
 impl StopSandboxOnDrop {
@@ -654,17 +755,23 @@ impl StopSandboxOnDrop {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.sandbox_label);
-        match self.provider.stop(&self.handle).await {
-            Ok(()) => {}
-            Err(error) => {
-                self.sandbox_slot.close();
-                tracing::error!(
-                    sandbox_label = self.sandbox_label,
-                    sandbox_id = %self.handle.sandbox_id,
-                    %error,
-                    "failed to stop a timed-out application harness sandbox; quarantined it from future turns"
-                );
-            }
+        let stop_error = if let Some(stop) = &self.managed_stop {
+            stop().await.err().map(|error| error.to_string())
+        } else {
+            self.provider
+                .stop(&self.handle)
+                .await
+                .err()
+                .map(|error| error.to_string())
+        };
+        if let Some(error) = stop_error {
+            self.sandbox_slot.close();
+            tracing::error!(
+                sandbox_label = self.sandbox_label,
+                sandbox_id = %self.handle.sandbox_id,
+                %error,
+                "failed to stop a timed-out application harness sandbox; quarantined it from future turns"
+            );
         }
         self.armed = false;
         self.global_permit.take();
@@ -687,9 +794,19 @@ impl Drop for StopSandboxOnDrop {
         let sandbox_slot = self.sandbox_slot.clone();
         let global_permit = self.global_permit.take();
         let sandbox_permit = self.sandbox_permit.take();
+        let managed_stop = self.managed_stop.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Err(error) = provider.stop(&handle).await {
+                let stop_error = if let Some(stop) = managed_stop {
+                    stop().await.err().map(|error| error.to_string())
+                } else {
+                    provider
+                        .stop(&handle)
+                        .await
+                        .err()
+                        .map(|error| error.to_string())
+                };
+                if let Some(error) = stop_error {
                     sandbox_slot.close();
                     tracing::error!(
                         sandbox_label,
@@ -709,6 +826,21 @@ impl Drop for StopSandboxOnDrop {
             );
         }
     }
+}
+
+fn workspace_model_discovery_command() -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        concat!(
+            "printf '%s\\n' '",
+            "{\"request_id\":\"temps-models\",\"type\":\"control_request\",",
+            "\"request\":{\"subtype\":\"initialize\"}}",
+            "' | claude --print --output-format stream-json --verbose ",
+            "--input-format stream-json --tools '' --setting-sources="
+        )
+        .to_string(),
+    ]
 }
 
 impl AgentCliAiService {
@@ -743,9 +875,14 @@ impl AgentCliAiService {
             sandbox_workspace_root: None,
             sandbox_credentials: None,
             sandbox_model_relay: None,
+            sandbox_workspace_resolver: None,
             sandbox_handles: Arc::new(Mutex::new(HashMap::new())),
             sandbox_slots: Arc::new(Mutex::new(HashMap::new())),
             sandbox_timeout: None,
+            workspace_models: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            workspace_model_refreshes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            workspace_model_refresh_barrier: Arc::new(tokio::sync::RwLock::new(())),
+            host_model_refresh: Arc::new(tokio::sync::Mutex::new(HostModelRefreshState::default())),
         }
     }
 
@@ -758,11 +895,13 @@ impl AgentCliAiService {
         sandbox_workspace_root: PathBuf,
         sandbox_credentials: SandboxCredentialResolver,
         sandbox_model_relay: Arc<SandboxModelRelayService>,
+        sandbox_workspace_resolver: SandboxWorkspaceResolverSlot,
     ) -> Self {
         self.sandbox_provider = Some(sandbox_provider);
         self.sandbox_workspace_root = Some(sandbox_workspace_root);
         self.sandbox_credentials = Some(sandbox_credentials);
         self.sandbox_model_relay = Some(sandbox_model_relay);
+        self.sandbox_workspace_resolver = Some(sandbox_workspace_resolver);
         self.sandbox_timeout = Some(Duration::from_secs(15 * 60));
         self
     }
@@ -916,6 +1055,363 @@ impl AgentCliAiService {
         }?;
         self.cache_sandbox_handle(workspace.sandbox_label.clone(), handle.clone());
         Ok(handle)
+    }
+
+    fn workspace_capabilities_from_models(
+        &self,
+        models: Vec<temps_agents::ai_cli::AiCliModelCapability>,
+    ) -> Result<temps_ai::ProviderCapabilities, AiError> {
+        let mut capabilities = provider_capabilities_from_models(self.provider.name(), models)
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: format!(
+                    "provider '{}' has no registered capability contract",
+                    self.provider.name()
+                ),
+            })?;
+        capabilities.auth_source = temps_ai::ProviderAuthSource::ConfiguredKey;
+        Ok(capabilities)
+    }
+
+    fn bootstrap_workspace_capabilities(
+        &self,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        Ok(temps_ai::ProviderCapabilitiesSnapshot {
+            capabilities: self.workspace_capabilities_from_models(Vec::new())?,
+            model_source: temps_ai::ModelCatalogSource::Bootstrap,
+            models_refreshed_at: None,
+        })
+    }
+
+    async fn cached_workspace_capabilities(
+        &self,
+        principal_id: i32,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        let states = self.workspace_models.lock().await;
+        let Some(snapshot) = states
+            .get(&principal_id)
+            .and_then(|state| state.snapshot.as_ref())
+        else {
+            drop(states);
+            return self.bootstrap_workspace_capabilities();
+        };
+        Ok(Self::workspace_cached_snapshot(snapshot))
+    }
+
+    fn workspace_cached_snapshot(
+        snapshot: &WorkspaceModelSnapshot,
+    ) -> temps_ai::ProviderCapabilitiesSnapshot {
+        temps_ai::ProviderCapabilitiesSnapshot {
+            capabilities: snapshot.capabilities.clone(),
+            model_source: if snapshot.expires_at > Instant::now() {
+                temps_ai::ModelCatalogSource::Cache
+            } else {
+                temps_ai::ModelCatalogSource::StaleCache
+            },
+            models_refreshed_at: Some(snapshot.refreshed_at.to_rfc3339()),
+        }
+    }
+
+    async fn discover_workspace_capabilities(
+        &self,
+        principal_id: i32,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        if self.provider.name() != "claude_cli" {
+            return Err(AiError::Provider {
+                purpose: "provider.capabilities.workspace".to_string(),
+                reason: format!(
+                    "workspace model discovery is not implemented for '{}'",
+                    self.provider.name()
+                ),
+            });
+        }
+
+        // The principal gate provides a real single-flight without making an
+        // unrelated user's slow sandbox block this refresh. The read barrier
+        // prevents a credential replacement from racing the probe.
+        let requested_at = Instant::now();
+        let _credential_guard = self.workspace_model_refresh_barrier.read().await;
+        let refresh_slot = {
+            let mut refreshes = self.workspace_model_refreshes.lock().await;
+            refreshes
+                .entry(principal_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _refresh_guard = refresh_slot.lock().await;
+        let states = self.workspace_models.lock().await;
+        if let Some(state) = states.get(&principal_id) {
+            if should_reuse_completed_refresh(state.last_completed_at, requested_at, Instant::now())
+            {
+                if let Some(snapshot) = state.snapshot.as_ref() {
+                    return Ok(Self::workspace_cached_snapshot(snapshot));
+                }
+                return Err(AiError::Provider {
+                    purpose: "provider.capabilities.workspace".to_string(),
+                    reason: "workspace model discovery was attempted recently; wait a few seconds before retrying"
+                        .to_string(),
+                });
+            }
+        }
+        drop(states);
+
+        let result = tokio::time::timeout(
+            WORKSPACE_MODEL_REFRESH_TIMEOUT,
+            self.run_workspace_model_discovery(principal_id),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(AiError::Provider {
+                purpose: "provider.capabilities.workspace".to_string(),
+                reason: "starting the workspace and resolving models timed out".to_string(),
+            })
+        });
+        let mut states = self.workspace_models.lock().await;
+        let state = states.entry(principal_id).or_default();
+        state.last_completed_at = Some(Instant::now());
+        match result {
+            Ok(capabilities) => {
+                let refreshed_at = chrono::Utc::now();
+                state.snapshot = Some(WorkspaceModelSnapshot {
+                    capabilities: capabilities.clone(),
+                    refreshed_at,
+                    expires_at: Instant::now() + WORKSPACE_MODEL_CACHE_TTL,
+                });
+                Ok(temps_ai::ProviderCapabilitiesSnapshot {
+                    capabilities,
+                    model_source: temps_ai::ModelCatalogSource::Live,
+                    models_refreshed_at: Some(refreshed_at.to_rfc3339()),
+                })
+            }
+            Err(error) => {
+                if let Some(snapshot) = state.snapshot.as_ref() {
+                    Ok(temps_ai::ProviderCapabilitiesSnapshot {
+                        capabilities: snapshot.capabilities.clone(),
+                        model_source: temps_ai::ModelCatalogSource::StaleCache,
+                        models_refreshed_at: Some(snapshot.refreshed_at.to_rfc3339()),
+                    })
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn run_workspace_model_discovery(
+        &self,
+        principal_id: i32,
+    ) -> Result<temps_ai::ProviderCapabilities, AiError> {
+        let sandbox_provider = self
+            .sandbox_provider
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities.workspace".to_string(),
+                reason: "Temps sandbox execution is not configured for workspace model discovery"
+                    .to_string(),
+            })?;
+        let resolved = self
+            .sandbox_workspace_resolver
+            .as_ref()
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities.workspace".to_string(),
+                reason: "the persistent global workspace resolver is not configured".to_string(),
+            })?
+            .resolve(principal_id)
+            .await?;
+        let workspace = resolved.workspace;
+        self.validate_sandbox_workspace(&workspace)?;
+        let sandbox_slot = self.sandbox_slot(&workspace.sandbox_label);
+        let sandbox_permit = sandbox_slot
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AiError::Provider {
+                purpose: "provider.capabilities.workspace".to_string(),
+                reason: "the persistent global workspace is busy with another harness operation; retry after it finishes"
+                    .to_string(),
+            })?;
+        let handle = resolved.handle;
+        let managed_stop = resolved.stop;
+        self.cache_sandbox_handle(workspace.sandbox_label.clone(), handle.clone());
+
+        async {
+            let credentials = self
+                .sandbox_credentials
+                .as_ref()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.capabilities.workspace".to_string(),
+                    reason: "workspace credentials are not configured".to_string(),
+                })?(self.provider.name())
+            .await?;
+            let relay_service = self
+                .sandbox_model_relay
+                .as_ref()
+                .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.capabilities.workspace".to_string(),
+                    reason: "workspace model relay is not configured".to_string(),
+                })?;
+            let relay_base_url = sandbox_provider
+                .model_relay_base_url(&handle, &credentials.internal_api_url)
+                .await
+                .map_err(|error| map_agent_error("provider.capabilities.workspace", error))?;
+            let (relay, _relay_guard) = relay_service.register(
+                self.provider.name(),
+                principal_id,
+                None,
+                credentials,
+                &relay_base_url,
+                WORKSPACE_MODEL_DISCOVERY_TIMEOUT + Duration::from_secs(5),
+            )?;
+            let mut environment = HashMap::new();
+            configure_sandbox_model_relay(self.provider.name(), &mut environment, &relay)?;
+            let command = workspace_model_discovery_command();
+            let mut stop_on_drop = StopSandboxOnDrop {
+                armed: true,
+                provider: sandbox_provider.clone(),
+                handle: handle.clone(),
+                handles: self.sandbox_handles.clone(),
+                sandbox_label: workspace.sandbox_label.clone(),
+                sandbox_slot,
+                global_permit: None,
+                sandbox_permit: Some(sandbox_permit),
+                managed_stop: Some(managed_stop),
+            };
+            let execution = match tokio::time::timeout(
+                WORKSPACE_MODEL_DISCOVERY_TIMEOUT,
+                sandbox_provider.exec(&handle, command, environment, None),
+            )
+            .await
+            {
+                Ok(Ok(execution)) => {
+                    stop_on_drop.disarm();
+                    execution
+                }
+                Ok(Err(error)) => {
+                    let error = map_agent_error("provider.capabilities.workspace", error);
+                    stop_on_drop.stop_now().await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    stop_on_drop.stop_now().await;
+                    return Err(AiError::Provider {
+                        purpose: "provider.capabilities.workspace".to_string(),
+                        reason: "workspace model discovery timed out".to_string(),
+                    });
+                }
+            };
+            if execution.exit_code != 0 {
+                return Err(AiError::Provider {
+                    purpose: "provider.capabilities.workspace".to_string(),
+                    reason: format!(
+                        "the {} CLI could not report models (exit code {})",
+                        self.provider.name(),
+                        execution.exit_code
+                    ),
+                });
+            }
+            let models = temps_agents::ai_cli::claude::parse_model_capabilities_from_initialize_output(
+                &execution.stdout,
+            );
+            if models.is_empty() {
+                return Err(AiError::Provider {
+                    purpose: "provider.capabilities.workspace".to_string(),
+                    reason: "Claude Code returned no selectable models for the saved workspace credential"
+                        .to_string(),
+                });
+            }
+            self.workspace_capabilities_from_models(models)
+        }
+        .await
+    }
+
+    async fn cached_host_capabilities_snapshot(
+        &self,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        self.host_capabilities_snapshot_inner(false).await
+    }
+
+    async fn host_capabilities_snapshot(
+        &self,
+        refresh: temps_ai::RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        if refresh == temps_ai::RefreshPolicy::Cached {
+            return self.cached_host_capabilities_snapshot().await;
+        }
+
+        // Keep the guard for the complete status + model probe. A caller that
+        // queued behind a live refresh sees the populated cache instead of
+        // launching the provider CLI again.
+        let requested_at = Instant::now();
+        let mut refresh_state = self.host_model_refresh.lock().await;
+        if should_reuse_completed_refresh(
+            refresh_state.last_completed_at,
+            requested_at,
+            Instant::now(),
+        ) {
+            return self.cached_host_capabilities_snapshot().await;
+        }
+        let result = self.host_capabilities_snapshot_inner(true).await;
+        refresh_state.last_completed_at = Some(Instant::now());
+        result
+    }
+
+    async fn host_capabilities_snapshot_inner(
+        &self,
+        refresh_live: bool,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        let status = if refresh_live {
+            get_status_cached(self.provider.as_ref(), true, PROVIDER_STATUS_TIMEOUT).await
+        } else {
+            cached_status(self.provider.name()).await
+        };
+        let Some(status) = status else {
+            return Ok(temps_ai::ProviderCapabilitiesSnapshot {
+                capabilities: provider_capabilities_from_models(self.provider.name(), Vec::new())
+                    .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: format!(
+                        "provider '{}' has no registered capability contract",
+                        self.provider.name()
+                    ),
+                })?,
+                model_source: temps_ai::ModelCatalogSource::Bootstrap,
+                models_refreshed_at: None,
+            });
+        };
+        if !status.installed || !status.authenticated {
+            return Err(AiError::NotAvailable);
+        }
+        let identity = format!(
+            "{}|{}|{}|{}",
+            status.version.as_deref().unwrap_or("unknown"),
+            status.auth_method.as_deref().unwrap_or("unknown"),
+            status.email.as_deref().unwrap_or("unknown"),
+            status.subscription_type.as_deref().unwrap_or("unknown")
+        );
+        let snapshot = if refresh_live {
+            Some(discover_model_capabilities_cached(self.provider.as_ref(), identity, true).await)
+        } else {
+            cached_model_capabilities(self.provider.name(), &identity).await
+        };
+        let (models, model_source, refreshed_at) = match snapshot {
+            Some(snapshot) if !snapshot.models.is_empty() => (
+                snapshot.models,
+                snapshot.source,
+                Some(snapshot.refreshed_at.to_rfc3339()),
+            ),
+            _ => (Vec::new(), temps_ai::ModelCatalogSource::Bootstrap, None),
+        };
+        Ok(temps_ai::ProviderCapabilitiesSnapshot {
+            capabilities: provider_capabilities_from_models(self.provider.name(), models)
+                .ok_or_else(|| AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: format!(
+                        "provider '{}' has no registered capability contract",
+                        self.provider.name()
+                    ),
+                })?,
+            model_source,
+            models_refreshed_at: refreshed_at,
+        })
     }
 
     async fn sandbox_chat_stream_turn(
@@ -1192,6 +1688,7 @@ impl AgentCliAiService {
                 sandbox_slot,
                 global_permit: Some(permit),
                 sandbox_permit: Some(sandbox_permit),
+                managed_stop: None,
             };
             tracing::info!(
             component = "ai_turn_timing",
@@ -1780,55 +2277,54 @@ impl AiService for AgentCliAiService {
         _provider: Option<&str>,
         refresh: temps_ai::RefreshPolicy,
     ) -> Result<temps_ai::ProviderCapabilities, AiError> {
-        let refresh_live = refresh == temps_ai::RefreshPolicy::Refresh;
-        let status = get_status_cached(
-            self.provider.as_ref(),
-            refresh_live,
-            PROVIDER_STATUS_TIMEOUT,
-        )
-        .await;
-        let host_ready = status
-            .as_ref()
-            .is_some_and(|status| status.installed && status.authenticated);
-        if !host_ready
-            && (self.provider.name() != "claude_cli"
-                || self.sandbox_provider.is_none()
-                || self.sandbox_credentials.is_none()
-                || self.sandbox_model_relay.is_none())
-        {
-            return Err(AiError::NotAvailable);
-        }
-        let identity = status
-            .as_ref()
-            .map(|status| {
-                format!(
-                    "{}|{}|{}|{}",
-                    status.version.as_deref().unwrap_or("unknown"),
-                    status.auth_method.as_deref().unwrap_or("unknown"),
-                    status.email.as_deref().unwrap_or("unknown"),
-                    status.subscription_type.as_deref().unwrap_or("unknown")
-                )
-            })
-            .unwrap_or_else(|| "unknown|unknown|unknown|unknown".to_string());
-        let models = if refresh_live {
-            discover_model_capabilities_cached(self.provider.as_ref(), identity, true)
-                .await
-                .models
-        } else {
-            cached_model_capabilities(self.provider.name(), &identity)
-                .await
-                .map(|snapshot| snapshot.models)
-                .unwrap_or_default()
-        };
-        provider_capabilities_from_models(self.provider.name(), models).ok_or_else(|| {
-            AiError::Provider {
-                purpose: "provider.capabilities".to_string(),
-                reason: format!(
-                    "provider '{}' has no registered capability contract",
-                    self.provider.name()
-                ),
+        self.host_capabilities_snapshot(refresh)
+            .await
+            .map(|snapshot| snapshot.capabilities)
+    }
+
+    async fn capabilities_snapshot_for(
+        &self,
+        _provider: Option<&str>,
+        refresh: temps_ai::RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        self.host_capabilities_snapshot(refresh).await
+    }
+
+    async fn capabilities_snapshot_for_principal(
+        &self,
+        _provider: Option<&str>,
+        principal_id: i32,
+        refresh: temps_ai::RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        if self.provider.name() == "claude_cli" {
+            if refresh == temps_ai::RefreshPolicy::Cached {
+                return self.cached_workspace_capabilities(principal_id).await;
             }
-        })
+            if self.sandbox_provider.is_none()
+                || self.sandbox_credentials.is_none()
+                || self.sandbox_model_relay.is_none()
+                || self
+                    .sandbox_workspace_resolver
+                    .as_ref()
+                    .is_none_or(|resolver| !resolver.is_configured())
+            {
+                return Err(AiError::Provider {
+                    purpose: "provider.capabilities.workspace".to_string(),
+                    reason: "secure workspace model discovery is unavailable because the persistent sandbox workspace is not configured"
+                        .to_string(),
+                });
+            }
+            return self.discover_workspace_capabilities(principal_id).await;
+        }
+        self.host_capabilities_snapshot(refresh).await
+    }
+
+    async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {
+        // Credential replacement is a hard freshness boundary. Wait for an
+        // old-credential discovery already in flight, then clear anything it
+        // published before allowing the save request to return.
+        let _refresh_guard = self.workspace_model_refresh_barrier.write().await;
+        self.workspace_models.lock().await.clear();
     }
 
     /// CLI chat exposes scoped tools through a per-turn loopback MCP bridge.
@@ -2265,6 +2761,359 @@ mod tests {
     use temps_ai::streaming::ChatTool;
     use temps_ai::AiRequest;
 
+    #[test]
+    fn workspace_model_discovery_matches_the_runtime_metadata_probe() {
+        let command = workspace_model_discovery_command();
+        let script = command.get(2).expect("shell discovery script");
+
+        assert!(script.contains("claude --print"));
+        assert!(script.contains("--tools ''"));
+        assert!(script.contains("--setting-sources="));
+        assert!(script.contains("\"subtype\":\"initialize\""));
+    }
+
+    #[tokio::test]
+    async fn workspace_resolver_is_late_bound_and_principal_scoped() {
+        let slot = SandboxWorkspaceResolverSlot::new();
+        assert!(!slot.is_configured());
+        let resolved_principal = Arc::new(AtomicUsize::new(0));
+        let observed_principal = resolved_principal.clone();
+        assert!(slot.set(Arc::new(move |principal_id| {
+            let observed_principal = observed_principal.clone();
+            Box::pin(async move {
+                observed_principal.store(principal_id as usize, Ordering::SeqCst);
+                Ok(ResolvedSandboxWorkspace {
+                    workspace: temps_ai::HarnessWorkspace {
+                        sandbox_label: format!("workspace-{principal_id}"),
+                        host_work_dir: PathBuf::from(format!(
+                            "/managed/global-user-{principal_id}"
+                        )),
+                    },
+                    handle: temps_agents::sandbox::SandboxHandle {
+                        sandbox_id: format!("sandbox-{principal_id}"),
+                        sandbox_name: format!("workspace-{principal_id}"),
+                        work_dir: PathBuf::from("/home/temps/workspace"),
+                        backend: temps_agents::sandbox::SandboxBackend::Docker,
+                        image: "test-image".to_string(),
+                    },
+                    stop: Arc::new(|| Box::pin(async { Ok(()) })),
+                })
+            })
+        })));
+
+        let resolved = slot.resolve(42).await.expect("persistent workspace");
+
+        assert_eq!(resolved_principal.load(Ordering::SeqCst), 42);
+        assert_eq!(resolved.workspace.sandbox_label, "workspace-42");
+        assert_eq!(
+            resolved.workspace.host_work_dir,
+            PathBuf::from("/managed/global-user-42")
+        );
+        assert!(!slot.set(Arc::new(|_| Box::pin(async { Err(AiError::NotAvailable) }))));
+    }
+
+    fn test_sandbox_handle() -> temps_agents::sandbox::SandboxHandle {
+        temps_agents::sandbox::SandboxHandle {
+            sandbox_id: "sandbox-model-discovery".to_string(),
+            sandbox_name: "workspace-model-discovery".to_string(),
+            work_dir: PathBuf::from("/tmp/workspace-model-discovery"),
+            backend: temps_agents::sandbox::SandboxBackend::Local,
+            image: "test-image".to_string(),
+        }
+    }
+
+    struct RecordingModelDiscoverySandbox {
+        exec_calls: Arc<AtomicUsize>,
+        lifecycle_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxProvider for RecordingModelDiscoverySandbox {
+        async fn create(
+            &self,
+            _config: SandboxCreateConfig,
+        ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
+            self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: "unexpected-create".to_string(),
+                reason: "model discovery must adopt the managed handle".to_string(),
+            })
+        }
+
+        async fn exec(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            command: Vec<String>,
+            environment: HashMap<String, String>,
+            _on_output: Option<OnEventCallback>,
+        ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
+            self.exec_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(command.first().map(String::as_str), Some("sh"));
+            assert!(environment.contains_key("ANTHROPIC_BASE_URL"));
+            assert!(environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
+            let response = serde_json::json!({
+                "type": "control_response",
+                "response": {
+                    "request_id": "temps-models",
+                    "response": {
+                        "models": [{
+                            "value": "sonnet",
+                            "resolvedModel": "claude-sonnet-current",
+                            "displayName": "Sonnet",
+                            "description": "Account-aware Sonnet",
+                            "supportedEffortLevels": ["low", "medium", "high"]
+                        }]
+                    }
+                }
+            });
+            Ok(temps_agents::sandbox::SandboxExecResult {
+                exit_code: 0,
+                stdout: format!("{response}\n"),
+                stderr: String::new(),
+            })
+        }
+
+        async fn is_alive(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+        ) -> Result<bool, AgentError> {
+            Ok(true)
+        }
+
+        async fn write_file(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _path: &str,
+            _contents: &[u8],
+            _mode: u32,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn read_file(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _path: &str,
+        ) -> Result<Vec<u8>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        async fn write_directory(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _local_dir: &Path,
+            _target_path: &str,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn kill_processes(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _pattern: &str,
+            _signal: temps_agents::sandbox::KillSignal,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn destroy(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _purge_volumes: bool,
+        ) -> Result<(), AgentError> {
+            self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stop(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+        ) -> Result<(), AgentError> {
+            self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn start(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+        ) -> Result<(), AgentError> {
+            self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn recover(
+            &self,
+            _run_id: i32,
+        ) -> Result<Option<temps_agents::sandbox::SandboxHandle>, AgentError> {
+            self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        fn name(&self) -> &str {
+            "recording-model-discovery"
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn image_status(&self) -> Result<(bool, String), AgentError> {
+            Ok((true, "test-image".to_string()))
+        }
+
+        async fn rebuild_image(&self) -> Result<String, AgentError> {
+            self.lifecycle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("test-image".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_workspace_discovery_adopts_the_live_handle_without_restarting_it() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let workspace_root = scratch.path().join("ai-applications");
+        let workspace_path = workspace_root.join("global-user-42");
+        std::fs::create_dir_all(&workspace_path).expect("managed workspace path");
+        let handle = test_sandbox_handle();
+        let resolver = SandboxWorkspaceResolverSlot::new();
+        let resolver_handle = handle.clone();
+        assert!(resolver.set(Arc::new(move |principal_id| {
+            let handle = resolver_handle.clone();
+            let workspace_path = workspace_path.clone();
+            Box::pin(async move {
+                assert_eq!(principal_id, 42);
+                Ok(ResolvedSandboxWorkspace {
+                    workspace: temps_ai::HarnessWorkspace {
+                        sandbox_label: handle.sandbox_name.clone(),
+                        host_work_dir: workspace_path,
+                    },
+                    handle,
+                    stop: Arc::new(|| Box::pin(async { Ok(()) })),
+                })
+            })
+        })));
+        let exec_calls = Arc::new(AtomicUsize::new(0));
+        let lifecycle_calls = Arc::new(AtomicUsize::new(0));
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(RecordingModelDiscoverySandbox {
+            exec_calls: exec_calls.clone(),
+            lifecycle_calls: lifecycle_calls.clone(),
+        });
+        let credentials: SandboxCredentialResolver = Arc::new(|provider_id| {
+            assert_eq!(provider_id, "claude_cli");
+            Box::pin(async {
+                Ok(SandboxHarnessCredentials::claude_oauth_token(
+                    "test-oauth-token",
+                    "http://model-relay.internal",
+                ))
+            })
+        });
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().join("cli-scratch"),
+            Duration::from_secs(30),
+            1,
+        )
+        .with_temps_sandbox(
+            sandbox,
+            workspace_root,
+            credentials,
+            Arc::new(SandboxModelRelayService::new().expect("model relay")),
+            resolver,
+        );
+
+        let snapshot = service
+            .discover_workspace_capabilities(42)
+            .await
+            .expect("account-aware workspace models");
+
+        assert_eq!(snapshot.model_source, temps_ai::ModelCatalogSource::Live);
+        assert_eq!(snapshot.capabilities.models[0].id, "sonnet");
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lifecycle_calls.load(Ordering::SeqCst),
+            0,
+            "successful discovery must not create, recover, restart, stop, or destroy managed compute"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_workspace_discovery_uses_the_managed_lifecycle_stopper() {
+        let managed_stop_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = managed_stop_calls.clone();
+        let managed_stop: SandboxWorkspaceStopper = Arc::new(move || {
+            let observed_calls = observed_calls.clone();
+            Box::pin(async move {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let handle = test_sandbox_handle();
+        let handles = Arc::new(Mutex::new(HashMap::from([(
+            handle.sandbox_name.clone(),
+            handle.clone(),
+        )])));
+        let guard = StopSandboxOnDrop {
+            armed: true,
+            provider: Arc::new(temps_agents::sandbox::local::LocalSandboxProvider::new()),
+            handle,
+            handles: handles.clone(),
+            sandbox_label: "workspace-model-discovery".to_string(),
+            sandbox_slot: Arc::new(Semaphore::new(1)),
+            global_permit: None,
+            sandbox_permit: None,
+            managed_stop: Some(managed_stop),
+        };
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while managed_stop_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("managed cancellation cleanup");
+
+        assert_eq!(managed_stop_calls.load(Ordering::SeqCst), 1);
+        assert!(handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_workspace_discovery_does_not_stop_the_workspace() {
+        let managed_stop_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = managed_stop_calls.clone();
+        let managed_stop: SandboxWorkspaceStopper = Arc::new(move || {
+            let observed_calls = observed_calls.clone();
+            Box::pin(async move {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let handle = test_sandbox_handle();
+        let mut guard = StopSandboxOnDrop {
+            armed: true,
+            provider: Arc::new(temps_agents::sandbox::local::LocalSandboxProvider::new()),
+            handle,
+            handles: Arc::new(Mutex::new(HashMap::new())),
+            sandbox_label: "workspace-model-discovery".to_string(),
+            sandbox_slot: Arc::new(Semaphore::new(1)),
+            global_permit: None,
+            sandbox_permit: None,
+            managed_stop: Some(managed_stop),
+        };
+
+        guard.disarm();
+        drop(guard);
+        tokio::task::yield_now().await;
+
+        assert_eq!(managed_stop_calls.load(Ordering::SeqCst), 0);
+    }
+
     // -----------------------------------------------------------------------
     // Mock provider helpers
     // -----------------------------------------------------------------------
@@ -2422,6 +3271,45 @@ mod tests {
         output: String,
         model: Option<String>,
         called: Arc<AtomicBool>,
+    }
+
+    struct CountingClaudeProvider {
+        status_calls: Arc<AtomicUsize>,
+        discovery_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AiCliProvider for CountingClaudeProvider {
+        fn name(&self) -> &str {
+            "claude_cli"
+        }
+
+        async fn check_installed(&self) -> bool {
+            true
+        }
+
+        async fn get_status(&self) -> AiCliStatus {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            available_status()
+        }
+
+        async fn discover_model_capabilities(
+            &self,
+        ) -> Vec<temps_agents::ai_cli::AiCliModelCapability> {
+            self.discovery_calls.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }
+
+        async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+            Ok(fixed_result("", None))
+        }
+
+        async fn continue_conversation(
+            &self,
+            config: AiRunConfig,
+        ) -> Result<AiRunResult, AgentError> {
+            self.run(config).await
+        }
     }
 
     #[async_trait]
@@ -2951,6 +3839,282 @@ mod tests {
             !service.is_available().await,
             "unauthenticated should not be available"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_capabilities_never_probe_the_cli_on_a_cold_cache() {
+        invalidate_status_cache().await;
+        temps_agents::ai_cli::invalidate_model_discovery_cache().await;
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let discovery_calls = Arc::new(AtomicUsize::new(0));
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: status_calls.clone(),
+                discovery_calls: discovery_calls.clone(),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+
+        let snapshot = service
+            .capabilities_snapshot_for_principal(
+                Some("claude_cli"),
+                7,
+                temps_ai::RefreshPolicy::Cached,
+            )
+            .await
+            .expect("bootstrap capabilities remain available");
+
+        assert_eq!(
+            snapshot.model_source,
+            temps_ai::ModelCatalogSource::Bootstrap
+        );
+        assert_eq!(status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(discovery_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_host_refreshes_share_one_cli_probe() {
+        invalidate_status_cache().await;
+        temps_agents::ai_cli::invalidate_model_discovery_cache().await;
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let discovery_calls = Arc::new(AtomicUsize::new(0));
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: status_calls.clone(),
+                discovery_calls: discovery_calls.clone(),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+
+        let (first, second) = tokio::join!(
+            service.host_capabilities_snapshot(temps_ai::RefreshPolicy::Refresh),
+            service.host_capabilities_snapshot(temps_ai::RefreshPolicy::Refresh),
+        );
+
+        first.expect("first refresh");
+        second.expect("second refresh reuses the populated cache");
+        assert_eq!(status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(discovery_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_cache_reads_do_not_wait_for_a_live_refresh() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let refresh_slot = Arc::new(tokio::sync::Mutex::new(()));
+        service
+            .workspace_model_refreshes
+            .lock()
+            .await
+            .insert(7, refresh_slot.clone());
+        let _refresh_in_flight = refresh_slot.lock().await;
+
+        let snapshot = tokio::time::timeout(
+            Duration::from_millis(100),
+            service.cached_workspace_capabilities(7),
+        )
+        .await
+        .expect("cache-only reads must not share the long-running refresh lock")
+        .expect("bootstrap snapshot");
+
+        assert_eq!(
+            snapshot.model_source,
+            temps_ai::ModelCatalogSource::Bootstrap
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_model_cache_never_crosses_principals() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let capabilities = provider_capabilities_from_models(
+            "claude_cli",
+            vec![temps_agents::ai_cli::AiCliModelCapability {
+                id: "principal-seven-model".to_string(),
+                name: "Principal seven model".to_string(),
+                reasoning_options: Vec::new(),
+                default_reasoning_option: None,
+            }],
+        )
+        .expect("Claude capability contract");
+        service.workspace_models.lock().await.insert(
+            7,
+            WorkspaceModelState {
+                snapshot: Some(WorkspaceModelSnapshot {
+                    capabilities,
+                    refreshed_at: chrono::Utc::now(),
+                    expires_at: Instant::now() + WORKSPACE_MODEL_CACHE_TTL,
+                }),
+                last_completed_at: Some(Instant::now()),
+            },
+        );
+
+        let owner = service
+            .cached_workspace_capabilities(7)
+            .await
+            .expect("owner cache");
+        let other = service
+            .cached_workspace_capabilities(8)
+            .await
+            .expect("other principal bootstrap");
+
+        assert_eq!(owner.model_source, temps_ai::ModelCatalogSource::Cache);
+        assert_eq!(owner.capabilities.models[0].id, "principal-seven-model");
+        assert_eq!(other.model_source, temps_ai::ModelCatalogSource::Bootstrap);
+        assert!(other.capabilities.models.is_empty());
+        assert!(other.capabilities.default_model_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_capabilities_never_fall_back_to_host_credentials() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+
+        let error = service
+            .capabilities_snapshot_for_principal(
+                Some("claude_cli"),
+                7,
+                temps_ai::RefreshPolicy::Refresh,
+            )
+            .await
+            .expect_err("workspace discovery must fail closed without a secure relay");
+
+        assert!(matches!(
+            error,
+            AiError::Provider { purpose, reason }
+                if purpose == "provider.capabilities.workspace"
+                    && reason.contains("persistent sandbox workspace is not configured")
+        ));
+    }
+
+    #[test]
+    fn queued_refresh_reuses_a_probe_completed_after_it_was_requested() {
+        let requested_at = Instant::now();
+        let completed_at = requested_at + WORKSPACE_MODEL_DISCOVERY_TIMEOUT;
+
+        assert!(should_reuse_completed_refresh(
+            Some(completed_at),
+            requested_at,
+            completed_at + Duration::from_secs(1),
+        ));
+    }
+
+    #[tokio::test]
+    async fn cooldown_never_promotes_an_expired_workspace_snapshot() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        );
+        let capabilities = provider_capabilities_from_models(
+            "claude_cli",
+            vec![temps_agents::ai_cli::AiCliModelCapability {
+                id: "account-model".to_string(),
+                name: "Account model".to_string(),
+                reasoning_options: Vec::new(),
+                default_reasoning_option: None,
+            }],
+        )
+        .expect("Claude capability contract");
+        {
+            let mut states = service.workspace_models.lock().await;
+            let state = states.entry(7).or_default();
+            state.snapshot = Some(WorkspaceModelSnapshot {
+                capabilities,
+                refreshed_at: chrono::Utc::now(),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            });
+            state.last_completed_at = Some(Instant::now());
+        }
+
+        let snapshot = service
+            .discover_workspace_capabilities(7)
+            .await
+            .expect("cooldown reuses the existing snapshot");
+
+        assert_eq!(
+            snapshot.model_source,
+            temps_ai::ModelCatalogSource::StaleCache,
+            "an expired inventory must remain non-authoritative during cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_invalidation_clears_an_in_flight_refresh_result() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let service = Arc::new(AgentCliAiService::new(
+            Arc::new(CountingClaudeProvider {
+                status_calls: Arc::new(AtomicUsize::new(0)),
+                discovery_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            scratch.path().to_owned(),
+            Duration::from_secs(30),
+            1,
+        ));
+        let refresh_guard = service.workspace_model_refresh_barrier.read().await;
+        let invalidation_service = Arc::clone(&service);
+        let invalidation = tokio::spawn(async move {
+            invalidation_service
+                .invalidate_capabilities_for(Some("claude_cli"))
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !invalidation.is_finished(),
+            "credential invalidation must wait for an old refresh to finish"
+        );
+
+        {
+            let mut states = service.workspace_models.lock().await;
+            let state = states.entry(7).or_default();
+            state.snapshot = Some(WorkspaceModelSnapshot {
+                capabilities: provider_capabilities_from_models("claude_cli", Vec::new())
+                    .expect("Claude capability contract"),
+                refreshed_at: chrono::Utc::now(),
+                expires_at: Instant::now() + WORKSPACE_MODEL_CACHE_TTL,
+            });
+            state.last_completed_at = Some(Instant::now());
+        }
+        drop(refresh_guard);
+        invalidation.await.expect("invalidation task");
+
+        let states = service.workspace_models.lock().await;
+        assert!(states.is_empty());
     }
 
     fn test_mcp_state() -> (

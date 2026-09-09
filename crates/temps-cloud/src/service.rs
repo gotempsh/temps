@@ -15,7 +15,7 @@ use temps_cloud_protocol::{
 use temps_config::{ConfigService, ConfigServiceError};
 use temps_core::EncryptionService;
 use thiserror::Error;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -154,6 +154,11 @@ pub struct CloudService {
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle_notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Lets [`Self::wake_backup_mirror`] pull the next sweep tick forward the
+    /// moment a local backup finishes, instead of it waiting behind whatever
+    /// backoff `backup_mirror::run` is currently sitting on. See the comment
+    /// on that `select!` arm for why this matters.
+    backup_mirror_wake: Arc<Notify>,
     allow_loopback_development: bool,
     configuration_issue: RwLock<Option<String>>,
     managed_backup_setup: RwLock<Option<ManagedBackupSetup>>,
@@ -180,6 +185,7 @@ impl CloudService {
             backup_credential_rotation_task: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
             lifecycle_notify_task: Mutex::new(None),
+            backup_mirror_wake: Arc::new(Notify::new()),
             allow_loopback_development,
             configuration_issue: RwLock::new(None),
             managed_backup_setup: RwLock::new(None),
@@ -242,12 +248,20 @@ impl CloudService {
             tracing::info!("Cloud service launching backup mirror task");
             let link = self.link.clone();
             let cancel = self.cancel.subscribe();
+            let wake = self.backup_mirror_wake.clone();
             *task = Some(tokio::spawn(async move {
-                crate::backup_mirror::run(link, db, encryption, cancel).await;
+                crate::backup_mirror::run(link, db, encryption, cancel, wake).await;
             }));
         } else {
             tracing::debug!("Cloud backup mirror task is already registered");
         }
+    }
+
+    /// Pull the backup mirror's next sweep tick forward immediately, rather
+    /// than leaving it to whatever backoff it currently sits on. Called by
+    /// [`crate::lifecycle_notify::run`] right after a local backup completes.
+    pub fn wake_backup_mirror(&self) {
+        self.backup_mirror_wake.notify_one();
     }
 
     /// Launch the background loop that keeps the Cloud-managed backup

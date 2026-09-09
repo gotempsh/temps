@@ -186,7 +186,7 @@ pub enum NativeToolEvent {
 pub struct AiCliModelSnapshot {
     pub models: Vec<AiCliModelCapability>,
     pub refreshed_at: chrono::DateTime<chrono::Utc>,
-    pub source: &'static str,
+    pub source: temps_ai::ModelCatalogSource,
 }
 
 #[derive(Clone)]
@@ -323,7 +323,7 @@ pub async fn discover_model_capabilities_cached(
             return AiCliModelSnapshot {
                 models: cached.models.clone(),
                 refreshed_at: cached.refreshed_at,
-                source: "cache",
+                source: temps_ai::ModelCatalogSource::Cache,
             };
         }
     }
@@ -334,13 +334,13 @@ pub async fn discover_model_capabilities_cached(
             return AiCliModelSnapshot {
                 models: cached.models,
                 refreshed_at: cached.refreshed_at,
-                source: "stale_cache",
+                source: temps_ai::ModelCatalogSource::StaleCache,
             };
         }
         return AiCliModelSnapshot {
             models: Vec::new(),
             refreshed_at: chrono::Utc::now(),
-            source: "unavailable",
+            source: temps_ai::ModelCatalogSource::Bootstrap,
         };
     }
 
@@ -357,7 +357,7 @@ pub async fn discover_model_capabilities_cached(
     AiCliModelSnapshot {
         models: discovered,
         refreshed_at,
-        source: "live",
+        source: temps_ai::ModelCatalogSource::Live,
     }
 }
 
@@ -377,9 +377,9 @@ pub async fn cached_model_capabilities(
         .cloned()
         .filter(|cached| cached.identity == identity)?;
     let source = if cached.expires_at > Instant::now() {
-        "cache"
+        temps_ai::ModelCatalogSource::Cache
     } else {
-        "stale_cache"
+        temps_ai::ModelCatalogSource::StaleCache
     };
     Some(AiCliModelSnapshot {
         models: cached.models,
@@ -861,7 +861,7 @@ mod tests {
         let snapshot = cached_model_capabilities(provider_id, identity)
             .await
             .expect("cached model snapshot");
-        assert_eq!(snapshot.source, "cache");
+        assert_eq!(snapshot.source, temps_ai::ModelCatalogSource::Cache);
         assert_eq!(snapshot.models[0].id, "model-1");
         assert_eq!(snapshot.refreshed_at, refreshed_at);
         assert!(cached_model_capabilities(provider_id, "different-user")
@@ -883,6 +883,15 @@ mod tests {
             .models
             .iter()
             .any(|model| model.id == "gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn empty_claude_discovery_does_not_invent_models() {
+        let capabilities = provider_capabilities_from_models("claude_cli", Vec::new())
+            .expect("Claude capability contract");
+
+        assert!(capabilities.models.is_empty());
+        assert!(capabilities.default_model_id.is_none());
     }
 
     #[test]

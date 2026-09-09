@@ -21,29 +21,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { usePageTitle } from '@/hooks/usePageTitle'
-
-interface CatalogEntry {
-  id: string
-  name: string
-  install_command: string
-  auth_command: string
-  credential_saved: boolean
-  current_auth_type: string | null
-  default_model: string | null
-  workspace_ready: boolean
-  workspace_readiness_hint: string | null
-}
-
-interface CatalogResponse {
-  default_provider: string
-  providers: CatalogEntry[]
-}
-
-async function fetchCatalog(): Promise<CatalogResponse> {
-  const r = await fetch('/api/settings/ai-providers')
-  if (!r.ok) throw new Error(`Failed to load AI provider catalog (${r.status})`)
-  return r.json()
-}
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 
 // One row per provider. Configured providers collapse to a single line of
 // status; unconfigured ones get a "Configure" CTA. Keeping this list dense
@@ -51,8 +29,7 @@ async function fetchCatalog(): Promise<CatalogResponse> {
 export function AgentSandboxProvidersList() {
   usePageTitle('AI Providers')
   const { data, isPending, isError } = useQuery({
-    queryKey: ['ai-provider-catalog'],
-    queryFn: fetchCatalog,
+    ...aiProviderCatalogQueryOptions,
     staleTime: 60 * 1000,
   })
 

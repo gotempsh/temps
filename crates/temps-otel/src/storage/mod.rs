@@ -17,6 +17,7 @@ pub mod cloud_metrics;
 pub mod cloud_routed;
 /// Reads mirrored spans back out of Temps Cloud through its read proxy.
 pub mod cloud_spans;
+pub mod global_traces;
 pub mod timescaledb;
 
 pub use cloud_metrics::{
@@ -109,6 +110,23 @@ pub(crate) fn truncate_sample_message(message: &str) -> String {
 /// ```
 #[async_trait]
 pub trait OtelStorage: Send + Sync {
+    /// One storage-wide ordered cursor; implementations must never fan out by project.
+    async fn global_trace_stream(
+        &self,
+        _query: global_traces::GlobalTraceQuery,
+    ) -> StorageResult<global_traces::GlobalTraceStream> {
+        Err(global_traces::invalid(
+            "Global trace reads are not supported by this storage backend",
+        ))
+    }
+    async fn global_trace_page(
+        &self,
+        mut query: global_traces::GlobalTraceQuery,
+    ) -> StorageResult<global_traces::GlobalTracePage> {
+        query.source_offset = query.filter.offset.unwrap_or(0);
+        let stream = self.global_trace_stream(query.clone()).await?;
+        global_traces::merge(vec![stream], &query).await
+    }
     // ── Write operations ────────────────────────────────────────────
 
     /// Batch-insert metric data points.

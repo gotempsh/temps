@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Link, useParams } from 'react-router'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
+  AlertTriangle,
   ArrowLeft,
   CheckCircle2,
+  Download,
   Loader2,
   Play,
+  RefreshCw,
   Save,
   XCircle,
 } from 'lucide-react'
@@ -33,52 +36,23 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-
-type CredentialFormat = 'api_key' | 'oauth_token' | 'config_file'
-
-interface AuthFlavorDto {
-  id: string
-  label: string
-  description: string
-  format: CredentialFormat
-  env_var: string | null
-}
-
-interface ProviderCatalogDto {
-  id: string
-  name: string
-  install_command: string
-  auth_command: string
-  auth_flavors: AuthFlavorDto[]
-  credential_saved: boolean
-  current_auth_type: string | null
-  models: string[]
-  default_model: string | null
-  max_turns_analysis: number | null
-  max_turns_fix: number | null
-  max_turns_feedback: number | null
-  supports_max_turns: boolean
-  workspace_ready: boolean
-  workspace_readiness_hint: string | null
-}
-
-interface ProviderCatalogResponse {
-  default_provider: string
-  providers: ProviderCatalogDto[]
-}
-
-async function fetchCatalog(): Promise<ProviderCatalogResponse> {
-  const r = await fetch('/api/settings/ai-providers')
-  if (!r.ok) throw new Error(`Failed to load AI provider catalog (${r.status})`)
-  return r.json()
-}
+import type { ProviderCatalogDto, ProviderCatalogResponse } from '@/api/client'
+import {
+  importLocalAiProviderCredentialMutation,
+  refreshAiProviderModelsMutation,
+} from '@/api/client/@tanstack/react-query.gen'
+import { problemDetail } from '@/lib/api-problem'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import {
+  isSavedProviderModelUnavailable,
+  mergeProviderModelRefresh,
+} from './provider-model-catalog'
 
 export function AgentSandboxProviderDetail() {
   const { id } = useParams<{ id: string }>()
   usePageTitle(id ? `Provider · ${id}` : 'AI Provider')
   const { data, isPending, isError } = useQuery({
-    queryKey: ['ai-provider-catalog'],
-    queryFn: fetchCatalog,
+    ...aiProviderCatalogQueryOptions,
     staleTime: 60 * 1000,
   })
 
@@ -147,7 +121,7 @@ interface ProviderEditorProps {
   isActive: boolean
 }
 
-function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
+export function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   const queryClient = useQueryClient()
   const defaultFlavor =
     provider.auth_flavors.find((f) => f.id === provider.current_auth_type) ??
@@ -174,6 +148,10 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       (initialModel !== '' && !provider.models.includes(initialModel))
   )
   const [savingModel, setSavingModel] = useState(false)
+  const refreshModelsMutation = useMutation(refreshAiProviderModelsMutation())
+  const importLocalCredentialMutation = useMutation(
+    importLocalAiProviderCredentialMutation()
+  )
 
   useEffect(() => {
     const fresh = provider.default_model ?? ''
@@ -194,6 +172,61 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   const selectedFlavor =
     provider.auth_flavors.find((f) => f.id === selectedFlavorId) ??
     defaultFlavor
+
+  const savedModelUnavailable = isSavedProviderModelUnavailable({
+    savedModel: serverModel,
+    availableModels: provider.models,
+    source: provider.model_source,
+  })
+
+  const handleRefreshModels = async () => {
+    try {
+      const refreshed = await refreshModelsMutation.mutateAsync({
+        path: { provider_id: provider.id },
+      })
+      queryClient.setQueryData<ProviderCatalogResponse>(
+        aiProviderCatalogQueryOptions.queryKey,
+        (catalog) =>
+          catalog ? mergeProviderModelRefresh(catalog, refreshed) : catalog
+      )
+      const freshModel = provider.default_model ?? ''
+      const refreshedModelIds = refreshed.runtime_models.map(
+        (model) => model.id
+      )
+      setCustomMode(
+        refreshedModelIds.length === 0 ||
+          (freshModel !== '' && !refreshedModelIds.includes(freshModel))
+      )
+      void queryClient.invalidateQueries({
+        queryKey: aiProviderCatalogQueryOptions.queryKey,
+      })
+
+      if (
+        refreshed.model_source === 'live' ||
+        refreshed.model_source === 'cache'
+      ) {
+        toast.success(`${provider.name} models refreshed`, {
+          description: `${refreshed.runtime_models.length} models reported by ${
+            provider.workspace_ready
+              ? 'the saved workspace credential'
+              : 'the authenticated host CLI'
+          }.`,
+        })
+      } else {
+        toast.warning(`Could not refresh ${provider.name} models`, {
+          description:
+            'Temps kept the last known model list because live discovery did not complete.',
+        })
+      }
+    } catch (cause) {
+      toast.error(`Could not refresh ${provider.name} models`, {
+        description: problemDetail(
+          cause,
+          'The provider did not return a model catalog. Check its credential and try again.'
+        ),
+      })
+    }
+  }
 
   const persistModel = async (next: string) => {
     if (next === serverModel) return
@@ -222,7 +255,9 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
           ? `${provider.name} will use its default model`
           : `${provider.name} model set to ${next}`
       )
-      await queryClient.invalidateQueries({ queryKey: ['ai-provider-catalog'] })
+      await queryClient.invalidateQueries({
+        queryKey: aiProviderCatalogQueryOptions.queryKey,
+      })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} model`, {
         description: e instanceof Error ? e.message : 'Network error',
@@ -264,7 +299,9 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       }
       toast.success(`${provider.name} is now the active provider`)
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['ai-provider-catalog'] }),
+        queryClient.invalidateQueries({
+          queryKey: aiProviderCatalogQueryOptions.queryKey,
+        }),
         queryClient.invalidateQueries({ queryKey: ['platform-settings'] }),
       ])
     } catch (e) {
@@ -337,13 +374,40 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       }
       toast.success(`${provider.name} credential encrypted and saved`)
       setCredential('')
-      await queryClient.invalidateQueries({ queryKey: ['ai-provider-catalog'] })
+      await queryClient.invalidateQueries({
+        queryKey: aiProviderCatalogQueryOptions.queryKey,
+      })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} credential`, {
         description: e instanceof Error ? e.message : 'Network error',
       })
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleImportLocalCredential = async () => {
+    try {
+      const imported = await importLocalCredentialMutation.mutateAsync({
+        path: { provider_id: provider.id },
+      })
+      setSelectedFlavorId(imported.auth_type)
+      setCredential('')
+      await queryClient.invalidateQueries({
+        queryKey: aiProviderCatalogQueryOptions.queryKey,
+      })
+      toast.success(`${provider.name} local login imported`, {
+        description: imported.workspace_ready
+          ? 'The credential is encrypted and this harness is ready for persistent workspaces.'
+          : 'The credential is encrypted and ready for supported host workflows.',
+      })
+    } catch (cause) {
+      toast.error(`Could not import ${provider.name} local login`, {
+        description: problemDetail(
+          cause,
+          'Authenticate the CLI as the operating-system user running Temps, then try again.'
+        ),
+      })
     }
   }
 
@@ -435,14 +499,49 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Credential</CardTitle>
-          <CardDescription>
-            Encrypted with AES-256-GCM at rest. Workspace-capable providers use
-            it only through a short-lived server relay; the reusable credential
-            is never injected into the sandbox.
-          </CardDescription>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <CardTitle className="text-base">Credential</CardTitle>
+              <CardDescription>
+                Encrypted with AES-256-GCM at rest. Workspace-capable providers
+                use it only through a short-lived server relay; the reusable
+                credential is never injected into the sandbox.
+              </CardDescription>
+            </div>
+            {provider.local_credential && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleImportLocalCredential()}
+                disabled={importLocalCredentialMutation.isPending}
+              >
+                {importLocalCredentialMutation.isPending ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                {importLocalCredentialMutation.isPending
+                  ? 'Importing…'
+                  : provider.credential_saved
+                    ? 'Replace with local login'
+                    : 'Use local login'}
+              </Button>
+            )}
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
+          {provider.local_credential && (
+            <div className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                Temps found an authenticated {provider.name} credential in{' '}
+                {provider.local_credential.label.toLowerCase()}. Importing it
+                copies the credential directly into encrypted settings without
+                exposing it to this browser.
+              </span>
+            </div>
+          )}
           {provider.auth_flavors.length > 1 && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {provider.auth_flavors.map((flavor) => (
@@ -564,24 +663,62 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
 
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <CardTitle className="text-base">Default model</CardTitle>
               <CardDescription>
-                {provider.id === 'opencode'
-                  ? 'OpenCode resolves models via ~/.config/opencode/config.json or per-session flags. Setting a value here exports it to OPENCODE_MODEL.'
-                  : 'Leave blank to let the CLI pick. Custom values are accepted — the catalog is just a convenience list.'}
+                {provider.workspace_ready
+                  ? 'Leave blank to let the CLI pick. Refresh checks which models the saved workspace credential can run inside a short-lived isolated sandbox.'
+                  : provider.id === 'opencode'
+                    ? 'OpenCode resolves models from its configured providers. Refresh asks the authenticated CLI on the Temps host for the current list.'
+                    : 'Leave blank to let the CLI pick. Refresh asks the authenticated CLI installed on the Temps host which models this account can run.'}
               </CardDescription>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {provider.models_refreshed_at
+                  ? `Last refreshed ${new Date(provider.models_refreshed_at).toLocaleString()} · ${provider.model_source.replace('_', ' ')}`
+                  : provider.workspace_ready
+                    ? 'Bootstrap catalog — not yet verified with the saved workspace credential.'
+                    : 'Bootstrap catalog — not yet verified against the authenticated host CLI.'}
+              </p>
             </div>
-            {savingModel && (
-              <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                <Loader2 className="h-3 w-3 animate-spin" />
-                Saving…
-              </span>
-            )}
+            <div className="flex items-center gap-2">
+              {savingModel && (
+                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Saving…
+                </span>
+              )}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleRefreshModels()}
+                disabled={refreshModelsMutation.isPending}
+              >
+                <RefreshCw
+                  className={`mr-1.5 h-3.5 w-3.5 ${refreshModelsMutation.isPending ? 'animate-spin' : ''}`}
+                />
+                {refreshModelsMutation.isPending
+                  ? 'Refreshing…'
+                  : 'Refresh models'}
+              </Button>
+            </div>
           </div>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-3">
+          {savedModelUnavailable && (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                The saved model <code>{serverModel}</code> was not reported by
+                the refreshed CLI. Choose an available model or use the provider
+                default before starting another turn.
+              </span>
+            </div>
+          )}
           {provider.models.length > 0 && !customMode ? (
             <Select
               value={modelDraft === '' ? '_default' : modelDraft}
@@ -716,7 +853,9 @@ function TurnLimitsCard({ provider }: { provider: ProviderCatalogDto }) {
         return
       }
       toast.success(`${provider.name} turn limits saved`)
-      await queryClient.invalidateQueries({ queryKey: ['ai-provider-catalog'] })
+      await queryClient.invalidateQueries({
+        queryKey: aiProviderCatalogQueryOptions.queryKey,
+      })
     } catch (e) {
       toast.error(`Failed to save ${provider.name} turn limits`, {
         description: e instanceof Error ? e.message : 'Network error',

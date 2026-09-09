@@ -686,11 +686,11 @@ impl DeployComposeJob {
         // are running unmanaged inside this compose stack — they won't get
         // Temps backup/restore, monitoring, or one-click upgrades the way a
         // Temps-managed external_services row would. Recommend the specific
-        // managed equivalent up front, and — for the subset that also runs
-        // with all Linux capabilities dropped by default (defense in depth)
-        // and isn't in `relaxed_capability_services` — warn about that too,
-        // rather than let the operator discover it only via a raw
-        // "Operation not permitted" crash-loop.
+        // managed equivalent up front. (Every sandboxed Compose service —
+        // database-shaped or not — is granted the minimal capability set
+        // its entrypoint needs by default now, so there's no longer a
+        // capability caveat to add here; see
+        // `ComposeExecutor::RELAXED_CAPABILITIES`.)
         for service in &compose_services {
             let Some(family) = service.detected_service_type else {
                 continue;
@@ -704,18 +704,13 @@ impl DeployComposeJob {
                 temps_entities::preset::ComposeServiceFamily::Redis => ("Redis", "redis"),
                 temps_entities::preset::ComposeServiceFamily::S3 => ("S3 / RustFS", "s3"),
             };
-            let needs_relaxed_capabilities = service.looks_like_database
-                && !self
-                    .relaxed_capability_services
-                    .iter()
-                    .any(|s| s == &service.name);
             if let Some(ref log_id) = self.log_id {
                 let image_suffix = service
                     .image
                     .as_deref()
                     .map(|image| format!(" ({image})"))
                     .unwrap_or_default();
-                let mut message = format!(
+                let message = format!(
                     "Service '{}'{} looks like a {} container running unmanaged in this \
                      compose stack — it won't have Temps backup/restore, monitoring, or \
                      one-click upgrades. Consider deploying it as a Temps-managed {} \
@@ -727,14 +722,6 @@ impl DeployComposeJob {
                     display_name,
                     type_param
                 );
-                if needs_relaxed_capabilities {
-                    message.push_str(&format!(
-                        " It also runs with all Linux capabilities dropped by default; if \
-                         it fails to start with \"Operation not permitted\" errors, enable \
-                         \"Elevated permissions\" for it in {}, then redeploy.",
-                        temps_deployer::compose::ELEVATED_PERMISSIONS_SETTINGS_PATH,
-                    ));
-                }
                 let _ = self.log_service.log_info(log_id, &message).await;
             }
         }
@@ -1130,6 +1117,11 @@ impl DeployComposeJob {
                     // Operation not permitted") — an operator with no support
                     // channel shouldn't have to reverse-engineer that this is
                     // Temps's own cap_drop: ALL sandbox, not a broken image.
+                    // Every sandboxed service is already granted
+                    // `ComposeExecutor::RELAXED_CAPABILITIES` by default, so a
+                    // denial matching this pattern means the image needs a
+                    // capability outside that default set, not just "a
+                    // well-known database image" — this can hit any image.
                     let lower = error_msg.to_lowercase();
                     let looks_like_capability_denial = lower.contains("operation not permitted")
                         && ["chown", "chmod", "setuid", "setgid"]
@@ -1140,15 +1132,17 @@ impl DeployComposeJob {
                             .log_service
                             .log_error(
                                 log_id,
-                                "This looks like a Linux capability denial: Temps drops all \
-                                 container capabilities by default, which can block a database \
-                                 image's entrypoint from fixing ownership on its data/socket \
-                                 directory. If the failing service is a well-known database or \
-                                 storage image (PostgreSQL, MariaDB/MySQL, MongoDB, Redis, or \
-                                 S3-compatible/MinIO), enable \"Elevated permissions\" for it in \
-                                 Project Settings → Git → Compose services, then redeploy — or \
-                                 better, deploy it as a Temps-managed service instead via \
-                                 Databases → Create.",
+                                "This looks like a Linux capability denial: Temps grants every \
+                                 sandboxed Compose service CHOWN, DAC_OVERRIDE, FOWNER, SETUID, \
+                                 SETGID by default — the capabilities official image entrypoints \
+                                 commonly need to fix ownership on a data/socket directory and \
+                                 drop from root to a service user. This failing image needs a \
+                                 capability outside that default set, or hit an unrelated \
+                                 permission problem (e.g. a read-only mount). If it genuinely \
+                                 needs broader permissions, use \"Disable sandbox\" for it in \
+                                 Project Settings → Git → Compose services, then redeploy — or, \
+                                 if this is a well-known database/storage image, deploy it as a \
+                                 Temps-managed service instead via Databases → Create.",
                             )
                             .await;
                     }

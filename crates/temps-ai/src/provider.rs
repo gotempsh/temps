@@ -16,6 +16,25 @@ pub enum RefreshPolicy {
     Refresh,
 }
 
+/// Provenance of a provider model inventory. Only live and unexpired cached
+/// inventories are authoritative enough to reject a saved model. Bootstrap
+/// and stale inventories remain useful for selectors, but must not block a
+/// turn because account entitlements may legitimately differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCatalogSource {
+    Live,
+    Cache,
+    StaleCache,
+    Bootstrap,
+}
+
+impl ModelCatalogSource {
+    pub fn is_authoritative(self) -> bool {
+        matches!(self, Self::Live | Self::Cache)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAuthSource {
@@ -62,6 +81,15 @@ pub struct ProviderCapabilities {
     pub permission_modes: Vec<SelectOption>,
     pub default_permission_mode_id: Option<String>,
     pub realtime: RealtimeCapabilities,
+}
+
+/// Capabilities together with enough provenance for callers to distinguish a
+/// current account-aware model inventory from a convenience fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProviderCapabilitiesSnapshot {
+    pub capabilities: ProviderCapabilities,
+    pub model_source: ModelCatalogSource,
+    pub models_refreshed_at: Option<String>,
 }
 
 impl ProviderCapabilities {

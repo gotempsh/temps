@@ -275,6 +275,13 @@ pub struct AgentState {
     /// health report exposes it so the control plane can resolve a node whose
     /// stored architecture is still unknown before transferring an image.
     pub platform: crate::server::SharedPlatform,
+    /// Address published container ports are bound to for services created
+    /// directly through this agent's HTTP API (managed databases, Redis,
+    /// etc. — see `service_handlers::create_service`), mirroring
+    /// `DockerRuntime::host_bind_address` used for app-container deploys.
+    /// Resolved once at startup from `AgentConfig::private_address`; never
+    /// `"0.0.0.0"` — see `crate::server::build_router`.
+    pub host_bind_address: String,
 }
 
 /// Response wrapper for consistent agent API responses.

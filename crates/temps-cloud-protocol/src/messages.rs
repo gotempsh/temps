@@ -328,6 +328,25 @@ pub struct NativeSnapshotRequest {
     pub compression: BackupCompression,
     pub identity: NativeSnapshotIdentity,
     pub objects: Vec<NativeSnapshotObjectDeclaration>,
+    /// The Docker image (repository:tag) the source database actually runs
+    /// on, when the instance can determine it -- e.g. the control plane's
+    /// own database, or a customer external service's configured
+    /// `docker_image`. Lets a downstream restore script use the exact same
+    /// image instead of guessing a generic one from `engine`/`format` alone,
+    /// which cannot distinguish a plain Postgres image from an
+    /// extension-bearing one (TimescaleDB, pgvector, ...) sharing the same
+    /// engine and format. `None` when the source image can't be determined
+    /// (e.g. an externally managed database Temps didn't deploy) -- the
+    /// consumer must keep a sensible generic fallback for that case.
+    ///
+    /// This value is reported by the instance and is not trusted input: a
+    /// consumer that runs `source_image` (e.g. `docker run`/`docker pull`)
+    /// MUST validate it against an allowlist first, the same way this repo's
+    /// own `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES` gates which images an
+    /// instance may pull -- never interpolate it into a shell command
+    /// unvalidated.
+    #[serde(default)]
+    pub source_image: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1041,6 +1060,7 @@ mod tests {
                 bytes: 1_024,
                 checksum_sha256: "ab".repeat(32),
             }],
+            source_image: None,
         };
 
         let value = serde_json::to_value(request).unwrap();

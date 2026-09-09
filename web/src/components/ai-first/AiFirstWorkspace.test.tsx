@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
+import type { ProviderCatalogDto } from '@/api/client'
 import {
   ApplicationStartScreen,
   HarnessPicker,
@@ -16,6 +17,8 @@ import {
 import { problemDetail } from './problem-detail'
 import {
   workspaceHarnessOptions,
+  workspaceNeedsAutomaticWake,
+  workspaceShouldAttemptAutomaticWake,
   workspaceStatusClickTarget,
   workspaceStatusPresentation,
 } from './workspace-readiness'
@@ -68,7 +71,7 @@ describe('HarnessPicker', () => {
       runtime_models: [],
       supports_max_turns: false,
       workspace_readiness_hint: null,
-    }
+    } satisfies Omit<ProviderCatalogDto, 'id' | 'name' | 'workspace_ready'>
     const harnesses = workspaceHarnessOptions([
       {
         ...base,
@@ -164,6 +167,43 @@ describe('WorkspaceStatusIndicator', () => {
     expect(workspaceStatusClickTarget(true, workspace)).toBe('workspace')
     expect(workspaceStatusClickTarget(false, workspace)).toBe('workspace')
     expect(workspaceStatusClickTarget(false, null)).toBeNull()
+  })
+
+  test('automatically wakes sleeping and failed desired-running workspaces only', () => {
+    expect(
+      workspaceNeedsAutomaticWake({ ...workspace, state: 'sleeping' })
+    ).toBe(true)
+    expect(workspaceNeedsAutomaticWake({ ...workspace, state: 'failed' })).toBe(
+      true
+    )
+    expect(
+      workspaceNeedsAutomaticWake({ ...workspace, state: 'recovering' })
+    ).toBe(false)
+    expect(workspaceNeedsAutomaticWake(workspace)).toBe(false)
+    expect(
+      workspaceNeedsAutomaticWake({
+        ...workspace,
+        desired_state: 'paused',
+        state: 'sleeping',
+      })
+    ).toBe(false)
+  })
+
+  test('attempts an automatic wake only once per selected application', () => {
+    const failed = { ...workspace, state: 'failed' }
+
+    expect(
+      workspaceShouldAttemptAutomaticWake(failed, 'app_one', null, null)
+    ).toBe(true)
+    expect(
+      workspaceShouldAttemptAutomaticWake(failed, 'app_one', 'app_one', null)
+    ).toBe(false)
+    expect(
+      workspaceShouldAttemptAutomaticWake(failed, 'app_one', null, 'app_one')
+    ).toBe(false)
+    expect(
+      workspaceShouldAttemptAutomaticWake(failed, 'app_two', 'app_one', null)
+    ).toBe(true)
   })
 })
 

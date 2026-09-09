@@ -2669,7 +2669,13 @@ pub async fn unlink_application_project(
         if let Some(summary) = sandboxes
             .application_workspace_summary(auth.user_id(), &application_public_id)
             .await
-            .map_err(Problem::from)?
+            .map_err(|error| {
+                application_workspace_provider_problem(
+                    error,
+                    &application_public_id,
+                    "inspect before unlink",
+                )
+            })?
             .filter(|summary| workspace_may_retain_data_plane(&summary.status))
         {
             // Stop compute before moving its source tree. This closes both the
@@ -2677,7 +2683,13 @@ pub async fn unlink_application_project(
             sandboxes
                 .pause_sandbox(&summary.public_id, auth.user_id())
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "pause before unlink",
+                    )
+                })?;
             paused_sandbox = Some(summary.public_id);
         }
     }
@@ -2772,11 +2784,23 @@ pub async fn unlink_application_project(
                 &remaining_project_ids,
             )
             .await
-            .map_err(Problem::from)?;
+            .map_err(|error| {
+                application_workspace_provider_problem(
+                    error,
+                    &application_public_id,
+                    "synchronize data network after unlink",
+                )
+            })?;
         sandboxes
             .resume_sandbox(sandbox_id, auth.user_id())
             .await
-            .map_err(Problem::from)?;
+            .map_err(|error| {
+                application_workspace_provider_problem(
+                    error,
+                    &application_public_id,
+                    "resume after unlink",
+                )
+            })?;
     }
     state
         .audit(&ApplicationTopologyChangedAudit {
@@ -2904,12 +2928,24 @@ pub async fn archive_application(
         if let Some(summary) = sandboxes
             .application_workspace_summary(auth.user_id(), &application_public_id)
             .await
-            .map_err(Problem::from)?
+            .map_err(|error| {
+                application_workspace_provider_problem(
+                    error,
+                    &application_public_id,
+                    "inspect before archive",
+                )
+            })?
         {
             sandboxes
                 .pause_sandbox(&summary.public_id, auth.user_id())
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "pause before archive",
+                    )
+                })?;
             paused_sandbox = Some(summary.public_id);
         }
     }
@@ -3903,6 +3939,154 @@ fn workspace_path(repository: &str, path: &str) -> String {
     }
 }
 
+fn application_workspace_failure_detail(
+    error: &temps_sandbox::error::SandboxError,
+) -> &'static str {
+    use temps_sandbox::error::SandboxError;
+
+    match error {
+        SandboxError::CreateFailed { reason, .. } => {
+            let reason = reason.to_ascii_lowercase();
+            if reason.contains("fully subnetted")
+                || reason.contains("address pool")
+                || reason.contains("non-overlapping ipv4")
+            {
+                "This Temps host has no private sandbox network capacity available. Contact your Temps administrator, then try again."
+            } else if reason.contains("gateway_mode_ipv4")
+                || reason.contains("unknown gateway mode")
+            {
+                "The sandbox runtime on this Temps host is incompatible with secure workspace networking. Contact your Temps administrator, then try again."
+            } else {
+                "Temps could not start workspace compute. Try again; if it continues, contact your Temps administrator."
+            }
+        }
+        SandboxError::Unavailable { .. } => {
+            "The sandbox runtime is unavailable on this Temps host. Contact your Temps administrator, then try again."
+        }
+        SandboxError::Timeout { .. } => {
+            "The workspace did not become ready before the startup timeout. Try again; if it continues, contact your Temps administrator."
+        }
+        SandboxError::InvalidState { .. } => {
+            "The workspace cannot resume from its current state. Rebuild it, or contact your Temps administrator."
+        }
+        SandboxError::RuntimeEnvironmentNotFound { .. } => {
+            "A linked project has no active environment, so Temps could not prepare workspace services. Activate the environment, then try again."
+        }
+        SandboxError::RuntimeCredentialsFailed { .. } => {
+            "Temps could not prepare credentials for a linked workspace service. Check the service configuration, then try again."
+        }
+        SandboxError::RuntimeVariableConflict { .. } => {
+            "Linked services expose conflicting runtime variable names. Resolve the service configuration, then try again."
+        }
+        _ => {
+            "Temps could not prepare the persistent application workspace. Try again; if it continues, contact your Temps administrator."
+        }
+    }
+}
+
+fn application_workspace_failure_problem(error: &temps_sandbox::error::SandboxError) -> Problem {
+    use temps_sandbox::error::SandboxError;
+
+    let status = match error {
+        SandboxError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        SandboxError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        SandboxError::InvalidState { .. } | SandboxError::RuntimeVariableConflict { .. } => {
+            StatusCode::CONFLICT
+        }
+        SandboxError::RuntimeEnvironmentNotFound { .. } => StatusCode::NOT_FOUND,
+        SandboxError::RuntimeCredentialsFailed { .. } => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    problemdetails::new(status)
+        .with_title("Application Workspace Failed")
+        .with_detail(application_workspace_failure_detail(error))
+}
+
+fn application_workspace_provider_problem(
+    error: temps_sandbox::error::SandboxError,
+    application_id: &str,
+    operation: &'static str,
+) -> Problem {
+    tracing::error!(
+        %error,
+        application_id,
+        operation,
+        "application workspace provider operation failed"
+    );
+    application_workspace_failure_problem(&error)
+}
+
+fn application_workspace_snapshot_problem(
+    error: temps_sandbox::error::SandboxSnapshotError,
+    application_id: &str,
+    operation: &'static str,
+) -> Problem {
+    use temps_sandbox::error::SandboxSnapshotError;
+
+    tracing::error!(
+        %error,
+        application_id,
+        operation,
+        "application workspace snapshot operation failed"
+    );
+    let (status, title, detail) = match error {
+        SandboxSnapshotError::NotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            "Snapshot Not Found",
+            "The requested workspace snapshot was not found.",
+        ),
+        SandboxSnapshotError::NotReady { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Snapshot Not Ready",
+            "The workspace snapshot is not ready to restore yet. Try again after it finishes.",
+        ),
+        SandboxSnapshotError::CrossBackendRestore { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Snapshot Restore Not Supported",
+            "This snapshot cannot be restored by the workspace's current runtime.",
+        ),
+        SandboxSnapshotError::NotSupported { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Snapshots Not Supported",
+            "The configured sandbox runtime does not support workspace snapshots.",
+        ),
+        SandboxSnapshotError::SnapshotInProgress { .. } => (
+            StatusCode::CONFLICT,
+            "Snapshot In Progress",
+            "Another workspace snapshot is still being created. Wait for it to finish, then try again.",
+        ),
+        SandboxSnapshotError::QuotaExceeded { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Snapshot Storage Limit Reached",
+            "The workspace snapshot storage limit has been reached. Remove an older snapshot, then try again.",
+        ),
+        SandboxSnapshotError::InvalidState { .. }
+        | SandboxSnapshotError::SandboxNotRunning { .. } => (
+            StatusCode::CONFLICT,
+            "Workspace Not Ready",
+            "The workspace must be running before this snapshot operation can continue.",
+        ),
+        SandboxSnapshotError::SandboxNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            "Workspace Compute Not Found",
+            "The workspace compute could not be found. Rebuild the workspace, then try again.",
+        ),
+        SandboxSnapshotError::LegacyArtifactUnsupported { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Snapshot Format Not Supported",
+            "This older workspace snapshot cannot be restored by the current runtime.",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Workspace Snapshot Failed",
+            "Temps could not complete the workspace snapshot operation. Try again; if it continues, contact your Temps administrator.",
+        ),
+    };
+    problemdetails::new(status)
+        .with_title(title)
+        .with_detail(detail)
+}
+
 async fn application_workspace_sandbox(
     state: &AppState,
     auth: &AuthContext,
@@ -3957,7 +4141,7 @@ async fn application_workspace_sandbox(
             .with_title("Application Sandbox Unavailable")
             .with_detail("The instance sandbox service is not configured.")
     })?;
-    let sandbox = sandboxes
+    let sandbox = match sandboxes
         .get_or_create_application_workspace_with_config(
             auth.user_id(),
             &application.application.public_id,
@@ -3967,12 +4151,29 @@ async fn application_workspace_sandbox(
             &project_ids,
         )
         .await
-        .map_err(|error| {
+    {
+        Ok(sandbox) => sandbox,
+        Err(error) => {
+            let detail = application_workspace_failure_detail(&error);
             error!(%error, application_id = application_public_id, "failed to prepare application Git workspace");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Application Workspace Failed")
-                .with_detail("Temps could not prepare the persistent application workspace.")
-        })?;
+            if let Err(persistence_error) = state
+                .applications
+                .update_workspace_runtime_state(
+                    application.application.id,
+                    None,
+                    Some(detail.to_string()),
+                )
+                .await
+            {
+                error!(
+                    %persistence_error,
+                    application_id = application_public_id,
+                    "failed to persist application workspace startup diagnostic"
+                );
+            }
+            return Err(application_workspace_failure_problem(&error));
+        }
+    };
     state
         .applications
         .record_workspace_sandbox(
@@ -5061,9 +5262,11 @@ pub async fn create_global_conversation(
         )
         .await
         .map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Global Chat Sandbox Failed")
-                .with_detail(error.to_string())
+            application_workspace_provider_problem(
+                error,
+                &workspace_context_id,
+                "start global workspace",
+            )
         })?;
 
     let conversation = state
@@ -5123,7 +5326,9 @@ pub async fn get_global_ai_workspace(
     let summary = sandboxes
         .application_workspace_summary(auth.user_id(), &workspace_id)
         .await
-        .map_err(Problem::from)?;
+        .map_err(|error| {
+            application_workspace_provider_problem(error, &workspace_id, "inspect global workspace")
+        })?;
     let defaults = temps_sandbox::services::ApplicationWorkspaceConfig::default();
     let mut diagnostic = None;
     let usage = if let Some(summary) = summary
@@ -5209,7 +5414,13 @@ async fn application_workspace_response(
     let summary = sandboxes
         .application_workspace_summary(auth.user_id(), &application.application.public_id)
         .await
-        .map_err(Problem::from)?;
+        .map_err(|error| {
+            application_workspace_provider_problem(
+                error,
+                &application.application.public_id,
+                "inspect workspace",
+            )
+        })?;
     let mut diagnostic = desired.last_error.clone();
     let usage = if let Some(summary) = summary
         .as_ref()
@@ -5490,7 +5701,13 @@ async fn synchronize_application_network_if_running(
     let Some(summary) = sandboxes
         .application_workspace_summary(auth.user_id(), &application.application.public_id)
         .await
-        .map_err(Problem::from)?
+        .map_err(|error| {
+            application_workspace_provider_problem(
+                error,
+                &application.application.public_id,
+                "inspect before data-network synchronization",
+            )
+        })?
         .filter(|summary| workspace_may_retain_data_plane(&summary.status))
     else {
         return Ok(());
@@ -5507,7 +5724,13 @@ async fn synchronize_application_network_if_running(
                 .collect::<Vec<_>>(),
         )
         .await
-        .map_err(Problem::from)?;
+        .map_err(|error| {
+            application_workspace_provider_problem(
+                error,
+                &application.application.public_id,
+                "synchronize data network",
+            )
+        })?;
     Ok(())
 }
 
@@ -5595,7 +5818,13 @@ pub async fn update_application_workspace(
         if let Some(summary) = sandboxes
             .application_workspace_summary(auth.user_id(), &application_public_id)
             .await
-            .map_err(Problem::from)?
+            .map_err(|error| {
+                application_workspace_provider_problem(
+                    error,
+                    &application_public_id,
+                    "inspect before resource update",
+                )
+            })?
         {
             if let Err(error) = sandboxes
                 .rebuild_application_workspace(
@@ -5617,7 +5846,11 @@ pub async fn update_application_workspace(
                         ),
                     )
                     .await?;
-                return Err(Problem::from(error));
+                return Err(application_workspace_provider_problem(
+                    error,
+                    &application_public_id,
+                    "rebuild after resource update",
+                ));
             }
             state
                 .applications
@@ -5694,14 +5927,22 @@ pub async fn control_application_workspace(
             let summary = sandboxes
                 .application_workspace_summary(auth.user_id(), &application_public_id)
                 .await
-                .map_err(Problem::from)?
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "inspect before pause",
+                    )
+                })?
                 .ok_or_else(|| {
                     ApplicationError::NotFound(format!("workspace:{application_public_id}"))
                 })?;
             sandboxes
                 .pause_sandbox(&summary.public_id, auth.user_id())
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(error, &application_public_id, "pause")
+                })?;
             state
                 .applications
                 .record_workspace_sandbox(
@@ -5718,32 +5959,29 @@ pub async fn control_application_workspace(
                 .update_workspace_runtime_state(application.application.id, Some("running"), None)
                 .await?;
             let (_, sandbox_id) =
-                match application_workspace_sandbox(&state, &auth, &application_public_id).await {
-                    Ok(workspace) => workspace,
-                    Err(problem) => {
-                        state
-                            .applications
-                            .update_workspace_runtime_state(
-                                application.application.id,
-                                None,
-                                Some(
-                                    "Workspace resume failed while restoring compute.".to_string(),
-                                ),
-                            )
-                            .await?;
-                        return Err(problem);
-                    }
-                };
+                application_workspace_sandbox(&state, &auth, &application_public_id).await?;
             if let Some(summary) = sandboxes
                 .application_workspace_summary(auth.user_id(), &application_public_id)
                 .await
-                .map_err(Problem::from)?
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "inspect before resume",
+                    )
+                })?
             {
                 if summary.status == "stopped" {
                     sandboxes
                         .resume_sandbox(&sandbox_id, auth.user_id())
                         .await
-                        .map_err(Problem::from)?;
+                        .map_err(|error| {
+                            application_workspace_provider_problem(
+                                error,
+                                &application_public_id,
+                                "resume",
+                            )
+                        })?;
                 }
             }
             state
@@ -5762,7 +6000,9 @@ pub async fn control_application_workspace(
             sandboxes
                 .restart_sandbox(&sandbox_id, auth.user_id())
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(error, &application_public_id, "restart")
+                })?;
             state
                 .applications
                 .update_workspace_runtime_state(application.application.id, None, None)
@@ -5787,7 +6027,9 @@ pub async fn control_application_workspace(
                     (&desired).into(),
                 )
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(error, &application_public_id, "rebuild")
+                })?;
             state
                 .applications
                 .update_workspace_runtime_state(application.application.id, None, None)
@@ -5804,7 +6046,13 @@ pub async fn control_application_workspace(
             let row = sandboxes
                 .find_by_public_id(&sandbox_id, auth.user_id())
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "inspect before snapshot",
+                    )
+                })?;
             let snapshot = snapshots
                 .create_snapshot(
                     row.id,
@@ -5814,7 +6062,13 @@ pub async fn control_application_workspace(
                     request.label,
                 )
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_snapshot_problem(
+                        error,
+                        &application_public_id,
+                        "create snapshot",
+                    )
+                })?;
             snapshot_id = Some(snapshot.public_id);
         }
         "restore" => {
@@ -5833,11 +6087,23 @@ pub async fn control_application_workspace(
             let sandbox_row = sandboxes
                 .find_by_public_id(&sandbox_id, auth.user_id())
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(
+                        error,
+                        &application_public_id,
+                        "inspect before restore",
+                    )
+                })?;
             let snapshot_row = snapshots
                 .get_snapshot(auth.user_id(), requested_snapshot)
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_snapshot_problem(
+                        error,
+                        &application_public_id,
+                        "inspect snapshot before restore",
+                    )
+                })?;
             if snapshot_row.source_sandbox_id != Some(sandbox_row.id) {
                 return Err(problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Snapshot Does Not Belong to Application")
@@ -5849,7 +6115,13 @@ pub async fn control_application_workspace(
             let artifact = snapshots
                 .resolve_for_restore(auth.user_id(), requested_snapshot, Some("docker"))
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_snapshot_problem(
+                        error,
+                        &application_public_id,
+                        "resolve snapshot before restore",
+                    )
+                })?;
             let workspace = state
                 .application_workspaces
                 .ensure(&application.application.public_id, &application.projects)
@@ -5867,7 +6139,9 @@ pub async fn control_application_workspace(
                     &artifact,
                 )
                 .await
-                .map_err(Problem::from)?;
+                .map_err(|error| {
+                    application_workspace_provider_problem(error, &application_public_id, "restore")
+                })?;
             state
                 .applications
                 .update_workspace_runtime_state(application.application.id, None, None)
@@ -6386,18 +6660,15 @@ pub async fn send_message(
     ensure_runtime_permission(&auth, Some(&conv.ai_provider), Some(effective_permission))?;
     ensure_enabled(&state, Some(&conv.ai_provider)).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
-    if req.ai_model.is_some() || req.ai_thinking_level.is_some() || req.ai_permission_mode.is_some()
-    {
-        conv = state
-            .service
-            .update_runtime_options(
-                &conv,
-                req.ai_model.as_deref(),
-                req.ai_thinking_level.as_deref(),
-                req.ai_permission_mode.as_deref(),
-            )
-            .await?;
-    }
+    conv = state
+        .service
+        .update_runtime_options(
+            &conv,
+            req.ai_model.as_deref(),
+            req.ai_thinking_level.as_deref(),
+            req.ai_permission_mode.as_deref(),
+        )
+        .await?;
     // Page context is advisory framing, not user content: cap it and silently
     // drop an oversized value rather than failing the message.
     let page_context = req
@@ -6541,18 +6812,15 @@ pub async fn send_user_message(
         Some(&conversation.ai_provider),
         Some(effective_permission),
     )?;
-    if req.ai_model.is_some() || req.ai_thinking_level.is_some() || req.ai_permission_mode.is_some()
-    {
-        conversation = state
-            .service
-            .update_runtime_options(
-                &conversation,
-                req.ai_model.as_deref(),
-                req.ai_thinking_level.as_deref(),
-                req.ai_permission_mode.as_deref(),
-            )
-            .await?;
-    }
+    conversation = state
+        .service
+        .update_runtime_options(
+            &conversation,
+            req.ai_model.as_deref(),
+            req.ai_thinking_level.as_deref(),
+            req.ai_permission_mode.as_deref(),
+        )
+        .await?;
     let attachments =
         resolve_chat_attachments(&state, &auth, &conversation, &req.attachments).await?;
     let attachment_metadata =
@@ -9139,6 +9407,84 @@ mod tests {
             application_workspace_state(Some("running"), "running", true, true),
             "failed"
         );
+    }
+
+    #[test]
+    fn workspace_startup_failure_classifies_exhausted_private_network_capacity() {
+        let error = temps_sandbox::error::SandboxError::CreateFailed {
+            user_id: 7,
+            reason: "create network temps-sandbox-private: all predefined address pools have been fully subnetted"
+                .to_string(),
+        };
+
+        let detail = application_workspace_failure_detail(&error);
+
+        assert_eq!(
+            detail,
+            "This Temps host has no private sandbox network capacity available. Contact your Temps administrator, then try again."
+        );
+        assert!(!detail.contains("temps-sandbox-private"));
+        assert!(!detail.contains("fully subnetted"));
+    }
+
+    #[test]
+    fn workspace_startup_failure_classifies_incompatible_secure_networking() {
+        let error = temps_sandbox::error::SandboxError::CreateFailed {
+            user_id: 7,
+            reason: "failed to parse com.docker.network.bridge.gateway_mode_ipv4 value: isolated (unknown gateway mode isolated)"
+                .to_string(),
+        };
+
+        let detail = application_workspace_failure_detail(&error);
+
+        assert!(detail.contains("incompatible with secure workspace networking"));
+        assert!(!detail.contains("gateway_mode_ipv4"));
+    }
+
+    #[test]
+    fn workspace_startup_failure_falls_back_without_exposing_provider_details() {
+        let error = temps_sandbox::error::SandboxError::CreateFailed {
+            user_id: 7,
+            reason: "provider detail with container temps-sandbox-secret-id".to_string(),
+        };
+
+        let detail = application_workspace_failure_detail(&error);
+
+        assert_eq!(
+            detail,
+            "Temps could not start workspace compute. Try again; if it continues, contact your Temps administrator."
+        );
+        assert!(!detail.contains("temps-sandbox-secret-id"));
+    }
+
+    #[test]
+    fn workspace_provider_problem_never_serializes_raw_provider_details() {
+        let error = temps_sandbox::error::SandboxError::CreateFailed {
+            user_id: 7,
+            reason: "private Docker path /var/run/docker.sock for temps-sandbox-secret-id"
+                .to_string(),
+        };
+
+        let problem = application_workspace_provider_problem(error, "app_test", "test operation");
+        let body = serde_json::to_string(&problem.body).expect("problem body serializes");
+
+        assert!(body.contains("Temps could not start workspace compute"));
+        assert!(!body.contains("/var/run/docker.sock"));
+        assert!(!body.contains("temps-sandbox-secret-id"));
+    }
+
+    #[test]
+    fn workspace_snapshot_problem_never_serializes_artifact_paths() {
+        let error = temps_sandbox::error::SandboxSnapshotError::ArtifactMissing {
+            path: "/private/snapshots/user-7/secret.tar".to_string(),
+        };
+
+        let problem = application_workspace_snapshot_problem(error, "app_test", "test snapshot");
+        let body = serde_json::to_string(&problem.body).expect("problem body serializes");
+
+        assert!(body.contains("Temps could not complete"));
+        assert!(!body.contains("/private/snapshots"));
+        assert!(!body.contains("secret.tar"));
     }
 
     #[test]

@@ -121,8 +121,10 @@ use crate::services::secret_service::SecretService;
         // AI providers
         ai_providers::list_ai_providers,
         ai_providers::save_ai_provider_credential,
+        ai_providers::import_local_ai_provider_credential,
         ai_providers::activate_ai_provider,
         ai_providers::update_ai_provider,
+        ai_providers::refresh_ai_provider_models,
     ),
     components(schemas(
         // Agent config
@@ -189,9 +191,13 @@ use crate::services::secret_service::SecretService;
         ai_providers::ProviderCatalogResponse,
         ai_providers::SaveCredentialRequest,
         ai_providers::SaveCredentialResponse,
+        ai_providers::LocalCredentialDto,
+        ai_providers::ImportLocalCredentialResponse,
         ai_providers::ActivateProviderResponse,
         ai_providers::UpdateProviderRequest,
         ai_providers::UpdateProviderResponse,
+        ai_providers::RefreshProviderModelsResponse,
+        temps_ai::ModelCatalogSource,
     )),
     tags(
         (name = "Agents", description = "Autonomous AI agents, autofixer (interactive AI debugging), skills/MCP definitions, and preview gateway management.")
@@ -219,6 +225,9 @@ pub struct AppState {
     pub telemetry: Arc<dyn temps_core::TelemetryReporter>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Late-bound normalized AI registry. Model refresh uses this service so
+    /// it observes the same credential/environment as the next workspace turn.
+    pub ai_service: Option<Arc<dyn temps_ai::AiService>>,
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {

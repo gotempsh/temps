@@ -23,10 +23,10 @@
 //! "DB says running, container is actually stopped or gone"), which then
 //! makes the next `exec` call fail with NotFound and the user confused.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use temps_agents::error::AgentError;
 use temps_agents::sandbox::{
@@ -36,6 +36,15 @@ use temps_agents::sandbox::{
 pub struct StandaloneSandboxRegistry {
     provider: Arc<dyn SandboxProvider>,
     handles: RwLock<HashMap<i32, SandboxHandle>>,
+    /// Sandboxes whose live provider handle was adopted in this server
+    /// generation. Their previous Temps process may have died while a harness
+    /// exec was active, so the first managed workspace operation must fence
+    /// those provider CLIs before reusing the container.
+    recovered_in_this_generation: RwLock<HashSet<i32>>,
+    /// Serialize the first verified fence per recovered sandbox. The
+    /// generation marker remains set while the future is in flight, making
+    /// cancellation fail closed; concurrent callers wait here and re-check it.
+    recovery_fence_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
 }
 
 const STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,6 +54,8 @@ impl StandaloneSandboxRegistry {
         Self {
             provider,
             handles: RwLock::new(HashMap::new()),
+            recovered_in_this_generation: RwLock::new(HashSet::new()),
+            recovery_fence_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -61,6 +72,7 @@ impl StandaloneSandboxRegistry {
         let id = config.run_id;
         let handle = self.provider.create(config).await?;
         self.handles.write().await.insert(id, handle.clone());
+        self.recovered_in_this_generation.write().await.remove(&id);
         Ok(handle)
     }
 
@@ -75,6 +87,7 @@ impl StandaloneSandboxRegistry {
         let id = config.run_id;
         let handle = self.provider.create_from_snapshot(artifact, config).await?;
         self.handles.write().await.insert(id, handle.clone());
+        self.recovered_in_this_generation.write().await.remove(&id);
         Ok(handle)
     }
 
@@ -106,6 +119,7 @@ impl StandaloneSandboxRegistry {
         self.handles.write().await.remove(&id);
         let handle = self.provider.create(config).await?;
         self.handles.write().await.insert(id, handle.clone());
+        self.recovered_in_this_generation.write().await.remove(&id);
         Ok(handle)
     }
 
@@ -122,6 +136,7 @@ impl StandaloneSandboxRegistry {
         self.handles.write().await.remove(&id);
         let handle = self.provider.create_from_snapshot(artifact, config).await?;
         self.handles.write().await.insert(id, handle.clone());
+        self.recovered_in_this_generation.write().await.remove(&id);
         Ok(handle)
     }
 
@@ -187,6 +202,7 @@ impl StandaloneSandboxRegistry {
         match self.provider.recover_by_name(label).await? {
             Some(recovered) => {
                 self.handles.write().await.insert(id, recovered.clone());
+                self.recovered_in_this_generation.write().await.insert(id);
                 Ok(recovered)
             }
             None => Err(AgentError::SandboxNotFound { run_id: id }),
@@ -237,6 +253,7 @@ impl StandaloneSandboxRegistry {
             return Err(e);
         }
         self.handles.write().await.remove(&id);
+        self.recovered_in_this_generation.write().await.remove(&id);
         Ok(())
     }
 
@@ -305,6 +322,7 @@ impl StandaloneSandboxRegistry {
             match tokio::time::timeout(timeout, self.provider.recover_by_name(label)).await {
                 Ok(Ok(Some(handle))) => {
                     self.handles.write().await.insert(*id, handle);
+                    self.recovered_in_this_generation.write().await.insert(*id);
                     recovered += 1;
                 }
                 Ok(Ok(None)) => {}
@@ -328,6 +346,49 @@ impl StandaloneSandboxRegistry {
             }
         }
         recovered
+    }
+
+    /// Fence provider CLI processes that may have outlived the previous Temps
+    /// server process. This is deliberately narrower than restarting the
+    /// container: user dev servers, terminals, and other background work keep
+    /// running, while only the three command shapes launched by the managed
+    /// harness runtime are terminated before a new turn or model probe starts.
+    ///
+    /// A per-sandbox lock makes concurrent callers await the same fence. The
+    /// generation marker is removed only after the provider verifies that the
+    /// complete matching process trees are gone. Provider failure, timeout,
+    /// or future cancellation leaves the marker intact so the next managed
+    /// operation retries and fails closed until fencing succeeds.
+    pub async fn fence_recovered_harness_processes(
+        &self,
+        id: i32,
+        public_id: &str,
+    ) -> Result<(), AgentError> {
+        let fence_lock = {
+            let mut locks = self.recovery_fence_locks.lock().await;
+            locks
+                .entry(id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _fence_guard = fence_lock.lock().await;
+
+        if !self.recovered_in_this_generation.read().await.contains(&id) {
+            return Ok(());
+        }
+        let handle = self.get_or_recover(id, public_id).await?;
+        self.provider
+            .fence_process_trees(
+                &handle,
+                &[
+                    r"(^|/)claude --print( |$)",
+                    r"(^|/)codex exec( |$)",
+                    r"(^|/)opencode run( |$)",
+                ],
+            )
+            .await?;
+        self.recovered_in_this_generation.write().await.remove(&id);
+        Ok(())
     }
 
     pub fn provider_name(&self) -> &str {
@@ -366,6 +427,10 @@ mod tests {
         stops: AtomicUsize,
         restarts: AtomicUsize,
         destroys: AtomicUsize,
+        fence_patterns: std::sync::Mutex<Vec<Vec<String>>>,
+        fence_attempts: AtomicUsize,
+        fence_failures_remaining: AtomicUsize,
+        fence_gate: Option<Arc<tokio::sync::Semaphore>>,
         recovery_delay: Duration,
     }
 
@@ -377,6 +442,10 @@ mod tests {
                 stops: AtomicUsize::new(0),
                 restarts: AtomicUsize::new(0),
                 destroys: AtomicUsize::new(0),
+                fence_patterns: std::sync::Mutex::new(Vec::new()),
+                fence_attempts: AtomicUsize::new(0),
+                fence_failures_remaining: AtomicUsize::new(0),
+                fence_gate: None,
                 recovery_delay: Duration::ZERO,
             }
         }
@@ -389,6 +458,17 @@ mod tests {
 
         fn with_recovery_delay(mut self, delay: Duration) -> Self {
             self.recovery_delay = delay;
+            self
+        }
+
+        fn with_fence_failures(self, failures: usize) -> Self {
+            self.fence_failures_remaining
+                .store(failures, Ordering::SeqCst);
+            self
+        }
+
+        fn with_fence_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+            self.fence_gate = Some(gate);
             self
         }
     }
@@ -453,9 +533,47 @@ mod tests {
         async fn kill_processes(
             &self,
             _handle: &SandboxHandle,
-            _pattern: &str,
+            pattern: &str,
             _signal: temps_agents::sandbox::KillSignal,
         ) -> Result<(), AgentError> {
+            let _ = pattern;
+            Ok(())
+        }
+
+        async fn fence_process_trees(
+            &self,
+            _handle: &SandboxHandle,
+            patterns: &[&str],
+        ) -> Result<(), AgentError> {
+            self.fence_attempts.fetch_add(1, Ordering::SeqCst);
+            self.fence_patterns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    patterns
+                        .iter()
+                        .map(|pattern| (*pattern).to_string())
+                        .collect(),
+                );
+            if let Some(gate) = &self.fence_gate {
+                gate.acquire()
+                    .await
+                    .expect("test fence gate remains open")
+                    .forget();
+            }
+            if self
+                .fence_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 42,
+                    sandbox_id: "sbx_abc123".to_string(),
+                    reason: "simulated strict fence failure".to_string(),
+                });
+            }
             Ok(())
         }
 
@@ -663,6 +781,162 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "sandbox recovery must not hold control-plane startup indefinitely"
         );
+    }
+
+    #[tokio::test]
+    async fn first_workspace_use_fences_only_recovered_harness_processes_once() {
+        let provider = Arc::new(FakeProvider::new().with_known("abc123"));
+        let reg = StandaloneSandboxRegistry::new(provider.clone());
+
+        assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
+        reg.fence_recovered_harness_processes(42, "sbx_abc123")
+            .await
+            .expect("first-generation fence");
+        reg.fence_recovered_harness_processes(42, "sbx_abc123")
+            .await
+            .expect("already-fenced workspace");
+
+        assert_eq!(provider.restarts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            provider
+                .fence_patterns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            [[
+                r"(^|/)claude --print( |$)",
+                r"(^|/)codex exec( |$)",
+                r"(^|/)opencode run( |$)",
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_fence_remains_required_until_verified() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_fence_failures(1),
+        );
+        let reg = StandaloneSandboxRegistry::new(provider.clone());
+
+        assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
+        reg.fence_recovered_harness_processes(42, "sbx_abc123")
+            .await
+            .expect_err("an unverified fence must fail closed");
+        reg.fence_recovered_harness_processes(42, "sbx_abc123")
+            .await
+            .expect("the next use retries the fence");
+        reg.fence_recovered_harness_processes(42, "sbx_abc123")
+            .await
+            .expect("verified fence is not repeated");
+
+        assert_eq!(provider.fence_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_fence_remains_required() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_fence_gate(gate.clone()),
+        );
+        let reg = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
+
+        assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
+        let cancelled = {
+            let reg = reg.clone();
+            tokio::spawn(async move {
+                reg.fence_recovered_harness_processes(42, "sbx_abc123")
+                    .await
+            })
+        };
+        while provider.fence_attempts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        gate.add_permits(1);
+        reg.fence_recovered_harness_processes(42, "sbx_abc123")
+            .await
+            .expect("cancellation must leave the fence pending");
+        assert_eq!(provider.fence_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_use_shares_one_verified_fence() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_fence_gate(gate.clone()),
+        );
+        let reg = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
+
+        assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
+        let first = {
+            let reg = reg.clone();
+            tokio::spawn(async move {
+                reg.fence_recovered_harness_processes(42, "sbx_abc123")
+                    .await
+            })
+        };
+        let second = {
+            let reg = reg.clone();
+            tokio::spawn(async move {
+                reg.fence_recovered_harness_processes(42, "sbx_abc123")
+                    .await
+            })
+        };
+        while provider.fence_attempts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(provider.fence_attempts.load(Ordering::SeqCst), 1);
+
+        gate.add_permits(1);
+        first.await.expect("first fence task").expect("first fence");
+        second
+            .await
+            .expect("second fence task")
+            .expect("shared fence result");
+        assert_eq!(provider.fence_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn newly_created_workspace_does_not_run_restart_fencing() {
+        let provider = Arc::new(FakeProvider::new());
+        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        reg.create(SandboxCreateConfig {
+            run_id: 42,
+            container_name_override: Some("abc123".to_string()),
+            host_work_dir: PathBuf::from("/workspace"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+            owner_user_id: Some(7),
+        })
+        .await
+        .expect("new workspace");
+
+        reg.fence_recovered_harness_processes(42, "sbx_abc123")
+            .await
+            .expect("new workspace needs no fence");
+
+        assert!(provider
+            .fence_patterns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]
