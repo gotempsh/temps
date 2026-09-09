@@ -1017,7 +1017,8 @@ async fn mirror_native_backup(
 /// Cloud. Factored out of `mirror_native_backup` so [`mirror_control_plane_backup`]
 /// can reuse the same declare/upload/complete sequence without duplicating
 /// it -- `source` is the only thing that differs (a `service_type/name` label
-/// for customer services, `control_plane/{name}` for the control plane).
+/// for customer services, the static `control_plane/control-plane` for the
+/// control plane, which is singular per instance).
 #[allow(clippy::too_many_arguments)]
 async fn declare_and_complete_native_snapshot(
     link: &CloudLink,
@@ -1156,7 +1157,7 @@ async fn mirror_control_plane_backup(
         instance_id,
         &source_config,
         &client,
-        format!("control_plane/{}", backup.name),
+        "control_plane/control-plane".to_string(),
         BackupEngine::Postgres,
         BackupFormat::PgDumpPlain,
         BackupCompression::Gzip,
