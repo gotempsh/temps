@@ -2198,29 +2198,6 @@ function ExcludedServicesInline({
     }
   }
 
-  const toggleCapabilities = async (serviceName: string, relaxed: boolean) => {
-    const next = relaxed
-      ? [...relaxedCapabilities, serviceName]
-      : relaxedCapabilities.filter((s) => s !== serviceName)
-    setSaving(true)
-    try {
-      await saveGitField({
-        preset_config: composeSettingPatch(
-          cfg,
-          'relaxedCapabilityServices',
-          next
-        ),
-      })
-      toast.success(
-        relaxed
-          ? `${serviceName} granted elevated permissions`
-          : `${serviceName} back to strict permissions`
-      )
-    } finally {
-      setSaving(false)
-    }
-  }
-
   const toggleSandbox = async (serviceName: string, disabled: boolean) => {
     const next = withComposeSandboxDisabled(
       relaxedCapabilities,
@@ -2260,14 +2237,14 @@ function ExcludedServicesInline({
           <Label className="text-sm font-medium">Compose services</Label>
           <p className="text-xs text-muted-foreground mt-0.5">
             Uncheck a service to skip deploying it entirely — e.g. a raw
-            database container, which won’t have Temps backup/restore. Services
-            run with all Linux container permissions dropped by default; some
-            official images (databases like postgres/mysql, but also others such
-            as Gitea) need a few back to fix ownership on their data volume at
-            startup — if a service fails with “Operation not permitted” errors,
-            enable “Elevated permissions” for it below. For images that remain
-            incompatible, “Disable sandbox” restores Docker’s normal runtime
-            permissions for only that service.
+            database container, which won’t have Temps backup/restore. Every
+            service runs with all Linux container permissions dropped except
+            a minimal set (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) most
+            official images need to fix ownership on their data volume at
+            startup — that's granted automatically, nothing to configure. If
+            a service still fails with “Operation not permitted” errors, it
+            needs a capability outside that set; “Disable sandbox” restores
+            Docker’s normal runtime permissions for only that service.
           </p>
         </div>
         <Button
@@ -2300,9 +2277,6 @@ function ExcludedServicesInline({
           <div className="space-y-1.5">
             {services.map((service) => {
               const included = !excluded.includes(service.name)
-              const hasElevatedPermissions = relaxedCapabilities.includes(
-                service.name
-              )
               const isUnsandboxed = unsandboxedServices.includes(service.name)
               return (
                 <div
@@ -2338,34 +2312,11 @@ function ExcludedServicesInline({
                       </TooltipTrigger>
                       <TooltipContent className="max-w-xs">
                         This looks like a database container — it won’t have
-                        Temps backup/restore, and it may need elevated
-                        permissions to start (see the toggle to the right).
-                        Consider excluding it and using a Temps-managed database
-                        instead.
+                        Temps backup/restore. Consider excluding it and using
+                        a Temps-managed database instead.
                       </TooltipContent>
                     </Tooltip>
                   )}
-                  <div className="flex items-center gap-1.5 pl-2 border-l">
-                    <Checkbox
-                      checked={hasElevatedPermissions}
-                      disabled={saving || !included || isUnsandboxed}
-                      onCheckedChange={(checked) =>
-                        toggleCapabilities(service.name, checked === true)
-                      }
-                      id={`relaxed-capabilities-${service.name}`}
-                    />
-                    <label
-                      htmlFor={`relaxed-capabilities-${service.name}`}
-                      className={cn(
-                        'text-xs cursor-pointer whitespace-nowrap',
-                        included
-                          ? 'text-muted-foreground'
-                          : 'text-muted-foreground/50'
-                      )}
-                    >
-                      Elevated permissions
-                    </label>
-                  </div>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <div className="flex items-center gap-1.5 pl-2 border-l">
