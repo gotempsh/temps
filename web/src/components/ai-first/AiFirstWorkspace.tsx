@@ -145,6 +145,7 @@ import {
 
 import {
   workspaceHarnessOptions,
+  workspaceShouldAttemptAutomaticWake,
   workspaceStatusClickTarget,
   workspaceStatusPresentation,
   type WorkspaceHarnessOption as HarnessOption,
@@ -292,6 +293,7 @@ export function AiFirstWorkspace() {
   const workspaceDiffGeneration = useRef(0)
   const harnessRequestGeneration = useRef(0)
   const workspaceWakeInFlight = useRef<string | null>(null)
+  const workspaceWakeAttempted = useRef<string | null>(null)
 
   useEffect(() => {
     if (!leftPanelOpen) return
@@ -851,12 +853,12 @@ export function AiFirstWorkspace() {
   // remains open. Re-read the inventory whenever an application/thread
   // chooser opens instead of requiring a full-page reload to see the newly
   // configured harness.
-  const loadHarnesses = useCallback(async (refreshModels = false) => {
+  const loadHarnesses = useCallback(async () => {
     const requestGeneration = ++harnessRequestGeneration.current
     setHarnessesLoading(true)
     try {
       const { data } = await listAiProviders({
-        query: { refresh_models: refreshModels },
+        query: { catalog_only: false },
         throwOnError: true,
       })
       if (requestGeneration !== harnessRequestGeneration.current) return
@@ -877,10 +879,14 @@ export function AiFirstWorkspace() {
         const { data } = await refetchApplicationWorkspace()
         if (!data) return
         if (
-          data.desired_state === 'running' &&
-          data.state === 'sleeping' &&
-          workspaceWakeInFlight.current !== activeApplicationId
+          workspaceShouldAttemptAutomaticWake(
+            data,
+            activeApplicationId,
+            workspaceWakeAttempted.current,
+            workspaceWakeInFlight.current
+          )
         ) {
+          workspaceWakeAttempted.current = activeApplicationId
           workspaceWakeInFlight.current = activeApplicationId
           setActiveWorkspaceWaking(true)
           try {
@@ -893,6 +899,11 @@ export function AiFirstWorkspace() {
               applicationWorkspaceOptions.queryKey,
               resumed
             )
+          } catch {
+            // The backend persists a safe, actionable diagnostic. Re-read it
+            // immediately so the failed automatic wake is visible without
+            // waiting for the next polling interval.
+            await refetchApplicationWorkspace()
           } finally {
             if (workspaceWakeInFlight.current === activeApplicationId) {
               workspaceWakeInFlight.current = null
@@ -918,27 +929,30 @@ export function AiFirstWorkspace() {
     ? applicationWorkspaceQuery.data
     : globalWorkspaceQuery.data
   useEffect(() => {
+    const resetTimer = window.setTimeout(() => {
+      workspaceWakeInFlight.current = null
+      workspaceWakeAttempted.current = null
+      setActiveWorkspaceWaking(false)
+    }, 0)
+    return () => window.clearTimeout(resetTimer)
+  }, [activeApplicationId])
+
+  useEffect(() => {
     if (!queriedWorkspace) return
     const syncTimer = window.setTimeout(() => {
       if (
-        activeApplicationId &&
-        queriedWorkspace.desired_state === 'running' &&
-        queriedWorkspace.state === 'sleeping' &&
-        workspaceWakeInFlight.current !== activeApplicationId
+        workspaceShouldAttemptAutomaticWake(
+          queriedWorkspace,
+          activeApplicationId,
+          workspaceWakeAttempted.current,
+          workspaceWakeInFlight.current
+        )
       ) {
         void loadActiveWorkspaceStatus()
       }
     }, 0)
     return () => window.clearTimeout(syncTimer)
   }, [activeApplicationId, loadActiveWorkspaceStatus, queriedWorkspace])
-
-  useEffect(() => {
-    const resetTimer = window.setTimeout(() => {
-      workspaceWakeInFlight.current = null
-      setActiveWorkspaceWaking(false)
-    }, 0)
-    return () => window.clearTimeout(resetTimer)
-  }, [activeApplicationId])
 
   useEffect(() => {
     const harnessLoadTimer = window.setTimeout(() => void loadHarnesses(), 0)

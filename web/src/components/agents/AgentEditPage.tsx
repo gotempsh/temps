@@ -36,6 +36,7 @@ import type {
   AgentConfigResponse,
   UpsertAgentRequest,
 } from '@/api/client/types.gen'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 
 export interface TriggerConfig {
   error?: { new_issue?: boolean; regression?: boolean }
@@ -175,19 +176,7 @@ function AgentEditForm({
   )
 
   const { data: providerCatalog } = useQuery({
-    queryKey: ['ai-provider-catalog'],
-    queryFn: async () => {
-      const res = await fetch('/api/settings/ai-providers')
-      if (!res.ok) return null
-      return res.json() as Promise<{
-        default_provider: string
-        providers: Array<{
-          id: string
-          models: string[]
-          default_model: string | null
-        }>
-      }>
-    },
+    ...aiProviderCatalogQueryOptions,
     staleTime: 60 * 1000,
   })
   const availableModels =

@@ -3,6 +3,7 @@
 
 import {
   Activity,
+  AlertTriangle,
   Archive,
   ArchiveRestore,
   Bot,
@@ -44,6 +45,7 @@ import {
   harnessUpgradeCommands,
   sandboxShellCommand,
 } from './harness-upgrade-commands'
+import { problemDetail } from './problem-detail'
 
 type Props = {
   applicationPublicId: string
@@ -100,7 +102,7 @@ export function ApplicationWorkspaceSettingsPanel({
       })
       acceptWorkspace(data)
     } catch (cause) {
-      setError(errorMessage(cause, 'Could not load workspace status.'))
+      setError(problemDetail(cause, 'Could not load workspace status.'))
     } finally {
       setLoading(false)
     }
@@ -133,7 +135,7 @@ export function ApplicationWorkspaceSettingsPanel({
       })
       acceptWorkspace(data)
     } catch (cause) {
-      setError(errorMessage(cause, `Could not ${action} the workspace.`))
+      setError(problemDetail(cause, `Could not ${action} the workspace.`))
     } finally {
       setBusy(null)
     }
@@ -157,7 +159,7 @@ export function ApplicationWorkspaceSettingsPanel({
       })
       acceptWorkspace(data)
     } catch (cause) {
-      setError(errorMessage(cause, 'Could not save workspace resources.'))
+      setError(problemDetail(cause, 'Could not save workspace resources.'))
     } finally {
       setBusy(null)
     }
@@ -170,6 +172,8 @@ export function ApplicationWorkspaceSettingsPanel({
       </div>
     )
   }
+
+  const diagnostic = error ?? workspace?.last_error
 
   return (
     <div className="space-y-5">
@@ -197,6 +201,38 @@ export function ApplicationWorkspaceSettingsPanel({
           <Loader2 className="size-3.5 animate-spin" />
           Sandbox waking up. Persistent files are already safe; controls and
           live usage will become available after the accessibility check.
+        </div>
+      )}
+
+      {diagnostic && (
+        <div
+          className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs leading-5 text-destructive"
+          role="alert"
+        >
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="font-medium">Workspace could not start</p>
+              <p className="mt-1">{diagnostic}</p>
+              {workspace?.state === 'failed' &&
+                workspace.desired_state === 'running' && (
+                  <Button
+                    className="mt-2"
+                    disabled={busy !== null}
+                    onClick={() => void control('resume')}
+                    size="sm"
+                    variant="outline"
+                  >
+                    {busy === 'resume' ? (
+                      <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                    ) : (
+                      <Play className="mr-1.5 size-3.5" />
+                    )}
+                    Try again
+                  </Button>
+                )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -530,12 +566,6 @@ export function ApplicationWorkspaceSettingsPanel({
           </section>
         </>
       )}
-
-      {(error || workspace?.last_error) && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs leading-5 text-destructive">
-          {error ?? workspace?.last_error}
-        </div>
-      )}
     </div>
   )
 }
@@ -676,9 +706,4 @@ function formatBytes(value: number | null | undefined): string {
 function formatCpu(value: number | null | undefined): string {
   if (value == null) return '—'
   return `${(value / 1_000_000).toFixed(1)} s`
-}
-
-function errorMessage(cause: unknown, fallback: string): string {
-  if (cause instanceof Error && cause.message.trim()) return cause.message
-  return fallback
 }

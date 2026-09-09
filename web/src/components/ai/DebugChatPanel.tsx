@@ -12,6 +12,7 @@ import {
   getUserConversation,
   getUserPendingAction,
   listAiProviders,
+  refreshAiProviderModels,
   refreshAiProviderStatus,
   rejectPendingAction,
   rejectUserPendingAction,
@@ -95,12 +96,14 @@ import { useAiAssistant } from './AiAssistantContext'
 import {
   chatDraftStorageKey,
   chatHarnessProviderOptions,
+  providerCatalogNeedsRefresh,
   chatModelLabel,
   chatPermissionLabel,
   chatProviderLabel,
   chatThinkingItemContent,
   reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
+  shouldAutoRefreshHarnessModels,
   usesHarnessCatalog,
   type ChatProviderOption,
   type ChatRuntimeSelection,
@@ -142,6 +145,63 @@ interface MdNode {
   type: string
   value?: string
   children?: MdNode[]
+}
+
+export function shouldPreserveRuntimeSelectionAfterProviderLoad(
+  providerPinned: boolean,
+  explicitRefresh: boolean
+): boolean {
+  return providerPinned || explicitRefresh
+}
+
+export type ProviderRefreshState = {
+  providerId: string
+  operation: 'workspace_models' | 'provider_status'
+}
+
+export function providerRefreshMatchesSelection(
+  refresh: ProviderRefreshState | null,
+  providerId: string | undefined
+): boolean {
+  return refresh !== null && refresh.providerId === providerId
+}
+
+export function providerRefreshCopy(
+  refresh: ProviderRefreshState | null,
+  providerId: string | undefined,
+  providerName: string
+): { status: string; button: string } | null {
+  if (!refresh || refresh.providerId !== providerId) return null
+
+  return refresh.operation === 'workspace_models'
+    ? {
+        status: `Starting your workspace and resolving models for ${providerName}…`,
+        button: 'Starting…',
+      }
+    : {
+        status: `Refreshing authentication and models for ${providerName}…`,
+        button: 'Refreshing…',
+      }
+}
+
+export function claimAutomaticModelRefresh(
+  attempts: Set<string>,
+  contextType: string,
+  provider: ChatProviderOption | undefined
+): boolean {
+  if (!provider) return false
+  const attemptKey = `${contextType}:${provider.id}`
+  if (
+    !shouldAutoRefreshHarnessModels(
+      contextType,
+      provider,
+      attempts.has(attemptKey)
+    )
+  ) {
+    return false
+  }
+  attempts.add(attemptKey)
+  return true
 }
 
 /**
@@ -2208,7 +2268,6 @@ function useConversationStream(
     let cancelled = false
     let ws: WebSocket | null = null
     let attempt = 0
-    setTransportState('connecting')
     // True once this effect instance has completed at least one connection —
     // distinguishes the initial connect (history was already loaded by the
     // panel's own init fetch, no need to resync) from a later reconnect
@@ -2483,13 +2542,20 @@ export function DebugChatPanel({
   )
   const providerPinnedRef = useRef(false)
   const providerStatusRequestRef = useRef(0)
+  const automaticModelRefreshesRef = useRef(new Set<string>())
   const [providerOptions, setProviderOptions] = useState<ChatProviderOption[]>(
     []
   )
   const [providerStatusState, setProviderStatusState] = useState<
     'loading' | 'success' | 'error'
   >('loading')
-  const [providerRefreshing, setProviderRefreshing] = useState(false)
+  const [providerRefresh, setProviderRefresh] =
+    useState<ProviderRefreshState | null>(null)
+  const providerRefreshing = providerRefresh !== null
+  const [providerRefreshFailure, setProviderRefreshFailure] = useState<{
+    providerId: string
+    detail: string
+  } | null>(null)
   const [runtimeSelection, setRuntimeSelection] =
     useState<ChatRuntimeSelection>({
       providerId: 'gateway',
@@ -2629,19 +2695,39 @@ export function DebugChatPanel({
   )
 
   const loadProviderStatus = useCallback(
-    async (forceRefresh = false, silent = false) => {
+    async (forceRefresh = false, providerId?: string) => {
       const requestGeneration = ++providerStatusRequestRef.current
-      if (forceRefresh) setProviderRefreshing(true)
-      else setProviderStatusState('loading')
+      if (forceRefresh) {
+        setProviderRefresh({
+          providerId: providerId ?? '',
+          operation:
+            usesHarnessCatalog(contextType) &&
+            providerId !== undefined &&
+            providerId !== 'gateway'
+              ? 'workspace_models'
+              : 'provider_status',
+        })
+        setProviderRefreshFailure(null)
+      } else {
+        setProviderStatusState('loading')
+      }
       try {
+        if (
+          forceRefresh &&
+          usesHarnessCatalog(contextType) &&
+          providerId &&
+          providerId !== 'gateway'
+        ) {
+          await refreshAiProviderModels({
+            path: { provider_id: providerId },
+            throwOnError: true,
+          })
+        }
         const options = usesHarnessCatalog(contextType)
           ? chatHarnessProviderOptions(
               (
                 await listAiProviders({
-                  query: {
-                    catalog_only: false,
-                    refresh_models: forceRefresh,
-                  },
+                  query: { catalog_only: false },
                   throwOnError: true,
                 })
               ).data.providers
@@ -2659,6 +2745,7 @@ export function DebugChatPanel({
                 auth_source: provider.auth_source,
                 models: extended.models ?? [],
                 default_model_id: extended.default_model_id,
+                model_source: extended.model_source,
                 model_discovery_status: extended.model_discovery_status,
                 model_discovery_error: extended.model_discovery_error,
                 permission_modes: extended.permission_modes ?? [],
@@ -2677,35 +2764,40 @@ export function DebugChatPanel({
             : options
         )
 
-        if (providerPinnedRef.current) {
+        if (
+          shouldPreserveRuntimeSelectionAfterProviderLoad(
+            providerPinnedRef.current,
+            forceRefresh
+          )
+        ) {
           setRuntimeSelection((current) =>
             reconcileChatRuntimeAfterRefresh(options, current)
           )
-        }
-
-        const active = 'gateway'
-        if (
-          !providerPinnedRef.current &&
-          active &&
-          options.some((option) => option.id === active)
-        ) {
-          setRuntimeSelection(resolveChatRuntimeSelection(options, active))
-        } else if (!providerPinnedRef.current && options[0]) {
-          setRuntimeSelection(
-            resolveChatRuntimeSelection(options, options[0].id)
-          )
+        } else {
+          const active = 'gateway'
+          if (active && options.some((option) => option.id === active)) {
+            setRuntimeSelection(resolveChatRuntimeSelection(options, active))
+          } else if (options[0]) {
+            setRuntimeSelection(
+              resolveChatRuntimeSelection(options, options[0].id)
+            )
+          }
         }
         setProviderStatusState('success')
-      } catch {
+      } catch (refreshError) {
         if (requestGeneration !== providerStatusRequestRef.current) return
-        if (forceRefresh && !silent) {
+        if (forceRefresh) {
+          setProviderRefreshFailure({
+            providerId: providerId ?? '',
+            detail: chatFailureFromProblem(refreshError).detail,
+          })
           toast.error('Couldn’t refresh provider authentication and models')
         } else if (!forceRefresh) {
           setProviderStatusState('error')
         }
       } finally {
         if (requestGeneration === providerStatusRequestRef.current) {
-          setProviderRefreshing(false)
+          setProviderRefresh(null)
         }
       }
     },
@@ -2713,18 +2805,39 @@ export function DebugChatPanel({
   )
 
   useEffect(() => {
-    // First paint uses cached/bootstrap capabilities and never invokes a CLI.
-    // Account-aware names/auth are refreshed silently after the composer is
-    // usable; the explicit refresh button uses the same path with error UI.
+    // First paint stays fast by using cached/bootstrap capabilities. A second
+    // effect below starts the user's persistent workspace only when a saved
+    // harness still needs an authoritative model catalog.
     const timer = window.setTimeout(() => void loadProviderStatus(), 0)
-    const refreshTimer = usesHarnessCatalog(contextType)
-      ? window.setTimeout(() => void loadProviderStatus(true, true), 250)
-      : null
     return () => {
       window.clearTimeout(timer)
-      if (refreshTimer != null) window.clearTimeout(refreshTimer)
     }
   }, [contextType, loadProviderStatus])
+
+  useEffect(() => {
+    const provider = selectedProviderOption
+    if (!provider) return
+    if (
+      providerStatusState !== 'success' ||
+      providerRefreshing ||
+      turnActive ||
+      !claimAutomaticModelRefresh(
+        automaticModelRefreshesRef.current,
+        contextType,
+        provider
+      )
+    ) {
+      return
+    }
+    void loadProviderStatus(true, provider.id)
+  }, [
+    contextType,
+    loadProviderStatus,
+    providerRefreshing,
+    providerStatusState,
+    selectedProviderOption,
+    turnActive,
+  ])
 
   useConversationStream(
     base,
@@ -3885,30 +3998,59 @@ export function DebugChatPanel({
             variant="outline"
             size="sm"
             className="h-7"
-            onClick={() => void loadProviderStatus(true)}
+            onClick={() => void loadProviderStatus()}
           >
             Retry
           </Button>
         </div>
       )}
       {providerStatusState === 'success' &&
-        selectedProviderOption?.model_discovery_status === 'unavailable' && (
+        selectedProviderOption &&
+        (providerRefreshMatchesSelection(
+          providerRefresh,
+          selectedProviderOption.id
+        ) ||
+          providerRefreshFailure?.providerId === selectedProviderOption.id ||
+          providerCatalogNeedsRefresh(selectedProviderOption)) && (
           <div
             className="flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-            role="status"
+            role={
+              providerRefreshFailure?.providerId === selectedProviderOption.id
+                ? 'alert'
+                : 'status'
+            }
           >
-            <span>
-              {selectedProviderOption.model_discovery_error ??
-                'Model discovery is unavailable; the provider default remains usable.'}
+            <span className="flex items-center gap-2">
+              {providerRefreshMatchesSelection(
+                providerRefresh,
+                selectedProviderOption.id
+              ) && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />}
+              {providerRefreshCopy(
+                providerRefresh,
+                selectedProviderOption.id,
+                selectedProviderOption.name
+              )?.status ??
+                (providerRefreshFailure?.providerId ===
+                selectedProviderOption.id
+                  ? providerRefreshFailure.detail
+                  : (selectedProviderOption.model_discovery_error ??
+                    'Model discovery is unavailable; the provider default remains usable.'))}
             </span>
             <Button
               type="button"
               variant="outline"
               size="sm"
               className="h-7"
-              onClick={() => void loadProviderStatus(true)}
+              disabled={providerRefreshing}
+              onClick={() =>
+                void loadProviderStatus(true, runtimeSelection.providerId)
+              }
             >
-              Retry
+              {providerRefreshCopy(
+                providerRefresh,
+                selectedProviderOption.id,
+                selectedProviderOption.name
+              )?.button ?? 'Retry'}
             </Button>
           </div>
         )}
@@ -4009,6 +4151,7 @@ export function DebugChatPanel({
                       Boolean(publicId) ||
                       turnActive ||
                       starting ||
+                      providerRefreshing ||
                       providerOptions.length === 0
                     }
                   >
@@ -4196,7 +4339,9 @@ export function DebugChatPanel({
                     size="icon"
                     className="h-8 w-8 shrink-0"
                     disabled={providerRefreshing || turnActive || starting}
-                    onClick={() => void loadProviderStatus(true)}
+                    onClick={() =>
+                      void loadProviderStatus(true, runtimeSelection.providerId)
+                    }
                     aria-label="Refresh provider authentication and models"
                     title="Refresh provider authentication and models"
                   >

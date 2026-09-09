@@ -99,11 +99,11 @@ pub struct ProviderCatalogEntry {
     /// Auth flavors this provider supports, in display order. The first entry
     /// is the recommended default for new installs.
     pub auth_flavors: &'static [AuthFlavor],
-    /// Model identifiers this provider accepts, in display order. The first
-    /// entry is the recommended default. Empty when the provider doesn't
-    /// expose model selection (e.g. OpenCode delegates model choice to its
-    /// own per-session config). The settings UI renders these in the model
-    /// dropdown for the *active* provider only.
+    /// Verified provider-native model identifiers that remain safe to offer
+    /// when live harness discovery is unavailable, in display order. The
+    /// first entry is the recommended default. Keep this empty when the
+    /// harness owns an account-aware catalog: callers must not invent model
+    /// identifiers when its metadata probe fails.
     pub models: &'static [&'static str],
     /// Provider-native modes translated into the common capability contract.
     /// Authorization remains enforced by Temps' Tool Broker; these values only
@@ -171,16 +171,10 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 seed_path_rel: "",
             },
         ],
-        // Bootstrap fallback when live CLI discovery is unavailable.
-        models: &[
-            "sonnet",
-            "opus",
-            "haiku",
-            "claude-sonnet-5",
-            "claude-opus-5",
-            "claude-fable-5",
-            "claude-haiku-4-5",
-        ],
+        // Claude Code's control initialization response is the only source of
+        // selectable models. Its account-aware aliases and concrete versions
+        // change independently of Temps, so a failed probe must stay empty.
+        models: &[],
         permission_modes: &[
             ProviderOption {
                 id: "default",
@@ -395,6 +389,15 @@ mod tests {
     fn claude_subscription_is_first_flavor() {
         let claude = find_provider("claude_cli").expect("claude_cli in catalog");
         assert_eq!(claude.default_flavor().id, "subscription");
+    }
+
+    #[test]
+    fn claude_models_are_never_synthesized_by_the_static_catalog() {
+        let claude = find_provider("claude_cli").expect("claude_cli in catalog");
+        assert!(
+            claude.models.is_empty(),
+            "Claude model choices must come from the installed harness"
+        );
     }
 
     #[test]

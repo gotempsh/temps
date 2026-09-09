@@ -699,6 +699,7 @@ impl TempsPlugin for AgentsPlugin {
                     .get_service::<dyn temps_core::TelemetryReporter>()
                     .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),
                 project_access_checker: None,
+                ai_service: None,
             });
             context.register_plugin_state("agents", app_state);
 
@@ -757,6 +758,7 @@ impl TempsPlugin for AgentsPlugin {
         // regardless of plugin load order.
         let old = context.get_plugin_state::<AppState>("agents")?;
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let ai_service = context.get_service::<dyn temps_ai::AiService>();
         let app_state = Arc::new(AppState {
             db: old.db.clone(),
             encryption_service: old.encryption_service.clone(),
@@ -771,6 +773,7 @@ impl TempsPlugin for AgentsPlugin {
             platform_config_service: old.platform_config_service.clone(),
             telemetry: old.telemetry.clone(),
             project_access_checker,
+            ai_service,
         });
 
         let router = crate::handlers::configure_routes().with_state(app_state);

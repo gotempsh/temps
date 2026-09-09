@@ -20,22 +20,29 @@
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, post},
-    Json, Router,
+    Extension, Json, Router,
 };
-use futures::future::join_all;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-use temps_auth::{permission_guard, RequireAuth};
-use temps_core::problemdetails::Problem;
+use temps_auth::{permission_guard, Permission, RequireAuth};
+use temps_core::audit::{AuditContext, AuditOperation};
+use temps_core::problemdetails::{self, Problem};
+use temps_core::RequestMetadata;
 
-use crate::ai_cli::catalog::{find_provider, CredentialFormat, PROVIDER_CATALOG};
+use crate::ai_cli::catalog::{
+    find_provider, CredentialFormat, HostAccessRequirement, PROVIDER_CATALOG,
+};
 use crate::error::AgentError;
 use crate::handlers::AppState;
+use crate::services::provider_credential_service::{
+    discover_local_credential, discover_local_credential_summary, LocalCredentialSummary,
+};
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -115,8 +122,8 @@ pub struct ProviderCatalogDto {
     pub host_auth_method: Option<String>,
     /// Installed CLI version used as part of the model-cache identity.
     pub host_version: Option<String>,
-    /// `live`, `cache`, `stale_cache`, or `bootstrap`.
-    pub model_source: String,
+    /// Whether the catalog is live, cached, stale, or a bootstrap fallback.
+    pub model_source: temps_ai::ModelCatalogSource,
     /// Time of the last successful account-aware CLI model discovery.
     pub models_refreshed_at: Option<String>,
     /// Explains why `host_authenticated` is false (not installed vs.
@@ -128,6 +135,9 @@ pub struct ProviderCatalogDto {
     pub workspace_ready: bool,
     /// Actionable explanation when `workspace_ready` is false.
     pub workspace_readiness_hint: Option<String>,
+    /// Importable credential already used by this host's CLI, if one can be
+    /// copied directly into encrypted Temps settings. Contains metadata only.
+    pub local_credential: Option<LocalCredentialDto>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -146,11 +156,6 @@ pub struct ListAiProvidersQuery {
     /// first paint; an authenticated refresh follows in the background.
     #[serde(default)]
     pub catalog_only: bool,
-    /// Run account-aware model discovery before returning. Normal catalog
-    /// reads intentionally use cached/bootstrap models so chat first paint is
-    /// not held hostage by provider CLIs that can take 10-15 seconds.
-    #[serde(default)]
-    pub refresh_models: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -170,9 +175,112 @@ pub struct SaveCredentialResponse {
     pub auth_type: String,
 }
 
+/// Metadata about a credential that Temps can import from the server process
+/// user's existing CLI login. This never includes a path or credential value.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LocalCredentialDto {
+    pub auth_type: String,
+    /// Stable machine-readable source: `environment` or `host_auth_store`.
+    pub source: String,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportLocalCredentialResponse {
+    pub saved: bool,
+    pub provider_id: String,
+    pub auth_type: String,
+    pub source: String,
+    pub workspace_ready: bool,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ActivateProviderResponse {
     pub default_provider: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RefreshProviderModelsResponse {
+    pub provider_id: String,
+    pub runtime_models: Vec<temps_ai::ModelCapability>,
+    pub default_runtime_model_id: Option<String>,
+    pub model_source: temps_ai::ModelCatalogSource,
+    pub models_refreshed_at: Option<String>,
+}
+
+fn uses_workspace_model_discovery(
+    provider: &crate::ai_cli::catalog::ProviderCatalogEntry,
+    config: &temps_core::ProviderConfig,
+) -> bool {
+    provider.workspace_chat_supported && config.credentials_encrypted.is_some()
+}
+
+fn should_discover_local_credentials(catalog_only: bool, is_system_admin: bool) -> bool {
+    !catalog_only && is_system_admin
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderModelsRefreshedAudit {
+    context: AuditContext,
+    provider_id: String,
+    model_count: usize,
+    model_source: temps_ai::ModelCatalogSource,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderCredentialSavedAudit {
+    context: AuditContext,
+    provider_id: String,
+    auth_type: String,
+    source: String,
+}
+
+impl AuditOperation for ProviderCredentialSavedAudit {
+    fn operation_type(&self) -> String {
+        "AI_PROVIDER_CREDENTIAL_SAVED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            temps_core::anyhow::anyhow!("failed to serialize provider credential audit: {error}")
+        })
+    }
+}
+
+impl AuditOperation for ProviderModelsRefreshedAudit {
+    fn operation_type(&self) -> String {
+        "AI_PROVIDER_MODELS_REFRESHED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            temps_core::anyhow::anyhow!("failed to serialize model refresh audit: {error}")
+        })
+    }
 }
 
 /// Body for `PATCH /settings/ai-providers/{provider_id}` — updates
@@ -232,8 +340,16 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(save_ai_provider_credential),
         )
         .route(
+            "/settings/ai-providers/{provider_id}/credential/import-local",
+            post(import_local_ai_provider_credential),
+        )
+        .route(
             "/settings/ai-providers/{provider_id}/activate",
             post(activate_ai_provider),
+        )
+        .route(
+            "/settings/ai-providers/{provider_id}/models/refresh",
+            post(refresh_ai_provider_models),
         )
 }
 
@@ -266,12 +382,50 @@ pub async fn list_ai_providers(
         load_agent_sandbox(&app_state).await?
     };
 
-    let providers = join_all(PROVIDER_CATALOG.iter().map(|entry| {
-        provider_catalog_dto(
-            entry,
-            sandbox.provider_config(entry.id),
-            query.refresh_models,
-        )
+    let ai_service = app_state.ai_service.clone();
+    let principal_id = auth.user_id();
+    let can_discover_local_credentials = auth.has_permission(&Permission::SystemAdmin);
+    let providers = futures::future::join_all(PROVIDER_CATALOG.iter().map(|entry| {
+        let provider_config = sandbox.provider_config(entry.id);
+        let ai_service = ai_service.clone();
+        async move {
+            let local_credential = if !should_discover_local_credentials(
+                query.catalog_only,
+                can_discover_local_credentials,
+            ) {
+                None
+            } else {
+                match discover_local_credential_summary(entry).await {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider_id = entry.id,
+                            %error,
+                            "could not inspect local AI provider credential"
+                        );
+                        None
+                    }
+                }
+            };
+            let workspace_snapshot = if entry.workspace_chat_supported
+                && provider_config.credentials_encrypted.is_some()
+            {
+                match ai_service {
+                    Some(service) => service
+                        .capabilities_snapshot_for_principal(
+                            Some(entry.id),
+                            principal_id,
+                            temps_ai::RefreshPolicy::Cached,
+                        )
+                        .await
+                        .ok(),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            provider_catalog_dto(entry, provider_config, workspace_snapshot, local_credential).await
+        }
     }))
     .await;
 
@@ -281,12 +435,157 @@ pub async fn list_ai_providers(
     }))
 }
 
-const PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Refresh exactly one provider's account-aware model inventory. This is an
+/// explicit operation because it starts a CLI process (and, for Claude
+/// workspaces, creates or wakes the user's persistent sandbox). Authorization
+/// therefore matches the provider's chat execution requirement instead of
+/// requiring unrelated settings mutation access. The AI service applies a
+/// provider-scoped single-flight and cooldown before doing that work.
+#[utoipa::path(
+    tag = "Agents",
+    post,
+    path = "/settings/ai-providers/{provider_id}/models/refresh",
+    params(("provider_id" = String, Path, description = "AI provider ID")),
+    responses(
+        (status = 200, body = RefreshProviderModelsResponse),
+        (status = 400, description = "Unknown provider"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Provider execution permission required"),
+        (status = 503, description = "Provider model discovery unavailable"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn refresh_ai_provider_models(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(provider_id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    let provider = find_provider(&provider_id).ok_or_else(|| {
+        Problem::from(AgentError::Validation {
+            message: format!("Unknown AI provider '{provider_id}'"),
+        })
+    })?;
+    ensure_provider_runtime_permission(&auth, provider)?;
+    let ai_service = app_state.ai_service.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("AI provider refresh unavailable")
+            .with_detail("The AI provider service is not configured on this Temps instance.")
+    })?;
+    let sandbox = load_agent_sandbox(&app_state).await?;
+    let provider_config = sandbox.provider_config(&provider_id);
+    let workspace_discovery = uses_workspace_model_discovery(provider, &provider_config);
+    if workspace_discovery {
+        ensure_workspace_model_discovery_permission(&auth)?;
+    }
+    let snapshot_result = if workspace_discovery {
+        ai_service
+            .capabilities_snapshot_for_principal(
+                Some(&provider_id),
+                auth.user_id(),
+                temps_ai::RefreshPolicy::Refresh,
+            )
+            .await
+    } else {
+        ai_service
+            .capabilities_snapshot_for(Some(&provider_id), temps_ai::RefreshPolicy::Refresh)
+            .await
+    };
+    let snapshot = snapshot_result.map_err(|error| {
+        let (error_kind, error_purpose) = match &error {
+            temps_ai::AiError::NotAvailable => ("not_available", None),
+            temps_ai::AiError::NoModel { purpose } => ("no_model", Some(purpose.as_str())),
+            temps_ai::AiError::Provider { purpose, .. } => ("provider", Some(purpose.as_str())),
+        };
+        tracing::warn!(
+            provider_id,
+            user_id = auth.user_id(),
+            workspace_discovery,
+            error_kind,
+            error_purpose,
+            "AI provider model refresh failed"
+        );
+        let detail = provider_model_refresh_error_detail(
+            provider,
+            &provider_id,
+            workspace_discovery,
+            &error,
+        );
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Could not refresh provider models")
+            .with_detail(detail)
+    })?;
+    let response = RefreshProviderModelsResponse {
+        provider_id: provider_id.clone(),
+        default_runtime_model_id: snapshot.capabilities.default_model_id.clone(),
+        runtime_models: snapshot.capabilities.models,
+        model_source: snapshot.model_source,
+        models_refreshed_at: snapshot.models_refreshed_at,
+    };
+    if let Err(error) = app_state
+        .audit_service
+        .create_audit_log(&ProviderModelsRefreshedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            provider_id,
+            model_count: response.runtime_models.len(),
+            model_source: response.model_source,
+        })
+        .await
+    {
+        tracing::error!(%error, "failed to write AI provider model refresh audit log");
+    }
+    Ok(Json(response))
+}
+
+fn ensure_provider_runtime_permission(
+    auth: &temps_auth::AuthContext,
+    provider: &crate::ai_cli::catalog::ProviderCatalogEntry,
+) -> Result<(), Problem> {
+    match provider.host_access_requirement {
+        HostAccessRequirement::AiGatewayWrite => permission_guard!(auth, AiGatewayWrite),
+        HostAccessRequirement::SystemAdmin => permission_guard!(auth, SystemAdmin),
+    }
+    Ok(())
+}
+
+fn ensure_workspace_model_discovery_permission(
+    auth: &temps_auth::AuthContext,
+) -> Result<(), Problem> {
+    permission_guard!(auth, SandboxesWrite);
+    permission_guard!(auth, SandboxesExec);
+    Ok(())
+}
+
+fn provider_model_refresh_error_detail(
+    provider: &crate::ai_cli::catalog::ProviderCatalogEntry,
+    provider_id: &str,
+    workspace_discovery: bool,
+    error: &temps_ai::AiError,
+) -> String {
+    if matches!(error, temps_ai::AiError::NotAvailable) {
+        return format!(
+            "{} is not installed and authenticated on the Temps host. Use the install and authentication commands shown above, then retry.",
+            provider.name
+        );
+    }
+    if workspace_discovery {
+        return format!(
+            "Temps could not start or inspect your persistent workspace, so {} models could not be resolved. Retry after the workspace is available; if it remains unavailable, contact your Temps administrator.",
+            provider.name
+        );
+    }
+    format!("Temps could not refresh the model inventory for '{provider_id}'. Check the provider authentication and retry.")
+}
 
 async fn provider_catalog_dto(
     entry: &'static crate::ai_cli::catalog::ProviderCatalogEntry,
     provider_cfg: temps_core::ProviderConfig,
-    refresh_models: bool,
+    workspace_snapshot: Option<temps_ai::ProviderCapabilitiesSnapshot>,
+    local_credential: Option<LocalCredentialSummary>,
 ) -> ProviderCatalogDto {
     let credential_saved = provider_cfg.credentials_encrypted.is_some();
     let current_auth_type = if credential_saved {
@@ -304,19 +603,49 @@ async fn provider_catalog_dto(
         discovered_source,
         models_refreshed_at,
     ) = match crate::ai_cli::create_provider(entry.id) {
-        Some(provider) => {
-            let status = if refresh_models {
-                crate::ai_cli::get_status_cached(provider.as_ref(), true, PROVIDER_STATUS_TIMEOUT)
-                    .await
-            } else {
-                crate::ai_cli::cached_status(entry.id).await
-            };
-            let Some(status) = status else {
-                return provider_catalog_dto_from_runtime(
-                    entry,
-                    provider_cfg,
-                    credential_saved,
-                    current_auth_type,
+        Some(_provider) => {
+            let status = crate::ai_cli::cached_status(entry.id).await;
+            match status {
+                Some(status) => {
+                    let authenticated = status.installed && status.authenticated;
+                    let version = status.version.clone();
+                    let identity = format!(
+                        "{}|{}|{}|{}",
+                        version.as_deref().unwrap_or("unknown"),
+                        status.auth_method.as_deref().unwrap_or("unknown"),
+                        status.email.as_deref().unwrap_or("unknown"),
+                        status.subscription_type.as_deref().unwrap_or("unknown")
+                    );
+                    let snapshot = if !status.installed {
+                        None
+                    } else {
+                        crate::ai_cli::cached_model_capabilities(entry.id, &identity).await
+                    };
+                    let models = snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.models.clone())
+                        .unwrap_or_default();
+                    (
+                        authenticated,
+                        status.auth_method,
+                        if authenticated {
+                            None
+                        } else {
+                            status.setup_hint
+                        },
+                        version,
+                        models,
+                        snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.source)
+                            .unwrap_or(temps_ai::ModelCatalogSource::Bootstrap),
+                        snapshot.as_ref().and_then(|snapshot| {
+                            (!snapshot.models.is_empty())
+                                .then(|| snapshot.refreshed_at.to_rfc3339())
+                        }),
+                    )
+                }
+                None => (
                     false,
                     None,
                     Some(
@@ -324,59 +653,22 @@ async fn provider_catalog_dto(
                     ),
                     None,
                     Vec::new(),
-                    "bootstrap",
+                    temps_ai::ModelCatalogSource::Bootstrap,
                     None,
-                );
-            };
-            let authenticated = status.installed && status.authenticated;
-            let version = status.version.clone();
-            let identity = format!(
-                "{}|{}|{}|{}",
-                version.as_deref().unwrap_or("unknown"),
-                status.auth_method.as_deref().unwrap_or("unknown"),
-                status.email.as_deref().unwrap_or("unknown"),
-                status.subscription_type.as_deref().unwrap_or("unknown")
-            );
-            let snapshot = if !status.installed {
-                None
-            } else if refresh_models {
-                Some(
-                    crate::ai_cli::discover_model_capabilities_cached(
-                        provider.as_ref(),
-                        identity,
-                        true,
-                    )
-                    .await,
-                )
-            } else {
-                crate::ai_cli::cached_model_capabilities(entry.id, &identity).await
-            };
-            let models = snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.models.clone())
-                .unwrap_or_default();
-            (
-                authenticated,
-                status.auth_method,
-                if authenticated {
-                    None
-                } else {
-                    status.setup_hint
-                },
-                version,
-                models,
-                snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.source)
-                    .unwrap_or("unavailable"),
-                snapshot.as_ref().and_then(|snapshot| {
-                    (!snapshot.models.is_empty()).then(|| snapshot.refreshed_at.to_rfc3339())
-                }),
-            )
+                ),
+            }
         }
-        None => (false, None, None, None, Vec::new(), "unavailable", None),
+        None => (
+            false,
+            None,
+            None,
+            None,
+            Vec::new(),
+            temps_ai::ModelCatalogSource::Bootstrap,
+            None,
+        ),
     };
-    provider_catalog_dto_from_runtime(
+    let mut dto = provider_catalog_dto_from_runtime(
         entry,
         provider_cfg,
         credential_saved,
@@ -388,7 +680,25 @@ async fn provider_catalog_dto(
         discovered_models,
         discovered_source,
         models_refreshed_at,
-    )
+        local_credential,
+    );
+    if let Some(snapshot) = workspace_snapshot {
+        dto.models = snapshot
+            .capabilities
+            .models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect();
+        dto.runtime_models = snapshot.capabilities.models;
+        dto.default_runtime_model_id = dto
+            .default_model
+            .clone()
+            .filter(|saved| dto.models.iter().any(|model| model == saved))
+            .or(snapshot.capabilities.default_model_id);
+        dto.model_source = snapshot.model_source;
+        dto.models_refreshed_at = snapshot.models_refreshed_at;
+    }
+    dto
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,8 +712,9 @@ fn provider_catalog_dto_from_runtime(
     host_auth_hint: Option<String>,
     host_version: Option<String>,
     discovered_models: Vec<crate::ai_cli::AiCliModelCapability>,
-    discovered_source: &str,
+    discovered_source: temps_ai::ModelCatalogSource,
     models_refreshed_at: Option<String>,
+    local_credential: Option<LocalCredentialSummary>,
 ) -> ProviderCatalogDto {
     let workspace_ready = entry.workspace_chat_supported && credential_saved;
     let workspace_readiness_hint = if workspace_ready {
@@ -422,7 +733,7 @@ fn provider_catalog_dto_from_runtime(
     let (runtime_models, model_source) = if discovered_models.is_empty() {
         (
             bootstrap_runtime_models(entry.models),
-            "bootstrap".to_string(),
+            temps_ai::ModelCatalogSource::Bootstrap,
         )
     } else {
         (
@@ -430,7 +741,7 @@ fn provider_catalog_dto_from_runtime(
                 .into_iter()
                 .map(runtime_model_capability)
                 .collect(),
-            discovered_source.to_string(),
+            discovered_source,
         )
     };
     let models = runtime_models
@@ -498,6 +809,11 @@ fn provider_catalog_dto_from_runtime(
         host_auth_hint,
         workspace_ready,
         workspace_readiness_hint,
+        local_credential: local_credential.map(|credential| LocalCredentialDto {
+            auth_type: credential.auth_type,
+            source: credential.source.as_str().to_string(),
+            label: credential.source.label().to_string(),
+        }),
     }
 }
 
@@ -524,6 +840,7 @@ fn provider_catalog_dto_from_runtime(
 pub async fn save_ai_provider_credential(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(provider_id): Path<String>,
     Json(request): Json<SaveCredentialRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -568,12 +885,147 @@ pub async fn save_ai_provider_credential(
     )
     .await
     .map_err(Problem::from)?;
+    if let Some(ai_service) = &app_state.ai_service {
+        ai_service
+            .invalidate_capabilities_for(Some(&provider_id))
+            .await;
+    }
+
+    write_provider_credential_audit(
+        &app_state,
+        &auth,
+        &metadata,
+        &provider_id,
+        &request.auth_type,
+        "manual",
+    )
+    .await;
 
     Ok(Json(SaveCredentialResponse {
         saved: true,
         provider_id,
         auth_type: request.auth_type,
     }))
+}
+
+/// Import the credential already used by this provider's CLI on the Temps
+/// host. Discovery and encryption happen entirely server-side; the plaintext
+/// credential is never serialized into the response or browser state.
+#[utoipa::path(
+    tag = "Agents",
+    post,
+    path = "/settings/ai-providers/{provider_id}/credential/import-local",
+    params(("provider_id" = String, Path, description = "AI provider ID")),
+    responses(
+        (status = 200, body = ImportLocalCredentialResponse),
+        (status = 400, description = "Unknown provider or invalid local credential"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "System administrator permission required"),
+        (status = 404, description = "No importable local credential found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn import_local_ai_provider_credential(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(provider_id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, SystemAdmin);
+
+    let provider = find_provider(&provider_id).ok_or_else(|| {
+        Problem::from(AgentError::Validation {
+            message: format!("Unknown AI provider '{provider_id}'"),
+        })
+    })?;
+    let discovered = discover_local_credential(provider)
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Local AI credential could not be imported")
+                .with_detail(error.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("No local AI credential found")
+                .with_detail(format!(
+                    "Temps could not find an importable {} credential for the operating-system user running this server. Authenticate the host CLI or save a credential manually.",
+                    provider.name
+                ))
+        })?;
+
+    let encrypted = app_state
+        .encryption_service
+        .encrypt_string(&discovered.credential)
+        .map_err(|error| {
+            Problem::from(AgentError::EncryptionError {
+                message: format!(
+                    "Failed to encrypt imported credential for provider '{provider_id}': {error}"
+                ),
+            })
+        })?;
+    persist_provider_credential_and_invalidate(
+        app_state.db.as_ref(),
+        app_state.platform_config_service.as_ref(),
+        &provider_id,
+        &discovered.auth_type,
+        encrypted,
+    )
+    .await
+    .map_err(Problem::from)?;
+    if let Some(ai_service) = &app_state.ai_service {
+        ai_service
+            .invalidate_capabilities_for(Some(&provider_id))
+            .await;
+    }
+    write_provider_credential_audit(
+        &app_state,
+        &auth,
+        &metadata,
+        &provider_id,
+        &discovered.auth_type,
+        discovered.source.as_str(),
+    )
+    .await;
+
+    Ok(Json(ImportLocalCredentialResponse {
+        saved: true,
+        provider_id,
+        auth_type: discovered.auth_type,
+        source: discovered.source.as_str().to_string(),
+        workspace_ready: provider.workspace_chat_supported,
+    }))
+}
+
+async fn write_provider_credential_audit(
+    app_state: &Arc<AppState>,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    provider_id: &str,
+    auth_type: &str,
+    source: &str,
+) {
+    if let Err(error) = app_state
+        .audit_service
+        .create_audit_log(&ProviderCredentialSavedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            provider_id: provider_id.to_string(),
+            auth_type: auth_type.to_string(),
+            source: source.to_string(),
+        })
+        .await
+    {
+        tracing::error!(
+            provider_id,
+            %error,
+            "failed to write AI provider credential audit log"
+        );
+    }
 }
 
 /// Persist a provider credential and make the successful write a strict cache
@@ -1041,18 +1493,24 @@ mod tests {
     }
 
     #[test]
-    fn provider_catalog_reads_do_not_refresh_models_by_default() {
+    fn provider_catalog_reads_never_accept_a_process_spawning_refresh_flag() {
         let query = serde_json::from_value::<ListAiProvidersQuery>(serde_json::json!({}))
             .expect("default query");
-        assert!(!query.refresh_models);
         assert!(!query.catalog_only);
 
-        let refresh = serde_json::from_value::<ListAiProvidersQuery>(
+        let ignored_legacy_refresh = serde_json::from_value::<ListAiProvidersQuery>(
             serde_json::json!({ "refresh_models": true, "catalog_only": true }),
         )
-        .expect("refresh query");
-        assert!(refresh.refresh_models);
-        assert!(refresh.catalog_only);
+        .expect("unknown query fields are harmless");
+        assert!(ignored_legacy_refresh.catalog_only);
+    }
+
+    #[test]
+    fn local_credential_discovery_requires_a_full_admin_catalog_request() {
+        assert!(should_discover_local_credentials(false, true));
+        assert!(!should_discover_local_credentials(true, true));
+        assert!(!should_discover_local_credentials(false, false));
+        assert!(!should_discover_local_credentials(true, false));
     }
 
     #[tokio::test]
@@ -1151,6 +1609,187 @@ mod tests {
     }
 
     #[test]
+    fn cold_claude_catalog_does_not_advertise_unverified_models() {
+        let claude =
+            crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
+        let dto = provider_catalog_dto_from_runtime(
+            claude,
+            temps_core::ProviderConfig::default(),
+            true,
+            Some("subscription".to_string()),
+            false,
+            None,
+            None,
+            None,
+            Vec::new(),
+            temps_ai::ModelCatalogSource::Bootstrap,
+            None,
+            None,
+        );
+
+        assert!(dto.models.is_empty());
+        assert!(dto.runtime_models.is_empty());
+        assert!(dto.default_runtime_model_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_models_overlay_a_cold_host_status_cache() {
+        crate::ai_cli::invalidate_status_cache().await;
+        let claude =
+            crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
+        let provider_config = temps_core::ProviderConfig {
+            auth_type: "subscription".to_string(),
+            credentials_encrypted: Some("encrypted-token".to_string()),
+            ..Default::default()
+        };
+        let capabilities = crate::ai_cli::provider_capabilities_from_models(
+            "claude_cli",
+            vec![crate::ai_cli::AiCliModelCapability {
+                id: "account-model".to_string(),
+                name: "Account model".to_string(),
+                reasoning_options: Vec::new(),
+                default_reasoning_option: None,
+            }],
+        )
+        .expect("Claude capability contract");
+
+        let dto = provider_catalog_dto(
+            claude,
+            provider_config,
+            Some(temps_ai::ProviderCapabilitiesSnapshot {
+                capabilities,
+                model_source: temps_ai::ModelCatalogSource::Live,
+                models_refreshed_at: Some("2026-09-08T00:00:00Z".to_string()),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(dto.model_source, temps_ai::ModelCatalogSource::Live);
+        assert_eq!(dto.models, vec!["account-model"]);
+        assert_eq!(
+            dto.models_refreshed_at.as_deref(),
+            Some("2026-09-08T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn claude_refresh_uses_host_without_a_saved_workspace_credential() {
+        let claude =
+            crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
+        assert!(!uses_workspace_model_discovery(
+            claude,
+            &temps_core::ProviderConfig::default()
+        ));
+
+        let configured = temps_core::ProviderConfig {
+            credentials_encrypted: Some("encrypted-token".to_string()),
+            ..temps_core::ProviderConfig::default()
+        };
+        assert!(uses_workspace_model_discovery(claude, &configured));
+
+        let codex =
+            crate::ai_cli::catalog::find_provider("codex_cli").expect("Codex catalog entry");
+        assert!(!uses_workspace_model_discovery(codex, &configured));
+    }
+
+    #[test]
+    fn model_refresh_uses_the_same_permission_as_provider_execution() {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Harness User".to_string(),
+            email: "harness-user@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let auth = |permissions| {
+            temps_auth::AuthContext::new_api_key(
+                user.clone(),
+                None,
+                Some(permissions),
+                "provider-refresh-test".to_string(),
+                1,
+            )
+        };
+        let claude = find_provider("claude_cli").expect("Claude catalog entry");
+        let codex = find_provider("codex_cli").expect("Codex catalog entry");
+
+        assert!(ensure_provider_runtime_permission(
+            &auth(vec![Permission::AiGatewayWrite]),
+            claude
+        )
+        .is_ok());
+        assert!(
+            ensure_provider_runtime_permission(&auth(vec![Permission::SettingsRead]), claude)
+                .is_err()
+        );
+        assert!(
+            ensure_provider_runtime_permission(&auth(vec![Permission::SystemAdmin]), codex).is_ok()
+        );
+        assert!(
+            ensure_provider_runtime_permission(&auth(vec![Permission::AiGatewayWrite]), codex)
+                .is_err()
+        );
+        assert!(ensure_workspace_model_discovery_permission(&auth(vec![
+            Permission::SandboxesWrite,
+            Permission::SandboxesExec,
+        ]))
+        .is_ok());
+        assert!(ensure_workspace_model_discovery_permission(&auth(vec![
+            Permission::SandboxesWrite,
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn workspace_refresh_errors_do_not_expose_sandbox_internals() {
+        let claude =
+            crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
+        let raw_error = temps_ai::AiError::Provider {
+            purpose: "provider.capabilities.workspace".to_string(),
+            reason: "create application network 'private-name': all predefined address pools have been fully subnetted"
+                .to_string(),
+        };
+
+        let detail = provider_model_refresh_error_detail(claude, "claude_cli", true, &raw_error);
+
+        assert!(detail.contains("persistent workspace"));
+        assert!(detail.contains("Claude Code models"));
+        assert!(!detail.contains("private-name"));
+        assert!(!detail.contains("address pools"));
+    }
+
+    #[test]
+    fn host_refresh_errors_keep_provider_context_without_raw_cli_output() {
+        let claude =
+            crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
+        let raw_error = temps_ai::AiError::Provider {
+            purpose: "provider.capabilities".to_string(),
+            reason: "authorization: Bearer secret-value".to_string(),
+        };
+
+        let detail = provider_model_refresh_error_detail(claude, "claude_cli", false, &raw_error);
+
+        assert!(detail.contains("claude_cli"));
+        assert!(!detail.contains("secret-value"));
+        assert!(!detail.contains("Bearer"));
+    }
+
+    #[test]
     fn workspace_readiness_requires_a_supported_relay_and_saved_credential() {
         let claude =
             crate::ai_cli::catalog::find_provider("claude_cli").expect("Claude catalog entry");
@@ -1164,7 +1803,8 @@ mod tests {
             Some("Host authentication is not used by workspaces.".to_string()),
             None,
             Vec::new(),
-            "bootstrap",
+            temps_ai::ModelCatalogSource::Bootstrap,
+            None,
             None,
         );
         assert!(configured.workspace_ready);
@@ -1180,7 +1820,8 @@ mod tests {
             None,
             Some("1.0.0".to_string()),
             Vec::new(),
-            "bootstrap",
+            temps_ai::ModelCatalogSource::Bootstrap,
+            None,
             None,
         );
         assert!(!host_only.workspace_ready);
@@ -1201,7 +1842,8 @@ mod tests {
             None,
             Some("1.0.0".to_string()),
             Vec::new(),
-            "bootstrap",
+            temps_ai::ModelCatalogSource::Bootstrap,
+            None,
             None,
         );
         assert!(!codex_configured.workspace_ready);

@@ -124,6 +124,40 @@ pub trait AiService: Send + Sync {
         Err(AiError::NotAvailable)
     }
 
+    /// Return capabilities for the provider credential available to the Temps
+    /// host. The snapshot preserves whether discovery was live, cached, stale,
+    /// or only a bootstrap fallback.
+    async fn capabilities_snapshot_for(
+        &self,
+        provider: Option<&str>,
+        refresh: RefreshPolicy,
+    ) -> Result<crate::ProviderCapabilitiesSnapshot, AiError> {
+        let capabilities = self.capabilities_for(provider, refresh).await?;
+        Ok(crate::ProviderCapabilitiesSnapshot {
+            capabilities,
+            model_source: match refresh {
+                RefreshPolicy::Refresh => crate::ModelCatalogSource::Live,
+                RefreshPolicy::Cached => crate::ModelCatalogSource::Cache,
+            },
+            models_refreshed_at: None,
+        })
+    }
+
+    /// Return provider capabilities for the credential used by a user's
+    /// persistent workspace. Implementations without a distinct workspace
+    /// credential inherit the ordinary provider capability path.
+    async fn capabilities_snapshot_for_principal(
+        &self,
+        provider: Option<&str>,
+        _principal_id: i32,
+        refresh: RefreshPolicy,
+    ) -> Result<crate::ProviderCapabilitiesSnapshot, AiError> {
+        self.capabilities_snapshot_for(provider, refresh).await
+    }
+
+    /// Invalidate account-scoped capability state after credentials change.
+    async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
+
     /// Low-level completion. Prefer the [`crate::complete_text`] /
     /// [`crate::complete_typed`] helpers for everyday use.
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError>;

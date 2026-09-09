@@ -6,11 +6,13 @@ import {
   chatHarnessProviderOptions,
   chatModelLabel,
   chatPermissionLabel,
+  providerCatalogNeedsRefresh,
   chatProviderLabel,
   chatThinkingItemContent,
   chatThinkingLabel,
   reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
+  shouldAutoRefreshHarnessModels,
   usesHarnessCatalog,
   type ChatProviderOption,
 } from './chat-runtime-options'
@@ -60,6 +62,62 @@ describe('usesHarnessCatalog', () => {
     expect(usesHarnessCatalog('global')).toBe(true)
     expect(usesHarnessCatalog('deployment')).toBe(false)
   })
+})
+
+describe('shouldAutoRefreshHarnessModels', () => {
+  const unresolvedClaude: ChatProviderOption = {
+    id: 'claude_cli',
+    name: 'Claude Code',
+    auth_source: 'host_environment',
+    models: [],
+    model_discovery_status: 'unavailable',
+    permission_modes: [],
+  }
+
+  test('requests one discovery attempt for a saved global workspace harness', () => {
+    expect(
+      shouldAutoRefreshHarnessModels('global', unresolvedClaude, false)
+    ).toBe(true)
+    expect(
+      shouldAutoRefreshHarnessModels('global', unresolvedClaude, true)
+    ).toBe(false)
+  })
+
+  test('does not start workspace discovery outside harness chat', () => {
+    expect(
+      shouldAutoRefreshHarnessModels('deployment', unresolvedClaude, false)
+    ).toBe(false)
+  })
+
+  test.each(['bootstrap', 'stale_cache'] as const)(
+    'refreshes a non-authoritative %s catalog even when it contains fallback models',
+    (modelSource) => {
+      const [provider] = chatHarnessProviderOptions([
+        {
+          id: 'claude_cli',
+          name: 'Claude Code',
+          workspace_ready: true,
+          runtime_models: [
+            {
+              id: 'sonnet',
+              name: 'Sonnet',
+              thinking_modes: [],
+            },
+          ],
+          default_runtime_model_id: 'sonnet',
+          model_source: modelSource,
+          permission_modes: [],
+          default_permission_mode_id: 'default',
+        },
+      ])
+
+      expect(provider.model_discovery_status).toBe('unavailable')
+      expect(providerCatalogNeedsRefresh(provider)).toBe(true)
+      expect(shouldAutoRefreshHarnessModels('global', provider, false)).toBe(
+        true
+      )
+    }
+  )
 })
 
 describe('resolveChatRuntimeSelection', () => {
@@ -193,6 +251,7 @@ test('harness catalog options preserve resolved runtime controls', () => {
           },
         ],
         default_runtime_model_id: 'default',
+        model_source: 'live',
         permission_modes: [{ id: 'full-access', name: 'Auto' }],
         default_permission_mode_id: 'full-access',
       },
@@ -212,6 +271,7 @@ test('harness catalog options preserve resolved runtime controls', () => {
         },
       ],
       default_model_id: 'default',
+      model_source: 'live',
       model_discovery_status: 'ready',
       model_discovery_error: null,
       permission_modes: [{ id: 'full-access', name: 'Auto' }],
@@ -229,6 +289,7 @@ test('harness catalog excludes a host-only CLI without a workspace relay', () =>
         workspace_ready: false,
         runtime_models: [],
         default_runtime_model_id: null,
+        model_source: 'bootstrap',
         permission_modes: [],
         default_permission_mode_id: 'default',
       },
@@ -269,3 +330,59 @@ test('a model refresh drops a stale thinking sentinel without switching harnesse
     permissionModeId: 'build',
   })
 })
+
+test.each(['bootstrap', 'stale_cache'])(
+  '%s model catalogs preserve an unresolved persisted selection',
+  (modelSource) => {
+    const incomplete: ChatProviderOption[] = [
+      {
+        id: 'claude_cli',
+        name: 'Claude Code',
+        auth_source: 'host_environment',
+        models: [
+          {
+            id: 'sonnet',
+            name: 'Sonnet',
+            thinking_options: [{ id: 'high', name: 'High' }],
+          },
+        ],
+        default_model_id: 'sonnet',
+        model_source: modelSource,
+        permission_modes: [{ id: 'auto', name: 'Auto' }],
+        default_permission_mode_id: 'auto',
+      },
+    ]
+
+    expect(
+      reconcileChatRuntimeAfterRefresh(incomplete, {
+        providerId: 'claude_cli',
+        modelId: 'account-only-model',
+        thinkingOptionId: 'adaptive',
+        permissionModeId: 'auto',
+      })
+    ).toEqual({
+      providerId: 'claude_cli',
+      modelId: 'account-only-model',
+      thinkingOptionId: 'adaptive',
+      permissionModeId: 'auto',
+    })
+
+    expect(
+      reconcileChatRuntimeAfterRefresh(incomplete, {
+        providerId: 'claude_cli',
+        modelId: 'sonnet',
+        thinkingOptionId: 'medium',
+        permissionModeId: 'auto',
+      }).thinkingOptionId
+    ).toBe('medium')
+
+    expect(
+      reconcileChatRuntimeAfterRefresh(incomplete, {
+        providerId: 'claude_cli',
+        modelId: 'sonnet',
+        thinkingOptionId: null,
+        permissionModeId: 'auto',
+      }).thinkingOptionId
+    ).toBeNull()
+  }
+)

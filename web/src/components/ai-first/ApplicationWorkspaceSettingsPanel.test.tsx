@@ -59,4 +59,30 @@ describe('ApplicationWorkspaceSettingsPanel', () => {
 
     expect(html).not.toContain('Harness maintenance')
   })
+
+  test('shows a failed startup reason and retry before lifecycle controls', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ApplicationWorkspaceSettingsPanel
+          applicationPublicId="app_example"
+          initialWorkspace={{
+            ...workspace,
+            state: 'failed',
+            last_error:
+              'This Temps host has no private sandbox network capacity available.',
+          }}
+        />
+      </MemoryRouter>
+    )
+
+    expect(html).toContain('role="alert"')
+    expect(html).toContain('Workspace could not start')
+    expect(html).toContain(
+      'This Temps host has no private sandbox network capacity available.'
+    )
+    expect(html).toContain('Try again')
+    expect(html.indexOf('Workspace could not start')).toBeLessThan(
+      html.indexOf('Lifecycle')
+    )
+  })
 })

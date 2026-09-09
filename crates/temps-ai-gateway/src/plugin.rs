@@ -136,6 +136,9 @@ impl TempsPlugin for AiGatewayPlugin {
                 })?,
             );
             context.register_service(sandbox_model_relay.clone());
+            let sandbox_workspace_resolver =
+                Arc::new(temps_ai_agent_cli::SandboxWorkspaceResolverSlot::new());
+            context.register_service(sandbox_workspace_resolver.clone());
             let sandbox_credentials: temps_ai_agent_cli::SandboxCredentialResolver = {
                 let config_service = config_service.clone();
                 let encryption_service = encryption_service.clone();
@@ -253,6 +256,7 @@ impl TempsPlugin for AiGatewayPlugin {
                             application_workspace_root.clone(),
                             sandbox_credentials.clone(),
                             sandbox_model_relay.clone(),
+                            sandbox_workspace_resolver.as_ref().clone(),
                         );
                     } else {
                         tracing::warn!(
