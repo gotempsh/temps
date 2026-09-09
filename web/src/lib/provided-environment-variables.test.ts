@@ -11,7 +11,7 @@ import {
   normalizeCreationPreset,
 } from '@/lib/provided-environment-variables'
 
-describe('ProvidedEnvironmentVariables', () => {
+describe('provided-environment-variables', () => {
   test('normalizes repository presets and keeps only the preset slug', () => {
     expect(normalizeCreationPreset('NextJS::apps/web')).toBe('nextjs')
     expect(normalizeCreationPreset('custom')).toBe('static')
