@@ -40,6 +40,10 @@ pub struct BranchInfo {
     pub name: String,
     pub commit_sha: String,
     pub protected: bool,
+    /// Whether this is the repository's default branch, as reported by the
+    /// git provider (e.g. `main` or `master`). Clients should use this
+    /// instead of guessing from the branch name.
+    pub is_default: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -145,11 +149,14 @@ pub async fn get_repository_branches(
     // Check permission
     permission_check!(auth, Permission::GitRepositoriesRead);
 
-    // Find the repository with the specific connection ID
-    state
+    // Find the repository with the specific connection ID; its stored
+    // `default_branch` is what tells us which branch to mark as default,
+    // since the provider's branch-list endpoint doesn't carry that flag.
+    let repository = state
         .git_provider_manager
         .get_repository_by_owner_and_name_in_connection(&owner, &repo, params.connection_id)
         .await?;
+    let default_branch = repository.default_branch;
 
     // We already filtered by connection_id, so we know it exists
     let connection_id = params.connection_id;
@@ -186,6 +193,7 @@ pub async fn get_repository_branches(
             let branch_infos: Vec<BranchInfo> = cached_branches
                 .into_iter()
                 .map(|branch| BranchInfo {
+                    is_default: branch.name == default_branch,
                     name: branch.name,
                     commit_sha: branch.commit_sha,
                     protected: branch.protected,
@@ -212,6 +220,7 @@ pub async fn get_repository_branches(
     let branch_infos: Vec<BranchInfo> = branches
         .into_iter()
         .map(|branch| BranchInfo {
+            is_default: branch.name == default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
@@ -436,6 +445,7 @@ pub async fn get_branches_by_repository_id(
             let branch_infos: Vec<BranchInfo> = cached_branches
                 .into_iter()
                 .map(|branch| BranchInfo {
+                    is_default: branch.name == repository.default_branch,
                     name: branch.name,
                     commit_sha: branch.commit_sha,
                     protected: branch.protected,
@@ -463,6 +473,7 @@ pub async fn get_branches_by_repository_id(
     let branch_infos: Vec<BranchInfo> = branches
         .into_iter()
         .map(|branch| BranchInfo {
+            is_default: branch.name == repository.default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
