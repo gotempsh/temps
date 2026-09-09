@@ -180,11 +180,38 @@ pub async fn get_repository_branches(
         .get_connection_token(connection_id)
         .await?;
 
-    // Prefer the provider's live default branch (it can change between
-    // syncs), but never let that lookup block branch listing: fall back to
-    // our DB-synced copy so a provider outage still serves cached branches
-    // instead of failing the whole request.
     let repository_id = repository.id;
+
+    // Create cache key
+    let cache_key =
+        crate::services::cache::BranchCacheKey::new(connection_id, owner.clone(), repo.clone());
+
+    // Try cache first (unless fresh=true). A cache hit is the fast path and
+    // must stay that way: use our DB-synced default_branch rather than
+    // paying for a live provider round-trip (with its own retry/backoff)
+    // just to compute is_default on data we're about to return anyway.
+    if !params.fresh {
+        if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
+            let branch_infos: Vec<BranchInfo> = cached_branches
+                .into_iter()
+                .map(|branch| BranchInfo {
+                    is_default: branch.name == repository.default_branch,
+                    name: branch.name,
+                    commit_sha: branch.commit_sha,
+                    protected: branch.protected,
+                })
+                .collect();
+            return Ok(Json(BranchListResponse {
+                branches: branch_infos,
+            }));
+        }
+    }
+
+    // Cache missed (or fresh=true), so we're making a live provider call
+    // either way: also prefer the provider's live default branch here (it
+    // can change between syncs), but never let that lookup block branch
+    // listing on its own -- fall back to our DB-synced copy so a provider
+    // outage still returns branches instead of failing the whole request.
     let default_branch = match provider_service
         .get_repository(&access_token, &owner, &repo)
         .await
@@ -204,28 +231,6 @@ pub async fn get_repository_branches(
         }
         Err(_) => repository.default_branch,
     };
-
-    // Create cache key
-    let cache_key =
-        crate::services::cache::BranchCacheKey::new(connection_id, owner.clone(), repo.clone());
-
-    // Try cache first (unless fresh=true)
-    if !params.fresh {
-        if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
-            let branch_infos: Vec<BranchInfo> = cached_branches
-                .into_iter()
-                .map(|branch| BranchInfo {
-                    is_default: branch.name == default_branch,
-                    name: branch.name,
-                    commit_sha: branch.commit_sha,
-                    protected: branch.protected,
-                })
-                .collect();
-            return Ok(Json(BranchListResponse {
-                branches: branch_infos,
-            }));
-        }
-    }
 
     // Get branches from the git provider
     let branches = provider_service
@@ -454,10 +459,39 @@ pub async fn get_branches_by_repository_id(
                 .build()
         })?;
 
-    // Prefer the provider's live default branch (it can change between
-    // syncs), but never let that lookup block branch listing: fall back to
-    // our DB-synced copy so a provider outage still serves cached branches
-    // instead of failing the whole request.
+    // Create cache key
+    let cache_key = crate::services::cache::BranchCacheKey::new(
+        connection_id,
+        repository.owner.clone(),
+        repository.name.clone(),
+    );
+
+    // Try cache first (unless fresh=true). A cache hit is the fast path and
+    // must stay that way: use our DB-synced default_branch rather than
+    // paying for a live provider round-trip (with its own retry/backoff)
+    // just to compute is_default on data we're about to return anyway.
+    if !params.fresh {
+        if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
+            let branch_infos: Vec<BranchInfo> = cached_branches
+                .into_iter()
+                .map(|branch| BranchInfo {
+                    is_default: branch.name == repository.default_branch,
+                    name: branch.name,
+                    commit_sha: branch.commit_sha,
+                    protected: branch.protected,
+                })
+                .collect();
+            return Ok(Json(BranchListResponse {
+                branches: branch_infos,
+            }));
+        }
+    }
+
+    // Cache missed (or fresh=true), so we're making a live provider call
+    // either way: also prefer the provider's live default branch here (it
+    // can change between syncs), but never let that lookup block branch
+    // listing on its own -- fall back to our DB-synced copy so a provider
+    // outage still returns branches instead of failing the whole request.
     let default_branch = match provider_service
         .get_repository(&access_token, &repository.owner, &repository.name)
         .await
@@ -477,31 +511,6 @@ pub async fn get_branches_by_repository_id(
         }
         Err(_) => repository.default_branch.clone(),
     };
-
-    // Create cache key
-    let cache_key = crate::services::cache::BranchCacheKey::new(
-        connection_id,
-        repository.owner.clone(),
-        repository.name.clone(),
-    );
-
-    // Try cache first (unless fresh=true)
-    if !params.fresh {
-        if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
-            let branch_infos: Vec<BranchInfo> = cached_branches
-                .into_iter()
-                .map(|branch| BranchInfo {
-                    is_default: branch.name == default_branch,
-                    name: branch.name,
-                    commit_sha: branch.commit_sha,
-                    protected: branch.protected,
-                })
-                .collect();
-            return Ok(Json(BranchListResponse {
-                branches: branch_infos,
-            }));
-        }
-    }
 
     // Get branches from the git provider using owner and repo from repository
     let branches = provider_service
