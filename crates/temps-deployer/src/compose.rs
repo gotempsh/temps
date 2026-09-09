@@ -53,11 +53,9 @@ const COMPOSE_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const MAX_RESOLVED_COMPOSE_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COMPOSE_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_RESOLVED_COMPOSE_SERVICES: usize = 256;
-// Platform-owned safety ceilings, not reservations. These remain high enough
-// for database and application services while preventing a single container
-// from consuming the entire host. A future per-service resource editor can
-// safely choose lower values without weakening these maxima.
-const COMPOSE_SERVICE_CPU_LIMIT: &str = "4.0";
+// Platform-owned memory ceiling, not a reservation. CPU limits are left to
+// the operator: a fixed CPU cap can exceed the Docker host's available CPUs
+// and prevent container creation on smaller hosts.
 const COMPOSE_SERVICE_MEMORY_LIMIT: &str = "4g";
 const DOCKER_IMAGE_INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_CONCURRENT_IMAGE_INSPECTIONS: usize = 8;
@@ -6010,7 +6008,6 @@ impl ComposeExecutor {
         let mut override_yaml = String::from("services:\n");
         for service in affected_services {
             override_yaml.push_str(&format!("  {}:\n", service));
-            override_yaml.push_str(&format!("    cpus: {COMPOSE_SERVICE_CPU_LIMIT}\n"));
             override_yaml.push_str(&format!("    mem_limit: {COMPOSE_SERVICE_MEMORY_LIMIT}\n"));
             override_yaml.push_str("    logging:\n");
             override_yaml.push_str("      driver: json-file\n");
@@ -8228,7 +8225,12 @@ services:
             "unexpected startup failure: {}",
             failure.error
         );
-        assert_eq!(failure.containers.len(), 1);
+        assert_eq!(
+            failure.containers.len(),
+            1,
+            "startup error: {}",
+            failure.error
+        );
         assert!(failure.cleanup_containers.is_empty());
         assert!(failure.retention_error.is_none());
         assert_eq!(failure.containers[0].service_name, "worker");
@@ -8335,11 +8337,17 @@ services:
             .deploy_prepared(prepared, &request)
             .await
             .expect_err("a quickly exiting service must never be reported ready");
-        assert!(matches!(
-            failure.error,
-            ComposeError::ServicesNotReady { .. }
-        ));
-        assert_eq!(failure.containers.len(), 1);
+        assert!(
+            matches!(failure.error, ComposeError::ServicesNotReady { .. }),
+            "startup error: {}",
+            failure.error
+        );
+        assert_eq!(
+            failure.containers.len(),
+            1,
+            "startup error: {}",
+            failure.error
+        );
         assert_eq!(failure.containers[0].status, "exited");
         let logs = executor
             .container_log_tail(&failure.containers[0].container_id)
@@ -8436,7 +8444,12 @@ services:
             .await
             .expect_err("unhealthy service must fail readiness");
         assert!(failure.containers.is_empty());
-        assert_eq!(failure.cleanup_containers.len(), 1);
+        assert_eq!(
+            failure.cleanup_containers.len(),
+            1,
+            "startup error: {}",
+            failure.error
+        );
         let unsafe_container_id = failure.cleanup_containers[0].container_id.clone();
         let retention_error = failure
             .retention_error
@@ -8538,7 +8551,7 @@ services:
             webserver.get("pids_limit").and_then(Value::as_u64),
             Some(512)
         );
-        assert!(webserver.contains_key("cpus"));
+        assert!(!webserver.contains_key("cpus"));
         assert!(webserver.contains_key("mem_limit"));
         assert!(webserver.contains_key("logging"));
         assert_eq!(webserver.get("init"), None);
@@ -8604,7 +8617,7 @@ services:
 
         let rewritten = tokio::fs::read_to_string(&stale_override).await.unwrap();
         assert!(rewritten.contains("pids_limit: 512"));
-        assert!(rewritten.contains("cpus:"));
+        assert!(!rewritten.contains("cpus:"));
         assert!(rewritten.contains("mem_limit:"));
         assert!(rewritten.contains("logging:"));
         assert!(!rewritten.contains("cap_drop:"));
@@ -10050,7 +10063,7 @@ volumes:
     }
 
     #[test]
-    fn test_security_override_enforces_resource_and_log_bounds() {
+    fn test_security_override_preserves_memory_and_log_bounds_without_cpu_cap() {
         let Some(executor) = test_executor() else {
             return;
         };
@@ -10059,7 +10072,21 @@ volumes:
         let parsed: YamlValue = serde_yaml::from_str(&override_yaml).unwrap();
 
         for service in ["image_app", "built_app"] {
-            assert_eq!(parsed["services"][service]["cpus"].as_f64(), Some(4.0));
+            // A platform-injected four-core cap prevents deployment on two-core hosts.
+            let service_config = parsed["services"][service].as_mapping().unwrap();
+            for field in [
+                "cpus",
+                "cpu_count",
+                "cpu_quota",
+                "cpu_period",
+                "cpuset",
+                "deploy",
+            ] {
+                assert!(
+                    !service_config.contains_key(field),
+                    "unexpected CPU override: {field}"
+                );
+            }
             assert_eq!(
                 parsed["services"][service]["mem_limit"].as_str(),
                 Some("4g")
