@@ -12,6 +12,7 @@ pub mod cloud_bulk_activation_handler;
 pub mod cloud_telemetry_handler;
 pub mod dashboard_handler;
 pub mod facet_handler;
+pub mod global_traces;
 pub mod ingest_handler;
 pub mod metric_alert_handler;
 pub mod query_handler;
@@ -76,6 +77,14 @@ pub fn configure_routes() -> Router<OtelAppState> {
     // routes below.
     let ingest_routes = Router::new()
         // OTLP ingest endpoints (header-based auth)
+        .route(
+            "/otel/global/trace-summaries",
+            get(global_traces::query_global_trace_summaries),
+        )
+        .route(
+            "/otel/global/spans",
+            get(global_traces::query_global_traces),
+        )
         .route("/otel/v1/metrics", post(ingest_handler::ingest_metrics))
         .route("/otel/v1/traces", post(ingest_handler::ingest_traces))
         .route("/otel/v1/logs", post(ingest_handler::ingest_logs))

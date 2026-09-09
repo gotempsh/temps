@@ -328,6 +328,85 @@ struct ModeCount {
 }
 
 impl TelemetryWriteModeService {
+    /// Two batched metadata reads, independent of the number of projects.
+    pub async fn global_trace_scopes(
+        &self,
+        project_id: Option<i32>,
+        hidden: &[i32],
+        from: DBDateTime,
+        to: DBDateTime,
+    ) -> Result<
+        (
+            Vec<crate::storage::global_traces::TraceReadScope>,
+            std::collections::BTreeMap<i32, (String, String)>,
+        ),
+        DbErr,
+    > {
+        let mut query = projects::Entity::find().filter(projects::Column::IsDeleted.eq(false));
+        if let Some(id) = project_id {
+            query = query.filter(projects::Column::Id.eq(id));
+        }
+        if !hidden.is_empty() {
+            query = query.filter(projects::Column::Id.is_not_in(hidden.to_vec()));
+        }
+        #[derive(FromQueryResult)]
+        struct Identity {
+            id: i32,
+            name: String,
+            slug: String,
+        }
+        let projects = query
+            .select_only()
+            .columns([
+                projects::Column::Id,
+                projects::Column::Name,
+                projects::Column::Slug,
+            ])
+            .into_model::<Identity>()
+            .all(self.db.as_ref())
+            .await?;
+        let ids: Vec<i32> = projects.iter().map(|p| p.id).collect();
+        if ids.is_empty() {
+            return Ok((Vec::new(), Default::default()));
+        }
+        let intervals = write_intervals::Entity::find()
+            .filter(write_intervals::Column::ProjectId.is_in(ids))
+            .filter(write_intervals::Column::SignalGroup.eq(TelemetrySignalGroup::Spans))
+            .filter(write_intervals::Column::EffectiveFrom.lte(to))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(write_intervals::Column::EffectiveTo.is_null())
+                    .add(write_intervals::Column::EffectiveTo.gte(from)),
+            )
+            .all(self.db.as_ref())
+            .await?;
+        let mut grouped: std::collections::BTreeMap<i32, Vec<write_intervals::Model>> =
+            Default::default();
+        for interval in intervals {
+            grouped
+                .entry(interval.project_id)
+                .or_default()
+                .push(interval);
+        }
+        let mut scopes = Vec::new();
+        let mut names = std::collections::BTreeMap::new();
+        for p in projects {
+            let resolution = resolve_window(
+                grouped.get(&p.id).map(Vec::as_slice).unwrap_or(&[]),
+                from,
+                to,
+            );
+            scopes.push(crate::storage::global_traces::TraceReadScope {
+                project_id: p.id,
+                from: resolution.from,
+                to: resolution.to,
+                cloud: resolution.source == CloudTelemetryWriteMode::Cloud,
+                window_clamped_at: resolution.window_clamped_at,
+            });
+            names.insert(p.id, (p.name, p.slug));
+        }
+        Ok((scopes, names))
+    }
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
             db,
@@ -1416,6 +1495,92 @@ pub fn resolve_window(
 mod tests {
     use super::*;
     use chrono::{Duration as ChronoDuration, Utc};
+
+    #[tokio::test]
+    async fn global_traces_resolve_a_large_catalog_in_two_metadata_queries() {
+        use sea_orm::MockDatabase;
+        let rows: Vec<std::collections::BTreeMap<String, sea_orm::Value>> = (1..=105)
+            .map(|id| {
+                std::collections::BTreeMap::from([
+                    ("id".into(), id.into()),
+                    ("name".into(), format!("Project {id}").into()),
+                    ("slug".into(), format!("project-{id}").into()),
+                ])
+            })
+            .collect();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([rows])
+                .append_query_results([Vec::<write_intervals::Model>::new()])
+                .into_connection(),
+        );
+        let service = TelemetryWriteModeService::new(db.clone());
+        let (scopes, names) = service
+            .global_trace_scopes(None, &[999], mins_ago(60), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(scopes.len(), 105);
+        assert_eq!(names.len(), 105);
+        assert!(scopes
+            .iter()
+            .all(|s| !s.cloud && s.window_clamped_at.is_none()));
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("sole test database owner")
+            .into_transaction_log();
+        assert_eq!(log.len(), 2);
+        let sql = format!("{log:?}");
+        assert!(sql.contains("NOT IN"));
+        assert!(sql.contains("is_deleted"));
+    }
+
+    #[tokio::test]
+    async fn global_trace_scopes_preserve_both_cutover_directions() {
+        use sea_orm::MockDatabase;
+        let to = Utc::now();
+        let from = to - ChronoDuration::hours(2);
+        let cutover = to - ChronoDuration::minutes(30);
+        for (old, new) in [
+            (
+                CloudTelemetryWriteMode::Local,
+                CloudTelemetryWriteMode::Cloud,
+            ),
+            (
+                CloudTelemetryWriteMode::Cloud,
+                CloudTelemetryWriteMode::Local,
+            ),
+        ] {
+            let rows = vec![std::collections::BTreeMap::<String, sea_orm::Value>::from(
+                [
+                    ("id".into(), 7.into()),
+                    ("name".into(), "Project".into()),
+                    ("slug".into(), "project".into()),
+                ],
+            )];
+            let mut before = interval(1, old, 240, Some(30));
+            before.effective_to = Some(cutover);
+            let mut after = interval(2, new, 30, None);
+            after.effective_from = cutover;
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([rows])
+                    .append_query_results([vec![before, after]])
+                    .into_connection(),
+            );
+            let service = TelemetryWriteModeService::new(db.clone());
+            let (scopes, _) = service
+                .global_trace_scopes(Some(7), &[], from, to)
+                .await
+                .unwrap();
+            assert_eq!(scopes.len(), 1);
+            assert_eq!(scopes[0].from, cutover);
+            assert_eq!(scopes[0].to, to);
+            assert_eq!(scopes[0].window_clamped_at, Some(cutover));
+            assert_eq!(scopes[0].cloud, new == CloudTelemetryWriteMode::Cloud);
+            drop(service);
+            assert_eq!(Arc::try_unwrap(db).unwrap().into_transaction_log().len(), 2);
+        }
+    }
 
     fn interval(
         id: i64,

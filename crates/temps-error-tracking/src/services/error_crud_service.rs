@@ -723,6 +723,80 @@ mod tests {
             .id
     }
 
+    #[tokio::test]
+    async fn test_global_errors_pagination_and_access() {
+        use sea_orm::ConnectionTrait;
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping global errors database test: {error}");
+                return;
+            }
+            Err(error) => panic!("Global errors test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let service = ErrorCRUDService::new(db.clone());
+        let a = create_test_project(&db).await;
+        let b = create_test_project(&db).await;
+        let first = create_test_error_group(&db, a, "unresolved").await;
+        let second = create_test_error_group(&db, b, "unresolved").await;
+        let start = Utc::now() - chrono::Duration::hours(1);
+        for (group, project) in [(first, a), (second, b)] {
+            db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO error_events (error_group_id, project_id, timestamp, fingerprint_hash, exception_type, source) VALUES ($1, $2, NOW(), $3, 'TypeError', 'test')",
+                vec![group.into(), project.into(), format!("group-{group}").into()],
+            )).await.expect("insert error event");
+        }
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        let (page1, total) = service
+            .list_global_error_groups(None, &[], 1, 1, None, None, start, end)
+            .await
+            .expect("global first page");
+        let (page2, total2) = service
+            .list_global_error_groups(None, &[], 2, 1, None, None, start, end)
+            .await
+            .expect("global second page");
+        assert_eq!((total, total2), (2, 2));
+        assert_ne!(page1[0].project_id, page2[0].project_id);
+        assert_eq!(page1[0].events_in_range, 1);
+        let (visible, count) = service
+            .list_global_error_groups(None, &[b], 1, 20, None, None, start, end)
+            .await
+            .expect("hidden projects");
+        assert_eq!(count, 1);
+        assert_eq!(visible[0].project_id, a);
+        let (scoped, count) = service
+            .list_global_error_groups(Some(b), &[], 1, 20, None, None, start, end)
+            .await
+            .expect("token scope");
+        assert_eq!(count, 1);
+        assert_eq!(scoped[0].project_id, b);
+        let (filtered, count) = service
+            .list_global_error_groups(None, &[], 1, 20, Some("resolved"), None, start, end)
+            .await
+            .expect("status filter");
+        assert_eq!(count, 0);
+        assert!(filtered.is_empty());
+        let (_, count) = service
+            .list_global_error_groups(
+                None,
+                &[],
+                1,
+                20,
+                None,
+                Some("no-matching-issue"),
+                start,
+                end,
+            )
+            .await
+            .expect("global search");
+        assert_eq!(count, 0);
+    }
+
     #[test]
     fn test_status_validation() {
         // Valid statuses
@@ -1000,5 +1074,236 @@ mod tests {
             .await
             .expect("Failed to check groups");
         assert!(has_groups);
+    }
+}
+
+/// One issue in the instance ledger, with identity resolved in the same query.
+#[derive(Debug, FromQueryResult)]
+pub struct GlobalErrorGroup {
+    pub id: i32,
+    pub title: String,
+    pub error_type: String,
+    pub status: String,
+    pub assigned_to: Option<String>,
+    pub project_id: i32,
+    pub project_name: String,
+    pub project_slug: String,
+    pub environment_name: Option<String>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub total_count: i64,
+    pub events_in_range: i64,
+    pub affected_users: i64,
+}
+
+impl ErrorCRUDService {
+    /// Control-plane query: pagination and access filtering happen before fetching rows.
+    /// Event aggregates cover only the returned page and a bounded time window.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_global_error_groups(
+        &self,
+        project_id: Option<i32>,
+        hidden_projects: &[i32],
+        page: u64,
+        page_size: u64,
+        status: Option<&str>,
+        search: Option<&str>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<(Vec<GlobalErrorGroup>, u64), ErrorTrackingError> {
+        use sea_orm::ConnectionTrait;
+        let (filter, mut values) =
+            global_error_filter(project_id, hidden_projects, status, search, start, end);
+        let count_sql = format!("SELECT COUNT(*) AS total FROM error_groups g JOIN projects p ON p.id = g.project_id WHERE {filter}");
+        let count = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                count_sql,
+                values.clone(),
+            ))
+            .await?
+            .ok_or_else(|| {
+                ErrorTrackingError::Validation("Global error count returned no result".into())
+            })?;
+        let total: i64 = count.try_get("", "total")?;
+        values.push(page_size.into());
+        let limit = values.len();
+        values.push(((page - 1) * page_size).into());
+        let offset = values.len();
+        let sql = format!(
+            r#"
+            WITH page AS (
+                SELECT g.*, p.name AS project_name, p.slug AS project_slug
+                FROM error_groups g JOIN projects p ON p.id = g.project_id
+                WHERE {filter}
+                ORDER BY g.last_seen DESC, g.id DESC LIMIT ${limit} OFFSET ${offset}
+            )
+            SELECT g.id, g.title, g.error_type, g.status, g.assigned_to, g.project_id,
+                   g.project_name, g.project_slug, env.name AS environment_name,
+                   g.first_seen, g.last_seen, g.total_count::bigint AS total_count,
+                   counts.events_in_range, counts.affected_users
+            FROM page g
+            LEFT JOIN environments env ON env.id = g.environment_id AND env.project_id = g.project_id
+            CROSS JOIN LATERAL (
+                SELECT COUNT(*) AS events_in_range, COUNT(DISTINCT e.visitor_id) AS affected_users
+                FROM error_events e WHERE e.error_group_id = g.id AND e.project_id = g.project_id
+                AND e.timestamp >= $1 AND e.timestamp <= $2
+            ) counts
+            ORDER BY g.last_seen DESC, g.id DESC
+        "#
+        );
+        let rows = GlobalErrorGroup::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok((rows, total as u64))
+    }
+}
+
+fn global_error_filter(
+    project_id: Option<i32>,
+    hidden_projects: &[i32],
+    status: Option<&str>,
+    search: Option<&str>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> (String, Vec<sea_orm::Value>) {
+    let mut values: Vec<sea_orm::Value> = vec![start.into(), end.into()];
+    let mut conditions = vec!["p.is_deleted = FALSE AND EXISTS (SELECT 1 FROM error_events e WHERE e.error_group_id = g.id AND e.project_id = g.project_id AND e.timestamp >= $1 AND e.timestamp <= $2)".to_string()];
+    if let Some(id) = project_id {
+        values.push(id.into());
+        conditions.push(format!("g.project_id = ${}", values.len()));
+    }
+    // One array parameter, never one parameter or request per hidden project.
+    if !hidden_projects.is_empty() {
+        values.push(hidden_projects.to_vec().into());
+        conditions.push(format!("NOT (g.project_id = ANY(${}))", values.len()));
+    }
+    if let Some(status) = status {
+        values.push(status.to_string().into());
+        conditions.push(format!("g.status = ${}", values.len()));
+    }
+    if let Some(search) = search.filter(|s| !s.trim().is_empty()) {
+        values.push(
+            format!(
+                "%{}%",
+                search
+                    .trim()
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+            .into(),
+        );
+        let index = values.len();
+        conditions.push(format!("(g.title ILIKE ${index} OR g.error_type ILIKE ${index} OR p.name ILIKE ${index} OR p.slug ILIKE ${index})"));
+    }
+    (conditions.join(" AND "), values)
+}
+
+#[cfg(test)]
+mod global_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn global_errors_postgres_pagination_and_scope() {
+        use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("Skipping PostgreSQL integration: TEST_DATABASE_URL is not configured");
+            return;
+        };
+        let mut options = ConnectOptions::new(url);
+        options.max_connections(1).min_connections(1);
+        let db = Arc::new(Database::connect(options).await.unwrap());
+        db.execute_unprepared(r#"
+            CREATE TEMP TABLE projects(id int, name text, slug text, is_deleted bool DEFAULT false);
+            CREATE TEMP TABLE environments(id int, project_id int, name text);
+            CREATE TEMP TABLE error_groups(id int, title text, error_type text, status text, assigned_to text,
+                project_id int, environment_id int, first_seen timestamptz, last_seen timestamptz, total_count bigint);
+            CREATE TEMP TABLE error_events(error_group_id int, project_id int, timestamp timestamptz, visitor_id int);
+            INSERT INTO projects SELECT i, 'Project '||i, 'project-'||i, false FROM generate_series(1,105) i;
+            INSERT INTO environments VALUES(1,1,'production');
+            INSERT INTO error_groups SELECT i, 'Failure '||i, 'RuntimeError', 'unresolved', NULL,
+                i, 1, '2026-01-01T01:00:00Z', '2026-01-01T01:00:00Z'::timestamptz+i*interval '1 minute', 1
+                FROM generate_series(1,105) i;
+            INSERT INTO error_events SELECT i,i,'2026-01-01T01:00:00Z',i FROM generate_series(1,105) i;
+            INSERT INTO error_events VALUES(104,105,'2026-01-01T01:00:00Z',999);
+        "#).await.unwrap();
+        let service = ErrorCRUDService::new(db);
+        let start = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = start + chrono::Duration::days(1);
+        let (rows, total) = service
+            .list_global_error_groups(None, &[105], 1, 2, None, None, start, end)
+            .await
+            .unwrap();
+        assert_eq!(total, 104);
+        assert_eq!(
+            rows.iter().map(|row| row.project_id).collect::<Vec<_>>(),
+            vec![104, 103]
+        );
+        assert_eq!(
+            rows[0].events_in_range, 1,
+            "cross-project events must not contaminate counts"
+        );
+        assert!(
+            rows[0].environment_name.is_none(),
+            "cross-project environment must not leak"
+        );
+        let (rows, total) = service
+            .list_global_error_groups(None, &[105], 52, 2, None, None, start, end)
+            .await
+            .unwrap();
+        assert_eq!(total, 104);
+        assert_eq!(
+            rows.iter().map(|row| row.project_id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        let (rows, total) = service
+            .list_global_error_groups(
+                Some(1),
+                &[],
+                1,
+                20,
+                Some("unresolved"),
+                Some("project-1"),
+                start,
+                end,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].environment_name.as_deref(), Some("production"));
+        let (rows, total) = service
+            .list_global_error_groups(Some(105), &[105], 1, 20, None, None, start, end)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn scope_and_hidden_projects_apply_before_pagination() {
+        let (sql, values) = global_error_filter(
+            Some(7),
+            &[8, 9],
+            Some("unresolved"),
+            Some("50%_off"),
+            Utc::now(),
+            Utc::now(),
+        );
+        assert!(sql.contains("g.project_id = $3"));
+        assert!(sql.contains("NOT (g.project_id = ANY($4))"));
+        assert!(sql.contains("g.status = $5"));
+        assert!(sql.contains("p.slug ILIKE $6"));
+        assert_eq!(values.len(), 6);
+        assert_eq!(values[5], sea_orm::Value::from("%50\\%\\_off%"));
+        assert!(sql.contains("e.project_id = g.project_id"));
+        assert!(sql.contains("e.timestamp >= $1 AND e.timestamp <= $2"));
     }
 }

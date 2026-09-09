@@ -24,8 +24,12 @@ use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 
+use super::global::search_global_logs;
 use crate::error::LogAggregatorError;
 use crate::handlers::types::LogAggregatorAppState;
+use crate::services::global_search::{
+    GlobalLogLine, GlobalLogSearchRequest, GlobalLogSearchResponse, GlobalLogSource,
+};
 use crate::types::*;
 
 // ── Error conversion ────────────────────────────────────────────────────
@@ -129,22 +133,40 @@ impl From<LogAggregatorError> for Problem {
 /// correct semantic is "allow when the caller has access to **any** linked project"
 /// (minimum bar) rather than the macro's single-project check.
 ///
-/// Deployment tokens and instance admins bypass the check (identical semantics to
-/// `project_access_guard!`).  When no `ProjectAccessChecker` is registered this
-/// is a synchronous no-op — OSS-only binaries are unaffected.
+/// Instance admins and creators of standalone services retain access. Deployment
+/// tokens require a link to their bound project. With no `ProjectAccessChecker`,
+/// session/API-key access follows the unrestricted OSS database access policy.
 async fn guard_external_service_access(
     auth: &temps_auth::AuthContext,
     external_service_id: i32,
     project_ids: &[i32],
+    created_by_user_id: Option<i32>,
     checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<(), Problem> {
-    // Deployment tokens are already confined by project_scope_guard! and carry
-    // no user identity — skip the team-membership check.
+    // A deployment token may only read services linked to its bound project.
     if auth.is_deployment_token() {
-        return Ok(());
+        return if auth
+            .project_id()
+            .is_some_and(|id| project_ids.contains(&id))
+        {
+            Ok(())
+        } else {
+            Err(problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Service Access Denied")
+                .with_detail(format!(
+                    "External service {external_service_id} is not linked to the token's project"
+                )))
+        };
     }
     // Instance administrators are never restricted by team membership.
     if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(());
+    }
+    // Match database access: creators retain access to their standalone services.
+    if project_ids.is_empty()
+        && created_by_user_id.is_some()
+        && auth.user_id_opt() == created_by_user_id
+    {
         return Ok(());
     }
     // No checker registered → no-op (matches project_access_guard! behaviour).
@@ -321,9 +343,13 @@ pub struct PurgeLogsRequest {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(search_logs, get_log_context, tail_logs, purge_project_logs),
+    paths(super::global::search_global_logs, search_logs, get_log_context, tail_logs, purge_project_logs),
     components(
         schemas(
+            GlobalLogSearchRequest,
+            GlobalLogSearchResponse,
+            GlobalLogLine,
+            GlobalLogSource,
             SearchLogsRequest,
             SearchLogsResponse,
             ContextLogsRequest,
@@ -355,6 +381,7 @@ pub struct LogAggregatorApiDoc;
 pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
     Router::new()
         .route("/logs/search", post(search_logs))
+        .route("/logs/global/search", post(search_global_logs))
         .route("/logs/context", get(get_log_context))
         .route("/logs/tail", get(tail_logs))
         .route("/projects/{project_id}/logs", delete(purge_project_logs))
@@ -391,21 +418,20 @@ async fn search_logs(
             project_access_guard!(auth, request.project_id, app_state.project_access_checker);
         }
         Some(service_id) => {
-            let project_ids = app_state
+            let scope = app_state
                 .metadata_service
-                .find_owning_project_ids(service_id)
-                .await?;
-            if project_ids.is_empty() {
-                return Err(problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("External Service Not Found")
-                    .with_detail(format!(
-                        "External service {service_id} is not associated with any project"
-                    )));
-            }
+                .find_external_service_scope(service_id)
+                .await?
+                .ok_or_else(|| {
+                    problemdetails::new(StatusCode::NOT_FOUND)
+                        .with_title("External Service Not Found")
+                        .with_detail(format!("External service {service_id} does not exist"))
+                })?;
             guard_external_service_access(
                 &auth,
                 service_id,
-                &project_ids,
+                &scope.project_ids,
+                scope.created_by_user_id,
                 &app_state.project_access_checker,
             )
             .await?;
@@ -533,21 +559,20 @@ async fn tail_logs(
             project_access_guard!(auth, request.project_id, app_state.project_access_checker);
         }
         Some(service_id) => {
-            let project_ids = app_state
+            let scope = app_state
                 .metadata_service
-                .find_owning_project_ids(service_id)
-                .await?;
-            if project_ids.is_empty() {
-                return Err(problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("External Service Not Found")
-                    .with_detail(format!(
-                        "External service {service_id} is not associated with any project"
-                    )));
-            }
+                .find_external_service_scope(service_id)
+                .await?
+                .ok_or_else(|| {
+                    problemdetails::new(StatusCode::NOT_FOUND)
+                        .with_title("External Service Not Found")
+                        .with_detail(format!("External service {service_id} does not exist"))
+                })?;
             guard_external_service_access(
                 &auth,
                 service_id,
-                &project_ids,
+                &scope.project_ids,
+                scope.created_by_user_id,
                 &app_state.project_access_checker,
             )
             .await?;
@@ -1828,6 +1853,126 @@ mod tests {
         build_test_server_with_role(app_state, temps_auth::Role::User)
     }
 
+    #[tokio::test]
+    async fn test_external_service_access_standalone_policy() {
+        let admin = create_test_auth_context();
+        let user =
+            temps_auth::AuthContext::new_session(admin.require_user().unwrap().clone(), Role::User);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(MockProjectAccessChecker { allowed: vec![7] }));
+        // Administrators can aggregate logs from services without a creator/link.
+        assert!(
+            guard_external_service_access(&admin, 42, &[], None, &checker)
+                .await
+                .is_ok()
+        );
+        // A creator can read their standalone database with team checks active.
+        assert!(
+            guard_external_service_access(&user, 42, &[], Some(1), &checker)
+                .await
+                .is_ok()
+        );
+        assert!(
+            guard_external_service_access(&user, 42, &[], Some(2), &checker)
+                .await
+                .is_err()
+        );
+        assert!(
+            guard_external_service_access(&user, 42, &[], None, &checker)
+                .await
+                .is_err()
+        );
+        // OSS follows the same unrestricted policy as database access.
+        assert!(guard_external_service_access(&user, 42, &[], None, &None)
+            .await
+            .is_ok());
+        // Creator ownership does not bypass linked-project access.
+        assert!(
+            guard_external_service_access(&user, 42, &[8], Some(1), &checker)
+                .await
+                .is_err()
+        );
+        assert!(
+            guard_external_service_access(&user, 42, &[8, 7], None, &checker)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_service_access_deployment_token_requires_link() {
+        let token = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "test-token".into(),
+            vec![],
+        );
+        assert!(guard_external_service_access(&token, 42, &[], None, &None)
+            .await
+            .is_err());
+        assert!(guard_external_service_access(&token, 42, &[8], None, &None)
+            .await
+            .is_err());
+        assert!(guard_external_service_access(&token, 42, &[7], None, &None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_search_external_service_standalone_returns_logs() {
+        use sea_orm::{ActiveModelTrait, Set};
+        let ctx = create_test_context().await;
+        let service = temps_entities::external_services::ActiveModel {
+            name: Set(format!("standalone-svc-{}", Uuid::new_v4())),
+            service_type: Set("postgres".into()),
+            status: Set("running".into()),
+            ..Default::default()
+        }
+        .insert(ctx._db.db.as_ref())
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let mut line = make_log_line(
+            0,
+            "postgres",
+            "",
+            LogLevel::Info,
+            "database system is ready to accept connections",
+            now,
+            "standalone-db",
+        );
+        line.external_service_id = Some(service.id);
+        seed_logs(&ctx, vec![line]).await;
+        let server = build_test_server(ctx.app_state.clone());
+        let response = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": 0,
+                "external_service_id": service.id,
+                "start_time": (now - Duration::minutes(1)).to_rfc3339(),
+                "end_time": (now + Duration::minutes(1)).to_rfc3339(),
+            }))
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["lines"][0]["message"],
+            "database system is ready to accept connections"
+        );
+        // A missing service is still distinguished from a valid standalone one.
+        let missing = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": 0, "external_service_id": -1,
+            }))
+            .await;
+        missing.assert_status_not_found();
+    }
+
     /// (a) A user WITH access to the external service's owning project can
     /// search its logs (200).
     #[tokio::test]
@@ -1897,12 +2042,11 @@ mod tests {
         );
     }
 
-    /// (c) An `external_service_id` with no project association must be denied
-    /// (404), not fail-open.  An allow-all checker is used so the 404 must
-    /// originate from the missing project link, not from the checker.
+    /// A standalone service remains inaccessible to unrelated users when team
+    /// access is configured, even if their checker allows other projects.
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_search_external_service_orphaned_service() {
+    async fn test_search_external_service_standalone_denied_unrelated_user() {
         let ctx = create_test_context().await;
         // Seed an external_services row but deliberately do NOT create a
         // project_services row linking it to any project.
@@ -1917,8 +2061,7 @@ mod tests {
         .await
         .expect("Failed to seed orphaned external_services row");
 
-        // Checker that allows everything — ensures the 404 comes from the
-        // missing project link, not from the checker.
+        // Access to unrelated projects does not grant standalone service access.
         let checker = Arc::new(MockProjectAccessChecker {
             allowed: vec![1, 2, 3, 9999],
         });
@@ -1937,8 +2080,8 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            StatusCode::NOT_FOUND,
-            "external service with no project link must be denied 404, not fail-open; \
+            StatusCode::FORBIDDEN,
+            "standalone service must deny unrelated users; \
              body: {}",
             response.text()
         );

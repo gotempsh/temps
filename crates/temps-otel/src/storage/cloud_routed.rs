@@ -77,6 +77,14 @@ use crate::types::{
 /// consumers that inherit this decorator.
 #[async_trait]
 pub trait CloudSpanSource: Send + Sync {
+    async fn global_trace_stream(
+        &self,
+        _query: super::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<super::global_traces::GlobalTraceStream> {
+        Err(super::global_traces::invalid(
+            "Global Cloud trace reads are unavailable",
+        ))
+    }
     async fn query_spans(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>>;
     async fn query_trace_summaries(&self, query: TraceQuery) -> StorageResult<Vec<TraceSummary>>;
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64>;
@@ -271,6 +279,34 @@ impl CloudRoutedOtelStorage {
 
 #[async_trait]
 impl OtelStorage for CloudRoutedOtelStorage {
+    async fn global_trace_page(
+        &self,
+        mut query: super::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<super::global_traces::GlobalTracePage> {
+        if query.scopes.iter().all(|s| s.cloud) || query.scopes.iter().all(|s| !s.cloud) {
+            query.source_offset = query.filter.offset.unwrap_or(0);
+        }
+        let mut local = query.clone();
+        local.scopes.retain(|s| !s.cloud);
+        let mut cloud = query.clone();
+        cloud.scopes.retain(|s| s.cloud);
+        let local_read = async {
+            if local.scopes.is_empty() {
+                Ok(super::global_traces::GlobalTraceStream::empty())
+            } else {
+                self.local.global_trace_stream(local).await
+            }
+        };
+        let cloud_read = async {
+            if cloud.scopes.is_empty() {
+                Ok(super::global_traces::GlobalTraceStream::empty())
+            } else {
+                self.cloud.global_trace_stream(cloud).await
+            }
+        };
+        let (local, cloud) = tokio::try_join!(local_read, cloud_read)?;
+        super::global_traces::merge(vec![local, cloud], &query).await
+    }
     // ── Writes: never routed ─────────────────────────────────────────────
 
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
@@ -727,13 +763,19 @@ impl CloudRoutedOtelStorage {
         let mut cloud_projects: Vec<i32> = Vec::new();
         let mut local_projects: Vec<i32> = Vec::new();
 
-        for project_id in &query.project_ids {
-            let resolution = self
-                .resolve(*project_id, Some(query.start_time), Some(query.end_time))
-                .await;
-            match resolution.source {
-                CloudTelemetryWriteMode::Cloud => cloud_projects.push(*project_id),
-                CloudTelemetryWriteMode::Local => local_projects.push(*project_id),
+        let (scopes, _) = self
+            .write_modes
+            .global_trace_scopes(None, &[], query.start_time, query.end_time)
+            .await?;
+        let selected: std::collections::BTreeSet<_> = query.project_ids.iter().copied().collect();
+        for scope in scopes
+            .into_iter()
+            .filter(|s| selected.contains(&s.project_id))
+        {
+            if scope.cloud {
+                cloud_projects.push(scope.project_id);
+            } else {
+                local_projects.push(scope.project_id);
             }
         }
 

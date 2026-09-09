@@ -808,6 +808,12 @@ struct P95Row {
 
 #[async_trait]
 impl OtelStorage for TimescaleDbStorage {
+    async fn global_trace_stream(
+        &self,
+        query: crate::storage::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<crate::storage::global_traces::GlobalTraceStream> {
+        super::global_traces::postgres(self.db.clone(), &query).await
+    }
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
         self.batch_insert_metrics(&points).await
     }
