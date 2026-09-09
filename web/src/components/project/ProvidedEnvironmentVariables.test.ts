@@ -18,6 +18,20 @@ describe('ProvidedEnvironmentVariables', () => {
     expect(normalizeCreationPreset('')).toBe('dockerfile')
   })
 
+  test('maps catalog-only slugs to a preset the backend recognizes', () => {
+    // `nixpacks-node` and `nixpacks-static` are grouped catalog slugs from
+    // `PresetInfo::catalog_slug()` (crates/temps-presets) — they aren't in
+    // `Preset::from_str`'s vocabulary and must be aliased down, or
+    // `/deployments/managed-environment-variables` 400s with "Unknown
+    // Deployment Preset".
+    expect(normalizeCreationPreset('nixpacks-node')).toBe('nodejs')
+    expect(normalizeCreationPreset('nixpacks-static')).toBe('static')
+    expect(normalizeCreationPreset('nixpacks-node::apps/web')).toBe('nodejs')
+    // Other nixpacks-prefixed or bare presets are untouched.
+    expect(normalizeCreationPreset('nixpacks')).toBe('nixpacks')
+    expect(normalizeCreationPreset('nixpacks-python')).toBe('nixpacks-python')
+  })
+
   test('groups backend variables in a stable user-facing order', () => {
     const variables: ManagedEnvironmentVariable[] = [
       {
