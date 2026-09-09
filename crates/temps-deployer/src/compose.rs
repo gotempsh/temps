@@ -414,11 +414,14 @@ fn render_env_file(vars: &HashMap<String, String>) -> Result<String, ComposeErro
 /// privileged startup operation — the signature of Temps' own `cap_drop: ALL`
 /// sandbox rather than a fault in the image or the user's configuration.
 ///
-/// The official postgres/mysql/mariadb/mongo entrypoints (and others, e.g.
-/// Gitea) start as root, `chown`/`chmod` their data directory, then drop to a
-/// service user via `gosu`/`su-exec`. All three steps need capabilities the
-/// sandbox removes, so they fail with `EPERM` unless the service is listed in
-/// `relaxed_capability_services`.
+/// Official entrypoints (postgres/mysql/mariadb/mongo, nginx, and many
+/// others, e.g. Gitea) start as root, `chown`/`chmod` a data/cache
+/// directory, then drop to a service user via `gosu`/`su-exec`. Every
+/// sandboxed service is granted `ComposeExecutor::RELAXED_CAPABILITIES` by
+/// default specifically so those steps succeed, so a denial matching this
+/// pattern now means the image needs something outside that default set
+/// (or hit an unrelated permission problem, e.g. a read-only mount) —
+/// see `capability_denial_remediation`.
 ///
 /// Deliberately a two-factor match: "operation not permitted" on its own
 /// appears in plenty of ordinary application errors, and pointing those at a
@@ -1403,13 +1406,7 @@ impl ComposeExecutor {
         // container, let Compose report the conflict instead of deleting
         // containers outside this Temps project boundary.
         if let Err(error) = self
-            .compose_up(
-                &effective_dir,
-                &project_name,
-                &compose_file,
-                &redact_values,
-                &request.relaxed_capability_services,
-            )
+            .compose_up(&effective_dir, &project_name, &compose_file, &redact_values)
             .await
         {
             return Err(Box::new(
@@ -1435,7 +1432,6 @@ impl ComposeExecutor {
                 &project_name,
                 &compose_file,
                 &redact_values,
-                &request.relaxed_capability_services,
                 COMPOSE_READY_TIMEOUT,
             )
             .await
@@ -2122,7 +2118,6 @@ impl ComposeExecutor {
         );
         let security_content = self.generate_security_override_with_image_init(
             &request.compose_content,
-            &request.relaxed_capability_services,
             &request.unsandboxed_services,
             detected_image_owned_init_services,
             &healthcheck_loopback_overrides,
@@ -4982,7 +4977,6 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
-        relaxed_capability_services: &[String],
     ) -> Result<(), ComposeError> {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
@@ -5021,7 +5015,6 @@ impl ComposeExecutor {
                     project_name,
                     compose_file,
                     redact_values,
-                    relaxed_capability_services,
                 )
                 .await;
             let diagnostic = sanitize_compose_diagnostic(
@@ -5112,7 +5105,6 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
-        relaxed_capability_services: &[String],
     ) -> String {
         let entries = match self
             .compose_ps(project_dir, project_name, compose_file)
@@ -5165,7 +5157,7 @@ impl ComposeExecutor {
         format!(
             "\n\nContainer logs for unhealthy/stopped services:\n\n{}{}",
             sections.join("\n\n"),
-            Self::capability_denial_remediation(&capability_denied, relaxed_capability_services)
+            Self::capability_denial_remediation(&capability_denied)
         )
     }
 
@@ -5175,46 +5167,28 @@ impl ComposeExecutor {
     /// hundreds of lines of image-pull progress — whereas the error is the one
     /// thing the operator cannot avoid reading.
     ///
-    /// A service that is *already* relaxed and still denied gets the opposite
-    /// message: the toggle is not the answer, so say so instead of sending the
-    /// operator to flip a switch that is on.
-    fn capability_denial_remediation(
-        denied_services: &[String],
-        relaxed_capability_services: &[String],
-    ) -> String {
+    /// Every sandboxed service already gets `RELAXED_CAPABILITIES` by
+    /// default, so a denial matching this pattern means the image needs a
+    /// capability outside that default set (or hit an unrelated permission
+    /// problem, e.g. a read-only mount) — the fix is no longer a toggle to
+    /// flip but exempting the service from the sandbox entirely.
+    fn capability_denial_remediation(denied_services: &[String]) -> String {
         if denied_services.is_empty() {
             return String::new();
         }
 
-        let (already_relaxed, needs_relaxing): (Vec<_>, Vec<_>) = denied_services
-            .iter()
-            .partition(|service| relaxed_capability_services.contains(service));
-
-        let mut hints = Vec::new();
-        if !needs_relaxing.is_empty() {
-            hints.push(format!(
-                "Service(s) {} failed with \"Operation not permitted\". Temps runs every \
-                 Compose service with all Linux capabilities dropped, and image entrypoints \
-                 that prepare a data directory and then drop from root to a service user \
-                 need {} to start. Enable \"Elevated permissions\" for them in {}, then \
-                 redeploy.",
-                quote_service_list(&needs_relaxing),
-                Self::RELAXED_CAPABILITIES.join(", "),
-                ELEVATED_PERMISSIONS_SETTINGS_PATH,
-            ));
-        }
-        if !already_relaxed.is_empty() {
-            hints.push(format!(
-                "Service(s) {} already have \"Elevated permissions\" enabled, so this denial \
-                 is not the Temps sandbox's capability drop — check whether the image needs a \
-                 capability outside the granted set ({}), or runs as a user that cannot write \
-                 its mounted data directory.",
-                quote_service_list(&already_relaxed),
-                Self::RELAXED_CAPABILITIES.join(", "),
-            ));
-        }
-
-        format!("\n\n{}", hints.join("\n\n"))
+        format!(
+            "\n\nService(s) {} failed with \"Operation not permitted\" despite Temps granting \
+             every sandboxed Compose service {} by default — the capabilities official image \
+             entrypoints commonly need to fix ownership on a data/cache directory and drop from \
+             root to a service user. This means the image needs a capability outside that \
+             default set, or hit an unrelated permission problem (e.g. a read-only mount). If \
+             the image genuinely needs broader permissions, use \"Disable sandbox\" for it in \
+             {}, then redeploy.",
+            quote_service_list(&denied_services.iter().collect::<Vec<_>>()),
+            Self::RELAXED_CAPABILITIES.join(", "),
+            ELEVATED_PERMISSIONS_SETTINGS_PATH,
+        )
     }
 
     /// Fetches the last [`Self::FAILED_CONTAINER_LOG_TAIL`] lines (stdout +
@@ -5255,7 +5229,6 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
-        relaxed_capability_services: &[String],
         timeout: std::time::Duration,
     ) -> Result<(), ComposeError> {
         let start = std::time::Instant::now();
@@ -5299,7 +5272,6 @@ impl ComposeExecutor {
                                 project_name,
                                 compose_file,
                                 redact_values,
-                                relaxed_capability_services,
                             )
                             .await;
                         return Err(ComposeError::ServicesNotReady {
@@ -5317,7 +5289,6 @@ impl ComposeExecutor {
                             project_name,
                             compose_file,
                             redact_values,
-                            relaxed_capability_services,
                         )
                         .await;
                     return Err(ComposeError::ServicesNotReady {
@@ -5335,7 +5306,6 @@ impl ComposeExecutor {
                                 project_name,
                                 compose_file,
                                 redact_values,
-                                relaxed_capability_services,
                             )
                             .await;
                         return Err(ComposeError::ServicesNotReady {
@@ -5934,12 +5904,19 @@ impl ComposeExecutor {
         serde_yaml::to_string(&Value::Mapping(root)).unwrap_or_default()
     }
 
-    /// Minimal Linux capabilities the official postgres/mysql/mariadb/mongo
-    /// entrypoints need to fix ownership on a data/socket directory at
-    /// container start (`chown`/`chmod` as root, then drop to a service user
-    /// via `gosu`/`su-exec`). Granted back only for services the user has
-    /// explicitly opted in via `relaxed_capability_services` — every other
-    /// service keeps the full `cap_drop: ALL` below.
+    /// Minimal Linux capabilities official image entrypoints commonly need to
+    /// fix ownership on a data/socket/cache directory at container start
+    /// (`chown`/`chmod` as root, then drop to a service user via
+    /// `gosu`/`su-exec`, or nginx's own non-root cache setup) — not just
+    /// databases (postgres/mysql/mariadb/mongo), but the vast majority of
+    /// official images, including plain web servers like nginx. None of
+    /// these grant anything beyond what the container already controls
+    /// (its own filesystem layers and process UID/GID), so they're part of
+    /// every sandboxed service's baseline rather than an opt-in — a service
+    /// still gets the full `cap_drop: ALL` below, just with this minimal set
+    /// added back. Genuinely risky capabilities are never granted here; an
+    /// image that needs one of those must be exempted from the sandbox
+    /// entirely via `unsandboxed_services`.
     const RELAXED_CAPABILITIES: [&'static str; 5] =
         ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"];
 
@@ -5969,12 +5946,10 @@ impl ComposeExecutor {
     fn generate_security_override(
         &self,
         compose_content: &str,
-        relaxed_capability_services: &[String],
         unsandboxed_services: &[String],
     ) -> String {
         self.generate_security_override_with_image_init(
             compose_content,
-            relaxed_capability_services,
             unsandboxed_services,
             &HashSet::new(),
             &Self::healthcheck_loopback_overrides(compose_content, None),
@@ -5984,7 +5959,6 @@ impl ComposeExecutor {
     fn generate_security_override_with_image_init(
         &self,
         compose_content: &str,
-        relaxed_capability_services: &[String],
         unsandboxed_services: &[String],
         detected_image_owned_init_services: &HashSet<String>,
         healthcheck_loopback_overrides: &HashMap<String, String>,
@@ -6026,11 +6000,9 @@ impl ComposeExecutor {
                 override_yaml.push_str("    privileged: false\n");
                 override_yaml.push_str("    cap_drop:\n");
                 override_yaml.push_str("      - ALL\n");
-                if relaxed_capability_services.iter().any(|s| s == service) {
-                    override_yaml.push_str("    cap_add:\n");
-                    for cap in Self::RELAXED_CAPABILITIES {
-                        override_yaml.push_str(&format!("      - {}\n", cap));
-                    }
+                override_yaml.push_str("    cap_add:\n");
+                for cap in Self::RELAXED_CAPABILITIES {
+                    override_yaml.push_str(&format!("      - {}\n", cap));
                 }
                 override_yaml.push_str("    security_opt:\n");
                 // Prevents exec-based privilege re-escalation (SUID binaries,
@@ -7156,9 +7128,8 @@ services:
     }
 
     #[test]
-    fn test_capability_denial_remediation_names_the_service_and_the_toggle() {
-        let remediation =
-            ComposeExecutor::capability_denial_remediation(&["postgres".to_string()], &[]);
+    fn test_capability_denial_remediation_names_the_service_and_the_escape_hatch() {
+        let remediation = ComposeExecutor::capability_denial_remediation(&["postgres".to_string()]);
 
         assert!(remediation.contains("'postgres'"), "{remediation}");
         assert!(
@@ -7166,33 +7137,14 @@ services:
             "{remediation}"
         );
         assert!(remediation.contains("SETUID"), "{remediation}");
-    }
-
-    /// A service that is already relaxed and *still* denied needs the opposite
-    /// advice: the toggle is on, so it is not the answer.
-    #[test]
-    fn test_capability_denial_remediation_does_not_resend_already_relaxed_services() {
-        let remediation = ComposeExecutor::capability_denial_remediation(
-            &["postgres".to_string()],
-            &["postgres".to_string()],
-        );
-
-        assert!(
-            remediation.contains("already have \"Elevated permissions\" enabled"),
-            "{remediation}"
-        );
-        assert!(
-            !remediation.contains(ELEVATED_PERMISSIONS_SETTINGS_PATH),
-            "should not send the operator to a toggle that is already on: {remediation}"
-        );
+        // The default-granted set means "Disable sandbox" is now the escape
+        // hatch — there is no "Elevated permissions" toggle left to flip.
+        assert!(remediation.contains("Disable sandbox"), "{remediation}");
     }
 
     #[test]
     fn test_capability_denial_remediation_is_empty_without_a_denial() {
-        assert!(
-            ComposeExecutor::capability_denial_remediation(&[], &["postgres".to_string()])
-                .is_empty()
-        );
+        assert!(ComposeExecutor::capability_denial_remediation(&[]).is_empty());
     }
 
     /// The two denylists must stay disjoint: a key in both would make the
@@ -7733,13 +7685,15 @@ services:
   worker:
     image: alpine
 "#;
-        let override_yaml = executor.generate_security_override(compose, &[], &[]);
+        let override_yaml = executor.generate_security_override(compose, &[]);
 
         assert_eq!(override_yaml.matches("cap_drop:").count(), 2);
         assert_eq!(override_yaml.matches("no-new-privileges:true").count(), 2);
         assert_eq!(override_yaml.matches("pids_limit: 512").count(), 2);
         assert_eq!(override_yaml.matches("init: true").count(), 2);
-        assert!(!override_yaml.contains("cap_add"));
+        // Every sandboxed service gets the minimal safe capability set back
+        // by default now — no opt-in required.
+        assert_eq!(override_yaml.matches("cap_add:").count(), 2);
     }
 
     #[test]
@@ -7784,7 +7738,6 @@ services:
         );
         let override_yaml = executor.generate_security_override_with_image_init(
             compose,
-            &[],
             &["web".to_string()],
             &HashSet::new(),
             &overrides,
@@ -7813,7 +7766,7 @@ services:
 "#;
 
         let override_yaml =
-            executor.generate_security_override(compose, &[], &["webserver".to_string()]);
+            executor.generate_security_override(compose, &["webserver".to_string()]);
 
         let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
         let webserver = override_value["services"]["webserver"]
@@ -7848,8 +7801,7 @@ services:
     image: alpine:latest
 "#;
 
-        let override_yaml =
-            executor.generate_security_override(compose, &["budge".to_string()], &[]);
+        let override_yaml = executor.generate_security_override(compose, &[]);
         let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
         let budge = override_value["services"]["budge"].as_mapping().unwrap();
         let worker = override_value["services"]["worker"].as_mapping().unwrap();
@@ -7918,7 +7870,6 @@ services:
         let override_yaml = executor.generate_security_override_with_image_init(
             compose,
             &[],
-            &[],
             &detected,
             &HashMap::new(),
         );
@@ -7973,7 +7924,7 @@ services:
             .unwrap();
         tokio::fs::write(
             project_dir.path().join("docker-compose.temps-security.yml"),
-            executor.generate_security_override(compose, &[], &[]),
+            executor.generate_security_override(compose, &[]),
         )
         .await
         .unwrap();
@@ -8008,7 +7959,7 @@ services:
 "#;
 
         let override_yaml =
-            executor.generate_security_override(compose, &[], &["webserver".to_string()]);
+            executor.generate_security_override(compose, &["webserver".to_string()]);
 
         assert!(override_yaml.contains("  webserver:"));
         assert!(override_yaml.contains("  worker:"));
@@ -8060,7 +8011,7 @@ services:
     network_mode: none
 "#;
         let override_yaml =
-            executor.generate_security_override(compose, &[], &["image-owned-init".to_string()]);
+            executor.generate_security_override(compose, &["image-owned-init".to_string()]);
         let project_dir = tempfile::tempdir().unwrap();
         let compose_path = project_dir.path().join("compose.yml");
         let override_path = project_dir.path().join("security.yml");
@@ -8541,7 +8492,7 @@ services:
         let compose = "services:\n  webserver:\n    image: paperless:latest\n";
 
         let override_yaml =
-            executor.generate_security_override(compose, &[], &["webserver".to_string()]);
+            executor.generate_security_override(compose, &["webserver".to_string()]);
 
         let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
         let webserver = override_value["services"]["webserver"]
@@ -8801,13 +8752,16 @@ services:
     }
 
     #[test]
-    fn test_generate_security_override_grants_relaxed_capabilities() {
+    fn test_generate_security_override_grants_baseline_capabilities_to_every_service() {
         let docker = Docker::connect_with_defaults();
         if docker.is_err() {
             return;
         }
         let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
 
+        // A plain web server (nginx) needs the exact same baseline as a
+        // database entrypoint to `chown` its cache dir and drop from root —
+        // both must get it without any opt-in.
         let compose = r#"
 services:
   db:
@@ -8815,52 +8769,40 @@ services:
   web:
     image: nginx
 "#;
-        let override_yaml = executor.generate_security_override(compose, &["db".to_string()], &[]);
+        let override_yaml = executor.generate_security_override(compose, &[]);
 
-        // Both services still get the strict cap_drop baseline.
+        // Both services get the strict cap_drop baseline...
         assert_eq!(override_yaml.matches("cap_drop:").count(), 2);
         assert_eq!(override_yaml.matches("no-new-privileges:true").count(), 2);
 
-        // Only the relaxed service gets cap_add, with exactly the minimal set.
-        assert_eq!(override_yaml.matches("cap_add:").count(), 1);
+        // ...and both get cap_add back, with exactly the minimal safe set.
+        assert_eq!(override_yaml.matches("cap_add:").count(), 2);
         for cap in ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"] {
             assert_eq!(
                 override_yaml.matches(cap).count(),
-                1,
-                "expected exactly one occurrence of {cap}"
+                2,
+                "expected exactly one occurrence of {cap} per service"
             );
         }
 
-        // cap_add must be nested under `db`, not `web` — check via string
-        // position (services are emitted in source order) AND by actually
-        // parsing the generated YAML, so a future change to emission order
-        // can't silently make the positional check pass while attaching
-        // cap_add to the wrong service.
-        let db_idx = override_yaml.find("  db:\n").expect("db service present");
-        let web_idx = override_yaml.find("  web:\n").expect("web service present");
-        let cap_add_idx = override_yaml.find("cap_add:").expect("cap_add present");
-        assert!(db_idx < cap_add_idx && cap_add_idx < web_idx);
-
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&override_yaml).expect("generated override is valid YAML");
-        let db_caps = parsed["services"]["db"]["cap_add"]
-            .as_sequence()
-            .expect("db has cap_add sequence")
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            db_caps,
-            vec!["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"]
-        );
-        assert!(
-            parsed["services"]["web"].get("cap_add").is_none(),
-            "web must not have cap_add"
-        );
+        for service in ["db", "web"] {
+            let caps = parsed["services"][service]["cap_add"]
+                .as_sequence()
+                .unwrap_or_else(|| panic!("{service} has cap_add sequence"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                caps,
+                vec!["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"]
+            );
+        }
     }
 
     #[test]
-    fn test_generate_security_override_empty_relaxed_list_matches_baseline() {
+    fn test_generate_security_override_unsandboxed_service_gets_no_cap_add() {
         let docker = Docker::connect_with_defaults();
         if docker.is_err() {
             return;
@@ -8868,12 +8810,12 @@ services:
         let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
 
         let compose = "services:\n  db:\n    image: postgres:18\n";
-        let with_empty = executor.generate_security_override(compose, &[], &[]);
-        let with_unmatched =
-            executor.generate_security_override(compose, &["nonexistent".to_string()], &[]);
+        let override_yaml = executor.generate_security_override(compose, &["db".to_string()]);
 
-        assert_eq!(with_empty, with_unmatched);
-        assert!(!with_empty.contains("cap_add"));
+        // Fully unsandboxed services skip the sandbox entirely, so they
+        // don't get cap_drop/cap_add at all — Docker's own defaults apply.
+        assert!(!override_yaml.contains("cap_drop"));
+        assert!(!override_yaml.contains("cap_add"));
     }
 
     /// A request with everything empty, so a test only states the fields it
@@ -10068,7 +10010,7 @@ volumes:
             return;
         };
         let compose = "services:\n  image_app:\n    image: alpine\n  built_app:\n    build: .\n";
-        let override_yaml = executor.generate_security_override(compose, &[], &[]);
+        let override_yaml = executor.generate_security_override(compose, &[]);
         let parsed: YamlValue = serde_yaml::from_str(&override_yaml).unwrap();
 
         for service in ["image_app", "built_app"] {
@@ -10222,7 +10164,7 @@ services:
   worker: &app
     image: alpine
 "#;
-        let override_yaml = executor.generate_security_override(compose, &[], &[]);
+        let override_yaml = executor.generate_security_override(compose, &[]);
         assert!(override_yaml.contains("web:"));
         assert!(override_yaml.contains("worker:"));
         assert_eq!(override_yaml.matches("cap_drop:").count(), 2);
@@ -11018,7 +10960,7 @@ services:
             return;
         };
         let compose = "services:\n  web:\n    image: nginx\n  worker:\n    image: alpine\n";
-        let override_yaml = executor.generate_security_override(compose, &[], &[]);
+        let override_yaml = executor.generate_security_override(compose, &[]);
         assert_eq!(override_yaml.matches("privileged: false").count(), 2);
     }
 
