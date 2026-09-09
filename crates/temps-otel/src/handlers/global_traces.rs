@@ -42,6 +42,8 @@ pub struct GlobalTraceSummariesResponse {
     pub data: Vec<GlobalTraceSummary>,
     pub total: u64,
     pub projects: Vec<TraceProject>,
+    /// Effective per-project windows; totals and rows describe these windows.
+    pub windows: Vec<GlobalTraceWindow>,
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TraceProject {
@@ -53,6 +55,40 @@ pub struct TraceProject {
 pub struct GlobalTracesResponse {
     pub data: Vec<SpanRecord>,
     pub total: u64,
+    /// Effective per-project windows; totals and rows describe these windows.
+    pub windows: Vec<GlobalTraceWindow>,
+}
+
+/// A global query can use different stores and effective windows per project.
+/// A non-null clamp explicitly tells clients the pre-cutover range is excluded;
+/// request an earlier window to read the older source (ADR-040/041).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GlobalTraceWindow {
+    pub project_id: i32,
+    pub source: temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode,
+    #[schema(value_type = String, format = DateTime)]
+    pub effective_start_time: DateTime<Utc>,
+    #[schema(value_type = String, format = DateTime)]
+    pub effective_end_time: DateTime<Utc>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub window_clamped_at: Option<DateTime<Utc>>,
+}
+
+impl From<&TraceReadScope> for GlobalTraceWindow {
+    fn from(scope: &TraceReadScope) -> Self {
+        use temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
+        Self {
+            project_id: scope.project_id,
+            source: if scope.cloud {
+                CloudTelemetryWriteMode::Cloud
+            } else {
+                CloudTelemetryWriteMode::Local
+            },
+            effective_start_time: scope.from,
+            effective_end_time: scope.to,
+            window_clamped_at: scope.window_clamped_at,
+        }
+    }
 }
 
 fn window(p: &GlobalTraceParams) -> Result<(DateTime<Utc>, DateTime<Utc>), Problem> {
@@ -111,6 +147,7 @@ async fn read(
     (
         GlobalTracePage,
         std::collections::BTreeMap<i32, (String, String)>,
+        Vec<GlobalTraceWindow>,
     ),
     Problem,
 > {
@@ -163,6 +200,7 @@ async fn read(
             _ => Err(invalid("Invalid trace status")),
         })
         .transpose()?;
+    let windows = scopes.iter().map(GlobalTraceWindow::from).collect();
     let query = GlobalTraceQuery {
         source_offset: 0,
         summaries,
@@ -197,7 +235,11 @@ async fn read(
             ..Default::default()
         },
     };
-    Ok((state.otel_service.global_trace_page(query).await?, names))
+    Ok((
+        state.otel_service.global_trace_page(query).await?,
+        names,
+        windows,
+    ))
 }
 
 #[utoipa::path(get, path="/otel/global/trace-summaries", tag="Traces", params(GlobalTraceParams), responses((status=200,body=GlobalTraceSummariesResponse),(status=403,body=ProblemDetails)), security(("bearer_auth"=[])))]
@@ -206,7 +248,7 @@ pub async fn query_global_trace_summaries(
     State(state): State<OtelAppState>,
     Query(p): Query<GlobalTraceParams>,
 ) -> Result<Json<GlobalTraceSummariesResponse>, Problem> {
-    let (page, names) = read(auth, state, p, true).await?;
+    let (page, names, windows) = read(auth, state, p, true).await?;
     let data = page
         .data
         .into_iter()
@@ -221,6 +263,7 @@ pub async fn query_global_trace_summaries(
     Ok(Json(GlobalTraceSummariesResponse {
         data,
         total: page.total,
+        windows,
         projects: names
             .into_iter()
             .map(|(id, (name, slug))| TraceProject { id, name, slug })
@@ -233,8 +276,9 @@ pub async fn query_global_traces(
     State(state): State<OtelAppState>,
     Query(p): Query<GlobalTraceParams>,
 ) -> Result<Json<GlobalTracesResponse>, Problem> {
-    let (page, _) = read(auth, state, p, false).await?;
+    let (page, _, windows) = read(auth, state, p, false).await?;
     Ok(Json(GlobalTracesResponse {
+        windows,
         data: page
             .data
             .into_iter()
@@ -242,4 +286,57 @@ pub async fn query_global_traces(
             .collect::<Result<Vec<_>, _>>()?,
         total: page.total,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_trace_responses_disclose_effective_windows_even_on_empty_pages() {
+        let to = DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::hours(2);
+        let cutover = to - chrono::Duration::minutes(30);
+        for cloud in [false, true] {
+            for clamped in [None, Some(cutover)] {
+                let scope = TraceReadScope {
+                    project_id: 7,
+                    from: clamped.unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+                    to,
+                    cloud,
+                    window_clamped_at: clamped,
+                };
+                let summary = GlobalTraceSummariesResponse {
+                    data: vec![],
+                    total: 0,
+                    projects: vec![],
+                    windows: vec![GlobalTraceWindow::from(&scope)],
+                };
+                let spans = GlobalTracesResponse {
+                    data: vec![],
+                    total: 0,
+                    windows: vec![GlobalTraceWindow::from(&scope)],
+                };
+                for response in [
+                    serde_json::to_value(summary).unwrap(),
+                    serde_json::to_value(spans).unwrap(),
+                ] {
+                    let window = &response["windows"][0];
+                    assert_eq!(window["project_id"], 7);
+                    assert_eq!(window["source"], if cloud { "cloud" } else { "local" });
+                    assert_eq!(
+                        window["effective_start_time"],
+                        serde_json::to_value(scope.from).unwrap()
+                    );
+                    assert_eq!(
+                        window["effective_end_time"],
+                        serde_json::to_value(to).unwrap()
+                    );
+                    assert_eq!(
+                        window["window_clamped_at"],
+                        serde_json::to_value(clamped).unwrap()
+                    );
+                }
+            }
+        }
+    }
 }

@@ -10257,6 +10257,10 @@ export type GlobalTraceSummariesResponse = {
     data: Array<GlobalTraceSummary>;
     projects: Array<TraceProject>;
     total: number;
+    /**
+     * Effective per-project windows; totals and rows describe these windows.
+     */
+    windows: Array<GlobalTraceWindow>;
 };
 
 export type GlobalTraceSummary = TraceSummary & {
@@ -10265,9 +10269,26 @@ export type GlobalTraceSummary = TraceSummary & {
     project_slug: string;
 };
 
+/**
+ * A global query can use different stores and effective windows per project.
+ * A non-null clamp explicitly tells clients the pre-cutover range is excluded;
+ * request an earlier window to read the older source (ADR-040/041).
+ */
+export type GlobalTraceWindow = {
+    effective_end_time: string;
+    effective_start_time: string;
+    project_id: number;
+    source: CloudTelemetryWriteMode;
+    window_clamped_at?: string | null;
+};
+
 export type GlobalTracesResponse = {
     data: Array<SpanRecord>;
     total: number;
+    /**
+     * Effective per-project windows; totals and rows describe these windows.
+     */
+    windows: Array<GlobalTraceWindow>;
 };
 
 export type GroupedPageMetric = {

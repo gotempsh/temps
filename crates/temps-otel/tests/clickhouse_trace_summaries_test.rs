@@ -834,6 +834,7 @@ async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
                 from: now - Duration::hours(2),
                 to: now,
                 cloud: false,
+                window_clamped_at: None,
             })
             .collect(),
         summaries: true,
@@ -877,6 +878,7 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
                 from,
                 to,
                 cloud: true,
+                window_clamped_at: None,
             })
             .collect(),
         summaries: true,

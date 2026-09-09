@@ -409,6 +409,7 @@ fn pipeline_stat_deltas(
             crate::handlers::global_traces::GlobalTraceSummariesResponse,
             crate::handlers::global_traces::GlobalTracesResponse,
             crate::handlers::global_traces::TraceProject,
+            crate::handlers::global_traces::GlobalTraceWindow,
             crate::storage::global_traces::GlobalTraceSummary,
             crate::types::TraceSummary,
             query_handler::SpanStatsResponse,
