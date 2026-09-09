@@ -31142,11 +31142,16 @@
                 "required": [
                     "name",
                     "commit_sha",
-                    "protected"
+                    "protected",
+                    "is_default"
                 ],
                 "properties": {
                     "commit_sha": {
                         "type": "string"
+                    },
+                    "is_default": {
+                        "type": "boolean",
+                        "description": "Whether this is the repository's default branch, as reported by the\ngit provider (e.g. `main` or `master`). Clients should use this\ninstead of guessing from the branch name."
                     },
                     "name": {
                         "type": "string"

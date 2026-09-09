@@ -500,7 +500,7 @@ pub async fn get_public_branches(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicRepoQueryParams>,
 ) -> Result<Json<BranchListResponse>, Problem> {
-    let (repo_provider, _, cache_scope) = provider_for_public_request(
+    let (repo_provider, info, cache_scope) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
@@ -509,6 +509,7 @@ pub async fn get_public_branches(
         params.base_url.as_deref(),
     )
     .await?;
+    let default_branch = info.default_branch;
 
     // Create cache key for public repos
     let cache_key = PublicBranchCacheKey::new(cache_scope, owner.clone(), repo.clone());
@@ -519,6 +520,7 @@ pub async fn get_public_branches(
             let branch_infos: Vec<BranchInfo> = cached_branches
                 .into_iter()
                 .map(|branch| BranchInfo {
+                    is_default: branch.name == default_branch,
                     name: branch.name,
                     commit_sha: branch.commit_sha,
                     protected: branch.protected,
@@ -556,6 +558,7 @@ pub async fn get_public_branches(
     let branch_infos: Vec<BranchInfo> = branches
         .into_iter()
         .map(|branch| BranchInfo {
+            is_default: branch.name == default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
