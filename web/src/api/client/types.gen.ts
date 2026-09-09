@@ -2390,6 +2390,12 @@ export type BlobStatusResponse = {
 
 export type BranchInfo = {
     commit_sha: string;
+    /**
+     * Whether this is the repository's default branch, as reported by the
+     * git provider (e.g. `main` or `master`). Clients should use this
+     * instead of guessing from the branch name.
+     */
+    is_default: boolean;
     name: string;
     protected: boolean;
 };
@@ -56605,7 +56611,7 @@ export type RefreshAiProviderModelsErrors = {
      */
     401: unknown;
     /**
-     * Settings write permission required
+     * Provider execution permission required
      */
     403: unknown;
     /**

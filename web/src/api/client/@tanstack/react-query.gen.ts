@@ -17154,8 +17154,10 @@ export const importLocalAiProviderCredentialMutation = (options?: Partial<Option
 
 /**
  * Refresh exactly one provider's account-aware model inventory. This is an
- * explicit write operation because it starts a CLI process (and, for Claude
- * workspaces, a short-lived isolated sandbox). The AI service applies a
+ * explicit operation because it starts a CLI process (and, for Claude
+ * workspaces, creates or wakes the user's persistent sandbox). Authorization
+ * therefore matches the provider's chat execution requirement instead of
+ * requiring unrelated settings mutation access. The AI service applies a
  * provider-scoped single-flight and cooldown before doing that work.
  */
 export const refreshAiProviderModelsMutation = (options?: Partial<Options<RefreshAiProviderModelsData>>): UseMutationOptions<RefreshAiProviderModelsResponse, DefaultError, Options<RefreshAiProviderModelsData>> => {
