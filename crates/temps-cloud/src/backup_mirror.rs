@@ -1009,6 +1009,9 @@ async fn mirror_native_backup(
         identity,
         &root,
         &selected,
+        // Customer external-service source image threading is deferred --
+        // the recovery script falls back to a generic image for this path.
+        None,
     )
     .await
 }
@@ -1034,6 +1037,7 @@ async fn declare_and_complete_native_snapshot(
     identity: NativeSnapshotIdentity,
     root: &str,
     selected: &[SourceObject],
+    source_image: Option<String>,
 ) -> Result<(), StageError> {
     let mut declarations = Vec::with_capacity(selected.len());
     for object in selected {
@@ -1084,6 +1088,7 @@ async fn declare_and_complete_native_snapshot(
         compression,
         identity,
         objects: declarations.clone(),
+        source_image,
     };
     let snapshot = link
         .declare_native_snapshot(&request)
@@ -1150,6 +1155,10 @@ async fn mirror_control_plane_backup(
             "control_plane backup {location_key} is incomplete or lacks {metadata_key}"
         )));
     }
+    let source_image = format!(
+        "gotempsh/timescaledb-walg:pg{}",
+        control_plane_postgres_major(resources).await?
+    );
     declare_and_complete_native_snapshot(
         link,
         resources,
@@ -1166,6 +1175,7 @@ async fn mirror_control_plane_backup(
         },
         &root,
         &selected,
+        Some(source_image),
     )
     .await
 }
@@ -1989,35 +1999,44 @@ async fn load_postgres_identity(
             major,
         ))
     } else {
-        let major = if let Some(major) = resources.control_plane_postgres_major {
-            major
-        } else {
-            let row = resources
-                .db
-                .query_one(Statement::from_string(
-                    resources.db.get_database_backend(),
-                    "SELECT current_setting('server_version') AS server_version".to_string(),
-                ))
-                .await
-                .map_err(|error| StageError::Retry(error.to_string()))?
-                .ok_or_else(|| {
-                    StageError::Retry("PostgreSQL did not return server_version".into())
-                })?;
-            let version: String = row
-                .try_get("", "server_version")
-                .map_err(|error| StageError::Retry(error.to_string()))?;
-            let major = parse_postgres_major(Some(&version)).ok_or_else(|| {
-                StageError::Unsupported(format!("unsupported PostgreSQL version {version}"))
-            })?;
-            resources.control_plane_postgres_major = Some(major);
-            major
-        };
+        let major = control_plane_postgres_major(resources).await?;
         Ok((
             "postgres/control-plane".into(),
             BackupEngine::Postgres,
             major,
         ))
     }
+}
+
+/// The control plane's own PostgreSQL major version, cached on
+/// [`SweepResources`] after the first query since it cannot change within a
+/// sweep. Shared by [`load_postgres_identity`]'s control-plane branch (a real
+/// WAL-G repository backup routed through the Postgres/TimescaleDB WAL-G
+/// path) and [`mirror_control_plane_backup`] (the control plane's own
+/// pg_dump-shaped backup, which never has an `external_services` row).
+async fn control_plane_postgres_major(
+    resources: &mut SweepResources<'_>,
+) -> Result<u16, StageError> {
+    if let Some(major) = resources.control_plane_postgres_major {
+        return Ok(major);
+    }
+    let row = resources
+        .db
+        .query_one(Statement::from_string(
+            resources.db.get_database_backend(),
+            "SELECT current_setting('server_version') AS server_version".to_string(),
+        ))
+        .await
+        .map_err(|error| StageError::Retry(error.to_string()))?
+        .ok_or_else(|| StageError::Retry("PostgreSQL did not return server_version".into()))?;
+    let version: String = row
+        .try_get("", "server_version")
+        .map_err(|error| StageError::Retry(error.to_string()))?;
+    let major = parse_postgres_major(Some(&version)).ok_or_else(|| {
+        StageError::Unsupported(format!("unsupported PostgreSQL version {version}"))
+    })?;
+    resources.control_plane_postgres_major = Some(major);
+    Ok(major)
 }
 
 fn s3_client(
