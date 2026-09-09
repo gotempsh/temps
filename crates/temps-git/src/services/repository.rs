@@ -318,28 +318,28 @@ impl RepositoryService {
 
     /// Opportunistically persist a freshly-observed default branch so that a
     /// later provider outage falls back to a recently-seen value instead of
-    /// whatever was last recorded at the repository's initial sync. No-op
-    /// when the value hasn't changed, so this doesn't churn `updated_at` on
-    /// every branch listing request.
+    /// whatever was last recorded at the repository's initial sync.
+    ///
+    /// This is a single conditional `UPDATE`, not a read-then-write: there's
+    /// no way to order two concurrent live fetches against each other
+    /// without tracking a fetch timestamp we don't otherwise need, so a
+    /// last-writer-wins outcome between two in-flight requests is accepted
+    /// as a rare, self-correcting staleness window (the very next
+    /// successful fetch overwrites it) rather than something worth a schema
+    /// change to fully order. The `!=` filter avoids a wasted write (and
+    /// `updated_at` churn) on every branch listing request when the value
+    /// hasn't changed.
     pub async fn update_default_branch(
         &self,
         repository_id: i32,
         default_branch: &str,
     ) -> Result<(), RepositoryServiceError> {
-        let Some(repo) = repositories::Entity::find_by_id(repository_id)
-            .one(self.db.as_ref())
-            .await?
-        else {
-            return Ok(());
-        };
-
-        if repo.default_branch == default_branch {
-            return Ok(());
-        }
-
-        let mut active: repositories::ActiveModel = repo.into();
-        active.default_branch = sea_orm::Set(default_branch.to_string());
-        active.update(self.db.as_ref()).await?;
+        repositories::Entity::update_many()
+            .col_expr(repositories::Column::DefaultBranch, default_branch.into())
+            .filter(repositories::Column::Id.eq(repository_id))
+            .filter(repositories::Column::DefaultBranch.ne(default_branch))
+            .exec(self.db.as_ref())
+            .await?;
 
         Ok(())
     }
@@ -576,6 +576,28 @@ mod tests {
         let repo = insert_repo_with_default_branch(&db, "master").await;
 
         let service = RepositoryService::new(db.clone());
+        service
+            .update_default_branch(repo.id, "main")
+            .await
+            .unwrap();
+
+        let refreshed = service
+            .find_by_owner_and_name("owner", "repo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.default_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn update_default_branch_is_noop_when_unchanged() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let repo = insert_repo_with_default_branch(&db, "main").await;
+
+        let service = RepositoryService::new(db.clone());
+        // Same value as already stored — must not error, and must leave the
+        // stored value as-is.
         service
             .update_default_branch(repo.id, "main")
             .await
