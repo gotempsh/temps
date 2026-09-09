@@ -305,6 +305,26 @@ impl Default for PipelineStatsAtomic {
 }
 
 impl OtelService {
+    pub async fn global_trace_page(
+        &self,
+        query: crate::storage::global_traces::GlobalTraceQuery,
+    ) -> crate::storage::StorageResult<crate::storage::global_traces::GlobalTracePage> {
+        static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let _permit = READS.try_acquire().map_err(|_| {
+            crate::storage::global_traces::invalid("Global trace reads are busy; retry shortly")
+        })?;
+        // A fixed deadline bounds both source setup and streaming, including Cloud.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.storage.global_trace_page(query),
+        )
+        .await
+        .map_err(|_| {
+            crate::storage::global_traces::invalid(
+                "Global trace query exceeded its 30 second budget",
+            )
+        })?
+    }
     pub fn new(
         storage: Arc<dyn OtelStorage>,
         auth_service: Arc<OtelAuthService>,

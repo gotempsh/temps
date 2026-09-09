@@ -69,6 +69,9 @@ impl TempsPlugin for AnalyticsPlugin {
             // Create ApiTrafficService (shares the DB connection and AI registry)
             let api_traffic_service = Arc::new(ApiTrafficService::new(db.clone(), ai));
             context.register_service(api_traffic_service);
+            context.register_service(Arc::new(crate::global::GlobalAnalyticsService::new(
+                db.clone(),
+            )));
 
             // Register the analytics service with both the concrete type and trait
             context.register_service(analytics_service.clone());
@@ -118,6 +121,13 @@ impl TempsPlugin for AnalyticsPlugin {
         // Configure routes with the state
         let routes = configure_routes()
             .with_state(app_state)
+            .merge(crate::global_handler::routes().with_state(Arc::new(
+                crate::global_handler::GlobalAnalyticsState {
+                    service: context.require_service::<crate::global::GlobalAnalyticsService>(),
+                    project_access_checker:
+                        context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+                },
+            )))
             .merge(configure_ingest_key_routes().with_state(ingest_keys_state));
 
         Some(PluginRoutes::new(routes))
@@ -193,6 +203,7 @@ impl TempsPlugin for AnalyticsPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut doc = AnalyticsApiDoc::openapi();
         doc.merge(AnalyticsIngestKeyApiDoc::openapi());
+        doc.merge(crate::global_handler::GlobalAnalyticsApiDoc::openapi());
         Some(doc)
     }
 }

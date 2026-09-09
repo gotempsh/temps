@@ -109,7 +109,8 @@ pub struct TraceQueryParams {
 
 /// Query parameters for `GET /otel/span-stats`.
 ///
-/// Every filter is optional except the project selection: pass `project_id` for
+/// Every filter is optional. With no project selection, report across all accessible
+/// projects. Pass `project_id` for
 /// one project, or `project_ids` (comma-separated) to rank operations across
 /// several at once. Each project is access-checked individually.
 #[derive(Debug, Deserialize)]
@@ -378,7 +379,7 @@ fn discovery_window(
     (start, end)
 }
 
-fn parse_attributes(s: &str) -> BTreeMap<String, String> {
+pub(super) fn parse_attributes(s: &str) -> BTreeMap<String, String> {
     s.split(',')
         .filter_map(|pair| {
             let mut parts = pair.splitn(2, '=');
@@ -884,17 +885,58 @@ pub async fn query_span_stats(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
 
-    let project_ids = parse_project_ids(&params)?;
-    // Authorize every project individually. A multi-project report must not
-    // become a way to read a project the caller cannot open on its own.
-    for project_id in &project_ids {
-        project_scope_guard!(auth, *project_id);
-        project_access_guard!(auth, *project_id, state.project_access_checker);
-    }
-
     let (start_time, end_time) =
         discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+    let project_ids = if params.project_id.is_none() && params.project_ids.is_none() {
+        let mut hidden = Vec::new();
+        if !auth.is_deployment_token() && !auth.is_instance_admin() {
+            if let Some(checker) = &state.project_access_checker {
+                let user = auth.user_id_opt().ok_or_else(|| {
+                    temps_core::error_builder::forbidden()
+                        .title("Project access denied")
+                        .build()
+                })?;
+                hidden = checker
+                    .hidden_project_ids(user)
+                    .await
+                    .map_err(|_| {
+                        temps_core::error_builder::internal_server_error()
+                            .title("Project access check failed")
+                            .build()
+                    })?
+                    .unwrap_or_default();
+            }
+        }
+        state
+            .telemetry_write_modes
+            .global_trace_scopes(auth.project_id(), &hidden, start_time, end_time)
+            .await
+            .map_err(|_| {
+                temps_core::error_builder::internal_server_error()
+                    .title("Could not resolve operation scopes")
+                    .build()
+            })?
+            .0
+            .into_iter()
+            .map(|s| s.project_id)
+            .collect()
+    } else {
+        let ids = parse_project_ids(&params)?;
+        for id in &ids {
+            project_scope_guard!(auth, *id);
+            project_access_guard!(auth, *id, state.project_access_checker);
+        }
+        ids
+    };
 
+    if project_ids.is_empty() {
+        return Ok(Json(SpanStatsResponse {
+            data: Vec::new(),
+            total: 0,
+            start_time,
+            end_time,
+        }));
+    }
     let query = SpanStatsQuery {
         project_ids,
         start_time,

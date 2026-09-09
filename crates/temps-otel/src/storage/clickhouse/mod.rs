@@ -1368,6 +1368,12 @@ impl ClickHouseOtelStorage {
 
 #[async_trait]
 impl OtelStorage for ClickHouseOtelStorage {
+    async fn global_trace_stream(
+        &self,
+        query: crate::storage::global_traces::GlobalTraceQuery,
+    ) -> StorageResult<crate::storage::global_traces::GlobalTraceStream> {
+        super::global_traces::clickhouse(&self.ch, &query, None).await
+    }
     // ── Span write (ClickHouse — system of record) ──────────────────────────
 
     /// Batch-insert spans directly into the ClickHouse `spans` table.

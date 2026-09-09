@@ -780,3 +780,136 @@ async fn has_traces_is_true_for_a_project_with_spans_and_false_otherwise() {
         "a project no span has ever named must report false"
     );
 }
+
+#[tokio::test]
+async fn global_trace_pages_sort_and_paginate_across_projects_without_fanout() {
+    use temps_otel::storage::global_traces::{GlobalTraceQuery, TraceReadScope};
+    let Some(h) = harness().await else { return };
+    let now = Utc::now();
+    let mut records = Vec::new();
+    for i in 0..45 {
+        let project = if i % 2 == 0 { 601 } else { 602 };
+        records.push(span(
+            project,
+            &format!("global-{i:03}"),
+            "root",
+            None,
+            "GET /items",
+            "api",
+            SpanStatusCode::Ok,
+            i + 1,
+            (i + 1) as f64,
+            None,
+            &[],
+        ));
+    }
+    // Same trace ID in another project is a separate summary, and hidden scope
+    // rows never enter the total or affect page boundaries.
+    records.push(span(
+        603,
+        "global-000",
+        "root",
+        None,
+        "hidden",
+        "api",
+        SpanStatusCode::Error,
+        0,
+        999.0,
+        None,
+        &[],
+    ));
+    h.storage.store_spans(records).await.unwrap();
+    let q = GlobalTraceQuery {
+        filter: TraceQuery {
+            start_time: Some(now - Duration::hours(2)),
+            end_time: Some(now),
+            limit: Some(20),
+            offset: Some(20),
+            ..Default::default()
+        },
+        scopes: [601, 602]
+            .into_iter()
+            .map(|project_id| TraceReadScope {
+                project_id,
+                from: now - Duration::hours(2),
+                to: now,
+                cloud: false,
+            })
+            .collect(),
+        summaries: true,
+        source_offset: 0,
+    };
+    let page = h.storage.global_trace_page(q.clone()).await.unwrap();
+    assert_eq!(page.total, 45);
+    assert_eq!(page.data.len(), 20);
+    assert_eq!(page.data[0].trace_id, "global-020");
+    assert_eq!(page.data[19].trace_id, "global-039");
+    assert_eq!(page.data[0].project_id, 601);
+    let mut sorted = q.clone();
+    sorted.filter.sort_by = TraceSortField::Duration;
+    let page = h.storage.global_trace_page(sorted).await.unwrap();
+    assert_eq!(page.data[0].trace_id, "global-024");
+    let mut raw = q;
+    raw.summaries = false;
+    let page = h.storage.global_trace_page(raw).await.unwrap();
+    assert_eq!(page.data[0].span_id, "root");
+    assert_eq!(page.total, 45);
+}
+
+#[tokio::test]
+async fn cloud_global_summaries_apply_offset_after_aggregation() {
+    use temps_otel::storage::global_traces::{self, GlobalTraceQuery, TraceReadScope};
+    let Some(h) = harness().await else { return };
+    h.probe.query("CREATE TABLE IF NOT EXISTS telemetry_spans (project_ref String, trace_id String, span_id String, parent_span_id String, name String, service_name String, environment String, span_kind String, status_code String, ts DateTime64(3), duration_ms Float64) ENGINE=Memory").execute().await.unwrap();
+    h.probe.query("INSERT INTO telemetry_spans SELECT if(number%2=0,'scope-a','scope-b'), concat('cloud-',toString(number)), 'root', '', 'GET /items', 'api', 'production', 'SERVER', 'OK', fromUnixTimestamp64Milli(1700000000000-number*1000), toFloat64(number+1) FROM numbers(45)").execute().await.unwrap();
+    let from = chrono::DateTime::from_timestamp_millis(1699999900000).unwrap();
+    let to = chrono::DateTime::from_timestamp_millis(1700000000001).unwrap();
+    let q = GlobalTraceQuery {
+        filter: TraceQuery {
+            limit: Some(20),
+            offset: Some(20),
+            ..Default::default()
+        },
+        scopes: [701, 702]
+            .into_iter()
+            .map(|project_id| TraceReadScope {
+                project_id,
+                from,
+                to,
+                cloud: true,
+            })
+            .collect(),
+        summaries: true,
+        source_offset: 20,
+    };
+    let refs = BTreeMap::from([(701, "scope-a".into()), (702, "scope-b".into())]);
+    let stream = global_traces::clickhouse(&h.probe, &q, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &q).await.unwrap();
+    assert_eq!(page.total, 45);
+    assert_eq!(page.data.len(), 20);
+    assert_eq!(page.data[0].trace_id, "cloud-20");
+    assert_eq!(page.data[0].project_id, 701);
+    assert_eq!(page.data[19].trace_id, "cloud-39");
+    let mut raw = q.clone();
+    raw.summaries = false;
+    let stream = global_traces::clickhouse(&h.probe, &raw, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &raw).await.unwrap();
+    assert_eq!(page.total, 45);
+    assert_eq!(page.data[0].span_id, "root");
+    let mut filtered = q;
+    filtered.filter.offset = Some(0);
+    filtered.source_offset = 0;
+    filtered.filter.min_duration_ms = Some(40.0);
+    filtered.filter.name_pattern = Some("items".into());
+    filtered.filter.service_name = Some("api".into());
+    let stream = global_traces::clickhouse(&h.probe, &filtered, Some(&refs))
+        .await
+        .unwrap();
+    let page = global_traces::merge(vec![stream], &filtered).await.unwrap();
+    assert_eq!(page.total, 6);
+    assert_eq!(page.data[0].trace_id, "cloud-39");
+}
