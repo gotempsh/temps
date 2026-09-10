@@ -46,7 +46,7 @@ use crate::handlers::types::{
     ServiceHealthStatusEntryResponse, ServiceMemberInfo, ServiceParameter, ServiceTypeInfo,
     ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
 };
-use crate::services::EnvironmentVariableOptions;
+use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
 
@@ -2247,6 +2247,7 @@ async fn stop_service(
     request_body = LinkServiceRequest,
     responses(
         (status = 201, description = "Service linked to project successfully", body = ProjectServiceInfo),
+        (status = 400, description = "Invalid database provisioning configuration"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permission to link this service"),
         (status = 404, description = "Service or project not found"),
@@ -2297,7 +2298,15 @@ async fn link_service_to_project(
 
     match app_state
         .external_service_manager
-        .link_service_to_project_with_claim(id, request.project_id, claim_user_id)
+        .link_service_to_project_with_provisioning(
+            id,
+            request.project_id,
+            claim_user_id,
+            DatabaseProvisioningConfig {
+                mode: request.database_provisioning_mode,
+                custom_database_name: request.custom_database_name,
+            },
+        )
         .await
     {
         Ok(info) => {
@@ -2316,6 +2325,8 @@ async fn link_service_to_project(
                 service_id: id,
                 service_name,
                 project_id: request.project_id,
+                database_provisioning_mode: info.database_provisioning_mode,
+                custom_database_name: info.custom_database_name.clone(),
             };
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(service_id = id, project_id = request.project_id, error = %error, "failed to audit service link");
@@ -2345,6 +2356,9 @@ async fn link_service_to_project(
                 .build()),
             crate::services::ExternalServiceError::DuplicateServiceType { .. } => {
                 Err(conflict().detail(e.to_string()).build())
+            }
+            crate::services::ExternalServiceError::InvalidDatabaseProvisioning { .. } => {
+                Err(bad_request().detail(e.to_string()).build())
             }
             _ => Err(internal_server_error()
                 .detail(format!("Failed to link service: {}", e))
@@ -3562,6 +3576,8 @@ mod tests {
         };
         let linked_service = project_services::Model {
             id: 1,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
             project_id: 99,
             service_id: 17,
             created_at: now,
@@ -3609,7 +3625,11 @@ mod tests {
             Path(17),
             RequireAuth(test_auth_context_with_role(temps_auth::Role::User)),
             Extension(test_request_metadata()),
-            Json(LinkServiceRequest { project_id: 7 }),
+            Json(LinkServiceRequest {
+                project_id: 7,
+                database_provisioning_mode: Default::default(),
+                custom_database_name: None,
+            }),
         )
         .await;
         let error = match result {

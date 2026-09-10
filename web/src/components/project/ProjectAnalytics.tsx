@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DataSection } from '@/components/data-display/DataSection'
+
+import { DateTimeRange } from '@/components/ui/date-time-range'
+
 import {
   createAnalyticsIngestKeyMutation,
   getEnvironmentsOptions,
@@ -43,7 +47,6 @@ import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
 import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { Button } from '@/components/ui/button'
-import { Calendar } from '@/components/ui/calendar'
 import {
   Card,
   CardContent,
@@ -56,11 +59,7 @@ import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { ChartRangeSelectionBar } from '@/components/charts/chart-range-selection-bar'
 import { CodeBlock } from '@/components/ui/code-block'
 import { CopyButton } from '@/components/ui/copy-button'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
+
 import {
   Select,
   SelectContent,
@@ -82,7 +81,6 @@ import {
 } from '@/components/project/setup/SetupWizardShell'
 import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -95,7 +93,12 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  Tabs,
+  TabsContent,
+  ScrollableTabsList,
+  TabsTrigger,
+} from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useSettings } from '@/hooks/useSettings'
 import { cn } from '@/lib/utils'
@@ -116,7 +119,6 @@ import {
   ArrowLeft,
   ArrowRight,
   Ban,
-  Calendar as CalendarIcon,
   Check,
   FileCode,
   Globe,
@@ -267,42 +269,36 @@ export function VisitorChart({
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <CardTitle className="text-base sm:text-lg">
-          {getChartTitle()}
-        </CardTitle>
-        <div className="flex items-center gap-2">
-          {onZoom && (
-            <span className="text-xs text-muted-foreground hidden sm:inline">
-              Drag on chart to select a timeframe
-            </span>
-          )}
-          <div className="flex gap-1.5 sm:gap-2">
-            <Badge
-              variant={aggregationLevel === 'events' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setAggregationLevel('events')}
+    <DataSection
+      title={getChartTitle()}
+      description={
+        onZoom ? 'Drag across the chart to inspect a time window.' : undefined
+      }
+      actions={
+        <div
+          role="group"
+          aria-label="Traffic metric"
+          className="flex items-center gap-1 rounded-md bg-muted p-1"
+        >
+          {(['events', 'sessions', 'visitors'] as const).map((metric) => (
+            <Button
+              key={metric}
+              type="button"
+              variant={aggregationLevel === metric ? 'secondary' : 'ghost'}
+              size="sm"
+              aria-pressed={aggregationLevel === metric}
+              onClick={() => setAggregationLevel(metric)}
             >
-              Events
-            </Badge>
-            <Badge
-              variant={aggregationLevel === 'sessions' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setAggregationLevel('sessions')}
-            >
-              Sessions
-            </Badge>
-            <Badge
-              variant={aggregationLevel === 'visitors' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setAggregationLevel('visitors')}
-            >
-              Visitors
-            </Badge>
-          </div>
+              {metric === 'events'
+                ? 'Page views'
+                : metric === 'sessions'
+                  ? 'Sessions'
+                  : 'Visitors'}
+            </Button>
+          ))}
         </div>
-      </div>
+      }
+    >
       {isLoading ? (
         <div className="h-[250px] w-full flex items-center justify-center">
           <div className="text-sm text-muted-foreground">
@@ -340,7 +336,7 @@ export function VisitorChart({
           onRangeSelect={onZoom}
         />
       )}
-    </div>
+    </DataSection>
   )
 }
 
@@ -382,8 +378,8 @@ export function AnalyticsFilters({
   })
 
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-      <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {leftActions}
         <Select
           value={selectedEnvironment?.toString()}
@@ -404,8 +400,8 @@ export function AnalyticsFilters({
         </Select>
       </div>
 
-      <div className="flex items-center sm:justify-end gap-2">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {actions}
           <Button
             variant="outline"
@@ -418,145 +414,42 @@ export function AnalyticsFilters({
             />
             Refresh
           </Button>
-          <div className="hidden sm:flex gap-1">
-            {QUICK_FILTERS.slice(0, -1).map((filter) => (
-              <Button
-                key={filter.value}
-                variant={activeFilter === filter.value ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => onFilterChange(filter.value)}
-              >
-                {filter.label}
-              </Button>
-            ))}
-          </div>
-          <div className="sm:hidden">
-            <Select value={activeFilter} onValueChange={onFilterChange}>
-              <SelectTrigger className="w-[140px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {QUICK_FILTERS.slice(0, -1).map((filter) => (
-                  <SelectItem key={filter.value} value={filter.value}>
-                    {filter.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                variant={activeFilter === 'custom' ? 'default' : 'outline'}
-                size="sm"
-                className={cn(
-                  'sm:min-w-[140px]',
-                  !dateRange?.from && 'text-muted-foreground'
-                )}
-              >
-                <CalendarIcon className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">
-                  {dateRange?.from ? (
-                    dateRange.to ? (
-                      <>
-                        {format(dateRange.from, 'LLL dd, y HH:mm')} -{' '}
-                        {format(dateRange.to, 'LLL dd, y HH:mm')}
-                      </>
-                    ) : (
-                      format(dateRange.from, 'LLL dd, y HH:mm')
-                    )
-                  ) : (
-                    'Custom range'
-                  )}
-                </span>
-                <span className="sm:hidden">
-                  {dateRange?.from ? format(dateRange.from, 'MM/dd') : 'Custom'}
-                </span>
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0" align="end">
-              <Calendar
-                autoFocus
-                mode="range"
-                defaultMonth={
-                  new Date(new Date().setMonth(new Date().getMonth() - 1))
-                }
-                selected={dateRange}
-                onSelect={onDateRangeChange}
-                numberOfMonths={
-                  typeof window !== 'undefined' && window.innerWidth < 640
-                    ? 1
-                    : 2
-                }
-                disabled={[
-                  (date) => date > new Date(),
-                  {
-                    before: new Date(
-                      new Date().setMonth(new Date().getMonth() - 1)
-                    ),
-                  },
-                ]}
-                endMonth={new Date()}
-                startMonth={
-                  new Date(new Date().setMonth(new Date().getMonth() - 1))
-                }
-              />
-              <div className="border-t p-3 flex items-end gap-4">
-                <div className="flex-1 space-y-1">
-                  <Label className="text-xs text-muted-foreground">
-                    Start time
-                  </Label>
-                  <Input
-                    type="time"
-                    className="h-8 text-xs"
-                    value={
-                      dateRange?.from
-                        ? format(dateRange.from, 'HH:mm')
-                        : '00:00'
-                    }
-                    onChange={(e) => {
-                      if (!dateRange?.from) return
-                      const [hours, minutes] = e.target.value
-                        .split(':')
-                        .map(Number)
-                      const updated = new Date(dateRange.from)
-                      updated.setHours(hours, minutes, 0, 0)
-                      onDateRangeChange({
-                        from: updated,
-                        to: dateRange.to,
-                      })
-                    }}
-                    disabled={!dateRange?.from}
-                  />
-                </div>
-                <div className="flex-1 space-y-1">
-                  <Label className="text-xs text-muted-foreground">
-                    End time
-                  </Label>
-                  <Input
-                    type="time"
-                    className="h-8 text-xs"
-                    value={
-                      dateRange?.to ? format(dateRange.to, 'HH:mm') : '23:59'
-                    }
-                    onChange={(e) => {
-                      if (!dateRange?.to) return
-                      const [hours, minutes] = e.target.value
-                        .split(':')
-                        .map(Number)
-                      const updated = new Date(dateRange.to)
-                      updated.setHours(hours, minutes, 59, 999)
-                      onDateRangeChange({
-                        from: dateRange.from,
-                        to: updated,
-                      })
-                    }}
-                    disabled={!dateRange?.to}
-                  />
-                </div>
-              </div>
-            </PopoverContent>
-          </Popover>
+          <DateTimeRange
+            value={(() => {
+              const { startDate, endDate } = getDateRangeFromFilter({
+                quickFilter: activeFilter,
+                dateRange,
+              })
+              const presets = {
+                lasthour: '1h',
+                '6hours': '6h',
+                '24hours': '1d',
+                '7days': '7d',
+              } as const
+              return {
+                from: (startDate ?? new Date()).toISOString(),
+                to: (endDate ?? new Date()).toISOString(),
+                preset:
+                  presets[activeFilter as keyof typeof presets] ?? 'custom',
+              }
+            })()}
+            onChange={(range) => {
+              if (range.preset === 'custom') {
+                onDateRangeChange({
+                  from: new Date(range.from),
+                  to: new Date(range.to),
+                })
+              } else {
+                const filters = {
+                  '1h': 'lasthour',
+                  '6h': '6hours',
+                  '1d': '24hours',
+                  '7d': '7days',
+                } as const
+                onFilterChange(filters[range.preset])
+              }
+            }}
+          />
         </div>
       </div>
     </div>
@@ -597,7 +490,10 @@ function PagesTab({ project }: PagesTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -732,7 +628,10 @@ function EventDetailTab({ project }: EventDetailTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   // Sync date filter to URL so deep links and back-navigation keep the range.
   const updateDateFilter = React.useCallback(
@@ -861,7 +760,10 @@ function DimensionTab({ project }: DimensionTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -995,7 +897,10 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -1150,7 +1055,10 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
@@ -1272,7 +1180,10 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -1337,7 +1248,10 @@ function JourneyTab({ project }: JourneyTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -1500,7 +1414,10 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
   const queryClient = useQueryClient()
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   // Keep chart selections provisional until the user reviews the timestamps.
   const handleChartZoom = React.useCallback((from: Date, to: Date) => {
@@ -1538,6 +1455,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   }, [hasNoData, showSetupOverride, project.slug, navigate])
 
   const handleRefresh = React.useCallback(async () => {
+    setDateFilter((previous) => ({ ...previous }))
     setIsRefreshing(true)
     try {
       // Invalidate all analytics queries for this project
@@ -1569,6 +1487,24 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   return (
     <>
       <div className="space-y-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">Analytics</h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Traffic, audience, and engagement for {project.name}.
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              navigate(`/projects/${project.slug}/analytics/globe`)
+            }
+          >
+            <Globe className="mr-2 size-4" /> Visitor globe
+          </Button>
+        </div>
+
         {hasNoData && (
           <Card className="border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950/50">
             <CardHeader className="pb-3">
@@ -1674,99 +1610,96 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               />
             )}
           </div>
-          {/* Globe link */}
-          <Card
-            className="cursor-pointer hover:bg-accent/50 transition-colors"
-            onClick={() =>
-              navigate(`/projects/${project.slug}/analytics/globe`)
-            }
-          >
-            <CardContent className="flex items-center justify-between gap-3 py-3 sm:py-4">
-              <div className="flex items-center gap-3 min-w-0">
-                <Globe className="h-5 w-5 text-muted-foreground shrink-0" />
-                <div className="min-w-0">
-                  <p className="font-medium text-sm">Visitor Globe</p>
-                  <p className="text-xs text-muted-foreground hidden sm:block">
-                    See where your visitors are coming from on an interactive 3D
-                    globe
-                  </p>
-                </div>
+          <Tabs defaultValue="traffic" className="min-w-0">
+            <ScrollableTabsList aria-label="Analytics breakdowns">
+              <TabsTrigger value="traffic">Traffic</TabsTrigger>
+              <TabsTrigger value="audience">Audience</TabsTrigger>
+              <TabsTrigger value="technology">Technology</TabsTrigger>
+              <TabsTrigger value="events">Events</TabsTrigger>
+            </ScrollableTabsList>
+            <TabsContent value="traffic" className="mt-3">
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <PagesChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <ReferrersChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <ChannelsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <UTMCampaignsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
               </div>
-              <Button variant="outline" size="sm" className="shrink-0">
-                View Globe
-              </Button>
-            </CardContent>
-          </Card>
-
-          {/* Analytics Charts */}
-          <div className="grid grid-cols-1 gap-4 sm:gap-6 md:grid-cols-2">
-            <PagesChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <LocationsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <ReferrersChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <BrowsersChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <AiAgentsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <OperatingSystemChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <DevicesChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <ChannelsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <LanguagesChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <UTMCampaignsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <EventsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-          </div>
+            </TabsContent>
+            <TabsContent value="audience" className="mt-3">
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <LocationsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <LanguagesChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <AiAgentsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+              </div>
+            </TabsContent>
+            <TabsContent value="technology" className="mt-3">
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <BrowsersChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <OperatingSystemChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <DevicesChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+              </div>
+            </TabsContent>
+            <TabsContent value="events" className="mt-3">
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <EventsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+              </div>
+            </TabsContent>
+          </Tabs>
         </div>
       </div>
     </>
@@ -2070,9 +2003,9 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
                   <AlertDialogTitle>Rotate this ingest key?</AlertDialogTitle>
                   <AlertDialogDescription>
                     The current value stops working immediately. Update it
-                    everywhere it&apos;s used — your app&apos;s code, env
-                    vars, or CDN script tag — before rotating, or analytics
-                    will stop flowing until you do.
+                    everywhere it&apos;s used — your app&apos;s code, env vars,
+                    or CDN script tag — before rotating, or analytics will stop
+                    flowing until you do.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -2108,7 +2041,11 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             <Alert variant="destructive">
               <AlertDescription className="flex items-center justify-between gap-2">
                 <span>Failed to load analytics ingest keys.</span>
-                <Button size="sm" variant="outline" onClick={() => refetchKeys()}>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => refetchKeys()}
+                >
                   Retry
                 </Button>
               </AlertDescription>
@@ -2137,7 +2074,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
                 <AlertDescription>
                   {createKey.isError
                     ? 'Failed to create an ingest key. Try again.'
-                    : "No ingest key yet — create one to let this app send analytics without being deployed by Temps."}
+                    : 'No ingest key yet — create one to let this app send analytics without being deployed by Temps.'}
                 </AlertDescription>
               </Alert>
               <Button
@@ -2163,9 +2100,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
               <Button
                 variant="ghost"
                 size="sm"
-                className={
-                  primaryKey ? 'text-muted-foreground' : 'hidden'
-                }
+                className={primaryKey ? 'text-muted-foreground' : 'hidden'}
                 disabled={revokeKey.isPending}
               >
                 <Ban className="h-4 w-4 mr-2" />
@@ -2177,8 +2112,8 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
                 <AlertDialogTitle>Revoke this ingest key?</AlertDialogTitle>
                 <AlertDialogDescription>
                   Analytics from apps using this key stop being recorded
-                  immediately. The key stays listed here, marked revoked, so
-                  you can still tell which key ingested past data.
+                  immediately. The key stays listed here, marked revoked, so you
+                  can still tell which key ingested past data.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -2228,10 +2163,10 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
       <div className="space-y-3">
         <h3 className="text-sm font-medium">Add it to your app</h3>
         <Tabs defaultValue="react">
-          <TabsList>
+          <ScrollableTabsList aria-label="Analytics installation examples">
             <TabsTrigger value="react">React</TabsTrigger>
             <TabsTrigger value="script">Any website (script tag)</TabsTrigger>
-          </TabsList>
+          </ScrollableTabsList>
           <TabsContent value="react" className="space-y-3 pt-3">
             <CodeBlock
               language="bash"

@@ -1486,51 +1486,6 @@
         },
         "type": "object"
       },
-      "AiCliStatusDto": {
-        "description": "Mirrors `temps_agents::ai_cli::AiCliStatus` with utoipa `ToSchema` added.\n`AiCliStatus` itself does not derive `ToSchema`, so this local projection is\nused for OpenAPI generation only — the fields are identical.",
-        "properties": {
-          "auth_method": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "authenticated": {
-            "type": "boolean"
-          },
-          "installed": {
-            "type": "boolean"
-          },
-          "provider": {
-            "type": "string"
-          },
-          "setup_hint": {
-            "description": "Instructions for the operator when not installed or not authenticated.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "subscription_type": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "version": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "provider",
-          "installed",
-          "authenticated"
-        ],
-        "type": "object"
-      },
       "AiConfigSettings": {
         "description": "Global AI configuration settings. Controls the default config repo\ncontaining `.claude/` directory (skills, MCP servers, plugins) that\ngets overlaid into every agent sandbox.",
         "properties": {
@@ -1660,32 +1615,10 @@
         "type": "object"
       },
       "AiProviderStatusResponse": {
-        "description": "Current AI provider routing preference and availability for this instance.\n\nThe `configured` field drives the UI onboarding state: when `false` the UI\nmust show _exactly what is missing_ (`reason`) and _where to fix it_\n(`setup_path`), not hide the feature.",
+        "description": "Current API-gateway availability for this instance.\n\nThe `configured` field drives the UI onboarding state: when `false` the UI\nmust show _exactly what is missing_ (`reason`) and _where to fix it_\n(`setup_path`), not hide the feature.",
         "properties": {
-          "active_provider_type": {
-            "description": "Active preference: `\"gateway\"` (BYOK) or `\"agent_cli\"` (subscription).",
-            "type": "string"
-          },
-          "agent_cli_provider_id": {
-            "description": "Catalog id of the active agent CLI provider, or `null` when\n`active_provider_type` is `\"gateway\"`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "agent_cli_status": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/AiCliStatusDto",
-                "description": "Live status of the selected agent CLI, or `null` when\n`active_provider_type` is `\"gateway\"`."
-              }
-            ]
-          },
           "available_providers": {
-            "description": "Providers a chat user may choose for a new conversation. Authentication\nsource is descriptive metadata only and never contains credentials.",
+            "description": "Gateway providers available to API-backed chat and summaries. Credential\nsource is descriptive metadata only and never contains secret values.",
             "items": {
               "$ref": "#/components/schemas/AvailableAiProviderDto"
             },
@@ -1730,7 +1663,6 @@
           }
         },
         "required": [
-          "active_provider_type",
           "configured",
           "gateway_available",
           "available_providers",
@@ -1812,7 +1744,7 @@
             ]
           },
           "provider_id": {
-            "description": "Normalized provider route (`gateway_key:{id}`, `claude_cli`, etc.).\n`null` inherits the active instance provider.",
+            "description": "Normalized gateway route (`gateway_key:{id}`). `null` inherits the\nactive gateway key.",
             "type": [
               "string",
               "null"
@@ -2185,6 +2117,17 @@
         ],
         "type": "object"
       },
+      "AnalyticsFacet": {
+        "enum": [
+          "summary",
+          "traffic",
+          "pages",
+          "events",
+          "breakdown",
+          "speed"
+        ],
+        "type": "string"
+      },
       "AnalyticsIngestKey": {
         "description": "An analytics ingest key as returned by the admin API.\n\n`public_key` is present in full on every response — see the module docs.",
         "properties": {
@@ -2280,6 +2223,22 @@
           "event_count",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "AnalyticsProjectOption": {
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "project_name"
         ],
         "type": "object"
       },
@@ -4589,7 +4548,7 @@
       "AvailableAiProviderDto": {
         "properties": {
           "auth_source": {
-            "description": "`configured_key` for the gateway or `host_environment` for an ambient\nCLI login discovered in the Temps process environment.",
+            "description": "`configured_key` for an encrypted gateway key.",
             "type": "string"
           },
           "default_model_id": {
@@ -10117,10 +10076,19 @@
           },
           "parameters": {
             "additionalProperties": {},
+            "description": "Service-type-specific configuration. Read\n`GET /external-services/types/{service_type}/parameters` before creating\na service and provide every field its schema marks as required. Secret\nvalues that the schema describes as auto-generated may be omitted.",
             "propertyNames": {
               "type": "string"
             },
             "type": "object"
+          },
+          "project_id": {
+            "description": "Optionally link the new service to this project as part of the same\nrequest. The caller must have write access to the target project. If\nlinking fails, Temps removes the newly created service so callers do\nnot have to recover an ambiguous half-created resource.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "service_type": {
             "$ref": "#/components/schemas/CreatableServiceTypeRoute"
@@ -11474,7 +11442,7 @@
             ]
           },
           "project_id": {
-            "description": "Create the sandbox against a temps project (temps-native). The\nproject's connected repo and git credential seed the work dir when\nno explicit `source` is given, and the sandbox is attributed to the\nproject so it can be listed alongside it.\n\nRequires access to the project — the same team/scope rules that\ngate every other project-scoped endpoint apply.",
+            "description": "Create the sandbox against a temps project (temps-native). The\nproject's connected repo and git credential seed the work dir when\nno explicit `source` is given, and the sandbox is attributed to the\nproject so it can be listed alongside it.\n\nRequires access to the project and `git_repositories:read` when Temps\nderives the source from the project. The same team/scope rules that\ngate every other project-scoped endpoint apply.",
             "format": "int32",
             "type": [
               "integer",
@@ -12312,6 +12280,15 @@
           "metrics"
         ],
         "type": "object"
+      },
+      "DatabaseProvisioningMode": {
+        "description": "Controls which logical database a deployment receives through a\nproject-to-service link.",
+        "enum": [
+          "project",
+          "project_environment",
+          "custom"
+        ],
+        "type": "string"
       },
       "DelRequest": {
         "description": "Request to delete keys",
@@ -21470,6 +21447,114 @@
         ],
         "type": "object"
       },
+      "GlobalAnalyticsResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/GlobalAnalyticsRow"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_views": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "total",
+          "total_views"
+        ],
+        "type": "object"
+      },
+      "GlobalAnalyticsRow": {
+        "properties": {
+          "avg_time_seconds": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "bounce_rate": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cls_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fcp_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "inp_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "lcp_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "sessions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ttfb_p75": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "views": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "visitors": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "project_id",
+          "project_name",
+          "views",
+          "sessions",
+          "visitors"
+        ],
+        "type": "object"
+      },
       "GlobalConversationResponse": {
         "description": "A conversation in the unified cross-project switcher: carries the project it\nbelongs to (name/slug) so the UI can show where the chat was started and\nlink back to the source.",
         "properties": {
@@ -21550,6 +21635,144 @@
         ],
         "type": "object"
       },
+      "GlobalErrorGroupResponse": {
+        "properties": {
+          "affected_users": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "assigned_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_type": {
+            "type": "string"
+          },
+          "events_in_range": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "first_seen": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_seen": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "total_count": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "error_type",
+          "status",
+          "project_id",
+          "project_name",
+          "project_slug",
+          "first_seen",
+          "last_seen",
+          "total_count",
+          "events_in_range",
+          "affected_users"
+        ],
+        "type": "object"
+      },
+      "GlobalErrorGroupsQuery": {
+        "properties": {
+          "end_date": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "search": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start_date": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GlobalErrorGroupsResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/GlobalErrorGroupResponse"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PaginationMeta"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
       "GlobalEventStatsResponse": {
         "properties": {
           "bounce_rate": {
@@ -21607,6 +21830,171 @@
           "complained"
         ],
         "type": "object"
+      },
+      "GlobalLogLine": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/LogSearchLine"
+          },
+          {
+            "properties": {
+              "env": {
+                "type": "string"
+              },
+              "external_service_id": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "owner": {
+                "type": "string"
+              },
+              "project_id": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "owner",
+              "env"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "GlobalLogSearchRequest": {
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deploy_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "end_time": {
+            "type": "string"
+          },
+          "envs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "external_services": {
+            "description": "Database/service IDs or names, not container service labels.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "levels": {
+            "items": {
+              "$ref": "#/components/schemas/LogLevel"
+            },
+            "type": "array"
+          },
+          "node_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "page_size": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "projects": {
+            "description": "Match project ID, slug or name. Empty selects all authorized projects.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scopes": {
+            "description": "Explicit resource identities, e.g. application:12 or service:34.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/GlobalLogSource"
+          },
+          "start_time": {
+            "type": "string"
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "start_time",
+          "end_time"
+        ],
+        "type": "object"
+      },
+      "GlobalLogSearchResponse": {
+        "properties": {
+          "lines": {
+            "description": "Newest first, ordered by timestamp, chunk ID and line offset.",
+            "items": {
+              "$ref": "#/components/schemas/GlobalLogLine"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scan_limit_reached": {
+            "description": "True means no complete ordered page could be established within the\nscan budget. Lines are empty; narrow the search rather than skipping logs.",
+            "type": "boolean"
+          },
+          "scanned_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scanned_chunks": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "lines",
+          "scan_limit_reached",
+          "scanned_chunks",
+          "scanned_bytes"
+        ],
+        "type": "object"
+      },
+      "GlobalLogSource": {
+        "enum": [
+          "collected",
+          "application",
+          "service"
+        ],
+        "type": "string"
       },
       "GlobalMrrResponse": {
         "properties": {
@@ -21742,6 +22130,80 @@
           "active_subscriptions",
           "active_customers",
           "transactions_last_30d"
+        ],
+        "type": "object"
+      },
+      "GlobalTraceSummariesResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/GlobalTraceSummary"
+            },
+            "type": "array"
+          },
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/TraceProject"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "total",
+          "projects"
+        ],
+        "type": "object"
+      },
+      "GlobalTraceSummary": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TraceSummary"
+          },
+          {
+            "properties": {
+              "project_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "project_name": {
+                "type": "string"
+              },
+              "project_slug": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "project_id",
+              "project_name",
+              "project_slug"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "GlobalTracesResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SpanRecord"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "total"
         ],
         "type": "object"
       },
@@ -22665,6 +23127,33 @@
           "service_type",
           "parameters",
           "container_id"
+        ],
+        "type": "object"
+      },
+      "ImportLocalCredentialResponse": {
+        "properties": {
+          "auth_type": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "saved": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string"
+          },
+          "workspace_ready": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "saved",
+          "provider_id",
+          "auth_type",
+          "source",
+          "workspace_ready"
         ],
         "type": "object"
       },
@@ -24223,6 +24712,17 @@
       },
       "LinkServiceRequest": {
         "properties": {
+          "custom_database_name": {
+            "description": "Exact database name used when `database_provisioning_mode` is `custom`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode",
+            "description": "How deployments linked through this service select a logical database."
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -25151,6 +25651,27 @@
           "total_count",
           "visitors",
           "window_minutes"
+        ],
+        "type": "object"
+      },
+      "LocalCredentialDto": {
+        "description": "Metadata about a credential that Temps can import from the server process\nuser's existing CLI login. This never includes a path or credential value.",
+        "properties": {
+          "auth_type": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "source": {
+            "description": "Stable machine-readable source: `environment` or `host_auth_store`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "auth_type",
+          "source",
+          "label"
         ],
         "type": "object"
       },
@@ -26702,6 +27223,16 @@
           "thinking_modes"
         ],
         "type": "object"
+      },
+      "ModelCatalogSource": {
+        "description": "Provenance of a provider model inventory. Only live and unexpired cached\ninventories are authoritative enough to reject a saved model. Bootstrap\nand stale inventories remain useful for selectors, but must not block a\nturn because account entitlements may legitimately differ.",
+        "enum": [
+          "live",
+          "cache",
+          "stale_cache",
+          "bootstrap"
+        ],
+        "type": "string"
       },
       "ModelInfo": {
         "properties": {
@@ -31705,7 +32236,7 @@
         "type": "object"
       },
       "PreviewGatewaySettings": {
-        "description": "Workspace preview gateway settings.\n\nThe preview gateway is a single shared Docker container that lives on the\n`temps-sandbox-net` network and routes requests to workspace sandbox dev\nservers based on the `Host` header (`ws-<sid>-<port>.<preview_domain>`).\n`temps serve` reconciles this container on startup; these settings let an\noperator override the image, host port, and auto-upgrade behavior.",
+        "description": "Workspace preview gateway settings.\n\nThe preview gateway uses a private routing container plus a hardened ingress\nrelay bound to host loopback. The router joins each sandbox's isolated\nnetwork and routes requests to workspace dev servers based on the `Host`\nheader (`ws-<sid>-<port>.<preview_domain>`), while the relay never joins a\ntenant network. `temps serve` reconciles both containers on startup; these\nsettings let an operator override the router image, host port, and\nauto-upgrade behavior.",
         "properties": {
           "auto_upgrade": {
             "default": true,
@@ -31728,9 +32259,9 @@
             "type": "integer"
           },
           "image": {
-            "default": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9",
+            "default": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448",
             "description": "Docker image reference for the gateway. Pinned by digest per Temps release.\nOperators can override this to test a custom build.",
-            "example": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9",
+            "example": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448",
             "type": "string"
           },
           "shared_secret": {
@@ -32443,17 +32974,6 @@
               "null"
             ]
           },
-          "ai_debug_chat_enabled": {
-            "description": "Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "ai_write_actions_enabled": {
-            "description": "Opt-in to AI propose-then-confirm write capability (false = off).",
-            "type": "boolean"
-          },
           "allow_alternate_sources": {
             "description": "Whether this project also accepts deployments from a source other than\n`source_type` — chiefly, whether a Git-backed project will take an\nuploaded source archive (`drop`). `null` or `false` means only the\nconfigured `source_type` (plus Docker images and static bundles, which\nevery project accepts) may be deployed.",
             "example": false,
@@ -32652,7 +33172,6 @@
           "is_public_repo",
           "deployment_config",
           "attack_mode",
-          "ai_write_actions_enabled",
           "error_source_context_enabled",
           "vulnerability_scanning_enabled",
           "enable_preview_environments",
@@ -32737,6 +33256,15 @@
       },
       "ProjectServiceInfo": {
         "properties": {
+          "custom_database_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -32751,7 +33279,8 @@
         "required": [
           "id",
           "project",
-          "service"
+          "service",
+          "database_provisioning_mode"
         ],
         "type": "object"
       },
@@ -33424,6 +33953,17 @@
           "install_command": {
             "type": "string"
           },
+          "local_credential": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LocalCredentialDto",
+                "description": "Importable credential already used by this host's CLI, if one can be\ncopied directly into encrypted Temps settings. Contains metadata only."
+              }
+            ]
+          },
           "max_turns_analysis": {
             "description": "Default max turns for the autofixer analysis phase. `None` = built-in\ndefault (10). Only enforced for CLIs with a turn flag (Claude Code).",
             "format": "int32",
@@ -33449,8 +33989,8 @@
             ]
           },
           "model_source": {
-            "description": "`live`, `cache`, `stale_cache`, or `bootstrap`.",
-            "type": "string"
+            "$ref": "#/components/schemas/ModelCatalogSource",
+            "description": "Whether the catalog is live, cached, stale, or a bootstrap fallback."
           },
           "models": {
             "description": "Model ids this provider accepts, in display order. The first entry is\nthe recommended default. Empty when the provider doesn't expose model\nselection (e.g. OpenCode), which the UI uses to hide the dropdown.",
@@ -35252,6 +35792,40 @@
           "start_date",
           "end_date",
           "project_id"
+        ],
+        "type": "object"
+      },
+      "RefreshProviderModelsResponse": {
+        "properties": {
+          "default_runtime_model_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_source": {
+            "$ref": "#/components/schemas/ModelCatalogSource"
+          },
+          "models_refreshed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "runtime_models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelCapability"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "provider_id",
+          "runtime_models",
+          "model_source"
         ],
         "type": "object"
       },
@@ -37719,6 +38293,24 @@
           "url",
           "subdomain",
           "port"
+        ],
+        "type": "object"
+      },
+      "SandboxRuntimeEnvironmentResponse": {
+        "description": "Live project runtime variables issued to a sandbox. Values are deliberately\nabsent from Debug output and must not be cached or persisted by Temps.",
+        "properties": {
+          "variables": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "variables"
         ],
         "type": "object"
       },
@@ -42114,6 +42706,13 @@
                   "null"
                 ]
               },
+              "destination": {
+                "description": "Optional path relative to the sandbox work directory.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "git_connection_id": {
                 "format": "int32",
                 "type": [
@@ -42132,6 +42731,10 @@
                   "string",
                   "null"
                 ]
+              },
+              "strip_git_metadata": {
+                "description": "Remove `<destination>/.git` after cloning. Requires destination.",
+                "type": "boolean"
               },
               "type": {
                 "enum": [
@@ -44512,7 +45115,7 @@
             ]
           },
           "provider": {
-            "description": "Provider ID: \"openai\", \"anthropic\", \"xai\", \"gemini\"",
+            "description": "Provider ID: \"openai\", \"anthropic\", \"xai\", \"gemini\", \"openrouter\"",
             "type": "string"
           }
         },
@@ -44999,6 +45602,26 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "TraceProject": {
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ],
         "type": "object"
       },
       "TraceProjectRef": {
@@ -48239,20 +48862,6 @@
               "null"
             ]
           },
-          "ai_debug_chat_enabled": {
-            "description": "Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "ai_write_actions_enabled": {
-            "description": "Opt in to AI propose-then-confirm write capability.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
           "attack_mode": {
             "description": "Enable/disable attack mode (CAPTCHA protection) for all project environments",
             "type": [
@@ -48497,33 +49106,6 @@
         },
         "required": [
           "is_enabled"
-        ],
-        "type": "object"
-      },
-      "UpdateProviderPreferenceRequest": {
-        "description": "Request body for `PUT /api/ai/provider-preference`.",
-        "properties": {
-          "agent_cli_provider_id": {
-            "description": "Required when `provider_type` is `\"agent_cli\"`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "interactive_bridge_enabled": {
-            "description": "Deprecated compatibility field. Adapter realtime behavior is derived\nfrom its capability contract and cannot be toggled independently.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "provider_type": {
-            "description": "`\"gateway\"` or `\"agent_cli\"`.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "provider_type"
         ],
         "type": "object"
       },
@@ -52861,7 +53443,8 @@
         "summary": "Public webhook endpoint. Authenticated via `X-Webhook-Token` header.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications": {
@@ -52931,7 +53514,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_application",
@@ -52973,7 +53557,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}": {
@@ -53015,7 +53600,8 @@
         "summary": "Archive an AI application",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "get": {
         "operationId": "get_application",
@@ -53066,7 +53652,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/conversations": {
@@ -53147,7 +53734,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_application_conversation",
@@ -53199,7 +53787,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts": {
@@ -53254,7 +53843,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_thread_artifact",
@@ -53317,7 +53907,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/preview-link": {
@@ -53378,7 +53969,8 @@
         "summary": "Mint a short-lived URL for a port running in the application harness\nsandbox. This intentionally does not return the bare `ws-…` hostname:\napplication sandboxes always have a private preview password and only the\ngateway can exchange this grant for the preview cookie.",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/projects": {
@@ -53437,7 +54029,8 @@
         "summary": "Create and link an application project",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/projects/link": {
@@ -53495,7 +54088,8 @@
         "summary": "Link an existing project to an application",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}": {
@@ -53553,7 +54147,8 @@
         "summary": "Unlink an application project",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/deploy": {
@@ -53627,7 +54222,8 @@
         "summary": "Deploy an application workspace project with Drop",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/primary": {
@@ -53681,7 +54277,8 @@
         "summary": "Choose the application's primary project",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/workspace/files": {
@@ -53752,7 +54349,8 @@
         "summary": "Write a bounded batch of local files into an application project",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/workspace/source": {
@@ -53819,7 +54417,8 @@
         "summary": "Import a Git repository into an application project",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/restore": {
@@ -53865,7 +54464,8 @@
         "summary": "Restore an archived AI application",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace": {
@@ -53912,7 +54512,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "patch": {
         "description": "Persists desired runtime and resource settings server-side, then replaces compute while retaining the application files.",
@@ -53969,7 +54570,8 @@
         "summary": "Update desired application workspace resources",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace/actions": {
@@ -54031,7 +54633,8 @@
         "summary": "Control an application workspace",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace/changes": {
@@ -54104,7 +54707,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace/diff": {
@@ -54168,7 +54772,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace/directory": {
@@ -54247,7 +54852,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace/file": {
@@ -54305,7 +54911,8 @@
         ],
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace/file/download": {
@@ -54372,7 +54979,8 @@
         "summary": "Download one application workspace file",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/applications/{application_public_id}/workspace/files": {
@@ -54437,7 +55045,8 @@
         "summary": "Upload files into an application workspace",
         "tags": [
           "AI Applications"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations": {
@@ -54517,7 +55126,8 @@
         "summary": "List the current user's active conversations across all projects,\nmost-recently-active first, annotated with project name/slug.",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_global_conversation",
@@ -54566,7 +55176,8 @@
         "summary": "Create a private user-owned operator thread without binding its lifetime or\nauthority to a project. Project access is selected per tool call and checked\nagainst the user's current role and memberships.",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}": {
@@ -54634,7 +55245,8 @@
         "summary": "Load one bounded history page for a private conversation by its owner-facing\nid. Project/application context is revalidated, but never used as the\nownership key.",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "patch": {
         "operationId": "rename_user_conversation",
@@ -54689,7 +55301,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/archive": {
@@ -54726,7 +55339,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/attachments": {
@@ -54786,7 +55400,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/attachments/{attachment_id}": {
@@ -54854,7 +55469,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/messages": {
@@ -54912,7 +55528,8 @@
         "summary": "Submit a turn to a user-owned conversation. The authenticated user's\ncurrent role and permissions are captured for this turn's tool executor;\nno project id from the browser is trusted or required.",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/pending-actions": {
@@ -54959,7 +55576,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/permission-mode": {
@@ -55019,7 +55637,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/permissions/{permission_id}/resolve": {
@@ -55083,7 +55702,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/restore": {
@@ -55121,7 +55741,8 @@
         "summary": "Restore a user-owned archived conversation.",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/conversations/{public_id}/stop": {
@@ -55158,7 +55779,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/pending-actions/{action_public_id}": {
@@ -55202,7 +55824,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/pending-actions/{action_public_id}/confirm": {
@@ -55249,7 +55872,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/pending-actions/{action_public_id}/reject": {
@@ -55296,7 +55920,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/pricing": {
@@ -55341,82 +55966,6 @@
         ],
         "tags": [
           "AI Gateway Pricing"
-        ],
-        "x-maturity": "experimental"
-      }
-    },
-    "/ai/provider-preference": {
-      "put": {
-        "operationId": "update_ai_provider_preference",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateProviderPreferenceRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AiProviderStatusResponse"
-                }
-              }
-            },
-            "description": "Updated provider preference and availability"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Validation error"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Insufficient permissions"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            },
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "AI Provider Status"
         ],
         "x-maturity": "experimental"
       }
@@ -57167,7 +57716,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/changes": {
@@ -57229,7 +57779,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/diff": {
@@ -57285,7 +57836,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/directory": {
@@ -57356,7 +57908,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/file": {
@@ -57406,7 +57959,8 @@
         ],
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/file-limits": {
@@ -57442,7 +57996,8 @@
         "summary": "Get effective AI workspace file limits",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/file/download": {
@@ -57501,7 +58056,8 @@
         "summary": "Download one global AI workspace file",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/files": {
@@ -57553,7 +58109,8 @@
         "summary": "Upload files into the global AI workspace",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/ai/workspace/preview-link": {
@@ -57601,7 +58158,8 @@
         "summary": "Mint a short-lived preview URL for a port in the user's shared global AI\nworkspace. The gateway grant is identical to application previews; the\nonly difference is how the owning sandbox is resolved.",
         "tags": [
           "AI Chat"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/analytics/active-visitors": {
@@ -58160,6 +58718,236 @@
           }
         ],
         "summary": "Get general statistics across all projects for a time frame",
+        "tags": [
+          "Analytics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/analytics/global": {
+      "get": {
+        "operationId": "get_global_analytics",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "facet",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/AnalyticsFacet"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "dimension",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "device",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_views",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_sessions",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalAnalyticsResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid analytics filters"
+          },
+          "403": {
+            "description": "Access denied"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Analytics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/analytics/global/projects": {
+      "get": {
+        "operationId": "get_analytics_projects",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AnalyticsProjectOption"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "description": "Access denied"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Analytics"
         ],
@@ -68734,6 +69522,114 @@
         "x-maturity": "beta"
       }
     },
+    "/error-groups": {
+      "get": {
+        "operationId": "list_global_error_groups",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_date",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_date",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalErrorGroupsResponse"
+                }
+              }
+            },
+            "description": "Visible errors across projects"
+          },
+          "400": {
+            "description": "Invalid filters"
+          },
+          "403": {
+            "description": "Access denied"
+          }
+        },
+        "summary": "List issues across every project visible to the caller.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/external-services": {
       "get": {
         "operationId": "list_services",
@@ -68747,10 +69643,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -68762,10 +69655,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -68773,10 +69663,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -68784,10 +69671,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -68815,6 +69699,7 @@
         ]
       },
       "post": {
+        "description": "Create a managed external service. The `parameters` object is service-type-specific. Read `get_service_type_parameters` for the chosen `service_type` immediately before creating the service and provide every field that schema marks as required. Set `project_id` to create and link the service in one approval-gated operation.",
         "operationId": "create_service",
         "requestBody": {
           "content": {
@@ -69031,10 +69916,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -69046,10 +69928,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -69057,10 +69936,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -69068,10 +69944,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -70570,10 +71443,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -70585,10 +71455,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -70596,10 +71463,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -70607,10 +71471,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -70680,6 +71541,9 @@
               }
             },
             "description": "Service linked to project successfully"
+          },
+          "400": {
+            "description": "Invalid database provisioning configuration"
           },
           "401": {
             "description": "Authentication required"
@@ -77561,6 +78425,71 @@
         ]
       }
     },
+    "/logs/global/search": {
+      "post": {
+        "operationId": "search_global_logs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GlobalLogSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalLogSearchResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
     "/logs/search": {
       "post": {
         "operationId": "search_logs",
@@ -78426,10 +79355,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -78441,10 +79367,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -78452,10 +79375,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -78463,10 +79383,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -79200,10 +80117,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -79215,10 +80129,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -79226,10 +80137,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -79237,10 +80145,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -79463,10 +80368,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -79478,10 +80380,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -79489,10 +80388,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -79500,10 +80396,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -81713,6 +82606,436 @@
           "GenAI"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/otel/global/spans": {
+      "get": {
+        "operationId": "query_global_traces",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "trace_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "service_name",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_duration_ms",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "deployment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs.\ne.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE).",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort field for the trace-summaries list: \"start_time\" (default) or\n\"duration\". Anything else falls back to start_time.",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort direction: \"asc\" or \"desc\" (default).",
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalTracesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traces"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/global/trace-summaries": {
+      "get": {
+        "operationId": "query_global_trace_summaries",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "trace_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "service_name",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_duration_ms",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "deployment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs.\ne.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE).",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort field for the trace-summaries list: \"start_time\" (default) or\n\"duration\". Anything else falls back to start_time.",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Sort direction: \"asc\" or \"desc\" (default).",
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalTraceSummariesResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traces"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/otel/global/traces/{trace_id}": {
@@ -86301,7 +87624,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "post": {
         "operationId": "create_agent",
@@ -86358,7 +87682,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/cli-status": {
@@ -86403,7 +87728,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs": {
@@ -86471,7 +87797,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/latest-for-source": {
@@ -86543,7 +87870,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}": {
@@ -86602,7 +87930,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/cancel": {
@@ -86664,7 +87993,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/retry": {
@@ -86727,7 +88057,8 @@
         "summary": "Retry a completed, failed, cancelled, or no_fix run with the same trigger context.\nCreates a new run record and spawns the executor.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/runs/{run_id}/stream": {
@@ -86780,7 +88111,8 @@
         "summary": "SSE endpoint for real-time streaming of run events.\nPolls the agent_run_logs table every 500ms for new entries and streams them.\nCloses when the run reaches a terminal status.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/sandbox-status": {
@@ -86823,7 +88155,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/smoke-test": {
@@ -86876,7 +88209,8 @@
         "summary": "Run a smoke test to verify the selected AI CLI works in the environment\nwhere agents will actually execute (host or sandbox container). If no\n`provider_id` is supplied the globally active provider is tested.",
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/{slug}": {
@@ -86927,7 +88261,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "get": {
         "operationId": "get_agent",
@@ -86980,7 +88315,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       },
       "put": {
         "operationId": "update_agent",
@@ -87049,7 +88385,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/{slug}/runs": {
@@ -87129,7 +88466,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/agents/{slug}/trigger": {
@@ -87209,7 +88547,8 @@
         ],
         "tags": [
           "Agents"
-        ]
+        ],
+        "x-maturity": "experimental"
       }
     },
     "/projects/{project_id}/aggregated-buckets": {
@@ -101023,10 +102362,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -101038,10 +102374,7 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -101049,10 +102382,7 @@
             "name": "sort_by",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -101060,10 +102390,7 @@
             "name": "sort_order",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -105335,15 +106662,6 @@
             "schema": {
               "type": "boolean"
             }
-          },
-          {
-            "description": "Run account-aware model discovery before returning. Normal catalog\nreads intentionally use cached/bootstrap models so chat first paint is\nnot held hostage by provider CLIs that can take 10-15 seconds.",
-            "in": "query",
-            "name": "refresh_models",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -105517,6 +106835,104 @@
           }
         ],
         "summary": "Save (or replace) a provider's credential. The credential is encrypted\nwith `EncryptionService` and stored inside\n`agent_sandbox.providers[provider_id].credentials_encrypted`.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/credential/import-local": {
+      "post": {
+        "operationId": "import_local_ai_provider_credential",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportLocalCredentialResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Unknown provider or invalid local credential"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "System administrator permission required"
+          },
+          "404": {
+            "description": "No importable local credential found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import the credential already used by this provider's CLI on the Temps\nhost. Discovery and encryption happen entirely server-side; the plaintext\ncredential is never serialized into the response or browser state.",
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/settings/ai-providers/{provider_id}/models/refresh": {
+      "post": {
+        "operationId": "refresh_ai_provider_models",
+        "parameters": [
+          {
+            "description": "AI provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshProviderModelsResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Unknown provider"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Provider execution permission required"
+          },
+          "503": {
+            "description": "Provider model discovery unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Refresh exactly one provider's account-aware model inventory. This is an\nexplicit operation because it starts a CLI process (and, for Claude\nworkspaces, creates or wakes the user's persistent sandbox). Authorization\ntherefore matches the provider's chat execution requirement instead of\nrequiring unrelated settings mutation access. The AI service applies a\nprovider-scoped single-flight and cooldown before doing that work.",
         "tags": [
           "Agents"
         ]
@@ -110346,6 +111762,58 @@
         "x-maturity": "experimental"
       }
     },
+    "/v1/sandboxes/{id}/runtime-environment": {
+      "post": {
+        "operationId": "sandbox_issue_runtime_environment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxRuntimeEnvironmentResponse"
+                }
+              }
+            },
+            "description": "Runtime variables issued"
+          },
+          "400": {
+            "description": "Sandbox has no attached project"
+          },
+          "403": {
+            "description": "Plaintext secret access is not permitted"
+          },
+          "404": {
+            "description": "Sandbox or project environment not found"
+          },
+          "409": {
+            "description": "Linked services expose ambiguous variables"
+          },
+          "503": {
+            "description": "Runtime credential provider unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Issue the same scoped service variables used by a deployment runtime for\nthe project attached to this sandbox.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/v1/sandboxes/{id}/snapshots": {
       "post": {
         "description": "Initiates a snapshot of the sandbox. The response is **202 Accepted**\nwith the snapshot row in `creating` status. The caller should poll\n`GET /v1/sandbox-snapshots/{snap_id}` until `status` is `ready` or\n`failed`.\n\nThe sandbox is stopped for the duration of the snapshot and restarted\nautomatically when it completes (unless it was already stopped).",
@@ -111844,7 +113312,7 @@
       "name": "Events"
     },
     {
-      "description": "Time-series metrics and alert rule endpoints",
+      "description": "Analytics metrics collection endpoints including performance web vitals",
       "name": "Metrics"
     },
     {
@@ -111870,30 +113338,6 @@
     {
       "description": "Teams and project-scoped access",
       "name": "Teams"
-    },
-    {
-      "description": "OpenAI-compatible chat, embeddings, and model endpoints",
-      "name": "AI Gateway"
-    },
-    {
-      "description": "Provider key management endpoints",
-      "name": "AI Gateway Admin"
-    },
-    {
-      "description": "Usage analytics and reporting endpoints",
-      "name": "AI Gateway Usage"
-    },
-    {
-      "description": "Model pricing endpoints",
-      "name": "AI Gateway Pricing"
-    },
-    {
-      "description": "Provider preference and availability endpoints",
-      "name": "AI Provider Status"
-    },
-    {
-      "description": "Manage non-secret analytics ingest keys for apps Temps does not deploy",
-      "name": "Analytics Ingest Keys"
     },
     {
       "description": "Git provider management endpoints",
@@ -111968,6 +113412,10 @@
       "name": "External Services - Query"
     },
     {
+      "description": "Time-series metrics and alert rule endpoints",
+      "name": "Metrics"
+    },
+    {
       "description": "Key-Value storage operations",
       "name": "KV Store"
     },
@@ -112022,6 +113470,30 @@
     {
       "description": "Autonomous AI agents, autofixer (interactive AI debugging), skills/MCP definitions, and preview gateway management.",
       "name": "Agents"
+    },
+    {
+      "description": "OpenAI-compatible chat, embeddings, and model endpoints",
+      "name": "AI Gateway"
+    },
+    {
+      "description": "Provider key management endpoints",
+      "name": "AI Gateway Admin"
+    },
+    {
+      "description": "Usage analytics and reporting endpoints",
+      "name": "AI Gateway Usage"
+    },
+    {
+      "description": "Model pricing endpoints",
+      "name": "AI Gateway Pricing"
+    },
+    {
+      "description": "Gateway capability and summary-default endpoints",
+      "name": "AI Provider Status"
+    },
+    {
+      "description": "Manage non-secret analytics ingest keys for apps Temps does not deploy",
+      "name": "Analytics Ingest Keys"
     },
     {
       "description": "Cron jobs management API",

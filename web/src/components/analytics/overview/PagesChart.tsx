@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RankedList } from '@/components/data-display/RankedList'
+import { Link } from 'react-router'
+
 import { getPropertyBreakdownOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
@@ -14,7 +17,7 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { ExternalLink, FileText } from 'lucide-react'
+import { ExternalLink } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 
@@ -73,23 +76,14 @@ export function PagesChart({
   const sortedPages = React.useMemo(() => {
     if (!data) return []
     const total = data.items.reduce((sum, item) => sum + item.count, 0)
-    return data.items
+    return [...data.items]
       .sort((a, b) => b.count - a.count)
       .map((item) => ({
         page: item.value || '/',
         visitors: item.count,
-        percentage: ((item.count / total) * 100).toFixed(1),
+        percentage: total > 0 ? ((item.count / total) * 100).toFixed(1) : '0.0',
       }))
   }, [data])
-
-  function handlePageClick(pagePath: string, e: React.MouseEvent) {
-    const url = `/projects/${project.slug}/analytics/pages${buildDateParams({ path: pagePath })}`
-    if (e.metaKey || e.ctrlKey) {
-      window.open(url, '_blank')
-    } else {
-      navigate(url)
-    }
-  }
 
   return (
     <Card>
@@ -109,7 +103,7 @@ export function PagesChart({
             className="text-xs"
             onClick={() =>
               navigate(
-                `/projects/${project.slug}/analytics/pages${buildDateParams()}`,
+                `/projects/${project.slug}/analytics/pages${buildDateParams()}`
               )
             }
           >
@@ -153,39 +147,24 @@ export function PagesChart({
             </p>
           </div>
         ) : (
-          <div className="space-y-3">
-            {sortedPages.map((page) => (
-              <button
-                type="button"
-                key={page.page}
-                className="space-y-2 w-full text-left cursor-pointer hover:bg-muted/50 rounded-lg p-1 -mx-1"
-                onClick={(e) => handlePageClick(page.page, e)}
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <FileText className="h-4 w-4 text-muted-foreground" />
-                    <span className="text-sm font-medium text-muted-foreground truncate max-w-[150px] sm:max-w-[300px]">
-                      {page.page}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-muted-foreground">
-                      {page.percentage}%
-                    </span>
-                    <span className="text-sm font-mono text-muted-foreground">
-                      {page.visitors.toLocaleString()}
-                    </span>
-                  </div>
-                </div>
-                <div className="relative h-2 bg-muted rounded-full overflow-hidden">
-                  <div
-                    className="absolute inset-y-0 left-0 bg-primary rounded-full transition-all duration-500"
-                    style={{ width: `${page.percentage}%` }}
-                  />
-                </div>
-              </button>
-            ))}
-          </div>
+          <RankedList
+            label="Top pages by visitors"
+            items={sortedPages.map((page) => ({
+              id: page.page,
+              title: (
+                <Link
+                  className="inline-block py-1 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
+                  to={`/projects/${project.slug}/analytics/pages${buildDateParams({ path: page.page })}`}
+                >
+                  {page.page}
+                </Link>
+              ),
+              facts: [
+                { label: 'Visitors', value: page.visitors.toLocaleString() },
+                { label: 'Share of top pages', value: `${page.percentage}%` },
+              ],
+            }))}
+          />
         )}
       </CardContent>
       {!isLoading && !error && sortedPages.length > 0 && (

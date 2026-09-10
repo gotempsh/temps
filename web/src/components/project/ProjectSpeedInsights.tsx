@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
@@ -46,7 +49,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { SpeedWorldMap } from '@/components/project/SpeedWorldMap'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import { format, subDays } from 'date-fns'
+import { format } from 'date-fns'
 import {
   AlertTriangle,
   CheckCircle2,
@@ -517,24 +520,9 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     }
   }, [environmentsData, selectedEnvironment])
 
-  const getDays = (range: string) => {
-    switch (range) {
-      case '1d':
-        return 1
-      case '7d':
-        return 7
-      case '30d':
-        return 30
-      default:
-        return 7
-    }
-  }
-
-  const startDate = useMemo(
-    () => subDays(new Date(), getDays(timeRange)).toISOString(),
-    [timeRange]
-  )
-  const endDate = useMemo(() => new Date().toISOString(), [])
+  const window = useMemo(() => resolveTimeRange(timeRange), [timeRange])
+  const startDate = window.from
+  const endDate = window.to
 
   const { data: hasMetricsData } = useQuery({
     ...hasPerformanceMetricsOptions({
@@ -568,7 +556,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     return metrics.timestamps.map((timestamp: string, i: number) => ({
       timestamp: format(
         new Date(timestamp),
-        timeRange === '1d' ? 'HH:mm' : 'MMM dd'
+        (Date.parse(endDate) - Date.parse(startDate)) <= 86400000 ? 'HH:mm' : 'MMM dd'
       ),
       fcp: metrics.fcp[i],
       lcp: metrics.lcp[i],
@@ -577,7 +565,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
       // CLS is stored as a ratio; display in raw units (no scaling).
       cls: metrics.cls[i],
     }))
-  }, [metrics, timeRange])
+  }, [metrics, startDate, endDate])
 
   const score = useMemo(
     () => (metrics ? calculateOverallScore(metrics) : 0),
@@ -797,16 +785,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
             </TabsList>
           </Tabs>
 
-          <Select value={timeRange} onValueChange={setTimeRange}>
-            <SelectTrigger className="h-8 w-[110px] text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="1d">Last 24h</SelectItem>
-              <SelectItem value="7d">Last 7 days</SelectItem>
-              <SelectItem value="30d">Last 30 days</SelectItem>
-            </SelectContent>
-          </Select>
+          <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
 
           <Select
             value={includeBots ? 'all' : 'human'}

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-export type TracesTimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
+import { resolveTimeRange } from './time-range-filter'
+
+export type TracesTimeRange = string
 
 export type TracesTimeWindow = {
   startTime: string
@@ -16,27 +18,10 @@ export type TracesTimeWindow = {
  */
 export function computeTracesTimeWindow(
   timeRange: TracesTimeRange,
-  now: Date = new Date(),
+  now: Date = new Date()
 ): TracesTimeWindow {
-  const start = new Date(now.getTime())
-  switch (timeRange) {
-    case '1h':
-      start.setHours(start.getHours() - 1)
-      break
-    case '6h':
-      start.setHours(start.getHours() - 6)
-      break
-    case '24h':
-      start.setDate(start.getDate() - 1)
-      break
-    case '7d':
-      start.setDate(start.getDate() - 7)
-      break
-    case '30d':
-      start.setDate(start.getDate() - 30)
-      break
-  }
-  return { startTime: start.toISOString(), endTime: now.toISOString() }
+  const range = resolveTimeRange(timeRange, now.getTime())
+  return { startTime: range.from, endTime: range.to }
 }
 
 /**
@@ -48,7 +33,7 @@ export function computeTracesTimeWindow(
  */
 export function tracesListTimeBounds(
   traceIdSearch: string | undefined,
-  window: TracesTimeWindow,
+  window: TracesTimeWindow
 ): { start_time?: string; end_time?: string } {
   if (traceIdSearch) {
     return { start_time: undefined, end_time: undefined }

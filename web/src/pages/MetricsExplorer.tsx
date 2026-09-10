@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import {
   EnvironmentResponse,
   HistogramSummary,
@@ -31,7 +34,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { DateRangePicker } from '@/components/ui/date-range-picker'
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
@@ -349,7 +351,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   // React Query into an infinite refetch loop.
   const fromDate = useMemo(
     () => (isCustom ? new Date(customStartStr!) : timeRangeToFrom(timeRange)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
     [isCustom, customStartStr, timeRange]
   )
   const toDate = useMemo(
@@ -813,35 +815,23 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
                   Range
                 </label>
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                  <Select
-                    value={isCustom ? 'custom' : timeRange}
-                    onValueChange={(v) => {
-                      // "custom" seeds the picker with the window currently on screen.
-                      if (v === 'custom') setCustomRange(fromDate, toDate)
-                      else setTimeRange(v as TimeRange)
+                  <DateTimeRange
+                    value={{
+                      from: fromDate.toISOString(),
+                      to: toDate.toISOString(),
+                      preset: isCustom
+                        ? 'custom'
+                        : resolveTimeRange(timeRange).preset,
                     }}
-                  >
-                    <SelectTrigger className="w-full sm:w-[160px]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {TIME_RANGES.map((r) => (
-                        <SelectItem key={r.value} value={r.value}>
-                          {r.label}
-                        </SelectItem>
-                      ))}
-                      <SelectItem value="custom">Custom range…</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  {isCustom && (
-                    <DateRangePicker
-                      date={{ from: fromDate, to: toDate }}
-                      onDateChange={(range) => {
-                        if (range?.from && range?.to)
-                          setCustomRange(range.from, range.to)
-                      }}
-                    />
-                  )}
+                    maxRangeDays={365}
+                    onChange={(next) =>
+                      next.preset === 'custom'
+                        ? setCustomRange(new Date(next.from), new Date(next.to))
+                        : setTimeRange(
+                            next.preset === '1d' ? '24h' : next.preset
+                          )
+                    }
+                  />
                 </div>
               </div>
             </div>
@@ -1032,7 +1022,7 @@ function MetricsOverview({
             aggregation={aggregation}
             status={alerts.statusFor(n, aggregation)}
             dynamicFiringCount={dynamicFiringSeriesCount(
-              alerts.rulesFor(n, aggregation),
+              alerts.rulesFor(n, aggregation)
             )}
             onSelect={onSelect}
           />
@@ -1055,7 +1045,7 @@ function MetricsOverview({
  */
 function alertStatusTooltip(
   status: AlertStatusLevel,
-  dynamicFiringCount: number | null,
+  dynamicFiringCount: number | null
 ): string {
   if (dynamicFiringCount != null) {
     return `${dynamicFiringCount} series breaching`

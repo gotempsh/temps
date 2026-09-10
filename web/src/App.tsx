@@ -269,6 +269,12 @@ const RequiredPasswordChange = lazy(() =>
     default: m.RequiredPasswordChange,
   }))
 )
+const GlobalAnalytics = lazy(
+  () => import('./pages/observability/GlobalAnalytics')
+)
+const GlobalTraces = lazy(() => import('./pages/observability/GlobalTraces'))
+const GlobalLogs = lazy(() => import('./pages/observability/GlobalLogs'))
+const GlobalErrors = lazy(() => import('./pages/observability/GlobalErrors'))
 const NotFound = lazy(() => import('./components/global/NotFound'))
 
 // Settings sub-pages
@@ -619,6 +625,11 @@ const FullAppRoutes = () => {
                       element={<Navigate to="/monitoring/alarms" replace />}
                     />
                     {/* Observe section */}
+                    <Route path="/analytics" element={<GlobalAnalytics />} />
+                    <Route path="/traces" element={<GlobalTraces />} />
+                    <Route path="/logs" element={<GlobalLogs />} />
+                    <Route path="/errors" element={<GlobalErrors />} />
+
                     {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
                     <Route
                       path="/traces/global/:traceId"

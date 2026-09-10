@@ -808,6 +808,8 @@ mod tests {
             id: 1,
             project_id,
             service_id,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
             created_at: now,
             updated_at: now,
         }

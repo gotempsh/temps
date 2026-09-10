@@ -8,6 +8,7 @@ import {
   projectPageCount,
   readProjectPagination,
   withProjectPagination,
+  withProjectSearch,
 } from './project-list-pagination'
 
 describe('project list pagination', () => {
@@ -39,5 +40,25 @@ describe('project list pagination', () => {
     )
 
     expect(params.toString()).toBe('view=compact&page=7&page_size=36')
+  })
+})
+
+describe('project search view', () => {
+  test('preserves the filter across reload and resets pagination without losing view options', () => {
+    const current = new URLSearchParams('page=4&page_size=18&view=compact')
+    const next = withProjectSearch(current, 'billing & API')
+    const reloaded = new URLSearchParams(next.toString())
+    expect(reloaded.get('q')).toBe('billing & API')
+    expect(readProjectPagination(reloaded)).toEqual({ page: 1, pageSize: 18 })
+    expect(reloaded.get('view')).toBe('compact')
+    expect(current.get('page')).toBe('4')
+  })
+  test('clearing search removes the filter and keeps the selected page size', () => {
+    const next = withProjectSearch(
+      new URLSearchParams('q=missing&page=3&page_size=36'),
+      ''
+    )
+    expect(next.has('q')).toBe(false)
+    expect(readProjectPagination(next)).toEqual({ page: 1, pageSize: 36 })
   })
 })

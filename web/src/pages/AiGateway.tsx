@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import type { DateTimeRangeValue } from '@/lib/date-time-range'
+
 import { Fragment, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -748,25 +751,49 @@ function computeCost(
   )
 }
 
-const TIME_RANGES = [
-  { label: '24h', hours: 24 },
-  { label: '7d', hours: 168 },
-  { label: '30d', hours: 720 },
-] as const
-
-type TimeRange = (typeof TIME_RANGES)[number]
+type TimeRange = { label: string; hours: number }
 
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
-  (range: TimeRange) => void,
+  (value: DateTimeRangeValue) => void,
 ] {
-  const [selection, setSelection] = useState<{
-    range: TimeRange
-    endMs: number
-  }>(() => ({ range: TIME_RANGES[0], endMs: Date.now() }))
-  const selectRange = (range: TimeRange) =>
-    setSelection({ range, endMs: Date.now() })
-  return [selection, selectRange]
+  const [selection, setSelection] = useState(() => ({
+    range: { label: '1d', hours: 24 },
+    endMs: Date.now(),
+  }))
+  return [
+    selection,
+    (value) =>
+      setSelection({
+        range: {
+          label: value.preset,
+          hours: (Date.parse(value.to) - Date.parse(value.from)) / 3600000,
+        },
+        endMs: Date.parse(value.to),
+      }),
+  ]
+}
+
+function AiTimeRange({
+  range,
+  endMs,
+  onChange,
+}: {
+  range: TimeRange
+  endMs: number
+  onChange: (value: DateTimeRangeValue) => void
+}) {
+  return (
+    <DateTimeRange
+      value={{
+        from: new Date(endMs - range.hours * 3600000).toISOString(),
+        to: new Date(endMs).toISOString(),
+        preset: range.label as DateTimeRangeValue['preset'],
+      }}
+      onChange={onChange}
+      maxRangeDays={365}
+    />
+  )
 }
 
 // Back-compat local aliases — the shared registry now lives in
@@ -1006,16 +1033,11 @@ export function UsageAnalytics() {
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Usage Analytics</h3>
         <div className="flex gap-1">
-          {TIME_RANGES.map((range) => (
-            <Button
-              key={range.label}
-              variant={timeRange.label === range.label ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => selectTimeRange(range)}
-            >
-              {range.label}
-            </Button>
-          ))}
+          <AiTimeRange
+            range={timeRange}
+            endMs={endMs}
+            onChange={selectTimeRange}
+          />
         </div>
       </div>
 
@@ -3405,18 +3427,11 @@ export function AgentActivity() {
             </SelectContent>
           </Select>
           <div className="flex gap-1">
-            {TIME_RANGES.map((range) => (
-              <Button
-                key={range.label}
-                variant={
-                  timeRange.label === range.label ? 'default' : 'outline'
-                }
-                size="sm"
-                onClick={() => selectTimeRange(range)}
-              >
-                {range.label}
-              </Button>
-            ))}
+            <AiTimeRange
+              range={timeRange}
+              endMs={endMs}
+              onChange={selectTimeRange}
+            />
           </div>
         </div>
       </div>
@@ -3701,18 +3716,11 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
             </SelectContent>
           </Select>
           <div className="flex gap-1">
-            {TIME_RANGES.map((range) => (
-              <Button
-                key={range.label}
-                variant={
-                  timeRange.label === range.label ? 'default' : 'outline'
-                }
-                size="sm"
-                onClick={() => selectTimeRange(range)}
-              >
-                {range.label}
-              </Button>
-            ))}
+            <AiTimeRange
+              range={timeRange}
+              endMs={endMs}
+              onChange={selectTimeRange}
+            />
           </div>
         </div>
       </div>

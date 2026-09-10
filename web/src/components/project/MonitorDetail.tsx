@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateRangePicker } from '@/components/ui/date-range-picker'
+
 import { ProjectResponse, StatusBucket } from '@/api/client'
 import {
   getBucketedStatusOptions,
@@ -16,16 +18,9 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
-import { Calendar } from '@/components/ui/calendar'
 import {
   Popover,
   PopoverContent,
@@ -36,7 +31,6 @@ import {
   Activity,
   AlertCircle,
   ArrowLeft,
-  Calendar as CalendarIcon,
   Clock,
   TrendingUp,
 } from 'lucide-react'
@@ -44,7 +38,6 @@ import { useMemo, useState, useRef } from 'react'
 import { Link, useParams } from 'react-router'
 import { format, subDays } from 'date-fns'
 import { DateRange } from 'react-day-picker'
-import { cn } from '@/lib/utils'
 
 interface MonitorDetailProps {
   project: ProjectResponse
@@ -164,13 +157,6 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
 }
 
 type QuickFilter = '24hours' | '7days' | '30days' | '90days' | 'custom'
-
-const QUICK_FILTERS = [
-  { label: 'Last 24 hours', value: '24hours' as const },
-  { label: 'Last 7 Days', value: '7days' as const },
-  { label: 'Last 30 Days', value: '30days' as const },
-  { label: 'Last 90 Days', value: '90days' as const },
-]
 
 type BucketInterval = '1min' | '5min' | 'hourly' | 'daily'
 
@@ -399,90 +385,13 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
       {/* Date Range Filter */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-end gap-2">
         <div className="flex items-center gap-2">
-          <div className="hidden sm:flex gap-1">
-            {QUICK_FILTERS.map((filter) => (
-              <Button
-                key={filter.value}
-                variant={activeFilter === filter.value ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setActiveFilter(filter.value)}
-              >
-                {filter.label}
-              </Button>
-            ))}
-          </div>
-          <div className="sm:hidden">
-            <Select
-              value={activeFilter}
-              onValueChange={(v) => setActiveFilter(v as QuickFilter)}
-            >
-              <SelectTrigger className="w-[140px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {QUICK_FILTERS.map((filter) => (
-                  <SelectItem key={filter.value} value={filter.value}>
-                    {filter.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                variant={activeFilter === 'custom' ? 'default' : 'outline'}
-                size="sm"
-                className={cn(
-                  'min-w-[140px]',
-                  !dateRange?.from && 'text-muted-foreground'
-                )}
-              >
-                <CalendarIcon className="mr-2 h-4 w-4" />
-                {dateRange?.from ? (
-                  dateRange.to ? (
-                    <>
-                      {format(dateRange.from, 'LLL dd, y')} -{' '}
-                      {format(dateRange.to, 'LLL dd, y')}
-                    </>
-                  ) : (
-                    format(dateRange.from, 'LLL dd, y')
-                  )
-                ) : (
-                  <span>Custom range</span>
-                )}
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0" align="end">
-              <Calendar
-                autoFocus
-                mode="range"
-                defaultMonth={
-                  new Date(new Date().setMonth(new Date().getMonth() - 1))
-                }
-                selected={dateRange}
-                onSelect={(range) => {
-                  setDateRange(range)
-                  if (range) {
-                    setActiveFilter('custom')
-                  }
-                }}
-                numberOfMonths={2}
-                disabled={[
-                  (date) => date > new Date(),
-                  {
-                    before: new Date(
-                      new Date().setMonth(new Date().getMonth() - 1)
-                    ),
-                  },
-                ]}
-                endMonth={new Date()}
-                startMonth={
-                  new Date(new Date().setMonth(new Date().getMonth() - 1))
-                }
-              />
-            </PopoverContent>
-          </Popover>
+          <DateRangePicker
+            date={{ from: startDate, to: endDate }}
+            onDateChange={(range) => {
+              setDateRange(range)
+              setActiveFilter('custom')
+            }}
+          />
         </div>
       </div>
 

@@ -60,7 +60,12 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  Tabs,
+  TabsContent,
+  ScrollableTabsList,
+  TabsTrigger,
+} from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -180,7 +185,11 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // change the query key, refire the fetch, and loop forever.
   const { startDate, endDate } = useMemo(
     () => getDateRangeFromFilter(dateFilter),
-    [dateFilter.quickFilter, dateFilter.dateRange?.from, dateFilter.dateRange?.to]
+    [
+      dateFilter.quickFilter,
+      dateFilter.dateRange?.from,
+      dateFilter.dateRange?.to,
+    ]
   )
   const timeRange = {
     startTime: (startDate ?? new Date()).toISOString(),
@@ -852,7 +861,7 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           setSelectedTab(v as 'errors' | 'analytics' | 'sourcemaps' | 'setup')
         }
       >
-        <TabsList className="grid w-full grid-cols-4 max-w-[700px]">
+        <ScrollableTabsList aria-label="Error tracking sections">
           <TabsTrigger value="errors">
             Error Groups
             {hasErrors && (
@@ -871,7 +880,7 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
               </Badge>
             )}
           </TabsTrigger>
-        </TabsList>
+        </ScrollableTabsList>
 
         <TabsContent value="errors" className="mt-5 space-y-3">
           {hasErrors ? (
@@ -1110,12 +1119,12 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
                 <CollapsibleContent>
                   <CardContent className="space-y-6">
                     <Tabs defaultValue="javascript" className="w-full">
-                      <TabsList className="grid w-full grid-cols-4">
+                      <ScrollableTabsList aria-label="SDK examples">
                         <TabsTrigger value="javascript">JavaScript</TabsTrigger>
                         <TabsTrigger value="react">React</TabsTrigger>
                         <TabsTrigger value="nodejs">Node.js</TabsTrigger>
                         <TabsTrigger value="python">Python</TabsTrigger>
-                      </TabsList>
+                      </ScrollableTabsList>
 
                       {/* JavaScript */}
                       <TabsContent value="javascript" className="space-y-4">

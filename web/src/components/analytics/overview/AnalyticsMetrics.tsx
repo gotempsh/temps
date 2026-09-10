@@ -1,25 +1,19 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { MetricSummary } from '@/components/data-display/MetricSummary'
+import { Button } from '@/components/ui/button'
+
 import { getUniqueCountsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 
 import { useQuery } from '@tanstack/react-query'
-import { Users, MousePointer, FileText, type LucideIcon } from 'lucide-react'
 
 interface AnalyticsMetricsProps {
   project: ProjectResponse
   startDate: Date | undefined
   endDate: Date | undefined
   environment: number | undefined
-}
-
-interface MetricCard {
-  label: string
-  value: number
-  icon: LucideIcon
-  secondary?: string
-  className?: string
 }
 
 export function AnalyticsMetrics({
@@ -110,79 +104,38 @@ export function AnalyticsMetrics({
       ? Math.round((returningVisitors / uniqueVisitors) * 100)
       : 0
 
-  const metrics: MetricCard[] = [
-    {
-      label: 'Unique Visitors',
-      value: uniqueVisitors,
-      icon: Users,
-      secondary: `${returningPercentage}% returning (${returningVisitors.toLocaleString()})`,
-      className: 'col-span-2 lg:col-span-1',
-    },
-    {
-      label: 'Total Sessions',
-      value: sessionsQuery.data?.count ?? 0,
-      icon: MousePointer,
-    },
-    {
-      label: 'Unique Pages',
-      value: pathsQuery.data?.count ?? 0,
-      icon: FileText,
-    },
-  ]
-
-  const gridCols = 'grid-cols-2 lg:grid-cols-3'
-  const skeletonCount = 3
+  if (hasError)
+    return (
+      <div role="alert" className="rounded-lg border p-4 text-sm">
+        <p>Could not load analytics metrics.</p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2"
+          onClick={() => {
+            void visitorsQuery.refetch()
+            void sessionsQuery.refetch()
+            void pathsQuery.refetch()
+            void returningVisitorsQuery.refetch()
+          }}
+        >
+          Retry metrics
+        </Button>
+      </div>
+    )
 
   return (
-    <>
-      {isLoading ? (
-        <div className={`grid ${gridCols} gap-3 sm:gap-4`}>
-          {[...Array(skeletonCount)].map((_, i) => (
-            <div
-              key={i}
-              className={`space-y-2 p-3 sm:p-4 rounded-lg border ${i === 0 ? 'col-span-2 lg:col-span-1' : ''}`}
-            >
-              <div className="h-4 w-20 bg-muted animate-pulse rounded" />
-              <div className="h-8 w-16 bg-muted animate-pulse rounded" />
-            </div>
-          ))}
-        </div>
-      ) : hasError ? (
-        <div className="flex flex-col items-center justify-center py-8 text-center">
-          <p className="text-sm text-muted-foreground">
-            Failed to load analytics metrics
-          </p>
-        </div>
-      ) : (
-        <div className={`grid ${gridCols} gap-3 sm:gap-4`}>
-          {metrics.map((metric) => {
-            const Icon = metric.icon
-            return (
-              <div
-                key={metric.label}
-                className={`flex flex-col p-3 sm:p-4 rounded-lg border bg-card transition-colors hover:bg-accent/50 ${metric.className ?? ''}`}
-              >
-                <div className="flex items-center justify-between mb-1 sm:mb-2">
-                  <Icon className="h-4 w-4 sm:h-5 sm:w-5 text-muted-foreground" />
-                </div>
-                <div className="space-y-0.5 sm:space-y-1">
-                  <p className="text-xl sm:text-2xl font-bold">
-                    {metric.value.toLocaleString()}
-                  </p>
-                  <p className="text-xs sm:text-sm text-muted-foreground">
-                    {metric.label}
-                  </p>
-                  {metric.secondary && (
-                    <p className="text-xs font-medium text-muted-foreground/80">
-                      {metric.secondary}
-                    </p>
-                  )}
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      )}
-    </>
+    <MetricSummary
+      loading={isLoading}
+      metrics={[
+        {
+          label: 'Visitors',
+          value: uniqueVisitors,
+          hint: `${returningPercentage}% returning`,
+        },
+        { label: 'Sessions', value: sessionsQuery.data?.count ?? 0 },
+        { label: 'Pages', value: pathsQuery.data?.count ?? 0 },
+      ]}
+    />
   )
 }

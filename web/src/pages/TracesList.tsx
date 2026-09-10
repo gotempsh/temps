@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+
 import {
   EnvironmentResponse,
   ProjectResponse,
@@ -63,7 +65,6 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
-  Clock,
   FileCode,
   Gauge,
   Loader2,
@@ -74,13 +75,7 @@ import {
   Terminal,
   Workflow,
 } from 'lucide-react'
-import {
-  ReactElement,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from 'react'
+import { ReactElement, useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
@@ -409,7 +404,8 @@ function OtelSetupSection({
   const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
   const [celebrate, setCelebrate] = useState(false)
   const [selectedEnvId, setSelectedEnvId] = useState<string>('')
-  const [selectedFrameworkId, setSelectedFrameworkId] = useState<string>('nextjs')
+  const [selectedFrameworkId, setSelectedFrameworkId] =
+    useState<string>('nextjs')
 
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({
@@ -439,7 +435,9 @@ function OtelSetupSection({
     frameworkPresets.find((f) => f.id === selectedFrameworkId) ??
     frameworkPresets[0]
 
-  const setupCode = preset.setupCode.split('__SERVICE_NAME__').join(project.name)
+  const setupCode = preset.setupCode
+    .split('__SERVICE_NAME__')
+    .join(project.name)
 
   const envVarsCode = `# Auto-injected on Temps deployments.
 # Set these manually when running on Vercel, Fly, AWS, bare metal, etc.
@@ -597,8 +595,8 @@ OTEL_SERVICE_NAME=${project.name}`
                 </h4>
               </div>
               <p className="text-xs text-muted-foreground">
-                Skip this if you deploy on Temps. Required when running the
-                app on Vercel, Fly, AWS, bare metal, etc.
+                Skip this if you deploy on Temps. Required when running the app
+                on Vercel, Fly, AWS, bare metal, etc.
               </p>
               <div className="flex items-center gap-3">
                 <span className="text-xs text-muted-foreground shrink-0">
@@ -619,14 +617,17 @@ OTEL_SERVICE_NAME=${project.name}`
               </div>
               <CodeBlock code={envVarsCode} language="bash" title=".env" />
               <p className="text-xs text-muted-foreground">
-                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key
-                (<code>tk_...</code>) from{' '}
+                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key (
+                <code>tk_...</code>) from{' '}
                 <strong>Settings &rarr; API Keys</strong>.
               </p>
             </div>
 
             <div className="flex items-center justify-between gap-3">
-              <Button variant="ghost" onClick={() => setWizardStep('framework')}>
+              <Button
+                variant="ghost"
+                onClick={() => setWizardStep('framework')}
+              >
                 <ArrowLeft className="mr-2 size-4" />
                 Back
               </Button>
@@ -670,8 +671,8 @@ OTEL_SERVICE_NAME=${project.name}`
                       Waiting for your first trace…
                     </h3>
                     <p className="text-sm text-muted-foreground">
-                      Deploy or run your app and trigger a request. We'll
-                      pick it up as soon as it arrives.
+                      Deploy or run your app and trigger a request. We'll pick
+                      it up as soon as it arrives.
                     </p>
                   </div>
                   <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -723,7 +724,9 @@ function SortHeader({
     <button
       type="button"
       onClick={onClick}
-      aria-sort={active ? (order === 'asc' ? 'ascending' : 'descending') : 'none'}
+      aria-sort={
+        active ? (order === 'asc' ? 'ascending' : 'descending') : 'none'
+      }
       className="ml-auto inline-flex items-center gap-1 hover:text-foreground transition-colors"
     >
       {label}
@@ -758,9 +761,7 @@ export default function TracesList({ project }: TracesListProps) {
   const [status, setStatus] = useState(
     () => searchParams.get('status') || 'all'
   )
-  const [search, setSearch] = useState(
-    () => searchParams.get('q') || ''
-  )
+  const [search, setSearch] = useState(() => searchParams.get('q') || '')
   const [namePattern, setNamePattern] = useState(
     () => searchParams.get('name') || ''
   )
@@ -795,7 +796,7 @@ export default function TracesList({ project }: TracesListProps) {
     return s === 'duration' ? 'duration' : s === 'none' ? null : 'start_time'
   })
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() =>
-    searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
+    searchParams.get('dir') === 'asc' ? 'asc' : 'desc'
   )
   const [showSetup, setShowSetup] = useState(false)
   // Bumped by Refresh so relative ranges recompute against "now". Without
@@ -807,7 +808,7 @@ export default function TracesList({ project }: TracesListProps) {
   // Compute time window (refreshKey forces a fresh "now" on Refresh)
   const { startTime, endTime } = useMemo(
     () => computeTracesTimeWindow(timeRange),
-    [timeRange, refreshKey],
+    [timeRange, refreshKey]
   )
 
   // Fetch environments for the filter dropdown
@@ -868,13 +869,28 @@ export default function TracesList({ project }: TracesListProps) {
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
     if (attrKey) params.set('attr_key', attrKey)
-    if (attrKey && debouncedAttrValue) params.set('attr_value', debouncedAttrValue)
+    if (attrKey && debouncedAttrValue)
+      params.set('attr_value', debouncedAttrValue)
     if (page > 1) params.set('page', page.toString())
     if (sortBy === null) params.set('sort', 'none')
     else if (sortBy !== 'start_time') params.set('sort', sortBy)
     if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, attrKey, debouncedAttrValue, page, sortBy, sortOrder, setSearchParams])
+  }, [
+    timeRange,
+    serviceName,
+    status,
+    debouncedSearch,
+    debouncedNamePattern,
+    environmentId,
+    deploymentId,
+    attrKey,
+    debouncedAttrValue,
+    page,
+    sortBy,
+    sortOrder,
+    setSearchParams,
+  ])
 
   // Cycle sort on a column header through three states: clicking a new column
   // selects it descending; clicking the active column goes desc → asc → unsorted
@@ -894,7 +910,7 @@ export default function TracesList({ project }: TracesListProps) {
       }
       setPage(1)
     },
-    [sortBy, sortOrder],
+    [sortBy, sortOrder]
   )
 
   // Breadcrumbs
@@ -1001,42 +1017,27 @@ export default function TracesList({ project }: TracesListProps) {
     return Array.from(names).sort()
   }, [traces])
 
-  const handleTimeRangeChange = useCallback(
-    (v: string) => {
-      setTimeRange(v as TracesTimeRange)
-      setPage(1)
-    },
-    []
-  )
-  const handleStatusChange = useCallback(
-    (v: string) => {
-      setStatus(v)
-      setPage(1)
-    },
-    []
-  )
-  const handleServiceChange = useCallback(
-    (v: string) => {
-      setServiceName(v === '__all__' ? '' : v)
-      setPage(1)
-    },
-    []
-  )
-  const handleEnvironmentChange = useCallback(
-    (v: string) => {
-      setEnvironmentId(v)
-      setDeploymentId('all') // Reset deployment when environment changes
-      setPage(1)
-    },
-    []
-  )
-  const handleDeploymentChange = useCallback(
-    (v: string) => {
-      setDeploymentId(v)
-      setPage(1)
-    },
-    []
-  )
+  const handleTimeRangeChange = useCallback((v: string) => {
+    setTimeRange(v as TracesTimeRange)
+    setPage(1)
+  }, [])
+  const handleStatusChange = useCallback((v: string) => {
+    setStatus(v)
+    setPage(1)
+  }, [])
+  const handleServiceChange = useCallback((v: string) => {
+    setServiceName(v === '__all__' ? '' : v)
+    setPage(1)
+  }, [])
+  const handleEnvironmentChange = useCallback((v: string) => {
+    setEnvironmentId(v)
+    setDeploymentId('all') // Reset deployment when environment changes
+    setPage(1)
+  }, [])
+  const handleDeploymentChange = useCallback((v: string) => {
+    setDeploymentId(v)
+    setPage(1)
+  }, [])
   const handleAttrKeyChange = useCallback((v: string) => {
     setAttrKey(v === '__none__' ? '' : v)
     setAttrValue('')
@@ -1068,7 +1069,9 @@ export default function TracesList({ project }: TracesListProps) {
             }}
             disabled={isFetching}
           >
-            <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+            <RefreshCw
+              className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+            />
           </Button>
           <Button
             variant="outline"
@@ -1146,19 +1149,10 @@ export default function TracesList({ project }: TracesListProps) {
       <Card>
         <CardContent className="p-3">
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
-            <Select value={timeRange} onValueChange={handleTimeRangeChange}>
-              <SelectTrigger className="w-full sm:w-[140px]">
-                <Clock className="mr-2 h-3.5 w-3.5" />
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="1h">Last 1 hour</SelectItem>
-                <SelectItem value="6h">Last 6 hours</SelectItem>
-                <SelectItem value="24h">Last 24 hours</SelectItem>
-                <SelectItem value="7d">Last 7 days</SelectItem>
-                <SelectItem value="30d">Last 30 days</SelectItem>
-              </SelectContent>
-            </Select>
+            <TimeRangeFilter
+              value={timeRange}
+              onChange={handleTimeRangeChange}
+            />
 
             <Select value={status} onValueChange={handleStatusChange}>
               <SelectTrigger className="w-full sm:w-[120px]">
@@ -1265,7 +1259,9 @@ export default function TracesList({ project }: TracesListProps) {
                     <SelectValue placeholder="Attribute" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__none__">No attribute filter</SelectItem>
+                    <SelectItem value="__none__">
+                      No attribute filter
+                    </SelectItem>
                     {facets.map((f) => (
                       <SelectItem key={f.attribute_key} value={f.attribute_key}>
                         {f.attribute_key}
@@ -1331,9 +1327,15 @@ export default function TracesList({ project }: TracesListProps) {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="min-w-[200px] md:w-[300px]">Trace</TableHead>
+                  <TableHead className="min-w-[200px] md:w-[300px]">
+                    Trace
+                  </TableHead>
                   <TableHead>Service</TableHead>
-                  {environmentId === 'all' && <TableHead className="hidden lg:table-cell">Environment</TableHead>}
+                  {environmentId === 'all' && (
+                    <TableHead className="hidden lg:table-cell">
+                      Environment
+                    </TableHead>
+                  )}
                   <TableHead className="hidden md:table-cell">Kind</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">
@@ -1344,7 +1346,9 @@ export default function TracesList({ project }: TracesListProps) {
                       onClick={() => handleSort('duration')}
                     />
                   </TableHead>
-                  <TableHead className="hidden md:table-cell text-right">Spans</TableHead>
+                  <TableHead className="hidden md:table-cell text-right">
+                    Spans
+                  </TableHead>
                   <TableHead className="hidden md:table-cell text-right">
                     <SortHeader
                       label="Timestamp"
@@ -1392,11 +1396,15 @@ export default function TracesList({ project }: TracesListProps) {
                             {trace.deployment_environment}
                           </Badge>
                         ) : (
-                          <span className="text-xs text-muted-foreground">—</span>
+                          <span className="text-xs text-muted-foreground">
+                            —
+                          </span>
                         )}
                       </TableCell>
                     )}
-                    <TableCell className="hidden md:table-cell">{kindBadge(trace.kind)}</TableCell>
+                    <TableCell className="hidden md:table-cell">
+                      {kindBadge(trace.kind)}
+                    </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-1.5">
                         {trace.error_count > 0
@@ -1438,7 +1446,8 @@ export default function TracesList({ project }: TracesListProps) {
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="text-sm text-muted-foreground text-center sm:text-left">
               <span className="hidden sm:inline">
-                Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, totalCount)} of{' '}
+                Showing {(page - 1) * PAGE_SIZE + 1}–
+                {Math.min(page * PAGE_SIZE, totalCount)} of{' '}
                 {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
               </span>
               <span className="sm:hidden">
