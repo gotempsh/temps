@@ -998,6 +998,8 @@ export type AllocEntry = {
     underlay_address: string;
 };
 
+export type AnalyticsFacet = 'summary' | 'traffic' | 'pages' | 'events' | 'breakdown' | 'speed';
+
 /**
  * An analytics ingest key as returned by the admin API.
  *
@@ -1041,6 +1043,11 @@ export type AnalyticsIngestKey = {
     rate_limit_per_minute?: number | null;
     revoked_at?: string | null;
     updated_at: string;
+};
+
+export type AnalyticsProjectOption = {
+    project_id: number;
+    project_name: string;
 };
 
 export type AnalyticsSessionEventsResponse = {
@@ -7203,6 +7210,54 @@ export type DockerComposePresetConfig = {
     relaxedCapabilityServices?: Array<string>;
 };
 
+/**
+ * Result of `docker system df` for the control-plane host.
+ */
+export type DockerDiskUsage = {
+    /**
+     * Docker API version the daemon answered with, when it reported one
+     * (`Api-Version` header). Useful when a category shows `null`
+     * reclaimable bytes.
+     */
+    api_version?: string | null;
+    build_cache: DockerDiskUsageCategory;
+    /**
+     * When this snapshot was taken (ISO 8601, UTC).
+     */
+    collected_at: string;
+    containers: DockerDiskUsageCategory;
+    images: DockerDiskUsageCategory;
+    /**
+     * Sum of the four category sizes.
+     */
+    total_bytes: number;
+    volumes: DockerDiskUsageCategory;
+};
+
+/**
+ * One slice of the Docker disk-usage donut.
+ */
+export type DockerDiskUsageCategory = {
+    /**
+     * Objects currently in use (images referenced by a container, running
+     * containers, mounted volumes, in-use cache records).
+     */
+    active_count: number;
+    /**
+     * Bytes `docker system prune` could free from this category. `null`
+     * when the daemon is older than API 1.52 and does not report it.
+     */
+    reclaimable_bytes?: number | null;
+    /**
+     * Bytes on disk attributed to this category.
+     */
+    size_bytes: number;
+    /**
+     * Number of objects in this category (all images, all containers, …).
+     */
+    total_count: number;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -10074,6 +10129,28 @@ export type GitSourcePlan = {
     repo: string;
 };
 
+export type GlobalAnalyticsResponse = {
+    rows: Array<GlobalAnalyticsRow>;
+    total: number;
+    total_views: number;
+};
+
+export type GlobalAnalyticsRow = {
+    avg_time_seconds?: number | null;
+    bounce_rate?: number | null;
+    cls_p75?: number | null;
+    fcp_p75?: number | null;
+    inp_p75?: number | null;
+    key: string;
+    lcp_p75?: number | null;
+    project_id: number;
+    project_name: string;
+    sessions: number;
+    ttfb_p75?: number | null;
+    views: number;
+    visitors: number;
+};
+
 /**
  * A conversation in the unified cross-project switcher: carries the project it
  * belongs to (name/slug) so the UI can show where the chat was started and
@@ -10100,6 +10177,38 @@ export type GlobalConversationResponse = {
     turn_status: string;
 };
 
+export type GlobalErrorGroupResponse = {
+    affected_users: number;
+    assigned_to?: string | null;
+    environment_name?: string | null;
+    error_type: string;
+    events_in_range: number;
+    first_seen: string;
+    id: number;
+    last_seen: string;
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+    status: string;
+    title: string;
+    total_count: number;
+};
+
+export type GlobalErrorGroupsQuery = {
+    end_date?: string | null;
+    page?: number;
+    page_size?: number;
+    project_id?: number | null;
+    search?: string | null;
+    start_date?: string | null;
+    status?: string | null;
+};
+
+export type GlobalErrorGroupsResponse = {
+    data: Array<GlobalErrorGroupResponse>;
+    pagination: PaginationMeta;
+};
+
 export type GlobalEventStatsResponse = {
     bounce_rate?: number | null;
     bounced: number;
@@ -10110,6 +10219,55 @@ export type GlobalEventStatsResponse = {
     open_rate?: number | null;
     opened: number;
 };
+
+export type GlobalLogLine = LogSearchLine & {
+    env: string;
+    external_service_id?: number | null;
+    owner: string;
+    project_id?: number | null;
+};
+
+export type GlobalLogSearchRequest = {
+    cursor?: string | null;
+    deploy_id?: number | null;
+    end_time: string;
+    envs?: Array<string>;
+    /**
+     * Database/service IDs or names, not container service labels.
+     */
+    external_services?: Array<string>;
+    levels?: Array<LogLevel>;
+    node_ids?: Array<number>;
+    page_size?: number | null;
+    /**
+     * Match project ID, slug or name. Empty selects all authorized projects.
+     */
+    projects?: Array<string>;
+    /**
+     * Explicit resource identities, e.g. application:12 or service:34.
+     */
+    scopes?: Array<string>;
+    source?: GlobalLogSource;
+    start_time: string;
+    text?: string | null;
+};
+
+export type GlobalLogSearchResponse = {
+    /**
+     * Newest first, ordered by timestamp, chunk ID and line offset.
+     */
+    lines: Array<GlobalLogLine>;
+    next_cursor?: string | null;
+    /**
+     * True means no complete ordered page could be established within the
+     * scan budget. Lines are empty; narrow the search rather than skipping logs.
+     */
+    scan_limit_reached: boolean;
+    scanned_bytes: number;
+    scanned_chunks: number;
+};
+
+export type GlobalLogSource = 'collected' | 'application' | 'service';
 
 export type GlobalMrrResponse = {
     /**
@@ -10147,6 +10305,44 @@ export type GlobalRevenueSummaryResponse = {
     refunded_all_time_minor: number;
     refunded_last_30d_minor: number;
     transactions_last_30d: number;
+};
+
+export type GlobalTraceSummariesResponse = {
+    data: Array<GlobalTraceSummary>;
+    projects: Array<TraceProject>;
+    total: number;
+    /**
+     * Effective per-project windows; totals and rows describe these windows.
+     */
+    windows: Array<GlobalTraceWindow>;
+};
+
+export type GlobalTraceSummary = TraceSummary & {
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+};
+
+/**
+ * A global query can use different stores and effective windows per project.
+ * A non-null clamp explicitly tells clients the pre-cutover range is excluded;
+ * request an earlier window to read the older source (ADR-040/041).
+ */
+export type GlobalTraceWindow = {
+    effective_end_time: string;
+    effective_start_time: string;
+    project_id: number;
+    source: CloudTelemetryWriteMode;
+    window_clamped_at?: string | null;
+};
+
+export type GlobalTracesResponse = {
+    data: Array<SpanRecord>;
+    total: number;
+    /**
+     * Effective per-project windows; totals and rows describe these windows.
+     */
+    windows: Array<GlobalTraceWindow>;
 };
 
 export type GroupedPageMetric = {
@@ -20911,6 +21107,12 @@ export type TopModelsQueryParams = {
     user_id?: number | null;
 };
 
+export type TraceProject = {
+    id: number;
+    name: string;
+    slug: string;
+};
+
 /**
  * All projects that contributed spans to a trace, including their sharing flag.
  *
@@ -26951,6 +27153,65 @@ export type GetGeneralStatsResponses = {
 };
 
 export type GetGeneralStatsResponse = GetGeneralStatsResponses[keyof GetGeneralStatsResponses];
+
+export type GetGlobalAnalyticsData = {
+    body?: never;
+    path?: never;
+    query: {
+        facet?: null | AnalyticsFacet;
+        project_id?: number | null;
+        environment_id?: number | null;
+        start_date: string;
+        end_date: string;
+        search?: string | null;
+        dimension?: string | null;
+        device?: string | null;
+        sort_by?: string | null;
+        sort_order?: string | null;
+        page?: number | null;
+        per_page?: number | null;
+        min_views?: number | null;
+        min_sessions?: number | null;
+    };
+    url: '/analytics/global';
+};
+
+export type GetGlobalAnalyticsErrors = {
+    /**
+     * Invalid analytics filters
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+};
+
+export type GetGlobalAnalyticsResponses = {
+    200: GlobalAnalyticsResponse;
+};
+
+export type GetGlobalAnalyticsResponse = GetGlobalAnalyticsResponses[keyof GetGlobalAnalyticsResponses];
+
+export type GetAnalyticsProjectsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/analytics/global/projects';
+};
+
+export type GetAnalyticsProjectsErrors = {
+    /**
+     * Access denied
+     */
+    403: unknown;
+};
+
+export type GetAnalyticsProjectsResponses = {
+    200: Array<AnalyticsProjectOption>;
+};
+
+export type GetAnalyticsProjectsResponse = GetAnalyticsProjectsResponses[keyof GetAnalyticsProjectsResponses];
 
 export type CheckAnalyticsHasEventsData = {
     body?: never;
@@ -33691,6 +33952,41 @@ export type GetEmailLinksResponses = {
 
 export type GetEmailLinksResponse = GetEmailLinksResponses[keyof GetEmailLinksResponses];
 
+export type ListGlobalErrorGroupsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number;
+        page_size?: number;
+        project_id?: number | null;
+        status?: string | null;
+        search?: string | null;
+        start_date?: string | null;
+        end_date?: string | null;
+    };
+    url: '/error-groups';
+};
+
+export type ListGlobalErrorGroupsErrors = {
+    /**
+     * Invalid filters
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+};
+
+export type ListGlobalErrorGroupsResponses = {
+    /**
+     * Visible errors across projects
+     */
+    200: GlobalErrorGroupsResponse;
+};
+
+export type ListGlobalErrorGroupsResponse = ListGlobalErrorGroupsResponses[keyof ListGlobalErrorGroupsResponses];
+
 export type ListServicesData = {
     body?: never;
     path?: never;
@@ -39767,6 +40063,27 @@ export type GetLogContextResponses = {
 
 export type GetLogContextResponse = GetLogContextResponses[keyof GetLogContextResponses];
 
+export type SearchGlobalLogsData = {
+    body: GlobalLogSearchRequest;
+    path?: never;
+    query?: never;
+    url: '/logs/global/search';
+};
+
+export type SearchGlobalLogsErrors = {
+    400: ProblemDetails;
+    403: ProblemDetails;
+    429: ProblemDetails;
+};
+
+export type SearchGlobalLogsError = SearchGlobalLogsErrors[keyof SearchGlobalLogsErrors];
+
+export type SearchGlobalLogsResponses = {
+    200: GlobalLogSearchResponse;
+};
+
+export type SearchGlobalLogsResponse = SearchGlobalLogsResponses[keyof SearchGlobalLogsResponses];
+
 export type SearchLogsData = {
     body: SearchLogsRequest;
     path?: never;
@@ -40277,6 +40594,96 @@ export type NodeMetricsUpdateAlertRuleResponses = {
 };
 
 export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
+
+export type NodeMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/latest';
+};
+
+export type NodeMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type NodeMetricsGetLatestResponse = NodeMetricsGetLatestResponses[keyof NodeMetricsGetLatestResponses];
+
+export type NodeDockerDiskUsageGetData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/nodes/{node_id}/docker-disk-usage';
+};
+
+export type NodeDockerDiskUsageGetErrors = {
+    /**
+     * Node is not the control plane
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Docker daemon answered with an unexpected response
+     */
+    502: unknown;
+    /**
+     * Docker daemon unreachable
+     */
+    503: unknown;
+    /**
+     * Docker daemon timed out
+     */
+    504: unknown;
+};
+
+export type NodeDockerDiskUsageGetResponses = {
+    /**
+     * Docker disk usage by category
+     */
+    200: DockerDiskUsage;
+};
+
+export type NodeDockerDiskUsageGetResponse = NodeDockerDiskUsageGetResponses[keyof NodeDockerDiskUsageGetResponses];
 
 export type DeletePreferencesData = {
     body?: never;
@@ -42175,6 +42582,104 @@ export type GetGenaiTraceResponses = {
 };
 
 export type GetGenaiTraceResponse = GetGenaiTraceResponses[keyof GetGenaiTraceResponses];
+
+export type QueryGlobalTracesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        project_id?: number | null;
+        trace_id?: string | null;
+        service_name?: string | null;
+        status?: string | null;
+        min_duration_ms?: number | null;
+        start_time?: string | null;
+        end_time?: string | null;
+        environment_id?: number | null;
+        deployment_id?: number | null;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs.
+         * e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string | null;
+        /**
+         * Filter by span name pattern (ILIKE).
+         */
+        name_pattern?: string | null;
+        /**
+         * Sort field for the trace-summaries list: "start_time" (default) or
+         * "duration". Anything else falls back to start_time.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: "asc" or "desc" (default).
+         */
+        sort_order?: string | null;
+        limit?: number | null;
+        offset?: number | null;
+    };
+    url: '/otel/global/spans';
+};
+
+export type QueryGlobalTracesErrors = {
+    403: ProblemDetails;
+};
+
+export type QueryGlobalTracesError = QueryGlobalTracesErrors[keyof QueryGlobalTracesErrors];
+
+export type QueryGlobalTracesResponses = {
+    200: GlobalTracesResponse;
+};
+
+export type QueryGlobalTracesResponse = QueryGlobalTracesResponses[keyof QueryGlobalTracesResponses];
+
+export type QueryGlobalTraceSummariesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        project_id?: number | null;
+        trace_id?: string | null;
+        service_name?: string | null;
+        status?: string | null;
+        min_duration_ms?: number | null;
+        start_time?: string | null;
+        end_time?: string | null;
+        environment_id?: number | null;
+        deployment_id?: number | null;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs.
+         * e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string | null;
+        /**
+         * Filter by span name pattern (ILIKE).
+         */
+        name_pattern?: string | null;
+        /**
+         * Sort field for the trace-summaries list: "start_time" (default) or
+         * "duration". Anything else falls back to start_time.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: "asc" or "desc" (default).
+         */
+        sort_order?: string | null;
+        limit?: number | null;
+        offset?: number | null;
+    };
+    url: '/otel/global/trace-summaries';
+};
+
+export type QueryGlobalTraceSummariesErrors = {
+    403: ProblemDetails;
+};
+
+export type QueryGlobalTraceSummariesError = QueryGlobalTraceSummariesErrors[keyof QueryGlobalTraceSummariesErrors];
+
+export type QueryGlobalTraceSummariesResponses = {
+    200: GlobalTraceSummariesResponse;
+};
+
+export type QueryGlobalTraceSummariesResponse = QueryGlobalTraceSummariesResponses[keyof QueryGlobalTraceSummariesResponses];
 
 export type GetUnifiedTraceData = {
     body?: never;

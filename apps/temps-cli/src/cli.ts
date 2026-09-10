@@ -36,6 +36,7 @@ import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
 import { registerMetricsCommands } from './commands/metrics/index.js'
+import { registerServerCommands } from './commands/server/index.js'
 import { registerTracesCommands } from './commands/traces/index.js'
 import { registerFacetsCommands } from './commands/facets/index.js'
 import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
@@ -189,6 +190,7 @@ export function createProgram(): Command {
   registerTokensCommands(program)
   registerErrorsCommands(program)
   registerMetricsCommands(program)
+  registerServerCommands(program)
   registerTracesCommands(program)
   registerFacetsCommands(program)
   registerOtelForwardCommands(program)
